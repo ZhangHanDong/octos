@@ -1,0 +1,29 @@
+{
+  "id": "botfather",
+  "name": "BotFather",
+  "enabled": true,
+  "config": {
+    "provider": "moonshot",
+    "model": "kimi-k2.5",
+    "api_key_env": "MOONSHOT_API_KEY",
+    "admin_mode": true,
+    "channels": [
+      {
+        "type": "matrix",
+        "homeserver": "http://127.0.0.1:8008",
+        "as_token": "d7d5dfb75d021d1fdb7e53d956af756baa69e333b5bf75a5291c07280a597f63",
+        "hs_token": "1fbdd11a50e1f3399d5dc59e62f9f57f7c9385b2548dd009d11adeacc02ea6d8",
+        "server_name": "127.0.0.1:8008",
+        "sender_localpart": "bot",
+        "user_prefix": "bot_",
+        "port": 8009
+      }
+    ],
+    "gateway": {
+      "max_history": 50,
+      "queue_mode": "followup"
+    }
+  },
+  "created_at": "2026-03-19T00:00:00Z",
+  "updated_at": "2026-03-19T00:00:00Z"
+}
