@@ -42,6 +42,7 @@ const METADATA_TARGET_PROFILE_ID: &str = "target_profile_id";
 const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
+const CONTENT_EXPLICIT_ROOM: &str = "org.octos.explicit_room";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
 #[cfg(test)]
@@ -225,7 +226,9 @@ impl BotRouter {
     pub async fn route_by_mention(&self, text: &str) -> Option<String> {
         let routes = self.routes.read().await;
         for (bot_user_id, entry) in routes.iter() {
-            if contains_exact_matrix_user_id_mention(text, bot_user_id) {
+            if contains_exact_matrix_user_id_mention(text, bot_user_id)
+                || contains_matrix_localpart_mention(text, bot_user_id)
+            {
                 return Some(entry.profile_id.clone());
             }
         }
@@ -404,6 +407,38 @@ fn contains_exact_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
     false
 }
 
+fn is_matrix_localpart_mention_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | '/')
+}
+
+fn contains_matrix_localpart_mention(text: &str, user_id: &str) -> bool {
+    let Some(localpart) = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split(':').next())
+        .filter(|localpart| !localpart.is_empty())
+    else {
+        return false;
+    };
+
+    let mention = format!("@{localpart}");
+    for (idx, _) in text.match_indices(&mention) {
+        let start_ok = text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_matrix_localpart_mention_char(c));
+        let end_idx = idx + mention.len();
+        let end_ok = text[end_idx..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_matrix_localpart_mention_char(c));
+        if start_ok && end_ok {
+            return true;
+        }
+    }
+
+    false
+}
+
 async fn route_by_explicit_target(bot_router: &BotRouter, content: &Value) -> Option<String> {
     let target_user_id = content
         .get(CONTENT_TARGET_USER_ID)
@@ -411,6 +446,13 @@ async fn route_by_explicit_target(bot_router: &BotRouter, content: &Value) -> Op
         .and_then(|v| v.as_str())
         .filter(|value| !value.is_empty())?;
     bot_router.route(target_user_id).await
+}
+
+fn has_explicit_room_marker(content: &Value) -> bool {
+    content
+        .get(CONTENT_EXPLICIT_ROOM)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 async fn route_by_matrix_mention(
@@ -568,6 +610,13 @@ impl MatrixChannel {
     /// Returns a reference to the bot router.
     pub fn bot_router(&self) -> &Arc<BotRouter> {
         &self.bot_router
+    }
+
+    /// Register the primary Matrix bot MXID so `@mainbot` mentions route to this profile too.
+    pub async fn register_primary_bot_route(&self, profile_id: &str) -> Result<()> {
+        self.bot_router
+            .register_entry(&self.bot_user_id, profile_id, "", BotVisibility::Public)
+            .await
     }
 
     /// Register a bot mapping and provision the Matrix virtual user on the homeserver.
@@ -1136,7 +1185,10 @@ async fn handle_transaction(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        // Route to bot profile: explicit target first, then @mention, then DM room mapping
+        let explicit_room = has_explicit_room_marker(content);
+
+        // Route to bot profile: explicit target first, then @mention,
+        // then explicit-room suppression, then room mapping fallback.
         let mut metadata = json!({});
         if let Some(profile_id) = route_by_explicit_target(&state.bot_router, content).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
@@ -1144,8 +1196,19 @@ async fn handle_transaction(
             route_by_matrix_mention(&state.bot_router, content, body_text).await
         {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
-        } else if let Some(profile_id) = state.bot_router.route_by_room(room_id).await {
+        } else if !explicit_room
+            && let Some(profile_id) = state.bot_router.route_by_room(room_id).await
+        {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
+        }
+
+        if explicit_room
+            && metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|value| value.as_str())
+                .is_none()
+        {
+            continue;
         }
 
         if let Some(profile_id) = metadata
@@ -1876,6 +1939,21 @@ mod tests {
             bot_router: Arc::new(BotRouter::new(None)),
             bot_manager: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_register_primary_bot_route_routes_main_bot_mentions() {
+        let ch = make_channel();
+        ch.register_primary_bot_route("botfather").await.unwrap();
+
+        assert_eq!(
+            ch.bot_router().route(ch.bot_user_id()).await,
+            Some("botfather".to_string()),
+        );
+        assert_eq!(
+            ch.bot_router().route_by_mention("@octos_bot 你是谁").await,
+            Some("botfather".to_string()),
+        );
     }
 
     #[derive(Clone, Debug)]
@@ -4445,6 +4523,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_transaction_localpart_mention_routes_to_target_bot() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_mybot:localhost", "profile-mybot")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$mentions-localpart-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "@octos_mybot 你是谁"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-mentions-localpart-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|v| v.as_str()),
+            Some("profile-mybot"),
+            "@localpart mention should route to the selected bot"
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_transaction_explicit_target_user_id() {
         use axum::body::Body;
         use axum::http::Request;
@@ -4563,6 +4697,243 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("profile-weather"),
             "explicit target_user_id should take priority over mention and room routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_explicit_room_skips_room_fallback() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register("@bot_weather:localhost", "profile-weather")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-weather")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$explicit-room-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello room",
+                    "org.octos.explicit_room": true
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-explicit-room-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "explicit_room should suppress single-bot room fallback and avoid bot dispatch",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_explicit_room_preserves_mention_routing() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register("@bot_weather:localhost", "profile-weather")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-weather")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$explicit-room-2",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "@bot_weather:localhost hello",
+                    "org.octos.explicit_room": true
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-explicit-room-2?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|v| v.as_str()),
+            Some("profile-weather"),
+            "explicit_room should not suppress explicit bot mentions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_explicit_room_preserves_explicit_target_priority() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register("@bot_weather:localhost", "profile-weather")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$explicit-room-3",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello weather",
+                    "org.octos.explicit_room": true,
+                    "org.octos.target_user_id": "@bot_weather:localhost"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-explicit-room-3?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|v| v.as_str()),
+            Some("profile-weather"),
+            "explicit target should still win when explicit_room is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_invalid_explicit_room_marker_ignored() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register("@bot_weather:localhost", "profile-weather")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-weather")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$explicit-room-4",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello fallback",
+                    "org.octos.explicit_room": "true"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-explicit-room-4?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|v| v.as_str()),
+            Some("profile-weather"),
+            "non-boolean explicit_room marker should be ignored"
         );
     }
 

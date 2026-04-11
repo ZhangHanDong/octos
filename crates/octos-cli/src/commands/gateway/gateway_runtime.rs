@@ -1136,6 +1136,16 @@ impl GatewayRuntime {
         #[cfg(feature = "matrix")]
         if admin_mode {
             if let Some(ref channel) = matrix_channel {
+                if let Err(error) = channel
+                    .register_primary_bot_route(
+                        profile_id
+                            .as_deref()
+                            .unwrap_or(MAIN_PROFILE_ID),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "failed to register primary Matrix bot route");
+                }
                 if let Some(ref store) = profile_store {
                     let bot_mgr = Arc::new(GatewayBotManager {
                         store: store.clone(),
