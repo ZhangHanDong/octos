@@ -24,6 +24,7 @@ use tracing::{info, warn};
 use super::build_system_prompt;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, detect_provider};
+use crate::profiles::UserProfile;
 use crate::session_actor::{
     ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
     SnapshotToolRegistryFactory, ToolRegistryFactory,
@@ -475,6 +476,28 @@ pub(crate) fn build_synthesis_config(
     })
 }
 
+fn profile_identity_context(profile: &UserProfile) -> Option<String> {
+    let matrix_user_id = profile
+        .config
+        .env_vars
+        .get("OCTOS_MATRIX_BOT_USER_ID")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let display_name = profile.name.trim();
+    let mut context = String::from("## Runtime Identity\n\n");
+    if display_name.is_empty() {
+        context.push_str(&format!(
+            "You are the Matrix bot `{matrix_user_id}`. If the user asks who you are, identify yourself as `{matrix_user_id}`. Do not claim to be a different bot in the room.\n"
+        ));
+    } else {
+        context.push_str(&format!(
+            "You are the Matrix bot `{display_name}` with Matrix user ID `{matrix_user_id}`. If the user asks who you are, identify yourself as `{display_name}` / `{matrix_user_id}`. Do not claim to be a different bot in the room.\n"
+        ));
+    }
+    Some(context)
+}
+
 pub(super) struct ProfileActorFactoryBuilder {
     pub(super) profile_store: Arc<crate::profiles::ProfileStore>,
     pub(super) project_dir: PathBuf,
@@ -575,6 +598,10 @@ impl ProfileActorFactoryBuilder {
         for fragment in &self.plugin_prompt_fragments {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(fragment);
+        }
+        if let Some(identity_context) = profile_identity_context(&effective_profile) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&identity_context);
         }
         let mut pipeline_factory = self.pipeline_factory.clone();
         let mut provider_policy = self.provider_policy.clone();
@@ -1202,5 +1229,44 @@ mod tests {
             "child-profile pipeline root must NOT be project_dir (cwd/.octos), which \
              bootstrap never wrote — the 344d0df1 defect"
         );
+    }
+
+    fn make_profile(name: &str, matrix_user_id: Option<&str>) -> UserProfile {
+        let mut profile = UserProfile {
+            id: "botfather--alexbot".to_string(),
+            name: name.to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: Some("botfather".to_string()),
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        if let Some(matrix_user_id) = matrix_user_id {
+            profile.config.env_vars.insert(
+                "OCTOS_MATRIX_BOT_USER_ID".to_string(),
+                matrix_user_id.to_string(),
+            );
+        }
+        profile
+    }
+
+    #[test]
+    fn test_profile_identity_context_includes_display_name_and_matrix_user_id() {
+        let profile = make_profile("Alex", Some("@octosbot_alexbot:127.0.0.1:8128"));
+
+        let context = profile_identity_context(&profile).expect("identity context");
+
+        assert!(context.contains("Alex"));
+        assert!(context.contains("@octosbot_alexbot:127.0.0.1:8128"));
+        assert!(context.contains("Do not claim to be a different bot"));
+    }
+
+    #[test]
+    fn test_profile_identity_context_absent_without_matrix_user_id() {
+        let profile = make_profile("Alex", None);
+
+        assert!(profile_identity_context(&profile).is_none());
     }
 }
