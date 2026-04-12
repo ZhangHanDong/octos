@@ -112,6 +112,7 @@ impl MatrixChannelSettings {
                 shutdown,
             )
             .with_admin_allowed_senders(self.allowed_senders.clone())
+            .with_media_dir(data_dir.join("media"))
             .with_bot_router(data_dir),
         )
     }
