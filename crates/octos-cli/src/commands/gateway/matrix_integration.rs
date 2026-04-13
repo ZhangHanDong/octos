@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};

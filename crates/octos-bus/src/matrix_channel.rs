@@ -6,22 +6,22 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
+use axum::Router;
 use chrono::Utc;
 use eyre::{Result, WrapErr};
-use octos_core::{InboundMessage, METADATA_SENDER_USER_ID, OutboundMessage};
+use octos_core::{InboundMessage, OutboundMessage, METADATA_SENDER_USER_ID};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::channel::{Channel, ChannelHealth};
@@ -3971,11 +3971,9 @@ mod tests {
 
         wait_for_request_count(&requests, 1).await;
         let requests = requests.lock().await;
-        assert!(
-            requests
-                .iter()
-                .any(|req| req.path == "/_matrix/client/v3/register")
-        );
+        assert!(requests
+            .iter()
+            .any(|req| req.path == "/_matrix/client/v3/register"));
 
         homeserver_handle.abort();
     }
