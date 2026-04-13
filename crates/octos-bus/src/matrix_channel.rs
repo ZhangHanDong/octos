@@ -1241,14 +1241,6 @@ async fn handle_transaction(
             continue;
         }
 
-        // Intercept slash commands before routing to agent
-        if let Some(response) = handle_slash_command(&state, sender, room_id, body_text).await {
-            if let Err(e) = send_text_to_room(&state, room_id, &response).await {
-                warn!(error = %e, room_id, "failed to send slash command response");
-            }
-            continue;
-        }
-
         let event_id = event
             .get("event_id")
             .and_then(|v| v.as_str())
@@ -1310,6 +1302,23 @@ async fn handle_transaction(
             }
         }
 
+        if let Some(response) = handle_slash_command(
+            &state,
+            sender,
+            room_id,
+            body_text,
+            metadata
+                .get(METADATA_TARGET_MATRIX_USER_ID)
+                .and_then(|value| value.as_str()),
+        )
+        .await
+        {
+            if let Err(e) = send_text_to_room(&state, room_id, &response).await {
+                warn!(error = %e, room_id, "failed to send slash command response");
+            }
+            continue;
+        }
+
         // For media messages with empty body, provide a descriptive placeholder
         let content_text = if body_text.is_empty() && !media.is_empty() {
             "[User sent a file]".to_string()
@@ -1346,8 +1355,13 @@ async fn handle_slash_command(
     sender: &str,
     _room_id: &str,
     body: &str,
+    target_matrix_user_id: Option<&str>,
 ) -> Option<String> {
     let bot_manager = state.bot_manager.as_ref()?;
+
+    if target_matrix_user_id.is_some_and(|target| target != state.bot_user_id) {
+        return None;
+    }
 
     let trimmed = body.trim();
     if !trimmed.starts_with('/') {
@@ -5331,8 +5345,14 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let state = make_test_state(tx);
         // bot_manager is None, so slash commands should not be intercepted
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            None,
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -5342,9 +5362,14 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "hello world")
-                .await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "hello world",
+            None,
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -5354,8 +5379,14 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -5371,6 +5402,7 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --prompt \"你是天气助手\"",
+            None,
         )
         .await;
         assert!(result.is_some());
@@ -5389,6 +5421,7 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot",
+            None,
         )
         .await;
 
@@ -5411,6 +5444,7 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --public",
+            None,
         )
         .await;
 
@@ -5430,6 +5464,7 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/deletebot @bot_weather:localhost",
+            None,
         )
         .await;
         assert!(result.is_some());
@@ -5442,8 +5477,14 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/createbot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/createbot",
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -5454,8 +5495,14 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/deletebot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/deletebot",
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -5466,8 +5513,14 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbot",
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -5478,12 +5531,58 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/unknown").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/unknown",
+            None,
+        )
+        .await;
         assert!(
             result.is_none(),
             "unknown slash commands should pass through to agent"
         );
+    }
+
+    #[tokio::test]
+    async fn test_slash_command_not_intercepted_for_explicit_child_bot_target() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            Some("@bot_weather:localhost"),
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "explicit child-bot target should bypass BotFather slash interception"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slash_command_intercepted_for_primary_bot_target() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            Some("@octos_bot:localhost"),
+        )
+        .await;
+
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("mock list"));
     }
 
     /// Mock BotManager for testing slash command dispatch.
