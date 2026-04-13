@@ -1265,10 +1265,10 @@ async fn handle_transaction(
             route_by_matrix_mention(&state.bot_router, content, body_text).await
         {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
-        } else if !explicit_room
-            && let Some(profile_id) = state.bot_router.route_by_room(room_id).await
-        {
-            metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
+        } else if !explicit_room {
+            if let Some(profile_id) = state.bot_router.route_by_room(room_id).await {
+                metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
+            }
         }
 
         if explicit_room
