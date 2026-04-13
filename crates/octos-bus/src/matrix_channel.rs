@@ -412,7 +412,12 @@ fn contains_exact_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
 }
 
 fn is_matrix_localpart_mention_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | '/')
+    // `:` is included because a `:` immediately after `@localpart` means the
+    // text is actually a full user ID `@localpart:homeserver`, not a standalone
+    // localpart-style mention. Without this, `@bot_weather:homeserverB` in a
+    // message would spuriously match a bot registered as `@bot_weather:homeserverA`,
+    // leaking messages across homeserver boundaries.
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | '/' | ':')
 }
 
 fn contains_matrix_localpart_mention(text: &str, user_id: &str) -> bool {
