@@ -1179,7 +1179,10 @@ async fn handle_transaction(
             .unwrap_or("");
 
         // Accept text and media message types; skip everything else (e.g. m.location, m.notice from other bots)
-        let is_media = matches!(msgtype, MSGTYPE_IMAGE | MSGTYPE_FILE | MSGTYPE_AUDIO | MSGTYPE_VIDEO);
+        let is_media = matches!(
+            msgtype,
+            MSGTYPE_IMAGE | MSGTYPE_FILE | MSGTYPE_AUDIO | MSGTYPE_VIDEO
+        );
         if msgtype != MSGTYPE_TEXT && !is_media {
             continue;
         }
@@ -1218,7 +1221,12 @@ async fn handle_transaction(
                 .await
                 {
                     Ok(local_path) => {
-                        info!(mxc_url, filename, ?local_path, "downloaded Matrix media file");
+                        info!(
+                            mxc_url,
+                            filename,
+                            ?local_path,
+                            "downloaded Matrix media file"
+                        );
                         media.push(local_path.to_string_lossy().into_owned());
                     }
                     Err(e) => {
@@ -1746,7 +1754,12 @@ impl Channel for MatrixChannel {
                     _ => "application/octet-stream",
                 };
 
-                info!(path = path_str, size = file_size, content_type, "sending media file via Matrix");
+                info!(
+                    path = path_str,
+                    size = file_size,
+                    content_type,
+                    "sending media file via Matrix"
+                );
 
                 let mxc_url = self
                     .upload_media(file_path, content_type, sender_user_id)
@@ -2015,8 +2028,14 @@ impl MatrixChannel {
             .wrap_err("failed to parse Matrix upload response")?;
 
         if !status.is_success() {
-            let errcode = resp_body.get("errcode").and_then(|v| v.as_str()).unwrap_or("");
-            let error = resp_body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            let errcode = resp_body
+                .get("errcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let error = resp_body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             return Err(eyre::eyre!(
                 "Matrix media upload failed: status={status} errcode={errcode} error={error}"
             ));
@@ -2093,8 +2112,14 @@ impl MatrixChannel {
             .wrap_err("failed to parse Matrix send response")?;
 
         if !status.is_success() {
-            let errcode = resp_body.get("errcode").and_then(|v| v.as_str()).unwrap_or("");
-            let error = resp_body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            let errcode = resp_body
+                .get("errcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let error = resp_body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             return Err(eyre::eyre!(
                 "Matrix media send failed: status={status} errcode={errcode} error={error}"
             ));

@@ -46,9 +46,9 @@ use crate::session_actor::{
 use crate::status_layers::StatusComposer;
 
 #[cfg(feature = "matrix")]
-use octos_core::MAIN_PROFILE_ID;
-#[cfg(feature = "matrix")]
 use super::matrix_integration::*;
+#[cfg(feature = "matrix")]
+use octos_core::MAIN_PROFILE_ID;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 
@@ -1139,11 +1139,7 @@ impl GatewayRuntime {
         if admin_mode {
             if let Some(ref channel) = matrix_channel {
                 if let Err(error) = channel
-                    .register_primary_bot_route(
-                        profile_id
-                            .as_deref()
-                            .unwrap_or(MAIN_PROFILE_ID),
-                    )
+                    .register_primary_bot_route(profile_id.as_deref().unwrap_or(MAIN_PROFILE_ID))
                     .await
                 {
                     tracing::warn!(%error, "failed to register primary Matrix bot route");
