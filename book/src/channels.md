@@ -417,6 +417,17 @@ octos cron enable <job-id> --disable     # Disable a job
 
 Jobs support an optional `timezone` field with IANA timezone names (e.g., `"America/New_York"`, `"Asia/Shanghai"`). When omitted, UTC is used.
 
+When running Matrix through a management bot (for example, a BotFather-style profile), the same cron capability can also be reached through chat commands:
+
+```text
+/schedule 20秒之后提醒我看天气
+/schedule 每天早上 9 点提醒我看天气
+/schedules
+/unschedule <job-id>
+```
+
+These commands are scoped to the current chat context. `/schedules` only shows jobs created for the current room/DM, and `/unschedule` only removes jobs visible in that same chat context.
+
 ---
 
 ## Message Coalescing

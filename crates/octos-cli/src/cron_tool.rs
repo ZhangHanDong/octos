@@ -5,9 +5,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{Local, Utc};
 use eyre::{Result, WrapErr};
 use octos_agent::tools::{Tool, ToolResult};
 use octos_bus::{CronPayload, CronSchedule, CronService};
+use regex::Regex;
 use serde::Deserialize;
 
 pub struct CronTool {
@@ -49,6 +51,515 @@ impl CronTool {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = chat_id.to_string();
     }
+
+    pub fn add_natural_language_for_context(
+        service: &Arc<CronService>,
+        channel: &str,
+        chat_id: &str,
+        request: &str,
+    ) -> Result<ToolResult> {
+        let request = request.trim();
+        if request.is_empty() {
+            return Ok(ToolResult {
+                output: "Usage: /schedule <natural-language task>".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let parsed = match parse_natural_schedule_request(request) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                return Ok(ToolResult {
+                    output: message,
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+
+        let payload = CronPayload {
+            message: parsed.message.clone(),
+            deliver: true,
+            channel: Some(channel.to_string()),
+            chat_id: Some(chat_id.to_string()),
+        };
+
+        let job = service.add_job_with_tz(
+            parsed.name,
+            parsed.schedule,
+            payload,
+            parsed.timezone,
+        )?;
+
+        Ok(ToolResult {
+            output: format!(
+                "Created schedule '{}' (id: {}). {}",
+                job.name, job.id, parsed.description
+            ),
+            success: true,
+            ..Default::default()
+        })
+    }
+
+    pub fn list_jobs_for_context(
+        service: &CronService,
+        channel: &str,
+        chat_id: &str,
+    ) -> ToolResult {
+        let jobs = service
+            .list_all_jobs()
+            .into_iter()
+            .filter(|job| job_matches_context(job, channel, chat_id))
+            .collect::<Vec<_>>();
+
+        if jobs.is_empty() {
+            return ToolResult {
+                output: "No scheduled jobs for this chat.".into(),
+                success: true,
+                ..Default::default()
+            };
+        }
+
+        let mut out = format!("{} scheduled job(s) for this chat:\n\n", jobs.len());
+        for (i, job) in jobs.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. [{}] {} — {} (msg: \"{}\")\n",
+                i + 1,
+                job.id,
+                job.name,
+                format_schedule_for_display(&job.schedule),
+                truncate(&job.payload.message, 60),
+            ));
+        }
+
+        ToolResult {
+            output: out,
+            success: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn remove_job_for_context(
+        service: &Arc<CronService>,
+        channel: &str,
+        chat_id: &str,
+        job_id: &str,
+    ) -> ToolResult {
+        let visible = service
+            .list_all_jobs()
+            .into_iter()
+            .any(|job| job.id == job_id && job_matches_context(&job, channel, chat_id));
+
+        if !visible {
+            return ToolResult {
+                output: format!("Job {job_id} not found in this chat."),
+                success: false,
+                ..Default::default()
+            };
+        }
+
+        if service.remove_job(job_id) {
+            ToolResult {
+                output: format!("Removed job {job_id}."),
+                success: true,
+                ..Default::default()
+            }
+        } else {
+            ToolResult {
+                output: format!("Job {job_id} not found."),
+                success: false,
+                ..Default::default()
+            }
+        }
+    }
+}
+
+struct ParsedNaturalSchedule {
+    name: String,
+    message: String,
+    schedule: CronSchedule,
+    timezone: Option<String>,
+    description: String,
+}
+
+fn parse_natural_schedule_request(request: &str) -> std::result::Result<ParsedNaturalSchedule, String> {
+    if let Some(parsed) = parse_delayed_schedule(request) {
+        return Ok(parsed);
+    }
+    if let Some(parsed) = parse_interval_schedule(request) {
+        return Ok(parsed);
+    }
+    if let Some(parsed) = parse_daily_schedule(request) {
+        return Ok(parsed);
+    }
+    if let Some(parsed) = parse_weekly_schedule(request) {
+        return Ok(parsed);
+    }
+
+    Err(
+        "I couldn't understand that schedule yet. Try patterns like `20秒之后提醒我看天气`, `每天早上 9 点提醒我看天气`, `每30分钟检查状态`, or `every day at 9am remind me to check weather`.".to_string(),
+    )
+}
+
+fn parse_delayed_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
+    let zh = Regex::new(r"^(\d+)\s*(秒|分钟|小时|天)(?:后|之后)\s*(.+)$").ok()?;
+    if let Some(caps) = zh.captures(request) {
+        let value = caps.get(1)?.as_str().parse::<i64>().ok()?;
+        let unit = caps.get(2)?.as_str();
+        let message = caps.get(3)?.as_str().trim().to_string();
+        let delay_ms = interval_to_ms(value, unit)?;
+        let at_ms = Utc::now().timestamp_millis() + delay_ms;
+        return Some(ParsedNaturalSchedule {
+            name: derive_job_name(&message),
+            message,
+            schedule: CronSchedule::At { at_ms },
+            timezone: None,
+            description: format!("Runs once in {}", interval_label(value, unit)),
+        });
+    }
+
+    let en = Regex::new(
+        r"(?i)^in\s+(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days)\s+(.+)$",
+    )
+    .ok()?;
+    let caps = en.captures(request)?;
+    let value = caps.get(1)?.as_str().parse::<i64>().ok()?;
+    let unit = caps.get(2)?.as_str().to_ascii_lowercase();
+    let message = caps.get(3)?.as_str().trim().to_string();
+    let delay_ms = interval_to_ms(value, unit.as_str())?;
+    let at_ms = Utc::now().timestamp_millis() + delay_ms;
+    Some(ParsedNaturalSchedule {
+        name: derive_job_name(&message),
+        message,
+        schedule: CronSchedule::At { at_ms },
+        timezone: None,
+        description: format!("Runs once in {} {}", value, unit),
+    })
+}
+
+fn parse_interval_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
+    let zh = Regex::new(r"^每\s*(\d+)\s*(秒|分钟|小时|天)\s*(.+)$").ok()?;
+    if let Some(caps) = zh.captures(request) {
+        let value = caps.get(1)?.as_str().parse::<i64>().ok()?;
+        let unit = caps.get(2)?.as_str();
+        let message = caps.get(3)?.as_str().trim().to_string();
+        let every_seconds = interval_to_seconds(value, unit)?;
+        return Some(ParsedNaturalSchedule {
+            name: derive_job_name(&message),
+            message,
+            schedule: CronSchedule::Every {
+                every_ms: every_seconds * 1000,
+            },
+            timezone: None,
+            description: format!("Runs every {}", interval_label(value, unit)),
+        });
+    }
+
+    let en = Regex::new(
+        r"(?i)^every\s+(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days)\s+(.+)$",
+    )
+    .ok()?;
+    let caps = en.captures(request)?;
+    let value = caps.get(1)?.as_str().parse::<i64>().ok()?;
+    let unit = caps.get(2)?.as_str().to_ascii_lowercase();
+    let message = caps.get(3)?.as_str().trim().to_string();
+    let every_seconds = interval_to_seconds(value, unit.as_str())?;
+    Some(ParsedNaturalSchedule {
+        name: derive_job_name(&message),
+        message,
+        schedule: CronSchedule::Every {
+            every_ms: every_seconds * 1000,
+        },
+        timezone: None,
+        description: format!("Runs every {} {}", value, unit),
+    })
+}
+
+fn parse_daily_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
+    let zh = Regex::new(
+        r"^每天(?:(早上|上午|中午|下午|晚上))?\s*(\d{1,2})(?:\s*[:点时]\s*(\d{1,2})?)?\s*分?\s*(.+)$",
+    )
+    .ok()?;
+    if let Some(caps) = zh.captures(request) {
+        let qualifier = caps.get(1).map(|m| m.as_str());
+        let hour = caps.get(2)?.as_str().parse::<u32>().ok()?;
+        let minute = caps
+            .get(3)
+            .map(|m| m.as_str().parse::<u32>().ok())
+            .flatten()
+            .unwrap_or(0);
+        let message = caps.get(4)?.as_str().trim().to_string();
+        let hour = apply_time_qualifier(hour, qualifier)?;
+        let (utc_hour, utc_minute, _) = local_wall_time_to_utc(hour, minute)?;
+        let offset_label = current_local_offset_label();
+        return Some(ParsedNaturalSchedule {
+            name: derive_job_name(&message),
+            message,
+            schedule: CronSchedule::Cron {
+                expr: format!("0 {utc_minute} {utc_hour} * * * *"),
+            },
+            timezone: None,
+            description: format!(
+                "Runs every day at {:02}:{:02} using server local offset {}",
+                hour, minute, offset_label
+            ),
+        });
+    }
+
+    let en = Regex::new(
+        r"(?i)^every\s+day\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+)$",
+    )
+    .ok()?;
+    let caps = en.captures(request)?;
+    let hour = caps.get(1)?.as_str().parse::<u32>().ok()?;
+    let minute = caps
+        .get(2)
+        .map(|m| m.as_str().parse::<u32>().ok())
+        .flatten()
+        .unwrap_or(0);
+    let am_pm = caps.get(3).map(|m| m.as_str());
+    let message = caps.get(4)?.as_str().trim().to_string();
+    let hour = apply_am_pm(hour, am_pm)?;
+    let (utc_hour, utc_minute, _) = local_wall_time_to_utc(hour, minute)?;
+    let offset_label = current_local_offset_label();
+    Some(ParsedNaturalSchedule {
+        name: derive_job_name(&message),
+        message,
+        schedule: CronSchedule::Cron {
+            expr: format!("0 {utc_minute} {utc_hour} * * * *"),
+        },
+        timezone: None,
+        description: format!(
+            "Runs every day at {:02}:{:02} using server local offset {}",
+            hour, minute, offset_label
+        ),
+    })
+}
+
+fn parse_weekly_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
+    let zh = Regex::new(
+        r"^每周([一二三四五六日天])(?:(早上|上午|中午|下午|晚上))?\s*(\d{1,2})(?:\s*[:点时]\s*(\d{1,2})?)?\s*分?\s*(.+)$",
+    )
+    .ok()?;
+    if let Some(caps) = zh.captures(request) {
+        let weekday = chinese_weekday_to_index(caps.get(1)?.as_str())?;
+        let qualifier = caps.get(2).map(|m| m.as_str());
+        let hour = caps.get(3)?.as_str().parse::<u32>().ok()?;
+        let minute = caps
+            .get(4)
+            .map(|m| m.as_str().parse::<u32>().ok())
+            .flatten()
+            .unwrap_or(0);
+        let message = caps.get(5)?.as_str().trim().to_string();
+        let hour = apply_time_qualifier(hour, qualifier)?;
+        let (utc_hour, utc_minute, day_shift) = local_wall_time_to_utc(hour, minute)?;
+        let utc_weekday = remap_weekday_to_utc(weekday, day_shift);
+        let offset_label = current_local_offset_label();
+        return Some(ParsedNaturalSchedule {
+            name: derive_job_name(&message),
+            message,
+            schedule: CronSchedule::Cron {
+                expr: format!("0 {utc_minute} {utc_hour} * * {utc_weekday} *"),
+            },
+            timezone: None,
+            description: format!(
+                "Runs weekly on {} at {:02}:{:02} using server local offset {}",
+                weekday_label(weekday),
+                hour,
+                minute,
+                offset_label
+            ),
+        });
+    }
+
+    let en = Regex::new(
+        r"(?i)^every\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+)$",
+    )
+    .ok()?;
+    let caps = en.captures(request)?;
+    let weekday = english_weekday_to_index(caps.get(1)?.as_str())?;
+    let hour = caps.get(2)?.as_str().parse::<u32>().ok()?;
+    let minute = caps
+        .get(3)
+        .map(|m| m.as_str().parse::<u32>().ok())
+        .flatten()
+        .unwrap_or(0);
+    let am_pm = caps.get(4).map(|m| m.as_str());
+    let message = caps.get(5)?.as_str().trim().to_string();
+    let hour = apply_am_pm(hour, am_pm)?;
+    let (utc_hour, utc_minute, day_shift) = local_wall_time_to_utc(hour, minute)?;
+    let utc_weekday = remap_weekday_to_utc(weekday, day_shift);
+    let offset_label = current_local_offset_label();
+    Some(ParsedNaturalSchedule {
+        name: derive_job_name(&message),
+        message,
+        schedule: CronSchedule::Cron {
+            expr: format!("0 {utc_minute} {utc_hour} * * {utc_weekday} *"),
+        },
+        timezone: None,
+        description: format!(
+            "Runs weekly on {} at {:02}:{:02} using server local offset {}",
+            weekday_label(weekday),
+            hour,
+            minute,
+            offset_label
+        ),
+    })
+}
+
+fn derive_job_name(message: &str) -> String {
+    let mut name = message
+        .chars()
+        .map(|c| if is_job_name_char(c) { c } else { '-' })
+        .collect::<String>();
+    while name.contains("--") {
+        name = name.replace("--", "-");
+    }
+    let trimmed = name.trim_matches('-');
+    if trimmed.is_empty() {
+        "schedule".to_string()
+    } else {
+        truncate(trimmed, 24)
+    }
+}
+
+fn is_job_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+fn interval_to_seconds(value: i64, unit: &str) -> Option<i64> {
+    match unit {
+        "秒" | "second" | "seconds" => Some(value),
+        "分钟" | "minute" | "minutes" => Some(value * 60),
+        "小时" | "hour" | "hours" => Some(value * 60 * 60),
+        "天" | "day" | "days" => Some(value * 24 * 60 * 60),
+        _ => None,
+    }
+}
+
+fn interval_to_ms(value: i64, unit: &str) -> Option<i64> {
+    interval_to_seconds(value, unit).map(|seconds| seconds * 1000)
+}
+
+fn interval_label(value: i64, unit: &str) -> String {
+    format!("{value}{unit}")
+}
+
+fn apply_time_qualifier(hour: u32, qualifier: Option<&str>) -> Option<u32> {
+    let adjusted = match qualifier {
+        Some("下午") | Some("晚上") if hour < 12 => hour + 12,
+        Some("中午") if hour < 11 => hour + 12,
+        _ => hour,
+    };
+    validate_hour_minute(adjusted, 0).map(|_| adjusted)
+}
+
+fn apply_am_pm(hour: u32, am_pm: Option<&str>) -> Option<u32> {
+    let mut adjusted = hour;
+    match am_pm.map(|value| value.to_ascii_lowercase()) {
+        Some(ref suffix) if suffix == "pm" && adjusted < 12 => adjusted += 12,
+        Some(ref suffix) if suffix == "am" && adjusted == 12 => adjusted = 0,
+        _ => {}
+    }
+    validate_hour_minute(adjusted, 0).map(|_| adjusted)
+}
+
+fn validate_hour_minute(hour: u32, minute: u32) -> Option<()> {
+    if hour < 24 && minute < 60 {
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn local_wall_time_to_utc(hour: u32, minute: u32) -> Option<(u32, u32, i32)> {
+    validate_hour_minute(hour, minute)?;
+    let local_total_minutes = (hour as i32) * 60 + (minute as i32);
+    let offset_minutes = Local::now().offset().local_minus_utc() / 60;
+    let utc_total_minutes = local_total_minutes - offset_minutes;
+    let day_shift = utc_total_minutes.div_euclid(24 * 60);
+    let wrapped = utc_total_minutes.rem_euclid(24 * 60);
+    Some(((wrapped / 60) as u32, (wrapped % 60) as u32, day_shift))
+}
+
+fn remap_weekday_to_utc(local_weekday: u32, day_shift: i32) -> u32 {
+    let index = ((local_weekday as i32) + day_shift).rem_euclid(7) as u32;
+    if index == 6 {
+        0
+    } else {
+        index + 1
+    }
+}
+
+fn chinese_weekday_to_index(value: &str) -> Option<u32> {
+    Some(match value {
+        "一" => 0,
+        "二" => 1,
+        "三" => 2,
+        "四" => 3,
+        "五" => 4,
+        "六" => 5,
+        "日" | "天" => 6,
+        _ => return None,
+    })
+}
+
+fn english_weekday_to_index(value: &str) -> Option<u32> {
+    Some(match value.to_ascii_lowercase().as_str() {
+        "monday" => 0,
+        "tuesday" => 1,
+        "wednesday" => 2,
+        "thursday" => 3,
+        "friday" => 4,
+        "saturday" => 5,
+        "sunday" => 6,
+        _ => return None,
+    })
+}
+
+fn weekday_label(index: u32) -> &'static str {
+    match index {
+        0 => "Monday",
+        1 => "Tuesday",
+        2 => "Wednesday",
+        3 => "Thursday",
+        4 => "Friday",
+        5 => "Saturday",
+        6 => "Sunday",
+        _ => "Unknown",
+    }
+}
+
+fn current_local_offset_label() -> String {
+    let offset = Local::now().offset().local_minus_utc();
+    let sign = if offset >= 0 { '+' } else { '-' };
+    let abs = offset.abs();
+    let hours = abs / 3600;
+    let minutes = (abs % 3600) / 60;
+    format!("UTC{sign}{hours:02}:{minutes:02}")
+}
+
+fn format_schedule_for_display(schedule: &CronSchedule) -> String {
+    match schedule {
+        CronSchedule::At { at_ms } => {
+            if let Some(local_time) = chrono::DateTime::<Utc>::from_timestamp_millis(*at_ms)
+                .map(|utc| utc.with_timezone(&Local))
+            {
+                format!("once at {}", local_time.format("%Y-%m-%d %H:%M:%S %z"))
+            } else {
+                format!("once at {at_ms}")
+            }
+        }
+        CronSchedule::Every { every_ms } => format!("every {}s", every_ms / 1000),
+        CronSchedule::Cron { expr } => format!("cron: {expr}"),
+    }
+}
+
+fn job_matches_context(job: &octos_bus::CronJob, channel: &str, chat_id: &str) -> bool {
+    job.payload.channel.as_deref() == Some(channel)
+        && job.payload.chat_id.as_deref() == Some(chat_id)
 }
 
 #[derive(Deserialize)]
@@ -471,5 +982,147 @@ mod tests {
             .unwrap();
         assert!(remove.success);
         assert!(remove.output.contains("Removed"));
+    }
+
+    #[tokio::test]
+    async fn test_schedule_natural_language_daily_creates_context_bound_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let result = CronTool::add_natural_language_for_context(
+            &service,
+            "matrix",
+            "!room:localhost",
+            "每天早上 9 点提醒我看天气",
+        )
+        .unwrap();
+
+        assert!(result.success);
+        let jobs = service.list_all_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].payload.channel.as_deref(), Some("matrix"));
+        assert_eq!(jobs[0].payload.chat_id.as_deref(), Some("!room:localhost"));
+        assert_eq!(jobs[0].payload.message, "提醒我看天气");
+    }
+
+    #[tokio::test]
+    async fn test_schedule_natural_language_relative_delay_creates_one_shot_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let before = Utc::now().timestamp_millis();
+        let result = CronTool::add_natural_language_for_context(
+            &service,
+            "matrix",
+            "!room:localhost",
+            "20秒之后提醒我看天气",
+        )
+        .unwrap();
+        let after = Utc::now().timestamp_millis();
+
+        assert!(result.success);
+        assert!(result.output.contains("Runs once in 20秒"));
+
+        let jobs = service.list_all_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].payload.message, "提醒我看天气");
+        match jobs[0].schedule {
+            CronSchedule::At { at_ms } => {
+                assert!(at_ms >= before + 20_000);
+                assert!(at_ms <= after + 20_000);
+            }
+            ref other => panic!("expected one-shot schedule, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schedule_natural_language_ambiguous_time_returns_clarification() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let result = CronTool::add_natural_language_for_context(
+            &service,
+            "matrix",
+            "!room:localhost",
+            "下次提醒我看天气",
+        )
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("couldn't understand"));
+        assert!(service.list_all_jobs().is_empty());
+    }
+
+    #[test]
+    fn test_derive_job_name_preserves_cjk_message_text() {
+        assert_eq!(derive_job_name("检查系统状态，告诉我"), "检查系统状态-告诉我");
+        assert_eq!(derive_job_name("提醒我看天气"), "提醒我看天气");
+    }
+
+    #[tokio::test]
+    async fn test_list_jobs_for_context_only_shows_matching_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        service
+            .add_job(
+                "room-a".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                CronPayload {
+                    message: "A".into(),
+                    deliver: true,
+                    channel: Some("matrix".into()),
+                    chat_id: Some("!room-a:localhost".into()),
+                },
+            )
+            .unwrap();
+        service
+            .add_job(
+                "room-b".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                CronPayload {
+                    message: "B".into(),
+                    deliver: true,
+                    channel: Some("matrix".into()),
+                    chat_id: Some("!room-b:localhost".into()),
+                },
+            )
+            .unwrap();
+
+        let result = CronTool::list_jobs_for_context(&service, "matrix", "!room-a:localhost");
+
+        assert!(result.success);
+        assert!(result.output.contains("room-a"));
+        assert!(!result.output.contains("room-b"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_job_for_context_rejects_foreign_job_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let job = service
+            .add_job(
+                "room-b".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                CronPayload {
+                    message: "B".into(),
+                    deliver: true,
+                    channel: Some("matrix".into()),
+                    chat_id: Some("!room-b:localhost".into()),
+                },
+            )
+            .unwrap();
+
+        let result = CronTool::remove_job_for_context(
+            &service,
+            "matrix",
+            "!room-a:localhost",
+            &job.id,
+        );
+
+        assert!(!result.success);
+        assert!(result.output.contains("not found in this chat"));
+        assert_eq!(service.list_all_jobs().len(), 1);
     }
 }

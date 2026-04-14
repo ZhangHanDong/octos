@@ -1159,6 +1159,7 @@ impl GatewayRuntime {
                         parent_profile_id: profile_id
                             .clone()
                             .unwrap_or_else(|| MAIN_PROFILE_ID.to_string()),
+                        cron_service: cron_service.clone(),
                     });
                     channel.set_bot_manager(bot_mgr);
                     info!("matrix slash commands enabled (/createbot, /deletebot, /listbots)");
