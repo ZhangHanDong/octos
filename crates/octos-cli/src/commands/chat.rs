@@ -1,8 +1,8 @@
 //! Chat command: interactive multi-turn conversation with an agent.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use clap::Args;
 use colored::Colorize;

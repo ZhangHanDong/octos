@@ -8,7 +8,7 @@ use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
 use octos_llm::{ChatConfig, ChatResponse, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 use super::message_repair::{
     normalize_system_messages, normalize_tool_call_ids, repair_message_order, repair_tool_pairs,
@@ -18,7 +18,7 @@ use super::{Agent, ConversationResponse, TokenTracker};
 use crate::agent::execution::ToolExecutionOutcome;
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
-use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
+use crate::tools::{TurnAttachmentContext, TURN_ATTACHMENT_CTX};
 
 impl Agent {
     /// Build a `ChatConfig` with optional `chat_max_tokens` override from `AgentConfig`.
@@ -651,9 +651,7 @@ impl Agent {
                 }
                 Ok(None)
             }
-            ToolExecutionOutcome::ApprovalRequested(pending_approval) => {
-                Ok(Some(pending_approval))
-            }
+            ToolExecutionOutcome::ApprovalRequested(pending_approval) => Ok(Some(pending_approval)),
         }
     }
 }

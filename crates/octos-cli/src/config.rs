@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use eyre::{Result, WrapErr, bail};
+use eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 /// Current config version.
@@ -266,7 +266,10 @@ impl ApprovalRuleConfig {
 impl ApprovalPolicyConfig {
     pub fn to_runtime_policy(&self) -> octos_agent::ApprovalPolicy {
         octos_agent::ApprovalPolicy::new(
-            self.rules.iter().map(ApprovalRuleConfig::to_runtime).collect(),
+            self.rules
+                .iter()
+                .map(ApprovalRuleConfig::to_runtime)
+                .collect(),
         )
     }
 }
@@ -1016,9 +1019,7 @@ impl Config {
                     bail!("approval_policy.rules[{idx}].require_approval must be true");
                 }
                 if rule.authorized_approvers.is_empty() {
-                    bail!(
-                        "approval_policy.rules[{idx}].authorized_approvers must not be empty"
-                    );
+                    bail!("approval_policy.rules[{idx}].authorized_approvers must not be empty");
                 }
                 if rule.expires_in_secs == 0 {
                     bail!("approval_policy.rules[{idx}].expires_in_secs must be > 0");
@@ -1289,11 +1290,9 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.tool_policy_by_provider.len(), 2);
         assert!(config.tool_policy_by_provider.contains_key("gemini"));
-        assert!(
-            config
-                .tool_policy_by_provider
-                .contains_key("claude-sonnet-4-20250514")
-        );
+        assert!(config
+            .tool_policy_by_provider
+            .contains_key("claude-sonnet-4-20250514"));
     }
 
     #[test]

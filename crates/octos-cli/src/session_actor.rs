@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -25,15 +25,15 @@ use octos_agent::{
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
 use octos_core::{
-    InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
-    OutboundMessage, SessionKey,
+    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
+    METADATA_SENDER_USER_ID,
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
     ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -425,9 +425,7 @@ pub enum ActorMessage {
         task_json: String,
     },
     /// A pending approval request reached its expiry deadline.
-    ApprovalExpired {
-        request_id: String,
-    },
+    ApprovalExpired { request_id: String },
     /// Cancel the current operation.
     Cancel,
 }
@@ -1436,10 +1434,7 @@ impl SessionActor {
             .send(OutboundMessage {
                 channel: self.channel.clone(),
                 chat_id: self.chat_id.clone(),
-                content: format!(
-                    "Approval request expired: {}",
-                    request.title
-                ),
+                content: format!("Approval request expired: {}", request.title),
                 reply_to: None,
                 media: vec![],
                 metadata: serde_json::json!({}),
@@ -1523,11 +1518,8 @@ impl SessionActor {
                     error = ?err,
                     "approval response rejected"
                 );
-                self.emit_approval_outcome_notice(format!(
-                    "Approval rejected: {:?}",
-                    err
-                ))
-                .await;
+                self.emit_approval_outcome_notice(format!("Approval rejected: {:?}", err))
+                    .await;
                 return true;
             }
         };
@@ -1566,11 +1558,8 @@ impl SessionActor {
                     approver = %inbound.sender_id,
                     "approval request denied"
                 );
-                self.emit_approval_outcome_notice(format!(
-                    "Denied {}",
-                    pending.request.title
-                ))
-                .await;
+                self.emit_approval_outcome_notice(format!("Denied {}", pending.request.title))
+                    .await;
             }
             ApprovalDecision::Approve => {
                 tracing::info!(
@@ -3108,7 +3097,8 @@ impl SessionActor {
                 }
 
                 if let Some(pending_approval) = pending_approval {
-                    self.handle_pending_approval(&inbound, pending_approval).await;
+                    self.handle_pending_approval(&inbound, pending_approval)
+                        .await;
                     return;
                 }
 
@@ -3849,7 +3839,8 @@ impl SessionActor {
                 }
 
                 if let Some(pending_approval) = pending_approval {
-                    self.handle_pending_approval(&inbound, pending_approval).await;
+                    self.handle_pending_approval(&inbound, pending_approval)
+                        .await;
                     return;
                 }
 

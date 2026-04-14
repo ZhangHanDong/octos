@@ -18,8 +18,8 @@ use octos_core::{AgentId, Message, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
-use crate::hooks::{HookContext, HookExecutor};
 use crate::approval::{ApprovalPolicy, PendingApprovalDraft};
+use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
 use crate::tools::ToolRegistry;
 

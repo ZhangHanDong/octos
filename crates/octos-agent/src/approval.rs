@@ -361,13 +361,8 @@ mod tests {
     fn test_pending_approval_rejects_empty_authorized_approvers() {
         let mut spec = valid_spec();
         spec.authorized_approvers.clear();
-        let err = PendingApprovalDraft::from_spec(
-            "shell",
-            "tc1",
-            serde_json::json!({}),
-            spec,
-        )
-        .unwrap_err();
+        let err = PendingApprovalDraft::from_spec("shell", "tc1", serde_json::json!({}), spec)
+            .unwrap_err();
 
         assert!(err.contains("authorized_approvers"));
     }

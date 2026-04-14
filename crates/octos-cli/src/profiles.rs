@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use eyre::{Result, WrapErr, bail};
+use eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ChannelEntry, Config, FallbackModel, GatewayConfig};
@@ -614,9 +614,7 @@ impl ProfileStore {
             if except_profile_id == Some(profile.id.as_str()) {
                 continue;
             }
-            if profile.id == normalized
-                || profile.public_subdomain.as_deref() == Some(normalized)
-            {
+            if profile.id == normalized || profile.public_subdomain.as_deref() == Some(normalized) {
                 bail!("public subdomain '{normalized}' is already in use");
             }
         }
@@ -1314,7 +1312,9 @@ mod tests {
         };
 
         let config = config_from_profile(&profile, None, None);
-        let policy = config.approval_policy.expect("approval_policy should passthrough");
+        let policy = config
+            .approval_policy
+            .expect("approval_policy should passthrough");
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.rules[0].tools, vec!["shell".to_string()]);
         assert_eq!(
@@ -1629,18 +1629,16 @@ mod tests {
         assert!(empty.is_empty());
 
         // Duplicate should fail
-        assert!(
-            store
-                .create_sub_account(
-                    "parent",
-                    "work-bot",
-                    "work-bot",
-                    "work bot",
-                    vec![],
-                    GatewaySettings::default(),
-                )
-                .is_err()
-        );
+        assert!(store
+            .create_sub_account(
+                "parent",
+                "work-bot",
+                "work-bot",
+                "work bot",
+                vec![],
+                GatewaySettings::default(),
+            )
+            .is_err());
     }
 
     #[test]
@@ -1707,11 +1705,17 @@ mod tests {
         store.save(&child).unwrap();
 
         assert_eq!(
-            store.resolve_routable_profile_id("newsbot").unwrap().as_deref(),
+            store
+                .resolve_routable_profile_id("newsbot")
+                .unwrap()
+                .as_deref(),
             Some("tenant--newsbot")
         );
         assert_eq!(
-            store.resolve_routable_profile_id("tenant").unwrap().as_deref(),
+            store
+                .resolve_routable_profile_id("tenant")
+                .unwrap()
+                .as_deref(),
             Some("tenant")
         );
         assert!(

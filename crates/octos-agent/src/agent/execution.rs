@@ -8,14 +8,14 @@ use octos_llm::ChatResponse;
 use tracing::{debug, info, warn};
 
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
-use crate::approval::{PendingApproval, PendingApprovalDraft, digest_tool_args};
+use crate::approval::{digest_tool_args, PendingApproval, PendingApprovalDraft};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
-use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext, ToolResult};
+use crate::tools::{ToolContext, ToolResult, TOOL_CTX, TURN_ATTACHMENT_CTX};
 use crate::workspace_contract::{
-    SpawnTaskContractResult, enforce_spawn_task_contract, requires_workspace_contract,
+    enforce_spawn_task_contract, requires_workspace_contract, SpawnTaskContractResult,
 };
 
 pub(super) enum ToolExecutionOutcome {
@@ -754,8 +754,7 @@ impl Agent {
             };
 
         // Log completion of all parallel tools
-        let result_sizes: Vec<usize> =
-            results.iter().map(|(m, _, _, _)| m.content.len()).collect();
+        let result_sizes: Vec<usize> = results.iter().map(|(m, _, _, _)| m.content.len()).collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
             parallel_tools = results.len(),
@@ -895,9 +894,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::AgentConfig;
-    use crate::approval::{ApprovalPolicy, ApprovalRiskLevel, ApprovalRule, ApprovalTimeoutBehavior};
+    use crate::approval::{
+        ApprovalPolicy, ApprovalRiskLevel, ApprovalRule, ApprovalTimeoutBehavior,
+    };
     use crate::tools::{ToolPolicy, ToolRegistry};
+    use crate::AgentConfig;
 
     struct NoopLlmProvider;
 

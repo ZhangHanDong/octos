@@ -1827,7 +1827,13 @@ impl Channel for MatrixChannel {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let event_id = self
-            .send_matrix_message(&msg.chat_id, &msg.content, &msg.metadata, sender_user_id, live)
+            .send_matrix_message(
+                &msg.chat_id,
+                &msg.content,
+                &msg.metadata,
+                sender_user_id,
+                live,
+            )
             .await?;
 
         // Remember which sender sent this event so edit_message can use the same identity.
@@ -3451,10 +3457,7 @@ mod tests {
             send_req.body[CONTENT_APPROVAL_REQUEST]["request_id"],
             "req_123"
         );
-        assert_eq!(
-            send_req.body[CONTENT_ACTIONS][0]["id"],
-            "approve"
-        );
+        assert_eq!(send_req.body[CONTENT_ACTIONS][0]["id"], "approve");
         handle.abort();
     }
 
