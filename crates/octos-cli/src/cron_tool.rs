@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{Local, Utc};
 use eyre::{Result, WrapErr};
+use iana_time_zone::get_timezone;
 use octos_agent::tools::{Tool, ToolResult};
 use octos_bus::{CronPayload, CronSchedule, CronService};
 use regex::Regex;
@@ -291,18 +292,20 @@ fn parse_daily_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
             .unwrap_or(0);
         let message = caps.get(4)?.as_str().trim().to_string();
         let hour = apply_time_qualifier(hour, qualifier)?;
-        let (utc_hour, utc_minute, _) = local_wall_time_to_utc(hour, minute)?;
-        let offset_label = current_local_offset_label();
+        let timezone = current_local_timezone_name();
+        let timezone_label = timezone
+            .clone()
+            .unwrap_or_else(current_local_offset_label);
         return Some(ParsedNaturalSchedule {
             name: derive_job_name(&message),
             message,
             schedule: CronSchedule::Cron {
-                expr: format!("0 {utc_minute} {utc_hour} * * * *"),
+                expr: format!("0 {minute} {hour} * * * *"),
             },
-            timezone: None,
+            timezone,
             description: format!(
-                "Runs every day at {:02}:{:02} using server local offset {}",
-                hour, minute, offset_label
+                "Runs every day at {:02}:{:02} using server local timezone {}",
+                hour, minute, timezone_label
             ),
         });
     }
@@ -321,18 +324,20 @@ fn parse_daily_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
     let am_pm = caps.get(3).map(|m| m.as_str());
     let message = caps.get(4)?.as_str().trim().to_string();
     let hour = apply_am_pm(hour, am_pm)?;
-    let (utc_hour, utc_minute, _) = local_wall_time_to_utc(hour, minute)?;
-    let offset_label = current_local_offset_label();
+    let timezone = current_local_timezone_name();
+    let timezone_label = timezone
+        .clone()
+        .unwrap_or_else(current_local_offset_label);
     Some(ParsedNaturalSchedule {
         name: derive_job_name(&message),
         message,
         schedule: CronSchedule::Cron {
-            expr: format!("0 {utc_minute} {utc_hour} * * * *"),
+            expr: format!("0 {minute} {hour} * * * *"),
         },
-        timezone: None,
+        timezone,
         description: format!(
-            "Runs every day at {:02}:{:02} using server local offset {}",
-            hour, minute, offset_label
+            "Runs every day at {:02}:{:02} using server local timezone {}",
+            hour, minute, timezone_label
         ),
     })
 }
@@ -353,22 +358,24 @@ fn parse_weekly_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
             .unwrap_or(0);
         let message = caps.get(5)?.as_str().trim().to_string();
         let hour = apply_time_qualifier(hour, qualifier)?;
-        let (utc_hour, utc_minute, day_shift) = local_wall_time_to_utc(hour, minute)?;
-        let utc_weekday = remap_weekday_to_utc(weekday, day_shift);
-        let offset_label = current_local_offset_label();
+        let cron_weekday = cron_weekday(weekday);
+        let timezone = current_local_timezone_name();
+        let timezone_label = timezone
+            .clone()
+            .unwrap_or_else(current_local_offset_label);
         return Some(ParsedNaturalSchedule {
             name: derive_job_name(&message),
             message,
             schedule: CronSchedule::Cron {
-                expr: format!("0 {utc_minute} {utc_hour} * * {utc_weekday} *"),
+                expr: format!("0 {minute} {hour} * * {cron_weekday} *"),
             },
-            timezone: None,
+            timezone,
             description: format!(
-                "Runs weekly on {} at {:02}:{:02} using server local offset {}",
+                "Runs weekly on {} at {:02}:{:02} using server local timezone {}",
                 weekday_label(weekday),
                 hour,
                 minute,
-                offset_label
+                timezone_label
             ),
         });
     }
@@ -388,22 +395,24 @@ fn parse_weekly_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
     let am_pm = caps.get(4).map(|m| m.as_str());
     let message = caps.get(5)?.as_str().trim().to_string();
     let hour = apply_am_pm(hour, am_pm)?;
-    let (utc_hour, utc_minute, day_shift) = local_wall_time_to_utc(hour, minute)?;
-    let utc_weekday = remap_weekday_to_utc(weekday, day_shift);
-    let offset_label = current_local_offset_label();
+    let cron_weekday = cron_weekday(weekday);
+    let timezone = current_local_timezone_name();
+    let timezone_label = timezone
+        .clone()
+        .unwrap_or_else(current_local_offset_label);
     Some(ParsedNaturalSchedule {
         name: derive_job_name(&message),
         message,
         schedule: CronSchedule::Cron {
-            expr: format!("0 {utc_minute} {utc_hour} * * {utc_weekday} *"),
+            expr: format!("0 {minute} {hour} * * {cron_weekday} *"),
         },
-        timezone: None,
+        timezone,
         description: format!(
-            "Runs weekly on {} at {:02}:{:02} using server local offset {}",
+            "Runs weekly on {} at {:02}:{:02} using server local timezone {}",
             weekday_label(weekday),
             hour,
             minute,
-            offset_label
+            timezone_label
         ),
     })
 }
@@ -430,6 +439,9 @@ fn is_job_name_char(c: char) -> bool {
 }
 
 fn interval_to_seconds(value: i64, unit: &str) -> Option<i64> {
+    if value <= 0 {
+        return None;
+    }
     match unit {
         "秒" | "second" | "seconds" => Some(value),
         "分钟" | "minute" | "minutes" => Some(value * 60),
@@ -474,22 +486,11 @@ fn validate_hour_minute(hour: u32, minute: u32) -> Option<()> {
     }
 }
 
-fn local_wall_time_to_utc(hour: u32, minute: u32) -> Option<(u32, u32, i32)> {
-    validate_hour_minute(hour, minute)?;
-    let local_total_minutes = (hour as i32) * 60 + (minute as i32);
-    let offset_minutes = Local::now().offset().local_minus_utc() / 60;
-    let utc_total_minutes = local_total_minutes - offset_minutes;
-    let day_shift = utc_total_minutes.div_euclid(24 * 60);
-    let wrapped = utc_total_minutes.rem_euclid(24 * 60);
-    Some(((wrapped / 60) as u32, (wrapped % 60) as u32, day_shift))
-}
-
-fn remap_weekday_to_utc(local_weekday: u32, day_shift: i32) -> u32 {
-    let index = ((local_weekday as i32) + day_shift).rem_euclid(7) as u32;
-    if index == 6 {
+fn cron_weekday(local_weekday: u32) -> u32 {
+    if local_weekday == 6 {
         0
     } else {
-        index + 1
+        local_weekday + 1
     }
 }
 
@@ -539,6 +540,15 @@ fn current_local_offset_label() -> String {
     let hours = abs / 3600;
     let minutes = (abs % 3600) / 60;
     format!("UTC{sign}{hours:02}:{minutes:02}")
+}
+
+fn current_local_timezone_name() -> Option<String> {
+    let timezone = get_timezone().ok()?;
+    if timezone.trim().is_empty() {
+        None
+    } else {
+        Some(timezone)
+    }
 }
 
 fn format_schedule_for_display(schedule: &CronSchedule) -> String {
@@ -1036,6 +1046,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_schedule_natural_language_zero_interval_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let result = CronTool::add_natural_language_for_context(
+            &service,
+            "matrix",
+            "!room:localhost",
+            "每0秒检查系统状态",
+        )
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("couldn't understand"));
+        assert!(service.list_all_jobs().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_schedule_natural_language_ambiguous_time_returns_clarification() {
         let dir = tempfile::tempdir().unwrap();
         let (service, _rx) = make_service(dir.path());
@@ -1057,6 +1085,30 @@ mod tests {
     fn test_derive_job_name_preserves_cjk_message_text() {
         assert_eq!(derive_job_name("检查系统状态，告诉我"), "检查系统状态-告诉我");
         assert_eq!(derive_job_name("提醒我看天气"), "提醒我看天气");
+    }
+
+    #[test]
+    fn test_parse_daily_schedule_preserves_local_timezone() {
+        let parsed = parse_daily_schedule("每天早上 9 点提醒我看天气").unwrap();
+        assert_eq!(parsed.message, "提醒我看天气");
+        assert!(matches!(parsed.schedule, CronSchedule::Cron { .. }));
+        match parsed.schedule {
+            CronSchedule::Cron { expr } => assert_eq!(expr, "0 0 9 * * * *"),
+            _ => unreachable!(),
+        }
+        assert_eq!(parsed.timezone, current_local_timezone_name());
+    }
+
+    #[test]
+    fn test_parse_weekly_schedule_preserves_local_timezone() {
+        let parsed = parse_weekly_schedule("每周一早上 9 点提醒我看天气").unwrap();
+        assert_eq!(parsed.message, "提醒我看天气");
+        assert!(matches!(parsed.schedule, CronSchedule::Cron { .. }));
+        match parsed.schedule {
+            CronSchedule::Cron { expr } => assert_eq!(expr, "0 0 9 * * 1 *"),
+            _ => unreachable!(),
+        }
+        assert_eq!(parsed.timezone, current_local_timezone_name());
     }
 
     #[tokio::test]

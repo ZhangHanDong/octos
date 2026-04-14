@@ -3625,6 +3625,7 @@ dependencies = [
  "eyre",
  "flate2",
  "futures",
+ "iana-time-zone",
  "image",
  "keyring",
  "lettre",
