@@ -198,6 +198,7 @@ mod tests {
             },
             files_modified: vec![],
             streamed: false,
+            pending_approval: None,
             messages: vec![],
         };
         let cloned = resp.clone();

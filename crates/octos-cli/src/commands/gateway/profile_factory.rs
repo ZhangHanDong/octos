@@ -628,8 +628,13 @@ impl ProfileActorFactoryBuilder {
             Some(Arc::new(HookExecutor::new(all_hooks)))
         };
 
+        let mut agent_config = self.agent_config.clone();
+        if let Some(ref policy) = profile_config.approval_policy {
+            agent_config.approval_policy = Some(policy.to_runtime_policy());
+        }
+
         Ok(ActorFactory {
-            agent_config: self.agent_config.clone(),
+            agent_config,
             llm: llm.clone(),
             llm_for_compaction,
             memory: self.memory.clone(),
@@ -679,6 +684,7 @@ mod tests {
     fn make_profile(name: &str, matrix_user_id: Option<&str>) -> UserProfile {
         let mut profile = UserProfile {
             id: "botfather--alexbot".to_string(),
+            public_subdomain: None,
             name: name.to_string(),
             enabled: true,
             data_dir: None,

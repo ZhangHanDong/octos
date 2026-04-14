@@ -15,6 +15,7 @@ use super::message_repair::{
     sanitize_tool_call_id, synthesize_missing_tool_results, truncate_old_tool_results,
 };
 use super::{Agent, ConversationResponse, TokenTracker};
+use crate::agent::execution::ToolExecutionOutcome;
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
@@ -168,6 +169,7 @@ impl Agent {
                             token_usage: total_usage,
                             files_modified,
                             streamed: false,
+                            pending_approval: None,
                             messages: messages[new_start..].to_vec(),
                         });
                     }
@@ -283,6 +285,7 @@ impl Agent {
                                 token_usage: total_usage,
                                 files_modified,
                                 streamed,
+                                pending_approval: None,
                                 messages: messages[new_start..].to_vec(),
                             });
                         }
@@ -302,18 +305,36 @@ impl Agent {
                                         token_usage: total_usage,
                                         files_modified,
                                         streamed,
+                                        pending_approval: None,
                                         messages: messages[new_start..].to_vec(),
                                     });
                                 }
                             }
-                            self.handle_tool_use(
+                            if let Some(pending_approval) = self.handle_tool_use(
                                 &response,
                                 &mut messages,
                                 &mut files_modified,
                                 &mut total_usage,
                                 tracker,
                             )
-                            .await?;
+                            .await?
+                            {
+                                let new_start = (1 + history.len()).min(messages.len());
+                                return Ok(ConversationResponse {
+                                    content: String::new(),
+                                    reasoning_content: None,
+                                    provider_metadata: Some(
+                                        self.llm.provider_metadata_for_index(
+                                            response.provider_index,
+                                        ),
+                                    ),
+                                    token_usage: total_usage,
+                                    files_modified,
+                                    streamed,
+                                    pending_approval: Some(pending_approval),
+                                    messages: messages[new_start..].to_vec(),
+                                });
+                            }
                         }
                         StopReason::MaxTokens => {
                             self.emit_cost_update(&total_usage, &response.usage);
@@ -327,6 +348,7 @@ impl Agent {
                                 token_usage: total_usage,
                                 files_modified,
                                 streamed,
+                                pending_approval: None,
                                 messages: messages[new_start..].to_vec(),
                             });
                         }
@@ -349,6 +371,7 @@ impl Agent {
                                 token_usage: total_usage,
                                 files_modified,
                                 streamed,
+                                pending_approval: None,
                                 messages: messages[new_start..].to_vec(),
                             });
                         }
@@ -568,7 +591,7 @@ impl Agent {
         files_modified: &mut Vec<PathBuf>,
         total_usage: &mut TokenUsage,
         tracker: Option<&TokenTracker>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::approval::PendingApprovalDraft>> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
         // Also sanitize characters: some providers (e.g. Moonshot/kimi) generate IDs
@@ -614,17 +637,23 @@ impl Agent {
             }
         }
         messages.push(self.response_to_message(&response));
-        let (tool_messages, tool_files, tool_tokens) = self.execute_tools(&response).await?;
-        messages.extend(tool_messages);
-        files_modified.extend(tool_files);
-        total_usage.input_tokens += tool_tokens.input_tokens;
-        total_usage.output_tokens += tool_tokens.output_tokens;
-        if let Some(t) = tracker {
-            t.input_tokens
-                .store(total_usage.input_tokens, Ordering::Relaxed);
-            t.output_tokens
-                .store(total_usage.output_tokens, Ordering::Relaxed);
+        match self.execute_tools(&response).await? {
+            ToolExecutionOutcome::Completed(tool_messages, tool_files, tool_tokens) => {
+                messages.extend(tool_messages);
+                files_modified.extend(tool_files);
+                total_usage.input_tokens += tool_tokens.input_tokens;
+                total_usage.output_tokens += tool_tokens.output_tokens;
+                if let Some(t) = tracker {
+                    t.input_tokens
+                        .store(total_usage.input_tokens, Ordering::Relaxed);
+                    t.output_tokens
+                        .store(total_usage.output_tokens, Ordering::Relaxed);
+                }
+                Ok(None)
+            }
+            ToolExecutionOutcome::ApprovalRequested(pending_approval) => {
+                Ok(Some(pending_approval))
+            }
         }
-        Ok(())
     }
 }

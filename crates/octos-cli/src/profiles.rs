@@ -86,6 +86,9 @@ pub struct ProfileConfig {
     /// Lifecycle hooks for agent events (per-profile).
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
+    /// Native approval policy for tool calls that require human confirmation.
+    #[serde(default)]
+    pub approval_policy: Option<crate::config::ApprovalPolicyConfig>,
     /// Admin mode: when true, gateway registers only admin management tools
     /// (no shell, file, web, browser tools). Used for the admin bot profile.
     #[serde(default)]
@@ -854,6 +857,7 @@ pub(crate) fn config_from_profile(
         mcp_servers: vec![],
         sandbox: profile.config.sandbox.clone(),
         tool_policy: None,
+        approval_policy: profile.config.approval_policy.clone(),
         tool_policy_by_provider: Default::default(),
         embedding: None,
         hooks: profile.config.hooks.clone(),
@@ -1280,6 +1284,43 @@ mod tests {
         assert_eq!(config.provider.as_deref(), Some("moonshot"));
         assert!(config.base_url.is_none());
         assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
+    }
+
+    #[test]
+    fn test_config_from_profile_approval_policy_passthrough() {
+        let profile = UserProfile {
+            id: "approval-test".into(),
+            public_subdomain: None,
+            name: "Approval".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                approval_policy: Some(crate::config::ApprovalPolicyConfig {
+                    default: crate::config::ApprovalPolicyDefault::Allow,
+                    rules: vec![crate::config::ApprovalRuleConfig {
+                        tools: vec!["shell".into()],
+                        require_approval: true,
+                        risk_level: crate::config::ApprovalPolicyRiskLevel::Critical,
+                        authorized_approvers: vec!["@alex:127.0.0.1:8128".into()],
+                        expires_in_secs: 300,
+                        on_timeout: crate::config::ApprovalPolicyTimeoutBehavior::Notify,
+                    }],
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let config = config_from_profile(&profile, None, None);
+        let policy = config.approval_policy.expect("approval_policy should passthrough");
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].tools, vec!["shell".to_string()]);
+        assert_eq!(
+            policy.rules[0].authorized_approvers,
+            vec!["@alex:127.0.0.1:8128".to_string()]
+        );
     }
 
     #[test]

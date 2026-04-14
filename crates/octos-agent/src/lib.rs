@@ -8,6 +8,7 @@
 //! - Integration with codex sandboxing (when enabled)
 
 mod agent;
+pub mod approval;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
@@ -49,6 +50,11 @@ pub use plugins::{PluginLoadResult, PluginLoader};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
+pub use approval::{
+    ApprovalDecision, ApprovalPolicy, ApprovalRequestEnvelope, ApprovalRequestSpec,
+    ApprovalResponsePayload, ApprovalRiskLevel, ApprovalRule, ApprovalTimeoutBehavior,
+    PendingApproval, PendingApprovalDraft, PendingApprovalStore,
+};
 pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};

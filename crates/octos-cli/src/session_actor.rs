@@ -11,13 +11,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use octos_agent::tools::{
     BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
-    Agent, AgentConfig, HookContext, HookExecutor, TaskSupervisor, TokenTracker,
-    TurnAttachmentContext, WorkspacePolicy, workspace_policy_path, write_workspace_policy,
+    workspace_policy_path, write_workspace_policy, Agent, AgentConfig, ApprovalDecision,
+    ApprovalRequestEnvelope, ApprovalResponsePayload, ApprovalTimeoutBehavior, HookContext,
+    HookExecutor, PendingApproval, PendingApprovalDraft, PendingApprovalStore, TaskSupervisor,
+    TokenTracker, TurnAttachmentContext, WorkspacePolicy,
 };
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
@@ -221,6 +224,10 @@ fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+const METADATA_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
+const METADATA_APPROVAL_REQUEST: &str = "org.octos.approval_request";
+const METADATA_ACTIONS: &str = "org.octos.actions";
+
 fn git_turn_summary(content: &str) -> String {
     let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
@@ -416,6 +423,10 @@ pub enum ActorMessage {
     TaskStatusChanged {
         /// Serialized JSON of the BackgroundTask.
         task_json: String,
+    },
+    /// A pending approval request reached its expiry deadline.
+    ApprovalExpired {
+        request_id: String,
     },
     /// Cancel the current operation.
     Cancel,
@@ -1125,6 +1136,7 @@ impl ActorFactory {
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
             inbox: rx,
+            self_tx: tx.clone(),
             agent: Arc::new(agent),
             session_handle,
             llm_for_compaction: self.llm_for_compaction.clone(),
@@ -1148,6 +1160,7 @@ impl ActorFactory {
             active_sessions: self.active_sessions.clone(),
             user_workspace: user_workspace.clone(),
             cron_tool: cron_tool_ref,
+            pending_approvals: PendingApprovalStore::default(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -1263,6 +1276,7 @@ struct SessionActor {
     chat_id: String,
 
     inbox: mpsc::Receiver<ActorMessage>,
+    self_tx: mpsc::Sender<ActorMessage>,
 
     agent: Arc<Agent>,
 
@@ -1310,6 +1324,8 @@ struct SessionActor {
     user_workspace: std::path::PathBuf,
     /// Per-session cron tool reference — updated with channel/chat_id on each message.
     cron_tool: Option<Arc<CronTool>>,
+    /// Pending approval requests awaiting a human decision.
+    pending_approvals: PendingApprovalStore,
 }
 
 impl SessionActor {
@@ -1352,6 +1368,246 @@ impl SessionActor {
         my_topic == active_topic
     }
 
+    fn approval_request_message_content(request: &ApprovalRequestEnvelope) -> String {
+        format!(
+            "Approval required: {}\n\n{}",
+            request.title, request.summary
+        )
+    }
+
+    fn approval_actions_metadata() -> serde_json::Value {
+        serde_json::json!([
+            { "id": "approve", "label": "Approve", "style": "primary" },
+            { "id": "deny", "label": "Deny", "style": "danger" }
+        ])
+    }
+
+    async fn emit_approval_request(&self, pending: &PendingApproval) {
+        let metadata = serde_json::json!({
+            METADATA_APPROVAL_REQUEST: pending.request,
+            METADATA_ACTIONS: Self::approval_actions_metadata(),
+        });
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: Self::approval_request_message_content(&pending.request),
+                reply_to: None,
+                media: vec![],
+                metadata,
+            })
+            .await;
+    }
+
+    fn parse_approval_response(message: &InboundMessage) -> Option<ApprovalResponsePayload> {
+        message
+            .metadata
+            .get(METADATA_APPROVAL_RESPONSE)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    async fn schedule_approval_expiry(&self, request: &ApprovalRequestEnvelope) {
+        let request_id = request.request_id.clone();
+        let expires_at = request.expires_at;
+        let inbox_tx = self.inbox_sender();
+        tokio::spawn(async move {
+            let now = Utc::now();
+            if expires_at > now {
+                let sleep_for = (expires_at - now)
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_secs(0));
+                tokio::time::sleep(sleep_for).await;
+            }
+            let _ = inbox_tx
+                .send(ActorMessage::ApprovalExpired { request_id })
+                .await;
+        });
+    }
+
+    fn inbox_sender(&self) -> mpsc::Sender<ActorMessage> {
+        self.self_tx.clone()
+    }
+
+    async fn emit_approval_timeout_notice(&self, request: &ApprovalRequestEnvelope) {
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: format!(
+                    "Approval request expired: {}",
+                    request.title
+                ),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await;
+    }
+
+    async fn emit_approval_outcome_notice(&self, content: String) {
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content,
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await;
+    }
+
+    async fn handle_pending_approval(
+        &mut self,
+        inbound: &InboundMessage,
+        draft: PendingApprovalDraft,
+    ) {
+        let pending = draft.into_pending(self.chat_id.clone(), inbound.sender_id.clone());
+        tracing::info!(
+            request_id = %pending.request.request_id,
+            tool_name = %pending.request.tool_name,
+            requester = %pending.requester,
+            room_id = %pending.room_id,
+            expires_at = %pending.request.expires_at,
+            "approval request created"
+        );
+        self.emit_approval_request(&pending).await;
+        self.schedule_approval_expiry(&pending.request).await;
+        self.pending_approvals.insert(pending);
+    }
+
+    async fn handle_approval_expired(&mut self, request_id: &str) {
+        if let Some(pending) = self.pending_approvals.get(request_id).cloned() {
+            if !pending.is_expired(Utc::now()) {
+                return;
+            }
+            let removed = self.pending_approvals.remove(request_id);
+            if let Some(expired) = removed {
+                tracing::info!(
+                    request_id = %request_id,
+                    tool_name = %expired.request.tool_name,
+                    room_id = %expired.room_id,
+                    "approval request expired"
+                );
+                if matches!(expired.request.on_timeout, ApprovalTimeoutBehavior::Notify) {
+                    self.emit_approval_timeout_notice(&expired.request).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_approval_response_message(&mut self, inbound: &InboundMessage) -> bool {
+        let Some(response) = Self::parse_approval_response(inbound) else {
+            return false;
+        };
+
+        let now = Utc::now();
+        let validation = self.pending_approvals.validate_response(
+            &self.chat_id,
+            &inbound.sender_id,
+            &response,
+            now,
+        );
+
+        let pending = match validation {
+            Ok(()) => self.pending_approvals.remove(&response.request_id),
+            Err(err) => {
+                tracing::warn!(
+                    request_id = %response.request_id,
+                    sender = %inbound.sender_id,
+                    room_id = %self.chat_id,
+                    error = ?err,
+                    "approval response rejected"
+                );
+                self.emit_approval_outcome_notice(format!(
+                    "Approval rejected: {:?}",
+                    err
+                ))
+                .await;
+                return true;
+            }
+        };
+
+        let Some(pending) = pending else {
+            self.emit_approval_outcome_notice(
+                "Approval rejected: request is no longer pending".to_string(),
+            )
+            .await;
+            return true;
+        };
+
+        if let Err(err) = self
+            .agent
+            .revalidate_pending_approval(&pending, &inbound.sender_id)
+            .await
+        {
+            tracing::warn!(
+                request_id = %response.request_id,
+                sender = %inbound.sender_id,
+                error = %err,
+                "approval response failed policy revalidation"
+            );
+            self.pending_approvals.mark_consumed(&response.request_id);
+            self.emit_approval_outcome_notice(format!("Approval rejected: {err}"))
+                .await;
+            return true;
+        }
+
+        self.pending_approvals.mark_consumed(&response.request_id);
+
+        match response.decision {
+            ApprovalDecision::Deny => {
+                tracing::info!(
+                    request_id = %response.request_id,
+                    approver = %inbound.sender_id,
+                    "approval request denied"
+                );
+                self.emit_approval_outcome_notice(format!(
+                    "Denied {}",
+                    pending.request.title
+                ))
+                .await;
+            }
+            ApprovalDecision::Approve => {
+                tracing::info!(
+                    request_id = %response.request_id,
+                    approver = %inbound.sender_id,
+                    "approval request approved"
+                );
+                match self.agent.execute_approved_tool(&pending).await {
+                    Ok(result) if result.success => {
+                        let output = if result.output.trim().is_empty() {
+                            format!("Approved and executed {}", pending.request.title)
+                        } else {
+                            result.output
+                        };
+                        self.emit_approval_outcome_notice(output).await;
+                    }
+                    Ok(result) => {
+                        self.emit_approval_outcome_notice(format!(
+                            "Approved but execution failed: {}",
+                            result.output
+                        ))
+                        .await;
+                    }
+                    Err(err) => {
+                        self.emit_approval_outcome_notice(format!(
+                            "Approved but execution errored: {}",
+                            err
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
     async fn run(mut self) {
         loop {
             tokio::select! {
@@ -1363,6 +1619,9 @@ impl SessionActor {
                             attachment_media,
                             attachment_prompt,
                         }) => {
+                            if self.handle_approval_response_message(&message).await {
+                                continue;
+                            }
                             // Update cron tool context with current channel/chat_id
                             // so new cron jobs inherit the correct delivery target.
                             if let Some(ref cron) = self.cron_tool {
@@ -1480,6 +1739,9 @@ impl SessionActor {
                                 media: vec![],
                                 metadata: serde_json::json!({ "_task_status": task_json }),
                             }).await;
+                        }
+                        Some(ActorMessage::ApprovalExpired { request_id }) => {
+                            self.handle_approval_expired(&request_id).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -2069,6 +2331,9 @@ impl SessionActor {
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
                         }
+                        Ok(ActorMessage::ApprovalExpired { request_id }) => {
+                            self.handle_approval_expired(&request_id).await;
+                        }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                             break;
@@ -2137,6 +2402,9 @@ impl SessionActor {
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
+                        }
+                        Ok(ActorMessage::ApprovalExpired { request_id }) => {
+                            self.handle_approval_expired(&request_id).await;
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -2524,6 +2792,7 @@ impl SessionActor {
         let started = Instant::now();
         let mut overflow_served = false;
         let mut overflow_commands: Vec<InboundMessage> = Vec::new();
+        let mut expired_approval_requests: Vec<String> = Vec::new();
 
         let (agent_result, llm_latency) = loop {
             tokio::select! {
@@ -2625,6 +2894,9 @@ impl SessionActor {
                                 metadata: serde_json::json!({ "_task_status": task_json }),
                             }).await;
                         }
+                        Some(ActorMessage::ApprovalExpired { request_id }) => {
+                            expired_approval_requests.push(request_id);
+                        }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                         }
@@ -2658,6 +2930,9 @@ impl SessionActor {
         // tasks so their responses don't preempt command replies (#21).
         if !overflow_commands.is_empty() {
             self.overflow_cancelled.store(true, Ordering::Release);
+        }
+        for request_id in &expired_approval_requests {
+            self.handle_approval_expired(request_id).await;
         }
 
         // Feed latency to responsiveness observer
@@ -2775,6 +3050,7 @@ impl SessionActor {
         };
         match agent_result {
             Ok(Ok(conv_response)) => {
+                let pending_approval = conv_response.pending_approval.clone();
                 // Save tool calls, tool results, and assistant reply to history.
                 // Skip the first message (user msg) — we already saved it before
                 // spawning to maintain chronological ordering.
@@ -2829,6 +3105,11 @@ impl SessionActor {
                     {
                         warn!("session compaction failed: {e}");
                     }
+                }
+
+                if let Some(pending_approval) = pending_approval {
+                    self.handle_pending_approval(&inbound, pending_approval).await;
+                    return;
                 }
 
                 // Auto-deliver report files produced by the agent (e.g. from run_pipeline).
@@ -3480,6 +3761,8 @@ impl SessionActor {
             None
         };
 
+        drop(_permit);
+
         // Stop status indicator (if stream forwarder didn't already cancel it)
         if let Some(handle) = status_handle {
             handle.stop().await;
@@ -3504,6 +3787,7 @@ impl SessionActor {
 
         match result {
             Ok(Ok(conv_response)) => {
+                let pending_approval = conv_response.pending_approval.clone();
                 // Save all messages from the agent (user msg, tool calls, tool
                 // results, assistant replies) so the full context is preserved
                 // for subsequent calls.
@@ -3562,6 +3846,11 @@ impl SessionActor {
                     {
                         warn!("session compaction failed: {e}");
                     }
+                }
+
+                if let Some(pending_approval) = pending_approval {
+                    self.handle_pending_approval(&inbound, pending_approval).await;
+                    return;
                 }
 
                 // Send reply — always goes to this actor's chat (no race!)
@@ -4018,6 +4307,7 @@ mod tests {
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
             agent: Arc::new(agent),
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
@@ -4042,6 +4332,7 @@ mod tests {
             responsiveness,
             adaptive_router,
             memory_store: None,
+            pending_approvals: PendingApprovalStore::default(),
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
@@ -4105,6 +4396,7 @@ mod tests {
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
             agent: Arc::new(agent),
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
@@ -4129,6 +4421,7 @@ mod tests {
             responsiveness,
             adaptive_router: Some(router),
             memory_store: None,
+            pending_approvals: PendingApprovalStore::default(),
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),

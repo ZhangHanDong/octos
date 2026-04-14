@@ -285,6 +285,10 @@ impl ChatCommand {
             max_iterations: self.max_iterations,
             save_episodes: true,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
+            approval_policy: config
+                .approval_policy
+                .as_ref()
+                .map(crate::config::ApprovalPolicyConfig::to_runtime_policy),
             ..Default::default()
         };
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)

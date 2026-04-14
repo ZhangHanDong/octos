@@ -19,6 +19,7 @@ use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
 use crate::hooks::{HookContext, HookExecutor};
+use crate::approval::{ApprovalPolicy, PendingApprovalDraft};
 use crate::progress::{ProgressReporter, SilentReporter};
 use crate::tools::ToolRegistry;
 
@@ -52,6 +53,8 @@ pub struct AgentConfig {
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
+    /// Native approval policy for turning matching tool calls into pending approvals.
+    pub approval_policy: Option<ApprovalPolicy>,
 }
 
 /// Default tool execution timeout in seconds.
@@ -71,6 +74,7 @@ impl Default for AgentConfig {
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             chat_max_tokens: None,
+            approval_policy: None,
         }
     }
 }
@@ -86,6 +90,7 @@ pub struct ConversationResponse {
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
     pub streamed: bool,
+    pub pending_approval: Option<PendingApprovalDraft>,
     /// All messages generated during processing (assistant replies, tool calls,
     /// tool results). Includes the user message at the front. Callers should
     /// persist these to session history so subsequent calls see the full context.

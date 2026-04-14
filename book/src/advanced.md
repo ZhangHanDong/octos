@@ -122,6 +122,41 @@ Different tool sets for different LLM models:
 }
 ```
 
+### Approval Policy
+
+`approval_policy` is the native configuration path for human approval. It
+complements `tool_policy`: deny still hard-blocks first, and approval rules only
+apply to calls that remain executable.
+
+```json
+{
+  "tool_policy": {
+    "deny": ["diff_edit"]
+  },
+  "approval_policy": {
+    "default": "allow",
+    "rules": [
+      {
+        "tools": ["shell"],
+        "require_approval": true,
+        "risk_level": "critical",
+        "authorized_approvers": ["@alex:127.0.0.1:8128"],
+        "expires_in_secs": 300,
+        "on_timeout": "notify"
+      }
+    ]
+  }
+}
+```
+
+Evaluation order:
+
+1. `tool_policy.deny` blocks the tool immediately
+2. `approval_policy` checks whether the call becomes a pending approval
+3. non-matching tools execute normally
+
+Rules are **first match wins** and v1 matches by tool name only.
+
 ---
 
 ## Queue Modes
@@ -223,7 +258,8 @@ Hooks are shell commands that run at agent lifecycle events. Each hook receives 
 |-----------|---------|---------------|--------------|
 | 0 | Allow | Operation proceeds | Success logged |
 | 1 | Deny | Operation blocked (reason on stdout) | Treated as error |
-| 2+ | Error | Logged, operation proceeds | Logged |
+| 3 | Approval required | Operation pauses; stdout must be approval-request JSON | Invalid / treated as error |
+| 2+ (except 3) | Error | Logged, operation proceeds | Logged |
 
 ### Events
 
@@ -231,7 +267,8 @@ Four lifecycle events, each with a specific payload:
 
 #### `before_tool_call`
 
-Fires before each tool execution. **Can deny** (exit 1).
+Fires before each tool execution. **Can deny** (exit 1) or request human approval
+(exit 3).
 
 ```json
 {
@@ -243,6 +280,37 @@ Fires before each tool execution. **Can deny** (exit 1).
   "profile_id": "my-bot"
 }
 ```
+
+When a `before_tool_call` hook exits with code `3`, stdout must be valid approval
+request JSON:
+
+```json
+{
+  "tool_name": "shell",
+  "title": "Execute shell command",
+  "summary": "rm -rf ~/tmp/cache",
+  "risk_level": "critical",
+  "authorized_approvers": ["@alice:example.org"],
+  "expires_at": "2026-04-14T14:30:00Z",
+  "on_timeout": "notify"
+}
+```
+
+Octos then:
+
+1. computes a stable `tool_args_digest`
+2. creates a pending approval bound to the originating `room_id`
+3. emits a Matrix approval message with `org.octos.approval_request` and
+   `org.octos.actions`
+4. waits for an approval response from an authorized Matrix sender
+
+If `authorized_approvers` is empty, or stdout is not valid JSON, the approval
+request is rejected and the tool call does not proceed.
+
+> Native `approval_policy` is the default approval path in v1. Hook exit code
+> `3` remains available for dynamic or environment-specific exceptions, but you
+> do not need an external hook just to declare that `shell` or `write_file`
+> requires approval.
 
 #### `after_tool_call`
 

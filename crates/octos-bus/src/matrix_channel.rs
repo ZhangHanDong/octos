@@ -47,6 +47,9 @@ const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 const CONTENT_EXPLICIT_ROOM: &str = "org.octos.explicit_room";
+const CONTENT_ACTIONS: &str = "org.octos.actions";
+const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
+const CONTENT_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
 #[cfg(test)]
@@ -1256,6 +1259,9 @@ async fn handle_transaction(
         // Route to bot profile: explicit target first, then @mention,
         // then explicit-room suppression, then room mapping fallback.
         let mut metadata = json!({});
+        if let Some(approval_response) = content.get(CONTENT_APPROVAL_RESPONSE) {
+            metadata[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
+        }
         if let Some(profile_id) = route_by_explicit_target(&state.bot_router, content).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
         } else if let Some(profile_id) =
@@ -1821,7 +1827,7 @@ impl Channel for MatrixChannel {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let event_id = self
-            .send_matrix_message(&msg.chat_id, &msg.content, sender_user_id, live)
+            .send_matrix_message(&msg.chat_id, &msg.content, &msg.metadata, sender_user_id, live)
             .await?;
 
         // Remember which sender sent this event so edit_message can use the same identity.
@@ -1945,6 +1951,7 @@ impl MatrixChannel {
         &self,
         room_id: &str,
         content: &str,
+        metadata: &serde_json::Value,
         sender_user_id: Option<&str>,
         live: bool,
     ) -> Result<String> {
@@ -1966,6 +1973,15 @@ impl MatrixChannel {
             "format": HTML_FORMAT,
             "formatted_body": formatted_body,
         });
+        if let Some(actions) = metadata.get(CONTENT_ACTIONS) {
+            body[CONTENT_ACTIONS] = actions.clone();
+        }
+        if let Some(approval_request) = metadata.get(CONTENT_APPROVAL_REQUEST) {
+            body[CONTENT_APPROVAL_REQUEST] = approval_request.clone();
+        }
+        if let Some(approval_response) = metadata.get(CONTENT_APPROVAL_RESPONSE) {
+            body[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
+        }
         if live {
             body[LIVE_MARKER] = json!({});
         }
@@ -3382,6 +3398,63 @@ mod tests {
             .find(|r| r.path.contains("/send/"))
             .expect("should have a send request");
         assert!(req.body.get(LIVE_MARKER).is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_send_projects_approval_metadata_into_event_content() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "Approval required".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({
+                CONTENT_APPROVAL_REQUEST: {
+                    "request_id": "req_123",
+                    "tool_name": "shell",
+                    "tool_args_digest": "sha256:deadbeef",
+                    "title": "Execute shell command",
+                    "summary": "rm -rf /tmp/cache",
+                    "risk_level": "critical",
+                    "authorized_approvers": ["@alice:localhost"],
+                    "expires_at": "2026-04-14T12:00:00Z",
+                    "on_timeout": "notify",
+                },
+                CONTENT_ACTIONS: [
+                    {"id": "approve", "label": "Approve", "style": "primary"},
+                    {"id": "deny", "label": "Deny", "style": "danger"},
+                ],
+            }),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let send_req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert_eq!(
+            send_req.body[CONTENT_APPROVAL_REQUEST]["request_id"],
+            "req_123"
+        );
+        assert_eq!(
+            send_req.body[CONTENT_ACTIONS][0]["id"],
+            "approve"
+        );
         handle.abort();
     }
 
@@ -5229,6 +5302,70 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("profile-weather"),
             "explicit target should still win when explicit_room is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_copies_approval_response_into_metadata() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "botfather")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$approval-response-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "Approve",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.approval_response": {
+                        "request_id": "req_123",
+                        "decision": "approve"
+                    }
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-approval-response-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata[CONTENT_APPROVAL_RESPONSE]["request_id"],
+            "req_123"
+        );
+        assert_eq!(
+            msg.metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|value| value.as_str()),
+            Some("botfather")
         );
     }
 

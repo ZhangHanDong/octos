@@ -105,6 +105,19 @@ The complete configuration structure with all available fields:
 
   // Tool policies
   "tool_policy": {"allow": [], "deny": []},
+  "approval_policy": {
+    "default": "allow",
+    "rules": [
+      {
+        "tools": ["shell"],
+        "require_approval": true,
+        "risk_level": "critical",
+        "authorized_approvers": ["@alice:example.org"],
+        "expires_in_secs": 300,
+        "on_timeout": "notify"
+      }
+    ]
+  },
   "tool_policy_by_provider": {},
   "context_filter": [],
 
@@ -159,6 +172,48 @@ The complete configuration structure with all available fields:
   "monitor": null
 }
 ```
+
+## Approval Policy
+
+Use `approval_policy` when a tool is allowed in principle, but must pause for a
+human decision before execution.
+
+```json
+{
+  "approval_policy": {
+    "default": "allow",
+    "rules": [
+      {
+        "tools": ["shell", "write_file"],
+        "require_approval": true,
+        "risk_level": "critical",
+        "authorized_approvers": ["@alex:127.0.0.1:8128"],
+        "expires_in_secs": 300,
+        "on_timeout": "notify"
+      }
+    ]
+  }
+}
+```
+
+Rules are evaluated top-to-bottom and **first match wins**.
+
+- `default`: v1 only supports `"allow"`
+- `tools`: non-empty tool-name list
+- `require_approval`: must be `true`
+- `risk_level`: `"normal"` or `"critical"`
+- `authorized_approvers`: non-empty Matrix user ID list
+- `expires_in_secs`: positive integer expiry window
+- `on_timeout`: v1 only supports `"notify"`
+
+`approval_policy` does not replace `tool_policy`:
+
+1. `tool_policy.deny` still hard-blocks the tool first
+2. `approval_policy` decides whether a matching call becomes a pending approval
+3. non-matching calls execute normally
+
+See [advanced.md](advanced.md) for how approval requests interact with hooks and
+the Matrix approval protocol.
 
 ## Environment Variables
 
