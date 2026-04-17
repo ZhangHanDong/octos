@@ -184,7 +184,9 @@ fn action_list(profiles_dir: &Path, parent_id: &str) {
     };
 
     if subs.is_empty() {
-        output_ok("No sub-accounts found. You can create one by asking me to create a sub-account with a name.");
+        output_ok(
+            "No sub-accounts found. You can create one by asking me to create a sub-account with a name.",
+        );
         return;
     }
 
@@ -684,7 +686,9 @@ fn action_update_by_id(profiles_dir: &Path, parent_id: &str, sub_id: &str, input
     }
 
     if changed.is_empty() {
-        output_error("Nothing to update. Provide at least one field to change (telegram_token, telegram_senders, whatsapp, feishu_app_id, feishu_app_secret, system_prompt, enabled, sandbox, sandbox_mode, sandbox_network).");
+        output_error(
+            "Nothing to update. Provide at least one field to change (telegram_token, telegram_senders, whatsapp, feishu_app_id, feishu_app_secret, system_prompt, enabled, sandbox, sandbox_mode, sandbox_network).",
+        );
         return;
     }
 
