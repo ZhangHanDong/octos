@@ -3,15 +3,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glob::glob;
 
+use crate::behaviour::{
+    ActionContext, ActionResult, evaluate_actions_with_context, run_action_with_context,
+};
 use crate::task_supervisor::{TaskRuntimeState, TaskSupervisor};
 use crate::tools::ToolRegistry;
-use crate::workspace_policy::{WorkspacePolicy, WorkspaceSpawnTaskPolicy, read_workspace_policy};
+use crate::workspace_policy::{
+    WorkspacePolicy, WorkspacePolicyKind, WorkspaceSpawnTaskPolicy, read_workspace_policy,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnTaskContractResult {
-    NotConfigured,
+    NotConfigured {
+        required: bool,
+        reason: Option<String>,
+    },
     Satisfied {
-        delivered_files: Vec<String>,
+        output_files: Vec<String>,
     },
     Failed {
         error: String,
@@ -19,8 +27,10 @@ pub enum SpawnTaskContractResult {
     },
 }
 
-pub fn requires_workspace_contract(tool_name: &str) -> bool {
-    matches!(tool_name, "fm_tts" | "voice_synthesize")
+#[derive(Debug, Clone)]
+struct ResolvedArtifacts {
+    context: ActionContext,
+    paths: Vec<PathBuf>,
 }
 
 pub async fn enforce_spawn_task_contract(
@@ -31,13 +41,22 @@ pub async fn enforce_spawn_task_contract(
     task_started_at: SystemTime,
     supervisor: Option<(&TaskSupervisor, &str)>,
 ) -> SpawnTaskContractResult {
+    let required_by_default = default_session_policy_requires_contract(tool_name);
     let Some(workspace_root) = tools.workspace_root() else {
-        return SpawnTaskContractResult::NotConfigured;
+        return SpawnTaskContractResult::NotConfigured {
+            required: required_by_default,
+            reason: required_by_default.then_some("workspace root unavailable".into()),
+        };
     };
 
     let policy = match read_workspace_policy(workspace_root) {
         Ok(Some(policy)) => policy,
-        Ok(None) => return SpawnTaskContractResult::NotConfigured,
+        Ok(None) => {
+            return SpawnTaskContractResult::NotConfigured {
+                required: required_by_default,
+                reason: required_by_default.then_some("workspace policy not found".into()),
+            };
+        }
         Err(error) => {
             return SpawnTaskContractResult::Failed {
                 error: format!("workspace contract read failed: {error}"),
@@ -46,27 +65,33 @@ pub async fn enforce_spawn_task_contract(
         }
     };
 
-    let Some(task_policy) = policy.spawn_tasks.get(tool_name) else {
-        return SpawnTaskContractResult::NotConfigured;
+    let Some(task_policy) = policy.spawn_tasks.get(tool_name).cloned() else {
+        let required = policy.workspace.kind == WorkspacePolicyKind::Session && required_by_default;
+        return SpawnTaskContractResult::NotConfigured {
+            required,
+            reason: required.then_some(format!(
+                "workspace policy is missing spawn_tasks.{tool_name}"
+            )),
+        };
     };
 
-    let notify_user = extract_notify_user(task_policy);
+    let notify_user = extract_notify_user(&task_policy);
 
     set_runtime_state(
         supervisor,
         TaskRuntimeState::ResolvingOutputs,
         Some(format!("resolve outputs for {tool_name}")),
     );
-    let artifact_paths = match resolve_artifacts(
+    let resolved_artifacts = match resolve_artifacts(
         workspace_root,
         &policy,
-        task_policy,
+        &task_policy,
         files_to_send,
         task_started_at,
     ) {
-        Ok(paths) => paths,
+        Ok(resolved) => resolved,
         Err(error) => {
-            run_failure_actions(workspace_root, supervisor, &task_policy.on_failure);
+            run_failure_actions(workspace_root, supervisor, &task_policy.on_failure, None);
             return SpawnTaskContractResult::Failed { error, notify_user };
         }
     };
@@ -76,29 +101,49 @@ pub async fn enforce_spawn_task_contract(
         TaskRuntimeState::VerifyingOutputs,
         Some(format!("verify outputs for {tool_name}")),
     );
-    if let Err(error) = run_verify_actions(workspace_root, &task_policy.on_verify, &artifact_paths)
+    if let Err(error) =
+        run_verify_actions(workspace_root, &task_policy.on_verify, &resolved_artifacts)
     {
-        run_failure_actions(workspace_root, supervisor, &task_policy.on_failure);
+        run_failure_actions(
+            workspace_root,
+            supervisor,
+            &task_policy.on_failure,
+            Some(&resolved_artifacts),
+        );
         return SpawnTaskContractResult::Failed { error, notify_user };
     }
 
     set_runtime_state(
         supervisor,
         TaskRuntimeState::DeliveringOutputs,
-        Some(format!("deliver outputs for {tool_name}")),
+        Some(format!("handoff outputs for {tool_name}")),
     );
-    match run_complete_actions(
+    if task_policy.delivery_actions().is_empty() {
+        let output_files = resolved_artifacts
+            .paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        return SpawnTaskContractResult::Satisfied { output_files };
+    }
+
+    match run_delivery_actions(
         tools,
         workspace_root,
         tool_call_id,
-        &task_policy.on_complete,
-        &artifact_paths,
+        task_policy.delivery_actions(),
+        &resolved_artifacts,
     )
     .await
     {
-        Ok(delivered_files) => SpawnTaskContractResult::Satisfied { delivered_files },
+        Ok(output_files) => SpawnTaskContractResult::Satisfied { output_files },
         Err(error) => {
-            run_failure_actions(workspace_root, supervisor, &task_policy.on_failure);
+            run_failure_actions(
+                workspace_root,
+                supervisor,
+                &task_policy.on_failure,
+                Some(&resolved_artifacts),
+            );
             SpawnTaskContractResult::Failed { error, notify_user }
         }
     }
@@ -110,7 +155,7 @@ fn resolve_artifacts(
     task_policy: &WorkspaceSpawnTaskPolicy,
     files_to_send: &[PathBuf],
     task_started_at: SystemTime,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<ResolvedArtifacts, String> {
     if !files_to_send.is_empty() {
         let files: Vec<PathBuf> = files_to_send
             .iter()
@@ -122,27 +167,76 @@ fn resolve_artifacts(
                 "contract expected output files but tool-reported files do not exist".into(),
             );
         }
-        return Ok(files);
+        let context = bind_explicit_files_to_artifacts(task_policy, files.clone())?;
+        return Ok(ResolvedArtifacts {
+            context,
+            paths: files,
+        });
     }
 
-    let artifact_name = task_policy
-        .artifact
-        .as_deref()
-        .ok_or_else(|| "workspace contract has no artifact source".to_string())?;
-    let pattern = policy.artifacts.entries.get(artifact_name).ok_or_else(|| {
-        format!("workspace contract references unknown artifact '{artifact_name}'")
-    })?;
+    let artifact_sources = task_policy.artifact_sources();
+    if artifact_sources.is_empty() {
+        return Err("workspace contract has no artifact source".into());
+    }
 
-    let mut matches = resolve_glob_matches(workspace_root, pattern, Some(task_started_at))?;
-    if matches.is_empty() {
-        matches = resolve_glob_matches(workspace_root, pattern, None)?;
+    let mut context = ActionContext::default();
+    let mut artifact_paths = Vec::new();
+
+    for artifact_name in artifact_sources {
+        let pattern = policy.artifacts.entries.get(artifact_name).ok_or_else(|| {
+            format!("workspace contract references unknown artifact '{artifact_name}'")
+        })?;
+
+        let mut matches = resolve_glob_matches(workspace_root, pattern, Some(task_started_at))?;
+        if matches.is_empty() {
+            matches = resolve_glob_matches(workspace_root, pattern, None)?;
+        }
+        if matches.is_empty() {
+            return Err(format!(
+                "contract could not find artifact '{artifact_name}' matching '{pattern}'"
+            ));
+        }
+
+        context = context.with_named_target(format!("${artifact_name}"), matches.clone());
+        artifact_paths.extend(matches);
     }
-    if matches.is_empty() {
-        return Err(format!(
-            "contract could not find artifact matching '{pattern}'"
-        ));
+
+    context = context.with_named_target("$artifact", artifact_paths.clone());
+
+    Ok(ResolvedArtifacts {
+        context,
+        paths: artifact_paths,
+    })
+}
+
+fn bind_explicit_files_to_artifacts(
+    task_policy: &WorkspaceSpawnTaskPolicy,
+    files: Vec<PathBuf>,
+) -> Result<ActionContext, String> {
+    let artifact_sources = task_policy.artifact_sources();
+    if artifact_sources.is_empty() {
+        return Err("workspace contract has no artifact source".into());
     }
-    Ok(matches)
+
+    let mut context = ActionContext::default();
+    if artifact_sources.len() == 1 {
+        context = context.with_named_target(format!("${}", artifact_sources[0]), files.clone());
+    } else {
+        if artifact_sources.len() != files.len() {
+            return Err(format!(
+                "workspace contract expects {} explicit output files for {:?}, got {}",
+                artifact_sources.len(),
+                artifact_sources,
+                files.len()
+            ));
+        }
+
+        for (artifact_name, path) in artifact_sources.iter().zip(files.iter()) {
+            context = context.with_named_target(format!("${artifact_name}"), vec![path.clone()]);
+        }
+    }
+
+    Ok(context.with_named_target("$artifact", files))
 }
 
 fn resolve_glob_matches(
@@ -194,62 +288,41 @@ fn resolve_glob_matches(
 fn run_verify_actions(
     workspace_root: &Path,
     actions: &[String],
-    artifact_paths: &[PathBuf],
+    resolved_artifacts: &ResolvedArtifacts,
 ) -> Result<(), String> {
-    for action in actions {
-        if let Some(target) = action.strip_prefix("file_exists:") {
-            let targets = resolve_action_targets(workspace_root, target, artifact_paths)?;
-            if targets.is_empty() || targets.iter().any(|path| !path.exists()) {
-                return Err(format!("verify failed: expected file for '{target}'"));
-            }
-            continue;
+    let mut failures = Vec::new();
+    for (spec, result) in
+        evaluate_actions_with_context(workspace_root, &resolved_artifacts.context, actions)
+    {
+        match result {
+            Ok(ActionResult::Pass | ActionResult::Notify { .. }) => {}
+            Ok(ActionResult::Fail { reason }) => failures.push(format!("{spec}: {reason}")),
+            Err(error) => failures.push(format!("{spec}: validator error: {error}")),
         }
-
-        if let Some(rest) = action.strip_prefix("file_size_min:") {
-            let mut parts = rest.splitn(2, ':');
-            let target = parts
-                .next()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| format!("invalid verify action '{action}'"))?;
-            let min_size = parts
-                .next()
-                .ok_or_else(|| format!("invalid verify action '{action}'"))?
-                .parse::<u64>()
-                .map_err(|error| format!("invalid minimum size in '{action}': {error}"))?;
-            for path in resolve_action_targets(workspace_root, target, artifact_paths)? {
-                let size = std::fs::metadata(&path)
-                    .map_err(|error| format!("stat failed for {}: {error}", path.display()))?
-                    .len();
-                if size < min_size {
-                    return Err(format!(
-                        "verify failed: {} is {} bytes (< {})",
-                        path.display(),
-                        size,
-                        min_size
-                    ));
-                }
-            }
-            continue;
-        }
-
-        return Err(format!("unsupported verify action '{action}'"));
     }
-
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
-async fn run_complete_actions(
+async fn run_delivery_actions(
     tools: &ToolRegistry,
     workspace_root: &Path,
     tool_call_id: &str,
     actions: &[String],
-    artifact_paths: &[PathBuf],
+    resolved_artifacts: &ResolvedArtifacts,
 ) -> Result<Vec<String>, String> {
     let mut delivered_files = Vec::new();
 
     for action in actions {
         if let Some(target) = action.strip_prefix("send_file:") {
-            for path in resolve_action_targets(workspace_root, target, artifact_paths)? {
+            for path in resolved_artifacts
+                .context
+                .resolve_targets(workspace_root, target)
+                .map_err(|error| format!("send_file target resolution failed: {error}"))?
+            {
                 let path_str = path.to_string_lossy().to_string();
                 let send_args =
                     serde_json::json!({ "file_path": path_str, "tool_call_id": tool_call_id });
@@ -270,21 +343,32 @@ async fn run_complete_actions(
             continue;
         }
 
-        if let Some(pattern) = action.strip_prefix("cleanup:") {
-            run_cleanup_action(workspace_root, pattern)?;
-            continue;
+        match run_action_with_context(workspace_root, &resolved_artifacts.context, action)
+            .map_err(|error| format!("delivery action error: {error}"))?
+        {
+            ActionResult::Pass | ActionResult::Notify { .. } => continue,
+            ActionResult::Fail { reason } => {
+                return Err(format!("delivery action failed: {action}: {reason}"));
+            }
         }
-
-        return Err(format!("unsupported completion action '{action}'"));
     }
 
-    Ok(delivered_files)
+    if delivered_files.is_empty() {
+        Ok(resolved_artifacts
+            .paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect())
+    } else {
+        Ok(delivered_files)
+    }
 }
 
 fn run_failure_actions(
     workspace_root: &Path,
     supervisor: Option<(&TaskSupervisor, &str)>,
     actions: &[String],
+    resolved_artifacts: Option<&ResolvedArtifacts>,
 ) {
     if actions.iter().any(|action| action.starts_with("cleanup:")) {
         set_runtime_state(
@@ -293,35 +377,18 @@ fn run_failure_actions(
             Some("cleanup failed outputs".to_string()),
         );
     }
+    let action_context = resolved_artifacts
+        .map(|resolved| resolved.context.clone())
+        .unwrap_or_default()
+        .with_named_target(
+            "$artifact",
+            resolved_artifacts
+                .map(|resolved| resolved.paths.clone())
+                .unwrap_or_default(),
+        );
     for action in actions {
-        if let Some(pattern) = action.strip_prefix("cleanup:") {
-            let _ = run_cleanup_action(workspace_root, pattern);
-        }
+        let _ = run_action_with_context(workspace_root, &action_context, action);
     }
-}
-
-fn run_cleanup_action(workspace_root: &Path, pattern: &str) -> Result<(), String> {
-    for path in resolve_glob_matches(workspace_root, pattern, None)? {
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-                .map_err(|error| format!("cleanup failed for {}: {error}", path.display()))?;
-        } else if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|error| format!("cleanup failed for {}: {error}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn resolve_action_targets(
-    workspace_root: &Path,
-    target: &str,
-    artifact_paths: &[PathBuf],
-) -> Result<Vec<PathBuf>, String> {
-    if target == "$artifact" {
-        return Ok(artifact_paths.to_vec());
-    }
-    resolve_glob_matches(workspace_root, target, None)
 }
 
 fn extract_notify_user(task_policy: &WorkspaceSpawnTaskPolicy) -> Option<String> {
@@ -341,43 +408,85 @@ fn set_runtime_state(
     }
 }
 
+fn default_session_policy_requires_contract(tool_name: &str) -> bool {
+    WorkspacePolicy::for_session()
+        .spawn_tasks
+        .contains_key(tool_name)
+}
+
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
-
     use super::*;
-    use crate::{SendFileTool, ToolRegistry, WorkspacePolicy, write_workspace_policy};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    use crate::{Tool, ToolRegistry, ToolResult, WorkspacePolicy, write_workspace_policy};
+
+    #[derive(Clone, Default)]
+    struct CaptureSendFileTool {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CaptureSendFileTool {
+        fn name(&self) -> &str {
+            "send_file"
+        }
+
+        fn description(&self) -> &str {
+            "capture send_file calls"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string" },
+                    "tool_call_id": { "type": "string" }
+                },
+                "required": ["file_path", "tool_call_id"]
+            })
+        }
+
+        async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            let file_path = args
+                .get("file_path")
+                .and_then(|value| value.as_str())
+                .expect("send_file should receive a file_path")
+                .to_string();
+            self.calls.lock().unwrap().push(file_path);
+            Ok(ToolResult {
+                success: true,
+                output: "sent".into(),
+                ..Default::default()
+            })
+        }
+    }
 
     #[tokio::test]
-    async fn tts_contract_auto_sends_new_mp3() {
+    async fn tts_contract_resolves_new_mp3_for_actor_delivery() {
         let temp = tempfile::tempdir().unwrap();
         write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
         let output = temp.path().join("tts_result.mp3");
         std::fs::write(&output, vec![1u8; 2048]).unwrap();
 
-        let mut tools = ToolRegistry::with_builtins(temp.path());
-        let (tx, mut rx) = mpsc::channel(4);
-        tools.register(SendFileTool::with_context(tx, "api", "sess-1").with_base_dir(temp.path()));
-
-        let result =
-            enforce_spawn_task_contract(&tools, "fm_tts", "tool-call-1", &[], UNIX_EPOCH, None)
-                .await;
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fm_tts",
+            "tool-call-1",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
 
         match result {
-            SpawnTaskContractResult::Satisfied { delivered_files } => {
-                assert_eq!(delivered_files, vec![output.to_string_lossy().to_string()]);
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(output_files, vec![output.to_string_lossy().to_string()]);
             }
             other => panic!("expected success, got {other:?}"),
         }
-
-        let msg = rx.recv().await.expect("file message");
-        assert_eq!(msg.media, vec![output.to_string_lossy().to_string()]);
-        assert_eq!(
-            msg.metadata
-                .get("tool_call_id")
-                .and_then(|value| value.as_str()),
-            Some("tool-call-1")
-        );
     }
 
     #[tokio::test]
@@ -385,13 +494,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
 
-        let mut tools = ToolRegistry::with_builtins(temp.path());
-        let (tx, _rx) = mpsc::channel(4);
-        tools.register(SendFileTool::with_context(tx, "api", "sess-1").with_base_dir(temp.path()));
-
-        let result =
-            enforce_spawn_task_contract(&tools, "fm_tts", "tool-call-2", &[], UNIX_EPOCH, None)
-                .await;
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fm_tts",
+            "tool-call-2",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
 
         match result {
             SpawnTaskContractResult::Failed { error, notify_user } => {
@@ -400,5 +511,319 @@ mod tests {
             }
             other => panic!("expected failure, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn podcast_contract_resolves_generated_audio_for_actor_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let output = temp
+            .path()
+            .join("skill-output/mofa-podcast/podcast_full_123.wav");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(&output, vec![1u8; 8192]).unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "podcast_generate",
+            "tool-call-3",
+            std::slice::from_ref(&output),
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(output_files, vec![output.to_string_lossy().to_string()]);
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_contract_resolves_multiple_artifact_sources_for_runtime_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("report".into(), "report.md".into());
+        policy
+            .artifacts
+            .entries
+            .insert("audio".into(), "audio.mp3".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: vec!["report".into(), "audio".into()],
+                on_verify: vec![
+                    "file_exists:$report".into(),
+                    "file_exists:$audio".into(),
+                    "file_size_min:$audio:1024".into(),
+                ],
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let report = temp.path().join("report.md");
+        let audio = temp.path().join("audio.mp3");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&audio, vec![0u8; 2048]).unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "bundle_generate",
+            "tool-call-4",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(
+                    output_files,
+                    vec![
+                        report.to_string_lossy().to_string(),
+                        audio.to_string_lossy().to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_contract_prefers_explicit_delivery_actions_over_legacy_completion_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle.md");
+        std::fs::write(&bundle, b"bundle").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("bundle".into(), "bundle.md".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: Some("bundle".into()),
+                artifacts: vec!["bundle".into()],
+                on_verify: vec!["file_exists:$bundle".into()],
+                on_complete: vec!["file_exists:missing.txt".into()],
+                on_deliver: vec!["notify_user:bundle delivered".into()],
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "bundle_generate",
+            "tool-call-4",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(output_files, vec![bundle.to_string_lossy().to_string()]);
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_contract_binds_explicit_files_to_named_artifacts_for_delivery_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        let audio = temp.path().join("audio.mp3");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&audio, vec![0u8; 2048]).unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("report".into(), "report.md".into());
+        policy
+            .artifacts
+            .entries
+            .insert("audio".into(), "audio.mp3".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: Some("legacy".into()),
+                artifacts: vec!["report".into(), "audio".into()],
+                on_verify: vec![
+                    "file_exists:$report".into(),
+                    "file_exists:$audio".into(),
+                    "file_size_min:$audio:1024".into(),
+                ],
+                on_complete: vec!["send_file:$legacy".into()],
+                on_deliver: vec!["send_file:$report".into(), "send_file:$audio".into()],
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let capture = CaptureSendFileTool::default();
+        let calls = capture.calls.clone();
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(capture);
+
+        let result = enforce_spawn_task_contract(
+            &registry,
+            "bundle_generate",
+            "tool-call-5",
+            &[report.clone(), audio.clone()],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(
+                    output_files,
+                    vec![
+                        report.to_string_lossy().to_string(),
+                        audio.to_string_lossy().to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                report.to_string_lossy().to_string(),
+                audio.to_string_lossy().to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_contract_rejects_mismatched_explicit_output_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        std::fs::write(&report, b"report").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("report".into(), "report.md".into());
+        policy
+            .artifacts
+            .entries
+            .insert("audio".into(), "audio.mp3".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: vec!["report".into(), "audio".into()],
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "bundle_generate",
+            "tool-call-6",
+            &[report.clone()],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, .. } => {
+                assert!(error.contains("expects 2 explicit output files"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_tts_contract_is_required_when_policy_file_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fm_tts",
+            "tool-call-4",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            SpawnTaskContractResult::NotConfigured {
+                required: true,
+                reason: Some("workspace policy not found".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_spawn_tool_without_contract_is_not_required() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "unknown_background_tool",
+            "tool-call-5",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            SpawnTaskContractResult::NotConfigured {
+                required: false,
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_verification_uses_shared_validator_semantics_for_file_size_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("output.mp3");
+        std::fs::write(&artifact, b"x").unwrap();
+
+        let resolved_artifacts = ResolvedArtifacts {
+            context: ActionContext::default()
+                .with_named_target("$artifact", vec![artifact.clone()]),
+            paths: vec![artifact.clone()],
+        };
+
+        let error = run_verify_actions(
+            temp.path(),
+            &["file_size_min:$artifact:1024".into()],
+            &resolved_artifacts,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("file_size_min:$artifact:1024"));
+        assert!(error.contains("output.mp3 is 1 bytes, minimum is 1024"));
     }
 }

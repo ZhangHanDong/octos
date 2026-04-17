@@ -6,6 +6,7 @@ use octos_core::TokenUsage;
 use tracing::{info, warn};
 
 use super::Agent;
+use super::activity::{DEFAULT_IDLE_TIMEOUT_SECS, LoopActivityState};
 use crate::progress::ProgressEvent;
 
 /// Reason why the agent loop stopped due to budget constraints.
@@ -13,7 +14,8 @@ pub(super) enum BudgetStop {
     Shutdown,
     MaxIterations,
     MaxTokens { used: u32, limit: u32 },
-    WallClockTimeout { limit: Duration },
+    ActivityTimeout { limit: Duration },
+    IdleProgressTimeout { limit: Duration },
 }
 
 impl BudgetStop {
@@ -24,8 +26,14 @@ impl BudgetStop {
             Self::MaxTokens { used, limit } => {
                 format!("Token budget exceeded ({used} of {limit}).")
             }
-            Self::WallClockTimeout { limit } => {
-                format!("Wall-clock timeout ({:.0}s limit).", limit.as_secs_f64())
+            Self::ActivityTimeout { limit } => {
+                format!("Activity timeout ({:.0}s limit).", limit.as_secs_f64())
+            }
+            Self::IdleProgressTimeout { limit } => {
+                format!(
+                    "Idle progress timeout ({:.0}s without progress).",
+                    limit.as_secs_f64()
+                )
             }
         }
     }
@@ -38,6 +46,7 @@ impl Agent {
         iteration: u32,
         start: Instant,
         total_usage: &TokenUsage,
+        activity: &LoopActivityState,
     ) -> Option<BudgetStop> {
         use std::sync::atomic::Ordering;
 
@@ -47,9 +56,15 @@ impl Agent {
         if iteration >= self.config.max_iterations {
             return Some(BudgetStop::MaxIterations);
         }
+        let idle_timeout = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
+        if activity.has_timed_out(idle_timeout) {
+            return Some(BudgetStop::IdleProgressTimeout {
+                limit: idle_timeout,
+            });
+        }
         if let Some(timeout) = self.config.max_timeout {
-            if start.elapsed() > timeout {
-                return Some(BudgetStop::WallClockTimeout { limit: timeout });
+            if start.elapsed() > timeout && !activity.recently_active_within(timeout) {
+                return Some(BudgetStop::ActivityTimeout { limit: timeout });
             }
         }
         if let Some(max_tokens) = self.config.max_tokens {
@@ -90,13 +105,19 @@ impl Agent {
                     limit: *limit,
                 });
             }
-            BudgetStop::WallClockTimeout { limit } => {
-                warn!(limit_s = limit.as_secs(), "hit wall-clock timeout");
+            BudgetStop::ActivityTimeout { limit } => {
+                warn!(limit_s = limit.as_secs(), "hit activity timeout");
                 self.reporter()
-                    .report(ProgressEvent::WallClockTimeoutReached {
+                    .report(ProgressEvent::ActivityTimeoutReached {
                         elapsed: *limit,
                         limit: *limit,
                     });
+            }
+            BudgetStop::IdleProgressTimeout { limit } => {
+                warn!(limit_s = limit.as_secs(), "hit idle progress timeout");
+                self.reporter().report(ProgressEvent::TaskInterrupted {
+                    iterations: iteration,
+                });
             }
         }
     }
@@ -170,15 +191,126 @@ mod tests {
     }
 
     #[test]
-    fn budget_stop_wall_clock_timeout_message() {
-        let msg = BudgetStop::WallClockTimeout {
+    fn budget_stop_activity_timeout_message() {
+        let msg = BudgetStop::ActivityTimeout {
             limit: Duration::from_secs(120),
         }
         .message();
         assert!(
+            msg.to_lowercase().contains("activity"),
+            "expected 'activity' in: {msg}"
+        );
+        assert!(
             msg.to_lowercase().contains("timeout"),
             "expected 'timeout' in: {msg}"
         );
+    }
+
+    #[test]
+    fn budget_stop_idle_progress_timeout_message() {
+        let msg = BudgetStop::IdleProgressTimeout {
+            limit: Duration::from_secs(120),
+        }
+        .message();
+        assert!(
+            msg.to_lowercase().contains("idle"),
+            "expected 'idle' in: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("progress"),
+            "expected 'progress' in: {msg}"
+        );
+    }
+
+    async fn test_agent(max_timeout: Option<Duration>) -> super::Agent {
+        use super::super::Agent;
+        use octos_core::AgentId;
+        use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        struct NoopProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for NoopProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                eyre::bail!("not used in budget tests")
+            }
+
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+        let tools = crate::tools::ToolRegistry::new();
+        let mut agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
+        let mut config = AgentConfig::default();
+        config.max_timeout = max_timeout;
+        agent = agent.with_config(config);
+        agent
+    }
+
+    #[tokio::test]
+    async fn active_progress_allows_runtime_past_activity_timeout() {
+        let agent = test_agent(Some(Duration::from_secs(30))).await;
+        let activity = super::super::activity::LoopActivityState::new(Instant::now());
+        activity.set_last_activity_at(Instant::now() - Duration::from_secs(5));
+
+        let stop = agent.check_budget(
+            1,
+            Instant::now() - Duration::from_secs(3600),
+            &TokenUsage::default(),
+            &activity,
+        );
+
+        assert!(stop.is_none(), "recent progress should keep the loop alive");
+    }
+
+    #[tokio::test]
+    async fn stale_progress_trips_activity_timeout_before_idle_timeout() {
+        let agent = test_agent(Some(Duration::from_secs(30))).await;
+        let activity = super::super::activity::LoopActivityState::new(Instant::now());
+        activity.set_last_activity_at(Instant::now() - Duration::from_secs(40));
+
+        let stop = agent.check_budget(
+            1,
+            Instant::now() - Duration::from_secs(3600),
+            &TokenUsage::default(),
+            &activity,
+        );
+
+        assert!(matches!(
+            stop,
+            Some(BudgetStop::ActivityTimeout { limit })
+                if limit == Duration::from_secs(30)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_progress_still_trips_idle_timeout() {
+        let agent = test_agent(Some(Duration::from_secs(600))).await;
+        let activity = super::super::activity::LoopActivityState::new(Instant::now());
+        activity.set_last_activity_at(Instant::now() - Duration::from_secs(301));
+
+        let stop = agent.check_budget(1, Instant::now(), &TokenUsage::default(), &activity);
+
+        assert!(matches!(
+            stop,
+            Some(BudgetStop::IdleProgressTimeout { limit })
+                if limit == Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        ));
     }
 
     // ---------- ConversationResponse derives ----------

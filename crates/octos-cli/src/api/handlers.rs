@@ -1,6 +1,7 @@
 //! API request handlers.
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Extension;
@@ -41,6 +42,8 @@ pub struct ChatRequest {
     /// File paths from prior `/api/upload` call.
     #[serde(default)]
     pub media: Vec<String>,
+    #[serde(default)]
+    pub attach_only: bool,
 }
 
 #[derive(Serialize)]
@@ -185,6 +188,7 @@ pub async fn chat(
             req.session_id.as_deref(),
             req.topic.as_deref(),
             &req.media,
+            req.attach_only,
         )
         .await;
     }
@@ -498,6 +502,14 @@ pub struct TopicQueryParams {
     pub topic: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SessionEventStreamQueryParams {
+    #[serde(default)]
+    pub since_seq: Option<usize>,
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
 fn default_page_limit() -> usize {
     100
 }
@@ -520,6 +532,17 @@ fn append_topic_query(path: &mut String, topic: Option<&str>) {
             "?topic="
         });
         path.push_str(&octos_bus::session::encode_path_component(topic));
+    }
+}
+
+fn append_since_seq_query(path: &mut String, since_seq: Option<usize>) {
+    if let Some(since_seq) = since_seq {
+        path.push_str(if path.contains('?') {
+            "&since_seq="
+        } else {
+            "?since_seq="
+        });
+        path.push_str(&since_seq.to_string());
     }
 }
 
@@ -635,6 +658,33 @@ pub async fn session_status(
         "active": false,
     }))
     .into_response()
+}
+
+/// GET /api/sessions/:id/events/stream -- subscribe to committed session events.
+pub async fn session_event_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<SessionEventStreamQueryParams>,
+) -> Response {
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let mut path = format!("/sessions/{id}/events/stream");
+        append_since_seq_query(&mut path, params.since_seq);
+        append_topic_query(&mut path, params.topic.as_deref());
+        return super::webhook_proxy::api_sse_get_proxy(&state, port, &path).await;
+    }
+
+    let replay_complete = serde_json::json!({
+        "type": "replay_complete",
+        "topic": params.topic,
+    })
+    .to_string();
+    let stream = futures::stream::iter(vec![Ok::<Event, Infallible>(
+        Event::default().data(replay_complete),
+    )]);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// GET /api/sessions/:id/tasks -- list background tasks for a session.
@@ -777,12 +827,37 @@ async fn resolve_file_access_data_dir(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
 ) -> Result<std::path::PathBuf, Response> {
+    if should_resolve_file_access_from_profile(headers, identity) {
+        match resolve_profile_data_dir(state, headers, identity).await {
+            Ok(data_dir) => return Ok(data_dir),
+            Err(response) if response.status() != StatusCode::SERVICE_UNAVAILABLE => {
+                return Err(response);
+            }
+            Err(_) => {}
+        }
+    }
+
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         return Ok(sess.data_dir());
     }
 
     resolve_profile_data_dir(state, headers, identity).await
+}
+
+fn should_resolve_file_access_from_profile(
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> bool {
+    // Hosted/profile-scoped requests must use the same root as /api/files/list so
+    // profile-encoded file handles round-trip through /api/files unchanged.
+    request_host(headers).is_some_and(|host| !is_local_request_host(&host))
+        || headers
+            .get("x-profile-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || identity.is_some()
 }
 
 /// DELETE /api/sessions/:id -- delete a session.
@@ -1830,6 +1905,7 @@ fn should_skip_listing_dir(dir_name: &str, include_build: bool) -> bool {
     let lower = dir_name.to_ascii_lowercase();
     lower.starts_with('.')
         || matches!(lower.as_str(), "node_modules" | "coverage" | "target")
+        || lower == "output_old"
         || (!include_build && matches!(lower.as_str(), "dist" | "out" | "docs" | "build"))
 }
 
@@ -2306,6 +2382,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         topic: None,
                         stream: true,
                         media: media.clone(),
+                        attach_only: false,
                     },
                 ) {
                     // Standalone agent mode — run the agent directly.
@@ -2659,6 +2736,50 @@ mod tests {
     }
 
     #[test]
+    fn should_resolve_file_access_from_profile_for_remote_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("windows.ominix.io"),
+        );
+
+        assert!(should_resolve_file_access_from_profile(&headers, None));
+    }
+
+    #[test]
+    fn should_resolve_file_access_from_profile_skips_local_host_without_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("localhost:8080"),
+        );
+
+        assert!(!should_resolve_file_access_from_profile(&headers, None));
+    }
+
+    #[tokio::test]
+    async fn resolve_file_access_data_dir_falls_back_to_session_store_when_gateway_missing() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+            ))),
+            ..AppState::empty_for_tests()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("windows.ominix.io"),
+        );
+
+        let resolved = resolve_file_access_data_dir(&state, &headers, None)
+            .await
+            .expect("fallback data dir");
+
+        assert_eq!(resolved, data_dir.path());
+    }
+
+    #[test]
     fn resolve_scoped_download_path_denies_other_profile_absolute_path() {
         let current = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
@@ -2715,6 +2836,7 @@ mod tests {
         assert!(should_skip_listing_dir("out", false));
         assert!(should_skip_listing_dir("docs", false));
         assert!(should_skip_listing_dir("build", false));
+        assert!(should_skip_listing_dir("output_old", false));
         assert!(should_skip_listing_dir("node_modules", false));
         assert!(should_skip_listing_dir(".cache", false));
     }
@@ -2725,6 +2847,7 @@ mod tests {
         assert!(!should_skip_listing_dir("out", true));
         assert!(!should_skip_listing_dir("docs", true));
         assert!(!should_skip_listing_dir("build", true));
+        assert!(should_skip_listing_dir("output_old", true));
         assert!(should_skip_listing_dir("node_modules", true));
         assert!(should_skip_listing_dir("target", true));
     }
@@ -2783,6 +2906,23 @@ mod tests {
         assert_eq!(
             path,
             "/sessions/slides-123/messages?limit=100&topic=slides%20untitled-deck"
+        );
+    }
+
+    #[test]
+    fn append_since_seq_query_uses_question_mark_for_clean_path() {
+        let mut path = "/sessions/slides-123/events/stream".to_string();
+        append_since_seq_query(&mut path, Some(8));
+        assert_eq!(path, "/sessions/slides-123/events/stream?since_seq=8");
+    }
+
+    #[test]
+    fn append_since_seq_query_uses_ampersand_when_query_exists() {
+        let mut path = "/sessions/slides-123/events/stream?topic=slides".to_string();
+        append_since_seq_query(&mut path, Some(8));
+        assert_eq!(
+            path,
+            "/sessions/slides-123/events/stream?topic=slides&since_seq=8"
         );
     }
 

@@ -1,14 +1,17 @@
 //! Agent implementation.
 
+mod activity;
 mod budget;
 mod compaction;
 mod detection;
 mod execution;
 mod llm_call;
+mod loop_compaction;
 mod loop_runner;
 mod memory;
 mod message_repair;
 mod streaming;
+mod turn_state;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -21,6 +24,7 @@ use octos_memory::EpisodeStore;
 use crate::approval::{ApprovalPolicy, PendingApprovalDraft};
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
+use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 
 tokio::task_local! {
@@ -41,7 +45,9 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     /// Maximum total tokens (input + output) before stopping. None = unlimited.
     pub max_tokens: Option<u32>,
-    /// Wall-clock timeout for the entire agent run. None = unlimited.
+    /// Activity timeout for the entire agent run. None = unlimited.
+    /// This is only enforced when the loop has not reported recent progress,
+    /// so active long-running turns are not killed just because wall time grew.
     pub max_timeout: Option<std::time::Duration>,
     /// Whether to save episodes to memory.
     pub save_episodes: bool,
@@ -55,6 +61,10 @@ pub struct AgentConfig {
     pub chat_max_tokens: Option<u32>,
     /// Native approval policy for turning matching tool calls into pending approvals.
     pub approval_policy: Option<ApprovalPolicy>,
+    /// Suppress the generic auto-send loop for tool `files_to_send`.
+    /// Background spawned workers rely on their outer workflow/session runtime
+    /// to persist terminal results exactly once.
+    pub suppress_auto_send_files: bool,
 }
 
 /// Default tool execution timeout in seconds.
@@ -75,6 +85,7 @@ impl Default for AgentConfig {
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             chat_max_tokens: None,
             approval_policy: None,
+            suppress_auto_send_files: false,
         }
     }
 }
@@ -142,6 +153,10 @@ pub struct Agent {
     pub(super) hook_context: std::sync::Mutex<Option<HookContext>>,
     /// Shutdown signal.
     pub(super) shutdown: Arc<AtomicBool>,
+    /// Optional per-session runtime limits for tool rounds and per-tool calls.
+    pub(super) session_limits: Option<SessionLimits>,
+    /// Mutable usage tracked against `session_limits`.
+    pub(super) session_usage: std::sync::Mutex<SessionUsage>,
 }
 
 impl Agent {
@@ -166,6 +181,8 @@ impl Agent {
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            session_limits: None,
+            session_usage: std::sync::Mutex::new(SessionUsage::default()),
         }
     }
 
@@ -191,6 +208,8 @@ impl Agent {
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            session_limits: None,
+            session_usage: std::sync::Mutex::new(SessionUsage::default()),
         }
     }
 
@@ -268,6 +287,13 @@ impl Agent {
     /// Set session-level context for hook payloads.
     pub fn with_hook_context(self, ctx: HookContext) -> Self {
         *self.hook_context.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+        self
+    }
+
+    /// Set per-session runtime limits for tool execution.
+    pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
+        self.session_limits = Some(limits);
+        self.session_usage = std::sync::Mutex::new(SessionUsage::default());
         self
     }
 

@@ -66,10 +66,13 @@ pub struct ChannelRegistrationCtx<'a> {
     pub media_dir: &'a Path,
     pub data_dir: &'a Path,
     pub session_mgr: &'a Arc<Mutex<SessionManager>>,
+    pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     pub task_query: Option<Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>>,
     pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,
     pub wechat_bridge_url: Option<&'a str>,
+    /// Callback to stop the session actor when a session is deleted via API.
+    pub on_session_deleted: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     #[cfg(feature = "matrix")]
     pub matrix_channel: &'a mut Option<Arc<octos_bus::MatrixChannel>>,
 }
@@ -105,9 +108,11 @@ pub fn register_all(
                 entry,
                 ctx.shutdown,
                 ctx.session_mgr,
+                ctx.metrics_handle.clone(),
                 ctx.task_query.clone(),
                 ctx.gateway_profile_id,
                 ctx.api_port_override,
+                ctx.on_session_deleted.clone(),
             )?,
             #[cfg(feature = "wecom-bot")]
             "wecom-bot" => wecom_bot::register(channel_mgr, entry, ctx.shutdown)?,

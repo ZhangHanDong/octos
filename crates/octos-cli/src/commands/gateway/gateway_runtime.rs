@@ -95,6 +95,9 @@ pub(super) struct GatewayRuntime {
     heartbeat_service: Arc<HeartbeatService>,
     cron_service: Arc<CronService>,
 
+    // Session delete events from API handlers
+    session_delete_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+
     // Matrix (feature-gated)
     #[cfg(feature = "matrix")]
     matrix_channel: Option<Arc<octos_bus::MatrixChannel>>,
@@ -116,6 +119,7 @@ impl GatewayRuntime {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
         let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
+        let metrics_handle = Some(crate::api::init_metrics());
 
         let mut profile_id: Option<String> = None;
         eprintln!(
@@ -173,7 +177,7 @@ impl GatewayRuntime {
             .provider
             .or(config.provider.clone())
             .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or_else(|| eyre::eyre!("no LLM provider configured for this profile"))?;
 
         let gw_config = config
             .gateway
@@ -1022,15 +1026,8 @@ impl GatewayRuntime {
             memory_store: Some(memory_store.clone()),
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
-            llm_strong: super::profile_factory::build_strong_chain(
-                &config,
-                &config
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| "anthropic".to_string()),
-                false,
-            )
-            .unwrap_or_else(|_| llm_for_compaction.clone()),
+            llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
+                .unwrap_or_else(|_| llm_for_compaction.clone()),
             task_query_store: task_query_store.clone(),
         };
         let profile_factory_builder =
@@ -1100,8 +1097,14 @@ impl GatewayRuntime {
             });
         }
 
+        // Channel for session delete events from API → gateway main loop.
+        // The API handler sends the session ID, the main loop removes the actor.
+        let (session_delete_tx, session_delete_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+
         let mut channel_mgr = ChannelManager::new();
         {
+            let delete_tx = session_delete_tx.clone();
             let mut reg_ctx = adapters::ChannelRegistrationCtx {
                 shutdown: &shutdown,
                 media_dir: &media_dir,
@@ -1111,9 +1114,13 @@ impl GatewayRuntime {
                     let store = task_query_store.clone();
                     move |session_key: &str| store.query_json(session_key)
                 })),
+                metrics_handle: metrics_handle.clone(),
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
+                on_session_deleted: Some(Arc::new(move |id: &str| {
+                    let _ = delete_tx.send(id.to_string());
+                })),
                 #[cfg(feature = "matrix")]
                 matrix_channel: &mut matrix_channel,
             };
@@ -1298,6 +1305,7 @@ impl GatewayRuntime {
             persona_service,
             heartbeat_service,
             cron_service,
+            session_delete_rx,
             #[cfg(feature = "matrix")]
             matrix_channel,
         };
@@ -1314,6 +1322,13 @@ impl GatewayRuntime {
                 _ = shutdown_notify.notified() => {
                     if self.shutdown.load(Ordering::Acquire) {
                         break;
+                    }
+                    continue;
+                }
+                session_id = self.session_delete_rx.recv() => {
+                    if let Some(id) = session_id {
+                        tracing::debug!(session = %id, "stopping actor for deleted session");
+                        self.actor_registry.remove_session(&id);
                     }
                     continue;
                 }
@@ -1671,7 +1686,9 @@ impl GatewayRuntime {
 
         // ── Shutdown ────────────────────────────────────────────────────
         // Timeout prevents hung actors from blocking the entire sequence.
-        let shutdown_timeout = Duration::from_secs(30);
+        // CLI shutdown should return control to the terminal promptly.
+        // Hung actors will be abandoned and then torn down by runtime shutdown.
+        let shutdown_timeout = Duration::from_secs(1);
         if tokio::time::timeout(shutdown_timeout, self.actor_registry.shutdown_all())
             .await
             .is_err()

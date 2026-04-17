@@ -157,6 +157,7 @@ pub async fn api_chat_proxy(
     session_id: Option<&str>,
     topic: Option<&str>,
     media: &[String],
+    attach_only: bool,
 ) -> Response {
     let url = format!("http://127.0.0.1:{port}/chat");
     let body = serde_json::json!({
@@ -165,6 +166,7 @@ pub async fn api_chat_proxy(
         "topic": topic,
         "media": media,
         "target_profile_id": profile_id,
+        "attach_only": attach_only,
     });
 
     let resp = match state
@@ -231,6 +233,44 @@ pub async fn api_get_proxy(state: &AppState, port: u16, path: &str) -> Response 
         .headers_mut()
         .insert("content-type", "application/json".parse().unwrap());
     response
+}
+
+/// Proxy a GET request that returns SSE from the gateway's API channel.
+pub async fn api_sse_get_proxy(state: &AppState, port: u16, path: &str) -> Response {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = match state.http_client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(port, error = %e, "API SSE GET proxy failed");
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("gateway proxy failed: {e}"),
+            );
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let err_body = resp.text().await.unwrap_or_default();
+        return json_error(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            &err_body,
+        );
+    }
+
+    let stream = resp.bytes_stream();
+    match Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+    {
+        Ok(response) => response,
+        Err(error) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to build SSE response: {error}"),
+        ),
+    }
 }
 
 /// Proxy a DELETE request to the gateway's API channel.

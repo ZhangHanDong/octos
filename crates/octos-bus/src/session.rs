@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use eyre::Result;
 use lru::LruCache;
+use metrics::counter;
 use octos_core::{Message, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -40,8 +41,110 @@ pub fn encode_path_component(s: &str) -> String {
     encoded
 }
 
+/// Derive a stable child session key from a parent session key and a child id.
+///
+/// The child id is percent-encoded so it remains safe for filenames and
+/// ledger metadata.
+pub fn child_session_key(parent: &SessionKey, child_id: &str) -> SessionKey {
+    let child_id = encode_path_component(child_id);
+    SessionKey(format!("{}#child-{child_id}", parent.0))
+}
+
 fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
+}
+
+fn record_session_persist(outcome: &'static str) {
+    counter!(
+        "octos_session_persist_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn record_session_rewrite(outcome: &'static str) {
+    counter!(
+        "octos_session_rewrite_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn record_child_session_fork(outcome: &'static str) {
+    counter!(
+        "octos_child_session_lifecycle_total",
+        "kind" => "fork".to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+/// Structured terminal outcome for a child session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionTerminalState {
+    Completed,
+    RetryableFailure,
+    TerminalFailure,
+}
+
+/// Whether the child session terminal contract was joined back to a parent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionJoinState {
+    Joined,
+    Orphaned,
+}
+
+/// Explicit failure policy for terminal child-session outcomes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionFailureAction {
+    Retry,
+    Escalate,
+}
+
+/// Durable child-session contract persisted alongside the session history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildSessionContract {
+    pub task_id: String,
+    pub task_label: String,
+    pub parent_session_key: String,
+    pub child_session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<ChildSessionTerminalState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_state: Option<ChildSessionJoinState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_action: Option<ChildSessionFailureAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_files: Vec<String>,
+}
+
+fn merge_child_contracts(
+    flat: Vec<ChildSessionContract>,
+    per_user: Vec<ChildSessionContract>,
+) -> Vec<ChildSessionContract> {
+    let mut merged = flat;
+    for contract in per_user {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.task_id == contract.task_id)
+        {
+            Session::merge_child_contract(contract, existing);
+        } else {
+            merged.push(contract);
+        }
+    }
+    merged
 }
 
 /// Metadata stored as the first line of each JSONL session file.
@@ -59,6 +162,8 @@ struct SessionMeta {
     /// Short summary of the session (first user message, truncated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    child_contracts: Vec<ChildSessionContract>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -73,6 +178,8 @@ pub struct Session {
     pub topic: Option<String>,
     /// Short summary of the session content.
     pub summary: Option<String>,
+    /// Durable child-session contracts associated with this session.
+    pub child_contracts: Vec<ChildSessionContract>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -87,6 +194,7 @@ impl Session {
             parent_key: None,
             topic,
             summary: None,
+            child_contracts: vec![],
             messages: vec![],
             created_at: now,
             updated_at: now,
@@ -108,6 +216,51 @@ impl Session {
     /// insertion order for messages with identical timestamps.
     pub fn sort_by_timestamp(&mut self) {
         self.messages.sort_by_key(|m| m.timestamp);
+    }
+
+    fn merge_child_contract(update: ChildSessionContract, existing: &mut ChildSessionContract) {
+        existing.task_label = update.task_label;
+        existing.parent_session_key = update.parent_session_key;
+        existing.child_session_key = update.child_session_key;
+        if update.workflow_kind.is_some() {
+            existing.workflow_kind = update.workflow_kind;
+        }
+        if update.current_phase.is_some() {
+            existing.current_phase = update.current_phase;
+        }
+        if update.terminal_state.is_some() {
+            existing.terminal_state = update.terminal_state;
+        }
+        if update.join_state.is_some() {
+            existing.join_state = update.join_state;
+        }
+        if update.joined_at.is_some() {
+            existing.joined_at = update.joined_at;
+        }
+        if update.failure_action.is_some() {
+            existing.failure_action = update.failure_action;
+        }
+        if update.error.is_some() {
+            existing.error = update.error;
+        }
+        if !update.output_files.is_empty() {
+            existing.output_files = update.output_files;
+        }
+    }
+
+    /// Insert or update a durable child-session contract.
+    pub fn upsert_child_contract(&mut self, contract: ChildSessionContract) -> bool {
+        if let Some(existing) = self
+            .child_contracts
+            .iter_mut()
+            .find(|existing| existing.task_id == contract.task_id)
+        {
+            Self::merge_child_contract(contract, existing);
+            true
+        } else {
+            self.child_contracts.push(contract);
+            false
+        }
     }
 }
 
@@ -259,11 +412,25 @@ impl SessionManager {
 
     /// Add a message to a session and persist it.
     pub async fn add_message(&mut self, key: &SessionKey, message: Message) -> Result<()> {
+        self.add_message_with_seq(key, message).await.map(|_| ())
+    }
+
+    /// Add a message to a session, persist it, and return its committed sequence.
+    pub async fn add_message_with_seq(
+        &mut self,
+        key: &SessionKey,
+        message: Message,
+    ) -> Result<usize> {
+        let _ = self.get_or_create(key).await;
+        if let Err(error) = self.append_to_disk(key, &message).await {
+            record_session_persist("failed");
+            return Err(error);
+        }
         let session = self.get_or_create(key).await;
-        session.messages.push(message.clone());
+        session.messages.push(message);
         session.updated_at = Utc::now();
-        self.append_to_disk(key, &message).await?;
-        Ok(())
+        record_session_persist("committed");
+        Ok(session.messages.len().saturating_sub(1))
     }
 
     /// Get the JSONL file path for a session key.
@@ -408,6 +575,7 @@ impl SessionManager {
                     parent_key: meta.parent_key.map(SessionKey),
                     topic: meta.topic,
                     summary: meta.summary,
+                    child_contracts: meta.child_contracts,
                     messages,
                     created_at: meta.created_at,
                     updated_at: meta.updated_at,
@@ -449,6 +617,10 @@ impl SessionManager {
                         parent_key: per_user.parent_key.or(flat.parent_key),
                         topic: per_user.topic.or(flat.topic),
                         summary: per_user.summary.or(flat.summary),
+                        child_contracts: merge_child_contracts(
+                            flat.child_contracts,
+                            per_user.child_contracts,
+                        ),
                         messages: merged_messages,
                         created_at: flat.created_at.min(per_user.created_at),
                         updated_at: flat.updated_at.max(per_user.updated_at),
@@ -483,6 +655,9 @@ impl SessionManager {
         let parent_key = session_peek.and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
         let topic = session_peek.and_then(|s| s.topic.clone());
         let summary = session_peek.and_then(|s| s.summary.clone());
+        let child_contracts = session_peek
+            .map(|session| session.child_contracts.clone())
+            .unwrap_or_default();
         let key_str = key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
@@ -517,6 +692,7 @@ impl SessionManager {
                     parent_key,
                     topic,
                     summary,
+                    child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 };
@@ -548,6 +724,7 @@ impl SessionManager {
             parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: session.topic.clone(),
             summary: session.summary.clone(),
+            child_contracts: session.child_contracts.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
         };
@@ -562,7 +739,7 @@ impl SessionManager {
         let path = self.session_path(key);
         let key_display = key.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = path.with_extension("jsonl.tmp");
             let mut file = std::fs::File::create(&tmp_path)?;
@@ -573,9 +750,14 @@ impl SessionManager {
             Ok::<_, eyre::Report>(())
         })
         .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
+        if let Err(error) = rewrite_result {
+            record_session_rewrite("failed");
+            return Err(error);
+        }
 
         debug!(key = %key_display, messages = msg_count, "Rewrote session to disk");
+        record_session_rewrite("committed");
         Ok(())
     }
 
@@ -601,6 +783,7 @@ impl SessionManager {
             parent_key: Some(parent_key.clone()),
             topic: None,
             summary: None,
+            child_contracts: vec![],
             messages,
             created_at: now,
             updated_at: now,
@@ -617,13 +800,52 @@ impl SessionManager {
         Ok(new_key)
     }
 
-    /// Clear a session's history (both in-memory and on disk).
+    /// Clear a session's chat history (both in-memory and on disk).
+    ///
+    /// Removes session data from:
+    /// 1. In-memory LRU cache
+    /// 2. Flat layout JSONL (`sessions/{encoded_key}.jsonl`)
+    /// 3. Per-user layout JSONL (`users/{encoded_base}/sessions/{topic}.jsonl`)
+    ///
+    /// Does NOT remove the user workspace directory — workspace data (slides,
+    /// git repos, artifacts) has a separate lifecycle from chat history.
     pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
         self.cache.pop(&key.0);
-        let path = self.session_path(key);
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
+
+        // 1. Flat layout JSONL
+        let flat_path = self.session_path(key);
+        if flat_path.exists() {
+            tokio::fs::remove_file(&flat_path).await?;
         }
+
+        // 2. Per-user layout JSONL
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        let user_dir = users_dir.join(&encoded_base);
+
+        if user_dir.exists() {
+            let topic = key.topic().unwrap_or("default");
+            let encoded_topic = encode_path_component(topic);
+            let per_user_path = user_dir
+                .join("sessions")
+                .join(format!("{encoded_topic}.jsonl"));
+            if per_user_path.exists() {
+                if let Err(e) = tokio::fs::remove_file(&per_user_path).await {
+                    warn!(
+                        key = %key,
+                        path = %per_user_path.display(),
+                        error = %e,
+                        "failed to delete per-user session file"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -716,6 +938,7 @@ impl SessionManager {
                     Some(topic.to_string())
                 },
                 summary: None,
+                child_contracts: vec![],
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
@@ -788,6 +1011,81 @@ impl SessionHandle {
         }
     }
 
+    /// Check whether a session file exists in either the per-user or legacy layout.
+    pub fn session_exists(data_dir: &Path, key: &SessionKey) -> bool {
+        let base_key = key.base_key();
+        let encoded_base = Self::encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = Self::encode_path_component(topic);
+
+        let per_user_path = data_dir
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        if per_user_path.exists() {
+            return true;
+        }
+
+        let legacy_path = SessionManager::session_path_static(&data_dir.join("sessions"), key);
+        legacy_path.exists()
+    }
+
+    /// Seed a child session from a parent session if the child does not already exist.
+    ///
+    /// Copies the parent's most recent `copy_messages` messages into the child
+    /// when the child is empty, repairs a missing parent linkage on existing
+    /// child sessions, and persists the result. Existing child history is never
+    /// overwritten.
+    pub async fn fork_from_parent_if_missing(
+        data_dir: &Path,
+        parent_key: &SessionKey,
+        child_key: &SessionKey,
+        copy_messages: usize,
+    ) -> Result<()> {
+        let parent_history = {
+            let parent = Self::open(data_dir, parent_key);
+            parent.get_history(copy_messages).to_vec()
+        };
+
+        let mut child = Self::open(data_dir, child_key);
+        if child
+            .session
+            .parent_key
+            .as_ref()
+            .is_some_and(|existing| existing != parent_key)
+        {
+            record_child_session_fork("skipped_existing");
+            return Ok(());
+        }
+
+        let mut changed = false;
+        let mut seeded_history = false;
+
+        if child.session.parent_key.is_none() {
+            child.session.parent_key = Some(parent_key.clone());
+            changed = true;
+        }
+        if child.session.messages.is_empty() {
+            child.session.messages = parent_history;
+            changed = true;
+            seeded_history = true;
+        }
+        if !changed {
+            record_child_session_fork("skipped_existing");
+            return Ok(());
+        }
+
+        child.session.updated_at = Utc::now();
+        child.rewrite().await?;
+        record_child_session_fork(if seeded_history {
+            "seeded"
+        } else {
+            "linked_existing"
+        });
+        Ok(())
+    }
+
     /// Encode a path component (base key) for safe directory names.
     fn encode_path_component(s: &str) -> String {
         encode_path_component(s)
@@ -828,10 +1126,27 @@ impl SessionHandle {
 
     /// Add a message to the session and persist it.
     pub async fn add_message(&mut self, message: Message) -> Result<()> {
+        self.add_message_with_seq(message).await.map(|_| ())
+    }
+
+    /// Add a message to the session, persist it, and return its committed sequence.
+    pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
-        self.append_to_disk(&message).await?;
-        Ok(())
+        if let Err(error) = self.append_to_disk(&message).await {
+            record_session_persist("failed");
+            return Err(error);
+        }
+        record_session_persist("committed");
+        Ok(self.session.messages.len().saturating_sub(1))
+    }
+
+    /// Insert or update a durable child-session contract and persist it.
+    pub async fn upsert_child_contract(&mut self, contract: ChildSessionContract) -> Result<bool> {
+        let existed = self.session.upsert_child_contract(contract);
+        self.session.updated_at = Utc::now();
+        self.rewrite().await?;
+        Ok(existed)
     }
 
     /// Sort messages by timestamp (for speculative overflow ordering).
@@ -847,6 +1162,7 @@ impl SessionHandle {
             parent_key: self.session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: self.session.topic.clone(),
             summary: self.session.summary.clone(),
+            child_contracts: self.session.child_contracts.clone(),
             created_at: self.session.created_at,
             updated_at: self.session.updated_at,
         };
@@ -861,7 +1177,7 @@ impl SessionHandle {
         let path = self.session_path();
         let key_display = self.session.key.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = path.with_extension("jsonl.tmp");
             let mut file = std::fs::File::create(&tmp_path)?;
@@ -871,10 +1187,20 @@ impl SessionHandle {
             Ok::<_, eyre::Report>(())
         })
         .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
+        if let Err(error) = rewrite_result {
+            record_session_rewrite("failed");
+            return Err(error);
+        }
 
         debug!(key = %key_display, messages = msg_count, "Rewrote session to disk");
+        record_session_rewrite("committed");
         Ok(())
+    }
+
+    /// Path for the append-only background task ledger sidecar.
+    pub fn task_state_path(&self) -> PathBuf {
+        self.session_path().with_extension("tasks.jsonl")
     }
 
     /// Clear the session (in-memory and on disk).
@@ -898,6 +1224,7 @@ impl SessionHandle {
         let parent_key = self.session.parent_key.as_ref().map(|k| k.0.clone());
         let topic = self.session.topic.clone();
         let summary = self.session.summary.clone();
+        let child_contracts = self.session.child_contracts.clone();
         let key_str = self.session.key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
@@ -928,6 +1255,7 @@ impl SessionHandle {
                     parent_key,
                     topic,
                     summary,
+                    child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 };
@@ -975,6 +1303,7 @@ impl SessionHandle {
             parent_key: meta.parent_key.map(SessionKey),
             topic: meta.topic,
             summary: meta.summary,
+            child_contracts: meta.child_contracts,
             messages,
             created_at: meta.created_at,
             updated_at: meta.updated_at,
@@ -1653,6 +1982,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_handle_fork_from_parent_if_missing_copies_recent_history() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+        let child = child_session_key(&parent, "task-123");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "msg0"))
+                .await
+                .unwrap();
+            parent_handle
+                .add_message(make_message(MessageRole::Assistant, "msg1"))
+                .await
+                .unwrap();
+            parent_handle
+                .add_message(make_message(MessageRole::User, "msg2"))
+                .await
+                .unwrap();
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 2)
+            .await
+            .unwrap();
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent.clone()));
+        assert_eq!(child_session.messages.len(), 2);
+        assert_eq!(child_session.messages[0].content, "msg1");
+        assert_eq!(child_session.messages[1].content, "msg2");
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_fork_from_parent_if_missing_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+        let child = child_session_key(&parent, "task-123");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "msg0"))
+                .await
+                .unwrap();
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
+            .await
+            .unwrap();
+
+        {
+            let mut child_handle = SessionHandle::open(tmp.path(), &child);
+            child_handle
+                .add_message(make_message(MessageRole::Assistant, "child-result"))
+                .await
+                .unwrap();
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
+            .await
+            .unwrap();
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.messages.len(), 2);
+        assert_eq!(child_session.messages[1].content, "child-result");
+    }
+
+    #[tokio::test]
+    async fn test_child_session_contract_round_trips_through_disk() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent");
+        let child = child_session_key(&parent, "task-contract");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "seed"))
+                .await
+                .unwrap();
+        }
+
+        {
+            let mut child_handle = SessionHandle::open(tmp.path(), &child);
+            child_handle
+                .upsert_child_contract(ChildSessionContract {
+                    task_id: "task-123".to_string(),
+                    task_label: "Research".to_string(),
+                    parent_session_key: parent.to_string(),
+                    child_session_key: child.to_string(),
+                    workflow_kind: Some("deep_research".to_string()),
+                    current_phase: Some("research".to_string()),
+                    terminal_state: None,
+                    join_state: None,
+                    joined_at: None,
+                    failure_action: None,
+                    error: None,
+                    output_files: vec![],
+                })
+                .await
+                .unwrap();
+            child_handle
+                .upsert_child_contract(ChildSessionContract {
+                    task_id: "task-123".to_string(),
+                    task_label: "Research".to_string(),
+                    parent_session_key: parent.to_string(),
+                    child_session_key: child.to_string(),
+                    workflow_kind: Some("deep_research".to_string()),
+                    current_phase: Some("deliver_result".to_string()),
+                    terminal_state: Some(ChildSessionTerminalState::Completed),
+                    join_state: Some(ChildSessionJoinState::Joined),
+                    joined_at: Some(Utc::now()),
+                    failure_action: None,
+                    error: None,
+                    output_files: vec!["/tmp/report.md".to_string()],
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(SessionHandle::session_exists(tmp.path(), &child));
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.child_contracts.len(), 1);
+        let contract = &child_session.child_contracts[0];
+        assert_eq!(contract.task_id, "task-123");
+        assert_eq!(
+            contract.terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+        assert_eq!(contract.join_state, Some(ChildSessionJoinState::Joined));
+        assert_eq!(contract.output_files, vec!["/tmp/report.md"]);
+        assert!(contract.joined_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_history() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+        let child = child_session_key(&parent, "task-linked");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "parent-msg"))
+                .await
+                .unwrap();
+        }
+
+        {
+            let mut child_handle = SessionHandle::open(tmp.path(), &child);
+            child_handle
+                .add_message(make_message(MessageRole::Assistant, "existing-child-msg"))
+                .await
+                .unwrap();
+            assert_eq!(child_handle.session().parent_key, None);
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
+            .await
+            .unwrap();
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent));
+        assert_eq!(child_session.messages.len(), 1);
+        assert_eq!(child_session.messages[0].content, "existing-child-msg");
+    }
+
+    #[tokio::test]
     async fn test_load_rejects_oversized_file() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
@@ -2146,5 +2647,49 @@ mod tests {
         for e in &entries {
             assert_eq!(e.message_count, 1, "each session should have 1 message");
         }
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_add_message_with_seq_returns_committed_index() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-seq-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        let first = handle
+            .add_message_with_seq(make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+        let second = handle
+            .add_message_with_seq(make_message(MessageRole::Assistant, "world"))
+            .await
+            .unwrap();
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(handle.get_history(10).len(), 2);
+    }
+
+    #[test]
+    fn test_session_handle_task_state_path_uses_sidecar_file() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-task-ledger");
+        let handle = SessionHandle::open(tmp.path(), &key);
+
+        let path = handle.task_state_path();
+        assert!(path.ends_with("default.tasks.jsonl"));
+        assert_eq!(
+            path.parent().unwrap(),
+            handle.session_path().parent().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_child_session_key_derivation_is_stable() {
+        let parent = SessionKey::new("api", "web-task-ledger");
+        let child = child_session_key(&parent, "spawn-01/alpha beta");
+
+        assert_eq!(child.0, "api:web-task-ledger#child-spawn-01%2Falpha%20beta");
+        assert_eq!(child.base_key(), "api:web-task-ledger");
+        assert_eq!(child.topic(), Some("child-spawn-01%2Falpha%20beta"));
     }
 }

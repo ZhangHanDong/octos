@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use eyre::{Result, WrapErr, eyre};
 use glob::glob;
 use serde::Serialize;
 use tracing::warn;
 
-use crate::behaviour::{ActionResult, run_action};
+use crate::behaviour::{ActionContext, ActionResult, evaluate_actions_with_context};
 use crate::workspace_policy::{
     WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
     WorkspaceVersionControlProvider, read_workspace_policy,
@@ -78,6 +82,14 @@ pub struct WorkspaceTurnSnapshotFailure {
     pub error: String,
 }
 
+#[derive(Clone, Debug)]
+struct PendingValidation {
+    repo_root: PathBuf,
+    repo_label: String,
+    specs: Vec<String>,
+    context: ActionContext,
+}
+
 enum WorkspaceTurnSnapshotPlan {
     LegacyGit,
     PolicyGit {
@@ -86,6 +98,7 @@ enum WorkspaceTurnSnapshotPlan {
         turn_end_validators: Vec<String>,
         completion_validators: Vec<String>,
         artifact_patterns: Vec<String>,
+        artifact_context: ActionContext,
     },
     Skip,
 }
@@ -139,6 +152,12 @@ pub fn detect_workspace_repo(base_dir: &Path, changed_path: &Path) -> Option<Wor
 }
 
 pub fn init_workspace_repo(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {
+    with_repo_git_lock(project_root, || {
+        init_workspace_repo_unlocked(project_root, kind)
+    })
+}
+
+fn init_workspace_repo_unlocked(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {
     std::fs::create_dir_all(project_root)
         .wrap_err_with(|| format!("create project dir failed: {}", project_root.display()))?;
 
@@ -170,22 +189,24 @@ pub fn initialize_and_commit(
     kind: WorkspaceProjectKind,
     message: &str,
 ) -> Result<bool> {
-    init_workspace_repo(project_root, kind)?;
-    run_git(project_root, &["add", "-A", "--", "."])?;
+    with_repo_git_lock(project_root, || {
+        init_workspace_repo_unlocked(project_root, kind)?;
+        run_git(project_root, &["add", "-A", "--", "."])?;
 
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["diff", "--cached", "--quiet", "--", "."])
-        .status()
-        .wrap_err("git diff --cached failed")?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["diff", "--cached", "--quiet", "--", "."])
+            .status()
+            .wrap_err("git diff --cached failed")?;
 
-    if status.success() {
-        return Ok(false);
-    }
+        if status.success() {
+            return Ok(false);
+        }
 
-    run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
-    Ok(true)
+        run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
+        Ok(true)
+    })
 }
 
 pub fn snapshot_workspace_change(
@@ -197,8 +218,6 @@ pub fn snapshot_workspace_change(
         Some(repo) => repo,
         None => return Ok(None),
     };
-
-    init_workspace_repo(&repo.root, repo.kind)?;
 
     let relative_path = changed_path
         .strip_prefix(&repo.root)
@@ -273,8 +292,8 @@ pub fn snapshot_workspace_turn(
 
     // Collect (repo_root, validators) from the plan phase so we don't re-read
     // the workspace policy during validation.
-    let mut pending_turn_end_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
-    let mut pending_completion_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+    let mut pending_turn_end_validations: Vec<PendingValidation> = Vec::new();
+    let mut pending_completion_validations: Vec<PendingValidation> = Vec::new();
 
     for repo in &repos {
         let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
@@ -292,6 +311,7 @@ pub fn snapshot_workspace_turn(
                 turn_end_validators,
                 completion_validators,
                 artifact_patterns,
+                artifact_context,
             }) => {
                 match commit_all_if_dirty_with_options(&repo.root, repo.kind, &message, auto_init) {
                     Ok(true) => report.committed.push(repo_label.clone()),
@@ -306,20 +326,22 @@ pub fn snapshot_workspace_turn(
                     }
                 }
                 if !turn_end_validators.is_empty() {
-                    pending_turn_end_validations.push((
-                        repo.root.clone(),
-                        repo_label.clone(),
-                        turn_end_validators,
-                    ));
+                    pending_turn_end_validations.push(PendingValidation {
+                        repo_root: repo.root.clone(),
+                        repo_label: repo_label.clone(),
+                        specs: turn_end_validators,
+                        context: artifact_context.clone(),
+                    });
                 }
                 if !completion_validators.is_empty()
                     && repo_has_declared_artifacts(&repo.root, &artifact_patterns)
                 {
-                    pending_completion_validations.push((
-                        repo.root.clone(),
+                    pending_completion_validations.push(PendingValidation {
+                        repo_root: repo.root.clone(),
                         repo_label,
-                        completion_validators,
-                    ));
+                        specs: completion_validators,
+                        context: artifact_context.clone(),
+                    });
                 }
             }
             Err(error) => {
@@ -352,32 +374,36 @@ pub fn snapshot_workspace_turn(
 /// the snapshot plan phase, avoiding a second policy read from disk.
 fn run_validators(
     phase: WorkspaceValidationPhase,
-    validations: &[(PathBuf, String, Vec<String>)],
+    validations: &[PendingValidation],
     report: &mut WorkspaceTurnSnapshotReport,
 ) {
-    for (repo_root, repo_label, specs) in validations {
-        for spec in specs {
-            match run_action(repo_root, spec) {
+    for validation in validations {
+        for (spec, result) in evaluate_actions_with_context(
+            &validation.repo_root,
+            &validation.context,
+            &validation.specs,
+        ) {
+            match result {
                 Ok(ActionResult::Pass | ActionResult::Notify { .. }) => {}
                 Ok(ActionResult::Fail { reason }) => {
                     report.validation_failures.push(WorkspaceValidationFailure {
-                        repo_label: repo_label.clone(),
+                        repo_label: validation.repo_label.clone(),
                         phase,
-                        check: spec.clone(),
+                        check: spec,
                         reason,
                     });
                 }
                 Err(e) => {
                     warn!(
-                        repo = %repo_label,
+                        repo = %validation.repo_label,
                         check = %spec,
                         error = %e,
                         "turn-end validator failed to execute"
                     );
                     report.validation_failures.push(WorkspaceValidationFailure {
-                        repo_label: repo_label.clone(),
+                        repo_label: validation.repo_label.clone(),
                         phase,
-                        check: spec.clone(),
+                        check: spec,
                         reason: format!("validator error: {e}"),
                     });
                 }
@@ -398,30 +424,32 @@ fn commit_all_if_dirty_with_options(
     message: &str,
     auto_init: bool,
 ) -> Result<bool> {
-    if auto_init {
-        init_workspace_repo(project_root, kind).wrap_err("ensure git repo failed")?;
-    } else if !project_root.join(".git").exists() {
-        return Err(eyre!(
-            "workspace policy requires git repo at {}, but auto_init is disabled",
-            project_root.display()
-        ));
-    }
+    with_repo_git_lock(project_root, || {
+        if auto_init {
+            init_workspace_repo_unlocked(project_root, kind).wrap_err("ensure git repo failed")?;
+        } else if !project_root.join(".git").exists() {
+            return Err(eyre!(
+                "workspace policy requires git repo at {}, but auto_init is disabled",
+                project_root.display()
+            ));
+        }
 
-    run_git(project_root, &["add", "-A", "--", "."])?;
+        run_git(project_root, &["add", "-A", "--", "."])?;
 
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["diff", "--cached", "--quiet", "--", "."])
-        .status()
-        .wrap_err("git diff --cached failed")?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["diff", "--cached", "--quiet", "--", "."])
+            .status()
+            .wrap_err("git diff --cached failed")?;
 
-    if status.success() {
-        return Ok(false);
-    }
+        if status.success() {
+            return Ok(false);
+        }
 
-    run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
-    Ok(true)
+        run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
+        Ok(true)
+    })
 }
 
 fn snapshot_plan_for_repo(repo: &WorkspaceRepo) -> Result<WorkspaceTurnSnapshotPlan> {
@@ -446,12 +474,16 @@ fn snapshot_plan_for_repo(repo: &WorkspaceRepo) -> Result<WorkspaceTurnSnapshotP
         return Ok(WorkspaceTurnSnapshotPlan::Skip);
     }
 
+    let artifact_context = artifact_validation_context(&repo.root, &policy.artifacts.entries);
+    let artifact_patterns = policy.artifacts.entries.into_values().collect();
+
     Ok(WorkspaceTurnSnapshotPlan::PolicyGit {
         auto_init: policy.version_control.auto_init,
         fail_on_error: policy.version_control.fail_on_error,
         turn_end_validators: policy.validation.on_turn_end,
         completion_validators: policy.validation.on_completion,
-        artifact_patterns: policy.artifacts.entries.into_values().collect(),
+        artifact_patterns,
+        artifact_context,
     })
 }
 
@@ -529,6 +561,7 @@ fn inspect_managed_workspace_contract(
     policy: &WorkspacePolicy,
 ) -> WorkspaceContractStatus {
     let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
+    let artifact_context = artifact_validation_context(&repo.root, &policy.artifacts.entries);
     let artifacts = policy
         .artifacts
         .entries
@@ -543,8 +576,16 @@ fn inspect_managed_workspace_contract(
             }
         })
         .collect::<Vec<_>>();
-    let turn_end_checks = evaluate_check_specs(&repo.root, &policy.validation.on_turn_end);
-    let completion_checks = evaluate_check_specs(&repo.root, &policy.validation.on_completion);
+    let turn_end_checks = evaluate_check_specs(
+        &repo.root,
+        &artifact_context,
+        &policy.validation.on_turn_end,
+    );
+    let completion_checks = evaluate_check_specs(
+        &repo.root,
+        &artifact_context,
+        &policy.validation.on_completion,
+    );
     let ready = check_list_passed(&turn_end_checks)
         && check_list_passed(&completion_checks)
         && artifacts.iter().all(|artifact| artifact.present);
@@ -564,27 +605,45 @@ fn inspect_managed_workspace_contract(
     }
 }
 
-fn evaluate_check_specs(repo_root: &Path, specs: &[String]) -> Vec<WorkspaceCheckStatus> {
-    specs
-        .iter()
-        .map(|spec| match run_action(repo_root, spec) {
+fn evaluate_check_specs(
+    repo_root: &Path,
+    context: &ActionContext,
+    specs: &[String],
+) -> Vec<WorkspaceCheckStatus> {
+    evaluate_actions_with_context(repo_root, context, specs)
+        .into_iter()
+        .map(|(spec, result)| match result {
             Ok(ActionResult::Pass | ActionResult::Notify { .. }) => WorkspaceCheckStatus {
-                spec: spec.clone(),
+                spec,
                 passed: true,
                 reason: None,
             },
             Ok(ActionResult::Fail { reason }) => WorkspaceCheckStatus {
-                spec: spec.clone(),
+                spec,
                 passed: false,
                 reason: Some(reason),
             },
             Err(error) => WorkspaceCheckStatus {
-                spec: spec.clone(),
+                spec,
                 passed: false,
                 reason: Some(format!("validator error: {error}")),
             },
         })
         .collect()
+}
+
+fn artifact_validation_context(
+    repo_root: &Path,
+    artifacts: &std::collections::BTreeMap<String, String>,
+) -> ActionContext {
+    let named_targets = artifacts.iter().map(|(name, pattern)| {
+        let matches = resolve_artifact_matches(repo_root, pattern)
+            .into_iter()
+            .map(|relative| repo_root.join(relative))
+            .collect::<Vec<_>>();
+        (format!("${name}"), matches)
+    });
+    ActionContext::default().with_named_targets(named_targets)
 }
 
 fn check_list_passed(checks: &[WorkspaceCheckStatus]) -> bool {
@@ -717,30 +776,64 @@ fn truncate_utf8_boundary(s: &str, max_len: usize) -> String {
 }
 
 fn run_git(project_root: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("failed to spawn git {:?}", args))?;
+    let mut attempt = 0_u32;
+    loop {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(args)
+            .output()
+            .wrap_err_with(|| format!("failed to spawn git {:?}", args))?;
 
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(eyre!(
-        "git {:?} failed in {}: {}{}",
-        args,
-        project_root.display(),
-        stderr.trim(),
-        if stdout.trim().is_empty() {
-            String::new()
-        } else {
-            format!(" | stdout: {}", stdout.trim())
+        if output.status.success() {
+            return Ok(());
         }
-    ))
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let lock_error = is_git_index_lock_error(&stderr) || is_git_index_lock_error(&stdout);
+        if lock_error && attempt < 5 {
+            attempt += 1;
+            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+            continue;
+        }
+
+        return Err(eyre!(
+            "git {:?} failed in {}: {}{}",
+            args,
+            project_root.display(),
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" | stdout: {}", stdout.trim())
+            }
+        ));
+    }
+}
+
+fn with_repo_git_lock<T>(project_root: &Path, op: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = repo_git_lock(project_root);
+    let _guard = lock
+        .lock()
+        .map_err(|_| eyre!("workspace git lock poisoned for {}", project_root.display()))?;
+    op()
+}
+
+fn repo_git_lock(project_root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks.lock().expect("workspace git lock map poisoned");
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn is_git_index_lock_error(output: &str) -> bool {
+    output.contains(".git/index.lock")
+        || (output.contains("index.lock") && output.contains("Unable to create"))
 }
 
 #[cfg(test)]
@@ -904,6 +997,41 @@ mod tests {
     }
 
     #[test]
+    fn inspection_uses_named_artifact_bindings_for_validator_specs() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-bundle");
+        std::fs::create_dir_all(slides_root.join("output").join("imgs")).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
+        std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+        std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.on_turn_end = vec!["file_exists:$deck".into()];
+        policy.validation.on_completion = vec!["file_exists:$previews".into()];
+        write_workspace_policy(&slides_root, &policy).unwrap();
+        initialize_and_commit(
+            &slides_root,
+            WorkspaceProjectKind::Slides,
+            "Initialize slides workspace",
+        )
+        .unwrap();
+
+        let statuses = inspect_workspace_contracts(temp.path()).unwrap();
+        let status = &statuses[0];
+
+        assert_eq!(status.repo_label, "slides/deck-bundle");
+        assert!(status.ready);
+        assert_eq!(status.turn_end_checks.len(), 1);
+        assert!(status.turn_end_checks[0].passed);
+        assert_eq!(status.turn_end_checks[0].spec, "file_exists:$deck");
+        assert_eq!(status.completion_checks.len(), 1);
+        assert!(status.completion_checks[0].passed);
+        assert_eq!(status.completion_checks[0].spec, "file_exists:$previews");
+    }
+
+    #[test]
     fn should_skip_validation_when_no_policy() {
         let temp = tempfile::tempdir().unwrap();
         let slides_root = temp.path().join("slides").join("deck-c");
@@ -927,7 +1055,7 @@ mod tests {
         let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
         policy.validation.on_completion = vec![
             "file_exists:output/*.pptx".into(),
-            "file_exists:output/**/manifest.json".into(),
+            "file_exists:output/**/slide-*.png".into(),
         ];
         write_workspace_policy(&slides_root, &policy).unwrap();
 
@@ -940,7 +1068,7 @@ mod tests {
         );
         assert_eq!(
             report.validation_failures[0].check,
-            "file_exists:output/**/manifest.json"
+            "file_exists:output/**/slide-*.png"
         );
     }
 
@@ -953,11 +1081,6 @@ mod tests {
         std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
         std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
         std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
-        std::fs::write(
-            slides_root.join("output/imgs/manifest.json"),
-            "{\"slides\":[]}\n",
-        )
-        .unwrap();
         std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
         write_workspace_policy(
             &slides_root,
@@ -979,9 +1102,84 @@ mod tests {
         assert!(status.ready);
         assert!(status.revision.is_some());
         assert!(!status.dirty);
-        assert_eq!(status.artifacts.len(), 3);
+        assert_eq!(status.artifacts.len(), 2);
         assert!(status.artifacts.iter().all(|artifact| artifact.present));
         assert!(status.turn_end_checks.iter().all(|check| check.passed));
         assert!(status.completion_checks.iter().all(|check| check.passed));
+    }
+
+    #[test]
+    fn inspection_uses_shared_validator_semantics_for_file_size_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-f");
+        std::fs::create_dir_all(&slides_root).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::create_dir_all(slides_root.join("output")).unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"x").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.on_turn_end = vec!["file_size_min:output/deck.pptx:1024".into()];
+        policy.validation.on_completion = Vec::new();
+        write_workspace_policy(&slides_root, &policy).unwrap();
+
+        let statuses = inspect_workspace_contracts(temp.path()).unwrap();
+        let status = &statuses[0];
+
+        assert_eq!(status.repo_label, "slides/deck-f");
+        assert_eq!(status.turn_end_checks.len(), 1);
+        assert!(!status.turn_end_checks[0].passed);
+        let reason = status.turn_end_checks[0]
+            .reason
+            .as_deref()
+            .expect("inspection reason");
+        assert!(reason.contains("output/deck.pptx is 1 bytes, minimum is 1024"));
+    }
+
+    #[test]
+    fn inspection_uses_shared_validator_semantics_for_file_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-g");
+        std::fs::create_dir_all(slides_root.join("output")).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(slides_root.join("output/slide-01.png"), b"png").unwrap();
+        std::fs::write(slides_root.join("output/slide-02.png"), b"png").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.artifacts.entries.clear();
+        policy.validation.on_turn_end = vec!["file_count_eq:output/*.png:2".into()];
+        policy.validation.on_completion = vec!["any_exists:output/*.png|output/*.pdf".into()];
+        write_workspace_policy(&slides_root, &policy).unwrap();
+        initialize_and_commit(
+            &slides_root,
+            WorkspaceProjectKind::Slides,
+            "Initialize slides workspace",
+        )
+        .unwrap();
+
+        let statuses = inspect_workspace_contracts(temp.path()).unwrap();
+        let status = &statuses[0];
+
+        assert_eq!(status.repo_label, "slides/deck-g");
+        assert!(status.ready);
+        assert_eq!(status.turn_end_checks.len(), 1);
+        assert!(status.turn_end_checks[0].passed);
+        assert_eq!(
+            status.turn_end_checks[0].spec,
+            "file_count_eq:output/*.png:2"
+        );
+        assert_eq!(status.completion_checks.len(), 1);
+        assert!(status.completion_checks[0].passed);
+        assert_eq!(
+            status.completion_checks[0].spec,
+            "any_exists:output/*.png|output/*.pdf"
+        );
+    }
+
+    #[test]
+    fn detects_git_index_lock_errors() {
+        assert!(is_git_index_lock_error(
+            "fatal: Unable to create 'C:/tmp/.git/index.lock': File exists."
+        ));
+        assert!(!is_git_index_lock_error("fatal: not a git repository"));
     }
 }
