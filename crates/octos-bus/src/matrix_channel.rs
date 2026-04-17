@@ -51,6 +51,7 @@ const CONTENT_BROADCAST_TARGETS: &str = "org.octos.broadcast_targets";
 const CONTENT_ACTIONS: &str = "org.octos.actions";
 const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
 const CONTENT_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
+const CONTENT_APP: &str = "org.octos.app";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
 #[cfg(test)]
@@ -2059,6 +2060,51 @@ impl Channel for MatrixChannel {
             .await
     }
 
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        let sender = self
+            .event_senders
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|(event_id, _)| event_id == message_id)
+            .map(|(_, sender)| sender.clone())
+            .unwrap_or_else(|| self.bot_user_id.clone());
+
+        let txn_id = uuid::Uuid::now_v7().to_string();
+        let url = self.make_api_url(&format!(
+            "/_matrix/client/v3/rooms/{}/redact/{}/{}?user_id={}",
+            percent_encode_path(chat_id),
+            percent_encode_path(message_id),
+            percent_encode_path(&txn_id),
+            percent_encode_path(&sender),
+        ));
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .json(&json!({}))
+            .send()
+            .await
+            .wrap_err("failed to send redact event to Matrix")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            return Err(eyre::eyre!(
+                "Matrix redact event failed: status={status} body={resp_body}"
+            ));
+        }
+
+        self.event_senders
+            .write()
+            .await
+            .retain(|(event_id, _)| event_id != message_id);
+
+        Ok(())
+    }
+
     async fn send_typing(&self, chat_id: &str) -> Result<()> {
         self.send_typing_as(chat_id, None).await
     }
@@ -2180,6 +2226,13 @@ impl MatrixChannel {
         }
         if let Some(approval_response) = metadata.get(CONTENT_APPROVAL_RESPONSE) {
             body[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
+        }
+        // Agent-to-app envelope: mini-app payload consumed by capable
+        // clients (see robrix2:specs/task-agent-to-app-system.spec.md).
+        // Robrix's type registry renders this as a native GPU card;
+        // other clients ignore it and show only the `body` text.
+        if let Some(app) = metadata.get(CONTENT_APP) {
+            body[CONTENT_APP] = app.clone();
         }
         if live {
             body[LIVE_MARKER] = json!({});
@@ -2608,6 +2661,10 @@ mod tests {
             )
             .route(
                 "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
+                any(capture_homeserver_request),
+            )
+            .route(
+                "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
                 any(capture_homeserver_request),
             )
             .route(
@@ -3735,6 +3792,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_matrix_delete_message_sends_redact_event() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        ch.event_senders.write().await.push_back((
+            "$stream_event".to_string(),
+            "@octos_weather:localhost".to_string(),
+        ));
+
+        ch.delete_message("!room:localhost", "$stream_event")
+            .await
+            .unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let redact_req = reqs
+            .iter()
+            .find(|r| r.path.contains("/redact/"))
+            .expect("should have a redact request");
+        assert_eq!(redact_req.method, Method::PUT);
+        assert!(
+            redact_req.path.starts_with(
+                "/_matrix/client/v3/rooms/%21room%3Alocalhost/redact/%24stream_event/"
+            )
+        );
+        assert!(
+            redact_req
+                .query
+                .as_deref()
+                .is_some_and(|q| q.contains("user_id=%40octos_weather%3Alocalhost"))
+        );
+        assert_eq!(redact_req.body, json!({}));
+        assert!(
+            ch.event_senders
+                .read()
+                .await
+                .iter()
+                .all(|(event_id, _)| event_id != "$stream_event")
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn test_matrix_send_typing() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
@@ -3919,6 +4029,79 @@ mod tests {
         assert_eq!(send_req.body["format"], HTML_FORMAT);
         assert!(send_req.body["formatted_body"].is_string());
         assert_eq!(send_req.body["body"], "**bold** text");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_send_injects_org_octos_app_from_metadata() {
+        // Given an OutboundMessage whose metadata carries an
+        // `org.octos.app` envelope (produced by the send_app_card tool in
+        // octos-agent), the Matrix channel must copy that envelope verbatim
+        // into the outgoing Matrix event content alongside `msgtype`,
+        // `body`, `format`, and `formatted_body`. This test pins the
+        // end-to-end contract between the producer (send_app_card tool →
+        // OutboundMessage.metadata) and the consumer (Robrix's
+        // org.octos.app type registry); without it, future refactors could
+        // silently strip the envelope and regress the weather card path.
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let app_envelope = json!({
+            "type": "weather",
+            "version": 1,
+            "initial_state": {
+                "location": "Beijing",
+                "temp_c": 22,
+                "condition": "sunny",
+                "humidity": 65
+            }
+        });
+
+        let msg = OutboundMessage {
+            channel: "matrix".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "Beijing 22°C sunny".to_string(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({ "org.octos.app": app_envelope.clone() }),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let send_req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        // The fallback body text must be preserved for non-Robrix clients.
+        assert_eq!(send_req.body["body"], "Beijing 22°C sunny");
+        assert_eq!(send_req.body["msgtype"], MSGTYPE_TEXT);
+        // The app envelope must be injected verbatim into the event content
+        // under the `org.octos.app` key.
+        assert_eq!(
+            send_req.body["org.octos.app"], app_envelope,
+            "org.octos.app envelope should be copied verbatim into event content"
+        );
+        // Drill into the initial_state to make sure nested fields survive.
+        assert_eq!(
+            send_req.body["org.octos.app"]["initial_state"]["location"],
+            "Beijing"
+        );
+        assert_eq!(
+            send_req.body["org.octos.app"]["initial_state"]["temp_c"],
+            22
+        );
 
         handle.abort();
     }

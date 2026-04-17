@@ -303,6 +303,7 @@ impl StatusComposer {
         voice_transcript: Option<String>,
         user_config: &UserStatusConfig,
         sender_user_id: Option<String>,
+        persist_visible_status: bool,
     ) -> ComposerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         let status_msg_id = Arc::new(Mutex::new(None::<String>));
@@ -367,6 +368,7 @@ impl StatusComposer {
                 metrics_visible,
                 provider_visible,
                 sender_user_id_for_loop,
+                persist_visible_status,
             )
             .await;
         });
@@ -592,6 +594,7 @@ async fn run_compose_loop(
     metrics_visible: bool,
     provider_visible: bool,
     sender_user_id: Option<String>,
+    persist_visible_status: bool,
 ) {
     let start = Instant::now();
     let mut last_edit = Instant::now() - EDIT_THROTTLE;
@@ -611,7 +614,7 @@ async fn run_compose_loop(
     }
 
     // Compose and send initial message
-    if !channel.supports_edit() {
+    if !persist_visible_status || !channel.supports_edit() {
         // Can't edit — skip status message entirely
         // Just keep sending typing indicators
         loop {
@@ -1002,6 +1005,7 @@ mod tests {
             None,
             &UserStatusConfig::default(),
             Some("@bot_mybot:localhost".to_string()),
+            true,
         );
 
         tokio::time::sleep(Duration::from_millis(3300)).await;
@@ -1031,6 +1035,7 @@ mod tests {
             None,
             &UserStatusConfig::default(),
             Some("@bot_mybot:localhost".to_string()),
+            true,
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1056,6 +1061,7 @@ mod tests {
             None,
             &UserStatusConfig::default(),
             Some("@bot_mybot:localhost".to_string()),
+            true,
         );
 
         handle.stop().await;
@@ -1065,6 +1071,29 @@ mod tests {
             stop_calls.first().and_then(|v| v.as_deref()),
             Some("@bot_mybot:localhost")
         );
+    }
+
+    #[tokio::test]
+    async fn matrix_typing_only_mode_skips_persisted_status_message() {
+        let channel = Arc::new(MockChannel::default());
+        let composer = StatusComposer::new(channel.clone(), vec!["✦ Thinking...".to_string()]);
+        let tracker = Arc::new(TokenTracker::new());
+
+        let handle = composer.start(
+            "!room:localhost".to_string(),
+            "今天天气怎么样",
+            tracker,
+            None,
+            &UserStatusConfig::default(),
+            Some("@bot_mybot:localhost".to_string()),
+            false,
+        );
+
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        handle.stop().await;
+
+        assert!(channel.sent.lock().await.is_empty());
+        assert!(!channel.typing_senders.lock().await.is_empty());
     }
 
     #[test]

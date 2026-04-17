@@ -182,10 +182,7 @@ mod tests {
 
     fn test_cron_service(dir: &std::path::Path) -> Arc<octos_bus::CronService> {
         let (cron_in_tx, _cron_in_rx) = mpsc::channel(1);
-        Arc::new(octos_bus::CronService::new(
-            dir.join("cron"),
-            cron_in_tx,
-        ))
+        Arc::new(octos_bus::CronService::new(dir.join("cron"), cron_in_tx))
     }
 
     fn make_profile(id: &str, system_prompt: Option<&str>) -> crate::profiles::UserProfile {

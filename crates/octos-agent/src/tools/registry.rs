@@ -269,6 +269,15 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    /// Return the names of tools that advertise a given tag.
+    pub fn names_with_tag(&self, tag: &str) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|(_, tool)| tool.tags().contains(&tag))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Number of registered tools.
     pub fn len(&self) -> usize {
         self.tools.len()

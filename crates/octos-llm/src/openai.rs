@@ -71,8 +71,11 @@ impl ModelHints {
         let uses_completion_tokens =
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
-        let fixed_temperature =
-            is_o_series || m.starts_with("gpt-5") || m.contains("k2.5") || m == "gpt-4.1-nano";
+        let fixed_temperature = is_o_series
+            || m.starts_with("gpt-5")
+            || m.contains("k2.5")
+            || m.contains("k2.6")
+            || m == "gpt-4.1-nano";
 
         let lacks_vision = m.starts_with("deepseek")
             || m.starts_with("minimax")
@@ -207,14 +210,16 @@ impl OpenAIProvider {
                         })
                         .collect()
                 });
-                // Kimi-k2.5 (and similar thinking models) require reasoning_content
+                // Kimi k2.x thinking models (k2.5, k2.6) require reasoning_content
                 // to be present (even empty) on ALL assistant messages when thinking
                 // is enabled. When omitted, the API returns 400 "reasoning_content
                 // is missing in assistant tool call message".
                 // Only synthesize a stub for models that actually need it (detected
-                // via fixed_temperature + model name containing "k2.5").
-                let needs_reasoning_stub =
-                    self.hints.fixed_temperature && self.model.to_lowercase().contains("k2.5");
+                // via fixed_temperature + model name containing "k2.5" or "k2.6").
+                let needs_reasoning_stub = self.hints.fixed_temperature && {
+                    let lower = self.model.to_lowercase();
+                    lower.contains("k2.5") || lower.contains("k2.6")
+                };
                 let reasoning = match m.reasoning_content.as_deref() {
                     Some(r) if !r.is_empty() => Some(r),
                     _ if role == "assistant" && needs_reasoning_stub => Some("."),
@@ -856,6 +861,19 @@ mod tests {
     #[test]
     fn test_detect_kimi_k25() {
         let h = ModelHints::detect("kimi-k2.5");
+        assert!(!h.uses_completion_tokens);
+        assert!(h.fixed_temperature);
+        assert!(!h.lacks_vision);
+    }
+
+    #[test]
+    fn test_detect_kimi_k26() {
+        // kimi-k2.6 also rejects any temperature other than 1 on the moonshot API
+        // (returns 400 "invalid temperature: only 1 is allowed for this model"),
+        // so it must be detected as fixed_temperature the same way k2.5 is.
+        // Pin this so a future renaming of the k2 detection can't silently
+        // regress the weather card e2e path.
+        let h = ModelHints::detect("kimi-k2.6");
         assert!(!h.uses_completion_tokens);
         assert!(h.fixed_temperature);
         assert!(!h.lacks_vision);

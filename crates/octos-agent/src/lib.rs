@@ -64,9 +64,10 @@ pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
     DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
-    ReadFileTool, RecallMemoryTool, SaveMemoryTool, SendFileTool, ShellTool, SpawnTool,
-    SynthesizeResearchTool, TakePhotoTool, Tool, ToolConfigStore, ToolPolicy, ToolRegistry,
-    ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
+    ReadFileTool, RecallMemoryTool, SaveMemoryTool, SendAppCardTool, SendFileTool, ShellTool,
+    ShowWeatherCardTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool, ToolConfigStore,
+    ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool,
+    WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};

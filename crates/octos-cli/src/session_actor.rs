@@ -4,7 +4,7 @@
 //! `set_context()` race condition where shared tools could route messages
 //! to the wrong chat.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1443,6 +1443,16 @@ impl ActorFactory {
         ));
         tools.register(message_tool);
         tools.register(send_file_tool);
+        tools.register(octos_agent::SendAppCardTool::with_context(
+            proxy_tx.clone(),
+            channel,
+            chat_id,
+        ));
+        tools.register(octos_agent::ShowWeatherCardTool::with_context(
+            proxy_tx.clone(),
+            channel,
+            chat_id,
+        ));
 
         // Spawn tool (per-session context, fully configured)
         let mut spawn_tool = SpawnTool::with_context(
@@ -3374,6 +3384,24 @@ impl SessionActor {
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
 
+        // Matrix app-reply hook: tools tagged "app_reply" produce GPU cards
+        // that replace the agent's text reply on capable clients. When any
+        // such tool is registered AND we're on matrix, suppress the persistent
+        // status message and final streamed text after an app-reply succeeds.
+        let app_reply_tools: Arc<HashSet<String>> = Arc::new(
+            self.agent
+                .tool_registry()
+                .names_with_tag("app_reply")
+                .into_iter()
+                .collect(),
+        );
+        let channel_is_matrix = self
+            .status_indicator
+            .as_ref()
+            .map(|si| si.channel().name() == "matrix")
+            .unwrap_or(false);
+        let persist_visible_status = !(channel_is_matrix && !app_reply_tools.is_empty());
+
         // Start status indicator
         let status_handle = self.status_indicator.as_ref().map(|si| {
             let voice_transcript = inbound
@@ -3388,6 +3416,7 @@ impl SessionActor {
                 voice_transcript,
                 &self.user_status_config,
                 self.sender_user_id.clone(),
+                persist_visible_status,
             )
         });
 
@@ -3435,6 +3464,7 @@ impl SessionActor {
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
                     op_updater,
+                    Arc::clone(&app_reply_tools),
                 )))
             } else {
                 drop(stream_rx);
@@ -4085,6 +4115,18 @@ impl SessionActor {
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
         let user_workspace = self.user_workspace.clone();
+        let app_reply_tools: Arc<HashSet<String>> = Arc::new(
+            self.agent
+                .tool_registry()
+                .names_with_tag("app_reply")
+                .into_iter()
+                .collect(),
+        );
+        let channel_is_matrix = status_indicator
+            .as_ref()
+            .map(|si| si.channel().name() == "matrix")
+            .unwrap_or(false);
+        let persist_visible_status = !(channel_is_matrix && !app_reply_tools.is_empty());
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -4114,6 +4156,7 @@ impl SessionActor {
                     None,
                     &user_status_config,
                     sender_user_id.clone(),
+                    persist_visible_status,
                 )
             });
 
@@ -4139,6 +4182,7 @@ impl SessionActor {
                     session_key.clone(),
                     sender_user_id.clone(),
                     op_updater,
+                    Arc::clone(&app_reply_tools),
                 )))
             } else {
                 drop(stream_rx);
@@ -4353,6 +4397,21 @@ impl SessionActor {
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
 
+        // Matrix app-reply hook (see process_inbound_speculative for rationale).
+        let app_reply_tools: Arc<HashSet<String>> = Arc::new(
+            self.agent
+                .tool_registry()
+                .names_with_tag("app_reply")
+                .into_iter()
+                .collect(),
+        );
+        let channel_is_matrix = self
+            .status_indicator
+            .as_ref()
+            .map(|si| si.channel().name() == "matrix")
+            .unwrap_or(false);
+        let persist_visible_status = !(channel_is_matrix && !app_reply_tools.is_empty());
+
         // Start status indicator
         let status_handle = self.status_indicator.as_ref().map(|si| {
             let voice_transcript = inbound
@@ -4368,6 +4427,7 @@ impl SessionActor {
                 voice_transcript,
                 &self.user_status_config,
                 self.sender_user_id.clone(),
+                persist_visible_status,
             )
         });
 
@@ -4416,6 +4476,7 @@ impl SessionActor {
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
                     op_updater,
+                    Arc::clone(&app_reply_tools),
                 )))
             } else {
                 drop(stream_rx);
