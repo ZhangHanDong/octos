@@ -5228,6 +5228,7 @@ mod tests {
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
             agent: Arc::new(agent),
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
@@ -5257,6 +5258,7 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            pending_approvals: PendingApprovalStore::default(),
         };
 
         let handle = tokio::spawn(actor.run());
