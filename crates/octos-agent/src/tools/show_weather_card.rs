@@ -636,7 +636,7 @@ async fn geocode(client: &Client, city: &str) -> Result<GeoLocation> {
         if let Some(mut results) = geo.results {
             if !results.is_empty() {
                 // Prefer the most populated result (avoids tiny hamlets).
-                results.sort_by(|a, b| b.population.unwrap_or(0).cmp(&a.population.unwrap_or(0)));
+                results.sort_by_key(|result| std::cmp::Reverse(result.population.unwrap_or(0)));
                 return Ok(results.into_iter().next().unwrap());
             }
         }

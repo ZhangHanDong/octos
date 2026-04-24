@@ -3515,7 +3515,7 @@ impl SessionActor {
             .as_ref()
             .map(|si| si.channel().name() == "matrix")
             .unwrap_or(false);
-        let persist_visible_status = !(channel_is_matrix && !app_reply_tools.is_empty());
+        let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
 
         // Start status indicator
         let status_handle = self.status_indicator.as_ref().map(|si| {
@@ -4262,7 +4262,7 @@ impl SessionActor {
             .as_ref()
             .map(|si| si.channel().name() == "matrix")
             .unwrap_or(false);
-        let persist_visible_status = !(channel_is_matrix && !app_reply_tools.is_empty());
+        let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -4551,7 +4551,7 @@ impl SessionActor {
             .as_ref()
             .map(|si| si.channel().name() == "matrix")
             .unwrap_or(false);
-        let persist_visible_status = !(channel_is_matrix && !app_reply_tools.is_empty());
+        let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
 
         // Start status indicator
         let status_handle = self.status_indicator.as_ref().map(|si| {
@@ -5034,7 +5034,8 @@ fn format_thinking_prefix(reasoning: Option<&str>) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use octos_agent::{HookConfig, HookEvent};
+    use octos_agent::{HookConfig, HookEvent, Tool, ToolResult};
+    use octos_core::ToolCall;
     use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
     use std::sync::atomic::AtomicUsize;
 
@@ -5455,6 +5456,151 @@ mod tests {
         }
     }
 
+    struct FilesToSendOnlyTool {
+        file_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for FilesToSendOnlyTool {
+        fn name(&self) -> &str {
+            "emit_deck"
+        }
+
+        fn description(&self) -> &str {
+            "Emit a deck via files_to_send only"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "deck generated".to_string(),
+                success: true,
+                files_to_send: vec![self.file_path.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    struct FileModifiedOnlyTool {
+        file_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for FileModifiedOnlyTool {
+        fn name(&self) -> &str {
+            "emit_deck_file_modified"
+        }
+
+        fn description(&self) -> &str {
+            "Emit a deck via file_modified only"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "deck generated".to_string(),
+                success: true,
+                file_modified: Some(self.file_path.clone()),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct RawGeneratedDeckTool {
+        file_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for RawGeneratedDeckTool {
+        fn name(&self) -> &str {
+            "emit_deck_raw_output"
+        }
+
+        fn description(&self) -> &str {
+            "Emit a deck path via raw tool output only"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: format!("Generated PPTX: {}", self.file_path.display()),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct ToolThenEndProvider {
+        calls: AtomicUsize,
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                Ok(ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_emit_deck".to_string(),
+                        name: self.tool_name.to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
     struct ErrorMockProvider {
         name: String,
         error: String,
@@ -5542,6 +5688,73 @@ mod tests {
             attachment_media: vec![attachment_path.to_string()],
             attachment_prompt: Some(summary.to_string()),
         }
+    }
+
+    async fn setup_actor_with_tools_and_session_key(
+        session_key: SessionKey,
+        agent_provider: Arc<dyn LlmProvider>,
+        tools: octos_agent::ToolRegistry,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-custom"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 2,
+                ..Default::default()
+            });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let user_workspace = dir.path().join("workspace");
+
+        let actor = SessionActor {
+            session_key: session_key.clone(),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(dir.path(), &session_key))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            pending_approvals: PendingApprovalStore::default(),
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace,
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
     }
 
     /// Build a SessionActor with configurable queue mode and optional adaptive router.
@@ -5732,6 +5945,7 @@ mod tests {
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
             agent: Arc::new(agent),
             hooks: Some(hooks),
             hook_context: Some(HookContext {
@@ -5766,6 +5980,7 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            pending_approvals: PendingApprovalStore::default(),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5853,6 +6068,7 @@ mod tests {
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
             agent: Arc::new(agent),
             hooks: Some(hooks),
             hook_context: Some(HookContext {
@@ -5887,6 +6103,7 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            pending_approvals: PendingApprovalStore::default(),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5973,6 +6190,7 @@ mod tests {
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
             agent: Arc::new(agent),
             hooks: None,
             hook_context: None,
@@ -6004,6 +6222,7 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: Some(cron_tool),
+            pending_approvals: PendingApprovalStore::default(),
         };
 
         let handle = tokio::spawn(actor.run());

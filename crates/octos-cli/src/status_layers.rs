@@ -295,6 +295,7 @@ impl StatusComposer {
     ///
     /// Creates all layers based on `user_config`, starts the compose loop,
     /// and returns a handle for updating layers and stopping.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         chat_id: String,
