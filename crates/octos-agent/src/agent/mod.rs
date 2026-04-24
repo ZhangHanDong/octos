@@ -100,6 +100,7 @@ pub struct ConversationResponse {
     pub provider_metadata: Option<ProviderMetadata>,
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
+    pub files_to_send: Vec<PathBuf>,
     pub streamed: bool,
     pub pending_approval: Option<PendingApprovalDraft>,
     /// All messages generated during processing (assistant replies, tool calls,

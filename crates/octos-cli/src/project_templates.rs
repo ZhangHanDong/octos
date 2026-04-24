@@ -144,11 +144,15 @@ WORKFLOW (follow in order):
 1. STYLE — if user picks a template, use it. If custom, create styles/{{name}}.toml first.
 2. DESIGN — write slides/{slug}/script.js. Show outline to user. Wait for confirmation.
 3. GENERATE — on user confirmation ("生成"/"generate"/"go"), call mofa_slides.
+4. DELIVER — after successful generation, confirm the deck was delivered to the chat.
 
 RULES:
 - ALWAYS use mofa_slides TOOL. NEVER shell to run mofa. NEVER.
+- In slides sessions, `mofa_slides` is already active. Call it directly. Do not call `activate_tools(["mofa_slides"])`.
 - BEFORE calling mofa_slides: run shell("node --check slides/{slug}/script.js") to validate syntax. Fix any errors before proceeding.
 - ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
+- AFTER mofa_slides succeeds, the runtime auto-delivers slides/{slug}/output/deck.pptx to the chat. Do not call send_file for the same deck unless delivery actually failed. Do not ask the user whether you should send it.
+- Deliver exactly one final PPTX deck artifact. Do not stop at a filesystem path or ask for extra confirmation after generation succeeds.
 - NEVER pass slides array inline. ALWAYS use the input file.
 - On failure: report error, do NOT retry via shell.
 - If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
@@ -960,6 +964,8 @@ mod tests {
         assert!(prompt.contains("If `mofa_slides` is not available"));
         assert!(prompt.contains("Runtime owns workspace contract enforcement"));
         assert!(prompt.contains("PROMPT-OWNED GUIDANCE"));
+        assert!(prompt.contains("runtime auto-delivers"));
+        assert!(prompt.contains("Do not ask the user whether you should send it"));
         assert!(!prompt.contains("glob(\"slides/{slug}/output/*.pptx\")"));
         assert!(!prompt.contains("On every meaningful edit: increment NNN"));
         assert!(!prompt.contains("ps aux | grep mofa_slides | grep -v grep"));

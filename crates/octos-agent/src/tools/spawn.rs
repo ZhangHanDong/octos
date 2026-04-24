@@ -15,6 +15,10 @@ use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::task_supervisor::TaskSupervisor;
+use crate::workspace_git::{
+    WorkspaceContractStatus, WorkspaceProjectKind,
+    resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
+};
 use crate::{Agent, AgentConfig};
 
 /// Callback for delivering background task results directly to the session actor.
@@ -528,6 +532,289 @@ fn select_workflow_terminal_files(
     Some(candidates)
 }
 
+fn workflow_uses_contract_terminal_delivery(workflow: &WorkflowMetadata) -> bool {
+    matches!(
+        workflow
+            .terminal_output
+            .as_ref()
+            .map(|policy| policy.required_artifact_kind.as_str()),
+        Some("presentation" | "site")
+    )
+}
+
+fn build_subagent_tool_policy(
+    allowed_tools: Vec<String>,
+    workflow: Option<&WorkflowMetadata>,
+) -> ToolPolicy {
+    let mut deny = vec!["spawn".to_string()];
+    if workflow.is_some_and(workflow_uses_contract_terminal_delivery) {
+        // Contract-owned workflow families must have exactly one runtime-owned
+        // terminal delivery path. Deny explicit send_file so child workers
+        // cannot double-deliver slides/site artifacts.
+        deny.push("send_file".to_string());
+    }
+    ToolPolicy {
+        allow: allowed_tools,
+        deny,
+        ..Default::default()
+    }
+}
+
+fn contract_artifact_priority(required_artifact_kind: &str) -> &'static [&'static str] {
+    match required_artifact_kind {
+        "presentation" => &["deck"],
+        "site" => &["entrypoint"],
+        _ => &[],
+    }
+}
+
+fn workflow_contract_kind_label(kind: WorkspaceProjectKind) -> &'static str {
+    match kind {
+        WorkspaceProjectKind::Slides => "slides",
+        WorkspaceProjectKind::Sites => "site",
+    }
+}
+
+fn workflow_contract_project_kind(workflow: &WorkflowMetadata) -> Option<WorkspaceProjectKind> {
+    match workflow
+        .terminal_output
+        .as_ref()
+        .map(|policy| policy.required_artifact_kind.as_str())
+    {
+        Some("presentation") => Some(WorkspaceProjectKind::Slides),
+        Some("site") => Some(WorkspaceProjectKind::Sites),
+        _ => None,
+    }
+}
+
+fn normalize_observed_path(base_dir: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn is_matching_workspace_root(path: &std::path::Path, expected_kind: WorkspaceProjectKind) -> bool {
+    if !crate::workspace_policy_path(path).is_file() {
+        return false;
+    }
+
+    matches!(
+        (
+            expected_kind,
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+        ),
+        (WorkspaceProjectKind::Slides, Some("slides"))
+            | (WorkspaceProjectKind::Sites, Some("sites"))
+    )
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn resolve_contract_workspace_root(
+    working_dir: &std::path::Path,
+    files_to_send: &[PathBuf],
+    files_modified: &[PathBuf],
+    workflow: &WorkflowMetadata,
+) -> std::result::Result<PathBuf, String> {
+    let expected_kind = workflow_contract_project_kind(workflow).ok_or_else(|| {
+        "workflow contract root resolution requires a contract-owned artifact kind".to_string()
+    })?;
+    let kind_label = workflow_contract_kind_label(expected_kind);
+
+    let mut ancestry_candidates = Vec::new();
+    for path in files_to_send.iter().chain(files_modified.iter()) {
+        let observed = normalize_observed_path(working_dir, path);
+        for ancestor in observed.ancestors() {
+            if is_matching_workspace_root(ancestor, expected_kind) {
+                push_unique_path(&mut ancestry_candidates, ancestor.to_path_buf());
+                break;
+            }
+        }
+    }
+
+    match ancestry_candidates.as_slice() {
+        [single] => return Ok(single.clone()),
+        [] => {}
+        _ => {
+            return Err(format!(
+                "multiple {kind_label} workspace contracts matched observed output paths"
+            ));
+        }
+    }
+
+    if is_matching_workspace_root(working_dir, expected_kind) {
+        return Ok(working_dir.to_path_buf());
+    }
+
+    let matching_roots = crate::list_workspace_repos(working_dir)
+        .map_err(|error| format!("workspace contract discovery failed: {error}"))?
+        .into_iter()
+        .filter(|repo| repo.kind == expected_kind)
+        .map(|repo| repo.root)
+        .collect::<Vec<_>>();
+
+    match matching_roots.as_slice() {
+        [single] => Ok(single.clone()),
+        [] => Err(format!(
+            "no {kind_label} workspace contract found beneath {}",
+            working_dir.display()
+        )),
+        _ => Err(format!(
+            "multiple {kind_label} workspace contracts found beneath {}; unable to choose a terminal artifact root deterministically",
+            working_dir.display()
+        )),
+    }
+}
+
+fn resolve_background_terminal_files(
+    working_dir: &std::path::Path,
+    files_to_send: &[PathBuf],
+    files_modified: &[PathBuf],
+    workflow: Option<&WorkflowMetadata>,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    if let Some(workflow) =
+        workflow.filter(|workflow| workflow_uses_contract_terminal_delivery(workflow))
+    {
+        let workspace_root =
+            resolve_contract_workspace_root(working_dir, files_to_send, files_modified, workflow)?;
+        return resolve_contract_terminal_files(&workspace_root, Some(workflow))?
+            .ok_or_else(|| "workspace contract returned no terminal files".to_string());
+    }
+
+    Ok(
+        select_workflow_terminal_files(files_to_send, files_modified, workflow).unwrap_or_else(
+            || {
+                files_to_send
+                    .iter()
+                    .chain(files_modified.iter())
+                    .cloned()
+                    .collect()
+            },
+        ),
+    )
+}
+
+fn format_workspace_contract_failure(status: &WorkspaceContractStatus) -> String {
+    let mut failures = Vec::new();
+    if let Some(error) = status.error.as_deref() {
+        failures.push(error.to_string());
+    }
+    failures.extend(
+        status
+            .turn_end_checks
+            .iter()
+            .chain(status.completion_checks.iter())
+            .filter(|check| !check.passed)
+            .map(|check| match check.reason.as_deref() {
+                Some(reason) if !reason.is_empty() => format!("{}: {}", check.spec, reason),
+                _ => format!("{}: failed", check.spec),
+            }),
+    );
+    failures.extend(
+        status
+            .artifacts
+            .iter()
+            .filter(|artifact| !artifact.present)
+            .map(|artifact| {
+                format!(
+                    "missing artifact '{}' matching '{}'",
+                    artifact.name, artifact.pattern
+                )
+            }),
+    );
+
+    if failures.is_empty() {
+        format!("workspace contract for {} is not ready", status.repo_label)
+    } else {
+        format!(
+            "workspace contract for {} is not ready: {}",
+            status.repo_label,
+            failures.join("; ")
+        )
+    }
+}
+
+fn resolve_contract_terminal_files(
+    workspace_root: &std::path::Path,
+    workflow: Option<&WorkflowMetadata>,
+) -> std::result::Result<Option<Vec<PathBuf>>, String> {
+    let Some(workflow) = workflow else {
+        return Ok(None);
+    };
+    if !workflow_uses_contract_terminal_delivery(workflow) {
+        return Ok(None);
+    }
+
+    let status = crate::inspect_workspace_contract_at_root(workspace_root)
+        .map_err(|error| format!("workspace contract inspection failed: {error}"))?;
+    if !status.policy_managed {
+        return Err(format!(
+            "workspace contract missing for {}",
+            status.repo_label
+        ));
+    }
+    if !status.ready {
+        return Err(format_workspace_contract_failure(&status));
+    }
+
+    let terminal_output = workflow
+        .terminal_output
+        .as_ref()
+        .ok_or_else(|| "workflow terminal output policy missing".to_string())?;
+    let mut selected = Vec::new();
+    let mut matched_named_artifact = false;
+
+    for artifact_name in contract_artifact_priority(&terminal_output.required_artifact_kind) {
+        if let Some(_artifact) = status
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == *artifact_name && artifact.present)
+        {
+            matched_named_artifact = true;
+            if terminal_output.deliver_final_artifact_only {
+                let path = resolve_preferred_workspace_contract_artifact_path(
+                    workspace_root,
+                    artifact_name,
+                )
+                .map_err(|error| format!("workspace contract resolution failed: {error}"))?;
+                if let Some(path) = path {
+                    return Ok(Some(vec![path]));
+                }
+            } else {
+                selected.extend(
+                    resolve_workspace_contract_artifact_paths(workspace_root, artifact_name)
+                        .map_err(|error| {
+                            format!("workspace contract resolution failed: {error}")
+                        })?,
+                );
+            }
+        }
+    }
+
+    if !selected.is_empty() {
+        return Ok(Some(selected));
+    }
+
+    if matched_named_artifact {
+        return Err(format!(
+            "workspace contract for {} is ready but the declared terminal artifact could not be resolved",
+            status.repo_label
+        ));
+    }
+
+    Err(format!(
+        "workspace contract for {} is ready but has no declared terminal artifact for '{}'",
+        status.repo_label, terminal_output.required_artifact_kind
+    ))
+}
 async fn deliver_background_result(
     sender: Option<BackgroundResultSender>,
     payload: BackgroundResultPayload,
@@ -725,11 +1012,7 @@ impl Tool for SpawnTool {
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
-            let policy = ToolPolicy {
-                allow: allowed_tools,
-                deny: vec!["spawn".into()],
-                ..Default::default()
-            };
+            let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
@@ -879,11 +1162,7 @@ impl Tool for SpawnTool {
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
-                let policy = ToolPolicy {
-                    allow: allowed_tools,
-                    deny: vec!["spawn".into()],
-                    ..Default::default()
-                };
+                let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
                     tools.set_provider_policy(pp);
@@ -906,31 +1185,38 @@ impl Tool for SpawnTool {
                         files: vec![],
                     },
                     TaskContext {
-                        working_dir,
+                        working_dir: working_dir.clone(),
                         ..Default::default()
                     },
                 );
 
                 let result = worker.run_task(&subtask).await;
-                let tracked_output_files = match &result {
-                    Ok(task_result) => select_workflow_terminal_files(
+                let contract_failure = match &result {
+                    Ok(task_result) if task_result.success => resolve_background_terminal_files(
+                        &working_dir,
                         &task_result.files_to_send,
                         &task_result.files_modified,
                         workflow_metadata.as_ref(),
                     )
-                    .unwrap_or_else(|| {
-                        task_result
-                            .files_to_send
-                            .iter()
-                            .chain(task_result.files_modified.iter())
-                            .cloned()
-                            .collect()
-                    })
-                    .into_iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect::<Vec<_>>(),
-                    Err(_) => Vec::new(),
+                    .err(),
+                    _ => None,
                 };
+                let terminal_files = match (&result, contract_failure.as_ref()) {
+                    (Ok(task_result), None) if task_result.success => {
+                        resolve_background_terminal_files(
+                            &working_dir,
+                            &task_result.files_to_send,
+                            &task_result.files_modified,
+                            workflow_metadata.as_ref(),
+                        )
+                        .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                let tracked_output_files = terminal_files
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
 
                 if matches!(&result, Ok(task_result) if task_result.success) {
                     if let (Some(supervisor), Some(task_id), Some(workflow)) = (
@@ -948,19 +1234,26 @@ impl Tool for SpawnTool {
                     }
                 }
 
-                let terminal_kind = classify_child_session_lifecycle_kind(&result);
+                let terminal_kind = if contract_failure.is_some() {
+                    ChildSessionLifecycleKind::TerminalFailed
+                } else {
+                    classify_child_session_lifecycle_kind(&result)
+                };
 
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
-                    match &result {
-                        Ok(task_result) if task_result.success => {
+                    match (&result, contract_failure.as_ref()) {
+                        (Ok(task_result), None) if task_result.success => {
                             supervisor.mark_completed(task_id, tracked_output_files.clone());
                         }
-                        Ok(task_result) => {
+                        (Ok(_), Some(error)) => {
+                            supervisor.mark_failed(task_id, error.clone());
+                        }
+                        (Ok(task_result), None) => {
                             supervisor.mark_failed(task_id, task_result.output.clone());
                         }
-                        Err(error) => {
+                        (Err(error), _) => {
                             supervisor.mark_failed(task_id, error.to_string());
                         }
                     }
@@ -977,8 +1270,25 @@ impl Tool for SpawnTool {
                     parent_session_key.as_ref(),
                     tracked_child_session_key.as_ref(),
                 ) {
-                    let payload = match &result {
-                        Ok(task_result) if task_result.success => ChildSessionLifecyclePayload {
+                    let payload = match (&result, contract_failure.as_ref()) {
+                        (Ok(task_result), None) if task_result.success => {
+                            ChildSessionLifecyclePayload {
+                                kind: terminal_kind,
+                                task_id: task_id.clone(),
+                                task_label: task_label.clone(),
+                                instruction: task_desc.clone(),
+                                parent_session_key: parent_session_key.clone(),
+                                child_session_key: child_session_key.clone(),
+                                workflow_kind: workflow_metadata
+                                    .as_ref()
+                                    .map(|workflow| workflow.workflow_kind.clone()),
+                                current_phase: Some("deliver_result".to_string()),
+                                output_files: tracked_output_files.clone(),
+                                failure_action: child_session_failure_action(terminal_kind),
+                                error: None,
+                            }
+                        }
+                        (Ok(_), Some(error)) => ChildSessionLifecyclePayload {
                             kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
@@ -991,9 +1301,9 @@ impl Tool for SpawnTool {
                             current_phase: Some("deliver_result".to_string()),
                             output_files: tracked_output_files.clone(),
                             failure_action: child_session_failure_action(terminal_kind),
-                            error: None,
+                            error: Some(error.clone()),
                         },
-                        Ok(task_result) => ChildSessionLifecyclePayload {
+                        (Ok(task_result), None) => ChildSessionLifecyclePayload {
                             kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
@@ -1010,7 +1320,7 @@ impl Tool for SpawnTool {
                             failure_action: child_session_failure_action(terminal_kind),
                             error: Some(task_result.output.clone()),
                         },
-                        Err(error) => ChildSessionLifecyclePayload {
+                        (Err(error), _) => ChildSessionLifecyclePayload {
                             kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
@@ -1062,30 +1372,32 @@ impl Tool for SpawnTool {
                     }
                 }
 
-                let content = match &result {
-                    Ok(r) => format!(
+                let content = match (&result, contract_failure.as_ref()) {
+                    (Ok(_), Some(error)) => format!("Status: FAILED\nError: {error}"),
+                    (Ok(r), None) => format!(
                         "Status: {}\n\n{}",
                         if r.success { "SUCCESS" } else { "FAILED" },
                         r.output
                     ),
-                    Err(e) => format!("Status: FAILED\nError: {e}"),
+                    (Err(e), _) => format!("Status: FAILED\nError: {e}"),
                 };
-                let (result_kind, result_media) = match &result {
-                    Ok(r) if r.success => {
-                        let workflow_media = select_workflow_terminal_files(
-                            &r.files_to_send,
-                            &r.files_modified,
-                            workflow_metadata.as_ref(),
-                        )
-                        .unwrap_or_default();
-                        if !workflow_media.is_empty() {
+                let (result_kind, result_media) = match (&result, contract_failure.as_ref()) {
+                    (Ok(_), Some(_)) => {
+                        record_terminal_result_reason(
+                            BackgroundResultKind::Report,
+                            "workspace_contract_failure",
+                        );
+                        (BackgroundResultKind::Report, Vec::new())
+                    }
+                    (Ok(r), None) if r.success => {
+                        if !terminal_files.is_empty() {
                             record_terminal_result_reason(
                                 BackgroundResultKind::Notification,
                                 "workflow_terminal_artifact",
                             );
                             (
                                 BackgroundResultKind::Notification,
-                                workflow_media
+                                terminal_files
                                     .into_iter()
                                     .map(|path| path.to_string_lossy().to_string())
                                     .collect::<Vec<_>>(),
@@ -1269,6 +1581,167 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_background_spawn_uses_contract_selected_slides_artifact_for_persistence() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        let ledger = temp.path().join("tasks.jsonl");
+        std::fs::create_dir_all(repo_root.join("output")).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            temp.path().to_path_buf(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Build the deck",
+                "label": "Slides deliverable",
+                "mode": "background",
+                "allowed_tools": ["mofa_slides"],
+                "workflow": {
+                    "workflow_kind": "slides",
+                    "current_phase": "design",
+                    "allowed_tools": ["mofa_slides"],
+                    "terminal_output": {
+                        "deliver_final_artifact_only": true,
+                        "deliver_media_only": false,
+                        "forbid_intermediate_files": true,
+                        "required_artifact_kind": "presentation"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Completed {
+                    assert_eq!(
+                        task.output_files,
+                        vec![
+                            repo_root
+                                .join("output/deck.pptx")
+                                .to_string_lossy()
+                                .to_string()
+                        ]
+                    );
+                    break;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn task did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger).unwrap();
+        let tasks = restored.get_tasks_for_session("api:test-session");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].status,
+            crate::task_supervisor::TaskStatus::Completed
+        );
+        assert_eq!(
+            tasks[0].output_files,
+            vec![
+                repo_root
+                    .join("output/deck.pptx")
+                    .to_string_lossy()
+                    .to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_spawn_fails_when_contract_owned_workflow_is_not_ready() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        let ledger = temp.path().join("tasks.jsonl");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            temp.path().to_path_buf(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger);
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Build the deck",
+                "label": "Slides deliverable",
+                "mode": "background",
+                "allowed_tools": ["mofa_slides"],
+                "workflow": {
+                    "workflow_kind": "slides",
+                    "current_phase": "design",
+                    "allowed_tools": ["mofa_slides"],
+                    "terminal_output": {
+                        "deliver_final_artifact_only": true,
+                        "deliver_media_only": false,
+                        "forbid_intermediate_files": true,
+                        "required_artifact_kind": "presentation"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Failed {
+                    let error = task.error.as_deref().unwrap_or_default();
+                    assert!(error.contains("workspace contract"));
+                    return;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn task did not fail in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[test]
     fn workflow_terminal_output_prefers_final_audio_and_skips_intermediates() {
         let workflow = WorkflowMetadata {
@@ -1349,6 +1822,93 @@ mod tests {
         assert_eq!(selected, vec![PathBuf::from("/tmp/site/dist/index.html")]);
     }
 
+    #[test]
+    fn contract_owned_workflow_denies_send_file_in_subagent_policy() {
+        let workflow = WorkflowMetadata {
+            workflow_kind: "slides".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["mofa_slides".to_string(), "send_file".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "presentation".to_string(),
+            }),
+        };
+
+        let policy = build_subagent_tool_policy(workflow.allowed_tools.clone(), Some(&workflow));
+
+        assert!(policy.deny.contains(&"spawn".to_string()));
+        assert!(policy.deny.contains(&"send_file".to_string()));
+    }
+
+    #[test]
+    fn contract_terminal_output_prefers_declared_slides_deck_name_over_newer_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        std::fs::create_dir_all(repo_root.join("output")).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(repo_root.join("output/deck-draft.pptx"), "draft").unwrap();
+        std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+
+        let workflow = WorkflowMetadata {
+            workflow_kind: "slides".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["mofa_slides".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "presentation".to_string(),
+            }),
+        };
+
+        let selected = resolve_contract_terminal_files(&repo_root, Some(&workflow))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected, vec![repo_root.join("output/deck.pptx")]);
+    }
+
+    #[test]
+    fn contract_terminal_output_fails_when_site_entrypoint_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("sites/news");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_site_build_output("out"),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("mofa-site-session.json"), "{}").unwrap();
+        std::fs::write(repo_root.join("site-plan.json"), "{}").unwrap();
+        std::fs::write(repo_root.join("optimized-prompt.md"), "# prompt").unwrap();
+
+        let workflow = WorkflowMetadata {
+            workflow_kind: "site".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["shell".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "site".to_string(),
+            }),
+        };
+
+        let error = resolve_contract_terminal_files(&repo_root, Some(&workflow)).unwrap_err();
+        assert!(error.contains("workspace contract"));
+        assert!(error.contains("out/index.html"));
+    }
     #[tokio::test]
     async fn test_background_spawn_persists_workflow_phase_transitions() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);

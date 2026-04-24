@@ -119,7 +119,10 @@ impl GatewayRuntime {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
         let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
+        #[cfg(feature = "api")]
         let metrics_handle = Some(crate::api::init_metrics());
+        #[cfg(not(feature = "api"))]
+        let metrics_handle = None::<()>;
 
         let mut profile_id: Option<String> = None;
         eprintln!(

@@ -60,13 +60,18 @@ mod whatsapp;
 pub(crate) use super::prompt::settings_str;
 
 /// Context needed by adapters that require extra parameters beyond the common set.
+#[cfg(feature = "api")]
+type GatewayMetricsHandle = metrics_exporter_prometheus::PrometheusHandle;
+#[cfg(not(feature = "api"))]
+type GatewayMetricsHandle = ();
+
 #[allow(dead_code, clippy::type_complexity)]
 pub struct ChannelRegistrationCtx<'a> {
     pub shutdown: &'a Arc<AtomicBool>,
     pub media_dir: &'a Path,
     pub data_dir: &'a Path,
     pub session_mgr: &'a Arc<Mutex<SessionManager>>,
-    pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    pub metrics_handle: Option<GatewayMetricsHandle>,
     pub task_query: Option<Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>>,
     pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,

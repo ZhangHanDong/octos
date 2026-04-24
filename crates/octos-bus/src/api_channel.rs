@@ -248,8 +248,14 @@ impl ApiChannel {
             .collect()
     }
 
-    async fn materialize_media_for_session(&self, chat_id: &str, media: &[String]) -> Vec<String> {
-        let key = current_profile_api_session_key(self.profile_id.as_deref(), chat_id);
+    async fn materialize_media_for_session(
+        &self,
+        chat_id: &str,
+        topic: Option<&str>,
+        media: &[String],
+    ) -> Vec<String> {
+        let key =
+            current_profile_api_session_key_with_topic(self.profile_id.as_deref(), chat_id, topic);
         let data_dir = {
             let sess = self.sessions.lock().await;
             sess.data_dir()
@@ -307,15 +313,32 @@ fn build_session_result_event(
     let mut message = raw.clone();
     let obj = message.as_object_mut()?;
 
-    if let Some(paths) = materialized_media {
-        let response_media: Vec<String> = paths
-            .iter()
-            .map(|path| {
-                response_path_for_session_file(data_dir, Path::new(path))
-                    .unwrap_or_else(|| path.clone())
-            })
-            .collect();
-        obj.insert("media".to_string(), serde_json::json!(response_media));
+    let response_media: Option<Vec<String>> = materialized_media
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| {
+                    response_path_for_session_file(data_dir, Path::new(path))
+                        .unwrap_or_else(|| path.clone())
+                })
+                .collect()
+        })
+        .or_else(|| {
+            obj.get("media")
+                .and_then(|value| value.as_array())
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .map(|path| {
+                            response_path_for_session_file(data_dir, Path::new(path))
+                                .unwrap_or_else(|| path.to_string())
+                        })
+                        .collect()
+                })
+        });
+    if let Some(paths) = response_media {
+        obj.insert("media".to_string(), serde_json::json!(paths));
     }
 
     Some(serde_json::json!({
@@ -438,12 +461,16 @@ impl Channel for ApiChannel {
         let topic = msg.metadata.get("topic").and_then(|v| v.as_str());
 
         if !msg.media.is_empty() {
-            let persisted_media = self
-                .materialize_media_for_session(&msg.chat_id, &msg.media)
-                .await;
             let data_dir = {
                 let sess = self.sessions.lock().await;
                 sess.data_dir()
+            };
+            let should_materialize_media = !history_already_persisted || session_result.is_none();
+            let persisted_media = if should_materialize_media {
+                self.materialize_media_for_session(&msg.chat_id, topic, &msg.media)
+                    .await
+            } else {
+                msg.media.clone()
             };
 
             // File message — persist to session history AND send SSE event.
@@ -461,7 +488,8 @@ impl Channel for ApiChannel {
                     reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 };
-                self.persist_to_session(&msg.chat_id, session_msg).await
+                self.persist_to_session(&msg.chat_id, topic, session_msg)
+                    .await
             } else {
                 None
             };
@@ -576,7 +604,9 @@ impl Channel for ApiChannel {
                     reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 };
-                let _ = self.persist_to_session(&msg.chat_id, session_msg).await;
+                let _ = self
+                    .persist_to_session(&msg.chat_id, topic, session_msg)
+                    .await;
             }
             return Ok(());
         }
@@ -703,8 +733,14 @@ async fn handle_metrics(State(state): State<ApiState>) -> String {
 impl ApiChannel {
     /// Persist a message to the session JSONL for the given chat_id and
     /// return the authoritative committed message shape when available.
-    async fn persist_to_session(&self, chat_id: &str, message: Message) -> Option<MessageInfo> {
-        let key = current_profile_api_session_key(self.profile_id.as_deref(), chat_id);
+    async fn persist_to_session(
+        &self,
+        chat_id: &str,
+        topic: Option<&str>,
+        message: Message,
+    ) -> Option<MessageInfo> {
+        let key =
+            current_profile_api_session_key_with_topic(self.profile_id.as_deref(), chat_id, topic);
         let mut sess = self.sessions.lock().await;
         let committed = match sess.add_message_with_seq(&key, message.clone()).await {
             Ok(seq) => {
@@ -728,7 +764,13 @@ impl ApiChannel {
         let base_key = key.base_key();
         let encoded = crate::session::encode_path_component(base_key);
         let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
-        let per_user_path = per_user_dir.join("default.jsonl");
+        let topic_name = topic
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("default");
+        let per_user_path = per_user_dir.join(format!(
+            "{}.jsonl",
+            crate::session::encode_path_component(topic_name)
+        ));
         if per_user_path.exists() {
             if let Ok(msg_json) = serde_json::to_string(&message) {
                 let path_clone = per_user_path.clone();
@@ -1739,6 +1781,53 @@ mod tests {
         assert!(info.content.contains("[file:pf/"));
     }
 
+    #[test]
+    fn build_session_result_event_normalizes_persisted_media_paths_like_history_replay() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let artifact = data_dir
+            .path()
+            .join("users")
+            .join("dspfac%3Aapi%3Aweb-1")
+            .join("workspace")
+            .join(".artifacts")
+            .join("deck.pptx");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"pptx").unwrap();
+
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "Deck ready",
+            "media": [artifact.to_string_lossy().to_string()],
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+
+        let event = build_session_result_event(&raw, data_dir.path(), None, Some("slides demo"))
+            .expect("session result event");
+        let event_media = event["message"]["media"]
+            .as_array()
+            .expect("event media array")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        let replay_media = message_info_from_history_message(
+            &Message {
+                role: MessageRole::Assistant,
+                content: "Deck ready".into(),
+                media: vec![artifact.to_string_lossy().to_string()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: Utc::now(),
+            },
+            data_dir.path(),
+            1,
+        )
+        .media;
+
+        assert_eq!(event_media, replay_media);
+    }
+
     #[tokio::test]
     async fn api_channel_persists_media_without_legacy_file_marker_content() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -2211,6 +2300,44 @@ mod tests {
         assert!(!history[0].content.contains(persisted));
         assert!(Path::new(persisted).exists());
         assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_persists_to_topic_scoped_session() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("deck.pptx");
+        std::fs::write(&source, b"pptx").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "slides-topic".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![source.to_string_lossy().to_string()],
+            metadata: serde_json::json!({ "topic": "slides demo" }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let topic_key =
+            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-topic", "slides demo");
+        let topic_session = sess.get_or_create(&topic_key).await;
+        assert_eq!(topic_session.get_history(10).len(), 1);
+        assert_eq!(topic_session.get_history(10)[0].media.len(), 1);
+
+        let base_key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "slides-topic");
+        let base_session = sess.get_or_create(&base_key).await;
+        assert!(base_session.get_history(10).is_empty());
     }
 
     #[tokio::test]
