@@ -19,6 +19,8 @@ use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
+#[cfg(feature = "matrix")]
+use octos_core::MAIN_PROFILE_ID;
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
     QosCatalog, RetryProvider, SwappableProvider,
@@ -29,7 +31,9 @@ use tracing::{info, warn};
 
 use super::build_system_prompt;
 use super::message_preprocessing;
-use super::profile_factory::{ProfileActorFactoryBuilder, build_plugin_env};
+use super::profile_factory::{
+    ProfileActorFactoryBuilder, build_plugin_env, profile_plugin_env, profile_search_provider_keys,
+};
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
@@ -37,6 +41,7 @@ use crate::commands::{load_prompt, resolve_data_dir};
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
+use crate::profiles::UserProfile;
 use crate::qos_catalog::{
     load_seed_qos_catalog, materialize_runtime_qos_catalog, persist_qos_catalog,
 };
@@ -47,10 +52,79 @@ use crate::status_layers::StatusComposer;
 
 #[cfg(feature = "matrix")]
 use super::matrix_integration::*;
-#[cfg(feature = "matrix")]
-use octos_core::MAIN_PROFILE_ID;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
+
+fn discover_ominix_url() -> Option<String> {
+    std::env::var("OMINIX_API_URL").ok().or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
+        std::fs::read_to_string(discovery)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn push_runtime_plugin_env(
+    plugin_env: &mut Vec<(String, String)>,
+    data_dir: &std::path::Path,
+    octos_home: &std::path::Path,
+    profile_id: Option<&str>,
+    ominix_url: Option<&str>,
+) {
+    plugin_env.push((
+        "OCTOS_DATA_DIR".to_string(),
+        data_dir.to_string_lossy().to_string(),
+    ));
+    plugin_env.push((
+        "OCTOS_HOME".to_string(),
+        octos_home.to_string_lossy().to_string(),
+    ));
+    if let Some(profile_id) = profile_id {
+        plugin_env.push(("OCTOS_PROFILE_ID".to_string(), profile_id.to_string()));
+    }
+    plugin_env.push((
+        "OCTOS_VOICE_DIR".to_string(),
+        data_dir
+            .join("voice_profiles")
+            .to_string_lossy()
+            .to_string(),
+    ));
+    if let Some(ominix_url) = ominix_url {
+        plugin_env.push(("OMINIX_API_URL".to_string(), ominix_url.to_string()));
+    }
+}
+
+async fn apply_profile_runtime_contracts(
+    profile: &UserProfile,
+    tool_config: &octos_agent::ToolConfigStore,
+) -> Result<()> {
+    if let Some(deep_crawl) = profile.config.deep_crawl.as_ref() {
+        match deep_crawl.page_settle_ms {
+            Some(value) => {
+                tool_config
+                    .set("deep_crawl", "page_settle_ms", serde_json::json!(value))
+                    .await?;
+            }
+            None => tool_config.remove("deep_crawl", "page_settle_ms").await?,
+        }
+
+        match deep_crawl.max_output_chars {
+            Some(value) => {
+                tool_config
+                    .set("deep_crawl", "max_output_chars", serde_json::json!(value))
+                    .await?;
+            }
+            None => tool_config.remove("deep_crawl", "max_output_chars").await?,
+        }
+    } else {
+        tool_config.remove("deep_crawl", "page_settle_ms").await?;
+        tool_config.remove("deep_crawl", "max_output_chars").await?;
+    }
+
+    Ok(())
+}
 
 /// Holds all state needed by the gateway's main message loop.
 ///
@@ -122,9 +196,10 @@ impl GatewayRuntime {
         #[cfg(feature = "api")]
         let metrics_handle = Some(crate::api::init_metrics());
         #[cfg(not(feature = "api"))]
-        let metrics_handle = None::<()>;
+        let metrics_handle: Option<()> = None;
 
         let mut profile_id: Option<String> = None;
+        let mut resolved_profile: Option<UserProfile> = None;
         eprintln!(
             "[gateway] loading config (profile={:?})",
             cmd.profile.as_deref().map(|p| p.display().to_string())
@@ -139,7 +214,7 @@ impl GatewayRuntime {
             profile_id = Some(profile.id.clone());
             admin_mode = profile.config.admin_mode;
 
-            // Sub-account: merge LLM provider config from parent profile
+            // Sub-account: inherit the parent's structured config sections.
             if let Some(ref parent_path) = cmd.parent_profile {
                 if let Ok(parent_content) = std::fs::read_to_string(parent_path) {
                     if let Ok(parent) =
@@ -148,20 +223,27 @@ impl GatewayRuntime {
                         info!(
                             parent = %parent.id,
                             sub_account = %profile.id,
-                            "inheriting provider config from parent profile"
+                            "inheriting llm contract from parent profile"
                         );
-                        profile.config.provider = parent.config.provider;
-                        profile.config.model = parent.config.model;
-                        profile.config.base_url = parent.config.base_url;
-                        profile.config.api_key_env = parent.config.api_key_env;
-                        profile.config.api_type = parent.config.api_type;
-                        profile.config.fallback_models = parent.config.fallback_models;
+                        profile.config.llm = parent.config.llm;
+                        if profile.config.search.is_none() {
+                            profile.config.search = parent.config.search;
+                        }
+                        if profile.config.deep_crawl.is_none() {
+                            profile.config.deep_crawl = parent.config.deep_crawl;
+                        }
+                        if profile.config.apps.is_none() {
+                            profile.config.apps = parent.config.apps;
+                        }
                         if profile.config.email.is_none() {
                             profile.config.email = parent.config.email;
                         }
                     }
                 }
             }
+
+            profile.config.normalize_llm_contract();
+            resolved_profile = Some(profile.clone());
 
             crate::profiles::config_from_profile(
                 &profile,
@@ -362,20 +444,6 @@ impl GatewayRuntime {
                 .ok()
                 .map(Arc::new);
 
-        // Export env vars for skill/plugin child processes. These are read by
-        // spawned binaries (mofa-fm, account-manager, voice skill), not by
-        // concurrent Rust threads. Consolidated here before any tokio::spawn
-        // calls to minimize the UB window (tokio worker threads exist but are
-        // idle at this point).
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("OCTOS_DATA_DIR", &data_dir);
-            std::env::set_var("OCTOS_HOME", &effective_octos_home);
-            if let Some(ref pid) = profile_id {
-                std::env::set_var("OCTOS_PROFILE_ID", pid);
-            }
-        }
-
         // Spawn periodic metrics exporter (writes model_catalog.json every 30s)
         if let Some(ref router) = adaptive_router_ref {
             let metrics_router = router.clone();
@@ -440,27 +508,15 @@ impl GatewayRuntime {
             .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR)
             .join("voice")
             .join("main");
-        let ominix_url = std::env::var("OMINIX_API_URL").ok().or_else(|| {
-            let home = std::env::var_os("HOME")?;
-            let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
-            std::fs::read_to_string(discovery)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        });
-        let asr_binary = if let Some(url) = ominix_url.filter(|_| voice_binary_path.exists()) {
-            println!("{}: voice platform skill ({})", "Transcriber".green(), url);
-            println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
-            // Export so the voice skill binary can find the OminiX server.
-            // Read by child processes only, not concurrent Rust threads.
-            #[allow(unsafe_code)]
-            unsafe {
-                std::env::set_var("OMINIX_API_URL", &url);
-            }
-            Some(voice_binary_path)
-        } else {
-            None
-        };
+        let ominix_url = discover_ominix_url();
+        let asr_binary =
+            if let Some(url) = ominix_url.as_deref().filter(|_| voice_binary_path.exists()) {
+                println!("{}: voice platform skill ({})", "Transcriber".green(), url);
+                println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
+                Some(voice_binary_path)
+            } else {
+                None
+            };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
         // Customer-installed skills are strictly account-scoped.
@@ -496,6 +552,15 @@ impl GatewayRuntime {
                 .await
                 .wrap_err("failed to open tool config store")?,
         );
+        let profile_search_keys = resolved_profile
+            .as_ref()
+            .map(profile_search_provider_keys)
+            .unwrap_or_default();
+        if let Some(profile) = resolved_profile.as_ref() {
+            apply_profile_runtime_contracts(profile, &tool_config)
+                .await
+                .wrap_err("failed to apply profile runtime contracts")?;
+        }
 
         // Session-specific tools (message, send_file, spawn, cron, pipeline)
         // are NOT registered in the base registry — they are created per-session
@@ -512,19 +577,16 @@ impl GatewayRuntime {
         // Build env vars to inject into plugin processes so skills can route
         // API calls through the configured provider/gateway (e.g. r9s.ai).
         let mut plugin_env = build_plugin_env(&config, &provider_name);
-        // Per-profile data_dir so skills (voice profiles, mofa-fm voices, etc.)
-        // resolve storage relative to the correct profile, not the gateway root.
-        plugin_env.push((
-            "OCTOS_DATA_DIR".to_string(),
-            data_dir.to_string_lossy().to_string(),
-        ));
-        plugin_env.push((
-            "OCTOS_VOICE_DIR".to_string(),
-            data_dir
-                .join("voice_profiles")
-                .to_string_lossy()
-                .to_string(),
-        ));
+        if let Some(profile) = resolved_profile.as_ref() {
+            plugin_env.extend(profile_plugin_env(profile));
+        }
+        push_runtime_plugin_env(
+            &mut plugin_env,
+            &data_dir,
+            &effective_octos_home,
+            profile_id.as_deref(),
+            ominix_url.as_deref(),
+        );
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let shutdown_notify = Arc::new(Notify::new());
@@ -549,7 +611,15 @@ impl GatewayRuntime {
             }
             let sandbox = octos_agent::create_sandbox(&sandbox_config);
             tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+            tools.set_output_dir_hint(data_dir.join("skill-output").to_string_lossy().to_string());
             tools.inject_tool_config(tool_config.clone());
+            if !profile_search_keys.is_empty() {
+                tools.register(
+                    octos_agent::WebSearchTool::new()
+                        .with_config(tool_config.clone())
+                        .with_provider_keys(profile_search_keys.clone()),
+                );
+            }
 
             // Override browser tool with configured timeout (replaces default 300s)
             if let Some(secs) = gw_config.browser_timeout_secs {
@@ -897,10 +967,6 @@ impl GatewayRuntime {
             // can run up to 30 minutes without the agent loop aborting early.
             max_timeout: Some(std::time::Duration::from_secs(session_timeout_secs)),
             chat_max_tokens: gw_config.max_output_tokens,
-            approval_policy: config
-                .approval_policy
-                .as_ref()
-                .map(crate::config::ApprovalPolicyConfig::to_runtime_policy),
             ..Default::default()
         };
 
@@ -1117,7 +1183,10 @@ impl GatewayRuntime {
                     let store = task_query_store.clone();
                     move |session_key: &str| store.query_json(session_key)
                 })),
+                #[cfg(feature = "api")]
                 metrics_handle: metrics_handle.clone(),
+                #[cfg(not(feature = "api"))]
+                metrics_handle,
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
@@ -1152,12 +1221,6 @@ impl GatewayRuntime {
         #[cfg(feature = "matrix")]
         if admin_mode {
             if let Some(ref channel) = matrix_channel {
-                if let Err(error) = channel
-                    .register_primary_bot_route(profile_id.as_deref().unwrap_or(MAIN_PROFILE_ID))
-                    .await
-                {
-                    tracing::warn!(%error, "failed to register primary Matrix bot route");
-                }
                 if let Some(ref store) = profile_store {
                     let bot_mgr = Arc::new(GatewayBotManager {
                         store: store.clone(),

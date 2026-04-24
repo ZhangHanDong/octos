@@ -1,7 +1,13 @@
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };
-use octos_agent::{WorkspacePolicy, WorkspaceProjectKind};
+use octos_agent::workspace_policy::WorkspacePolicyWorkspace;
+use octos_agent::{
+    ValidationPolicy, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
+    WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
+    WorkspaceVersionControlProvider,
+};
+use std::collections::BTreeMap;
 
 pub fn build() -> WorkflowInstance {
     WorkflowInstance {
@@ -28,7 +34,6 @@ pub fn build() -> WorkflowInstance {
         },
         terminal_output: WorkflowTerminalOutput {
             deliver_final_artifact_only: true,
-            deliver_media_only: false,
             forbid_intermediate_files: true,
             required_artifact_kind: "presentation".into(),
         },
@@ -37,7 +42,50 @@ pub fn build() -> WorkflowInstance {
 }
 
 pub fn workspace_policy() -> WorkspacePolicy {
-    WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides)
+    WorkspacePolicy {
+        schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
+        workspace: WorkspacePolicyWorkspace {
+            kind: WorkspacePolicyKind::Slides,
+        },
+        version_control: WorkspaceVersionControlPolicy {
+            provider: WorkspaceVersionControlProvider::Git,
+            auto_init: true,
+            trigger: WorkspaceSnapshotTrigger::TurnEnd,
+            fail_on_error: true,
+        },
+        tracking: WorkspaceTrackingPolicy {
+            ignore: vec![
+                "history/**".into(),
+                "output/**".into(),
+                "skill-output/**".into(),
+                "*.pptx".into(),
+                "*.tmp".into(),
+                ".DS_Store".into(),
+            ],
+        },
+        validation: ValidationPolicy {
+            on_turn_end: vec![
+                "file_exists:script.js".into(),
+                "file_exists:memory.md".into(),
+                "file_exists:changelog.md".into(),
+            ],
+            on_source_change: Vec::new(),
+            on_completion: vec![
+                "file_exists:output/deck.pptx".into(),
+                "file_exists:output/**/slide-*.png".into(),
+            ],
+            validators: Vec::new(),
+        },
+        artifacts: WorkspaceArtifactsPolicy {
+            entries: BTreeMap::from([
+                ("primary".into(), "output/deck.pptx".into()),
+                ("deck".into(), "output/deck.pptx".into()),
+                ("previews".into(), "output/**/slide-*.png".into()),
+            ]),
+        },
+        spawn_tasks: BTreeMap::new(),
+        compaction: None,
+    }
 }
 
 #[cfg(test)]
@@ -54,7 +102,6 @@ mod tests {
             "presentation"
         );
         assert!(workflow.terminal_output.deliver_final_artifact_only);
-        assert!(!workflow.terminal_output.deliver_media_only);
         assert!(workflow.terminal_output.forbid_intermediate_files);
         assert!(
             workflow
@@ -87,7 +134,7 @@ mod tests {
             policy
                 .validation
                 .on_completion
-                .contains(&"file_exists:output/*.pptx".to_string())
+                .contains(&"file_exists:output/deck.pptx".to_string())
         );
     }
 }

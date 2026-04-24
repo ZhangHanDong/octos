@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
@@ -90,6 +90,21 @@ fn resolve_routed_profile_id_candidate(state: &AppState, candidate: &str) -> Opt
         .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
 }
 
+fn resolve_trusted_local_profile_id_candidate(state: &AppState, candidate: &str) -> Option<String> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    resolve_routed_profile_id_candidate(state, candidate).or_else(|| {
+        state
+            .profile_store
+            .as_ref()
+            .and_then(|store| store.get(candidate).ok().flatten())
+            .map(|profile| profile.id)
+    })
+}
+
 fn host_scoped_profile_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let host = request_host(headers)?;
     if is_local_request_host(&host) {
@@ -115,7 +130,7 @@ fn trusted_auth_scope_profile_id(state: &AppState, headers: &HeaderMap) -> Optio
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|candidate| resolve_routed_profile_id_candidate(state, candidate))
+        .and_then(|candidate| resolve_trusted_local_profile_id_candidate(state, candidate))
 }
 
 fn resolve_scoped_login_user(
@@ -845,6 +860,112 @@ pub async fn my_profile(
     }))
 }
 
+/// GET /api/my/profile/skills
+pub async fn my_profile_skills(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile_id =
+        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let skills = crate::commands::skills::list_skills(&skills_dir)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "skills": skills })))
+}
+
+#[derive(Deserialize, Default)]
+pub struct MySkillRegistryQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+/// GET /api/my/profile/skills/registry
+pub async fn my_profile_skill_registry(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Query(query): Query<MySkillRegistryQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile_id =
+        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    // Validate this profile has a resolvable skills scope.
+    crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let q = query.q;
+    let packages = tokio::task::spawn_blocking(move || {
+        crate::commands::skills::search_registry(q.as_deref(), None)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "packages": packages })))
+}
+
+/// POST /api/my/profile/skills
+pub async fn install_my_profile_skill(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<super::admin::InstallSkillRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile_id =
+        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::commands::skills::install_skill(&skills_dir, &req.repo, req.force, &req.branch)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "installed": result.installed,
+        "skipped": result.skipped,
+        "deps_installed": result.deps_installed,
+    })))
+}
+
+/// DELETE /api/my/profile/skills/:name
+pub async fn remove_my_profile_skill(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Result<Json<super::admin::ActionResponse>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile_id =
+        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    crate::commands::skills::remove_skill(&skills_dir, &name)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    Ok(Json(super::admin::ActionResponse {
+        ok: true,
+        message: Some(format!("Removed skill: {name}")),
+    }))
+}
+
 /// PUT /api/my/profile
 pub async fn update_my_profile(
     State(state): State<Arc<AppState>>,
@@ -1226,7 +1347,7 @@ pub async fn start_my_gateway(
     let profile = resolve_my_profile(&identity, ps)?;
 
     // Validate LLM provider is configured
-    if profile.config.provider.is_none() && profile.config.model.is_none() {
+    if profile.config.primary_provider().is_none() && profile.config.primary_model().is_none() {
         return Ok(Json(ActionResponse {
             ok: false,
             message: Some("Cannot start: LLM provider must be configured first".into()),
@@ -2059,6 +2180,8 @@ mod tests {
             broadcaster: Arc::new(crate::api::SseBroadcaster::new(8)),
             started_at: chrono::Utc::now(),
             auth_token: Some("bootstrap-token".into()),
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
             profile_store: Some(profile_store.clone()),
             process_manager: None,
@@ -2277,10 +2400,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn my_profile_skills_lists_current_user_skills() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+
+        let skills_dir =
+            crate::commands::skills::resolve_profile_skills_dir(&profile_store, "alice").unwrap();
+        let skill_dir = skills_dir.join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Demo skill\n").unwrap();
+
+        let Json(resp) = my_profile_skills(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let skills = resp
+            .get("skills")
+            .and_then(|value| value.as_array())
+            .expect("skills array");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0].get("name").and_then(|value| value.as_str()),
+            Some("demo-skill")
+        );
+    }
+
+    #[tokio::test]
+    async fn install_my_profile_skill_allows_non_admin_users_for_own_profile() {
+        let (dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+
+        let local_skill_dir = dir.path().join("demo-local-skill");
+        std::fs::create_dir_all(&local_skill_dir).unwrap();
+        std::fs::write(local_skill_dir.join("SKILL.md"), "# Demo local skill\n").unwrap();
+
+        let Json(resp) = install_my_profile_skill(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }),
+            Json(crate::api::admin::InstallSkillRequest {
+                repo: local_skill_dir.to_string_lossy().to_string(),
+                force: false,
+                branch: "main".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.get("ok").and_then(|value| value.as_bool()), Some(true));
+
+        let skills_dir =
+            crate::commands::skills::resolve_profile_skills_dir(&profile_store, "alice").unwrap();
+        assert!(
+            skills_dir
+                .join("demo-local-skill")
+                .join("SKILL.md")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn scoped_send_code_rejects_wrong_email() {
         let (_dir, state, user_store, profile_store) = temp_app_state();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
         profile_store.save(&child).unwrap();
         user_store
             .save(&User {
@@ -2295,7 +2491,7 @@ mod tests {
 
         let Json(resp) = send_code(
             State(Arc::new(state)),
-            scoped_host_headers("tenant--assistant.example.test"),
+            scoped_host_headers("assistant.example.test"),
             Json(SendCodeRequest {
                 email: "wrong@example.com".into(),
             }),
@@ -2403,6 +2599,7 @@ mod tests {
         let (_dir, state, user_store, profile_store) = temp_app_state();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
         profile_store.save(&child).unwrap();
         user_store
             .save(&User {
@@ -2419,7 +2616,7 @@ mod tests {
 
         let Json(send_resp) = send_code(
             State(state.clone()),
-            scoped_host_headers("tenant--assistant.example.test"),
+            scoped_host_headers("assistant.example.test"),
             Json(SendCodeRequest {
                 email: "assistant@example.com".into(),
             }),
@@ -2442,7 +2639,7 @@ mod tests {
 
         let Json(verify_resp) = verify(
             State(state),
-            scoped_host_headers("tenant--assistant.example.test"),
+            scoped_host_headers("assistant.example.test"),
             Json(VerifyRequest {
                 email: "assistant@example.com".into(),
                 code,

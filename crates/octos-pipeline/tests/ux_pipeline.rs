@@ -60,6 +60,8 @@ async fn make_config(provider: Arc<dyn LlmProvider>, dir: &TempDir) -> ExecutorC
         status_bridge: None,
         shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         max_parallel_workers: 8,
+        checkpoint_store: None,
+        hook_executor: None,
     }
 }
 
@@ -702,7 +704,10 @@ async fn test_06_send_file_sandbox_escape() {
     use octos_agent::tools::SendFileTool;
 
     let sandbox = TempDir::new().unwrap();
-    let outside = TempDir::new().unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("octos-pipeline-send-file-outside-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
 
     // Create a "secret" file outside the sandbox
     let secret = outside.path().join("credentials.json");

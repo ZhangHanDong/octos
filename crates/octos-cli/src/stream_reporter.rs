@@ -63,19 +63,35 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::StreamDone { iteration } => {
                 StreamProgressEvent::StreamDone { iteration }
             }
-            ProgressEvent::ToolStarted { ref name, .. } => {
+            ProgressEvent::ToolStarted {
+                ref name,
+                ref tool_id,
+            } => {
                 // Also send raw SSE for web client status indicators
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({"type": "tool_start", "tool": name}).to_string(),
+                    json: serde_json::json!({
+                        "type": "tool_start",
+                        "tool": name,
+                        "tool_call_id": tool_id,
+                    })
+                    .to_string(),
                 });
                 StreamProgressEvent::ToolStarted { name: name.clone() }
             }
             ProgressEvent::ToolCompleted {
-                ref name, success, ..
+                ref name,
+                ref tool_id,
+                success,
+                ..
             } => {
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({"type": "tool_end", "tool": name, "success": success})
-                        .to_string(),
+                    json: serde_json::json!({
+                        "type": "tool_end",
+                        "tool": name,
+                        "tool_call_id": tool_id,
+                        "success": success,
+                    })
+                    .to_string(),
                 });
                 StreamProgressEvent::ToolCompleted {
                     name: name.clone(),
@@ -150,11 +166,46 @@ fn strip_think_from_buffer(buf: &str) -> String {
         }
     }
     result.push_str(rest);
+    result = strip_invoke_from_buffer(&result);
     // Collapse runs of 3+ newlines left behind after stripping
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
     }
     result
+}
+
+fn strip_invoke_from_buffer(buf: &str) -> String {
+    let mut out = String::new();
+    let mut rest = buf;
+
+    loop {
+        let Some(start) = rest.find("<invoke") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let from_tag = &rest[start..];
+
+        let Some(open_end) = from_tag.find('>') else {
+            out.push_str(from_tag);
+            break;
+        };
+        let open_tag = &from_tag[..=open_end];
+        let after_open = &from_tag[open_end + 1..];
+
+        if open_tag.trim_end().ends_with("/>") {
+            rest = after_open;
+            continue;
+        }
+
+        if let Some(close_rel) = after_open.find("</invoke>") {
+            rest = &after_open[close_rel + "</invoke>".len()..];
+        } else {
+            break;
+        }
+    }
+
+    out
 }
 
 /// Result of the stream forwarder — returns the message ID if streaming happened.
@@ -702,6 +753,16 @@ mod tests {
         assert_eq!(
             strip_think_from_buffer("Hello <think>still thinking"),
             "Hello"
+        );
+    }
+
+    #[test]
+    fn should_strip_invoke_tags_from_buffer() {
+        assert_eq!(
+            strip_think_from_buffer(
+                "before <invoke name=\"cron\">{\"action\":\"list\"}</invoke> after"
+            ),
+            "before  after"
         );
     }
 

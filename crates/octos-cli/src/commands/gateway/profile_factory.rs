@@ -4,6 +4,7 @@
 //! Matrix child bot), this builder constructs a dedicated [`ActorFactory`] with
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -28,6 +29,139 @@ use crate::session_actor::{
     ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
     SnapshotToolRegistryFactory, ToolRegistryFactory,
 };
+
+const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "GEMINI_API_KEY",
+    "GEMINI_BASE_URL",
+    "GOOGLE_API_KEY",
+    "GOOGLE_BASE_URL",
+    "DASHSCOPE_API_KEY",
+    "DASHSCOPE_BASE_URL",
+];
+
+pub(crate) fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "tavily" => Some("TAVILY_API_KEY"),
+        "perplexity" => Some("PERPLEXITY_API_KEY"),
+        "brave" => Some("BRAVE_API_KEY"),
+        "you" => Some("YDC_API_KEY"),
+        "serper" => Some("SERPER_API_KEY"),
+        _ => None,
+    }
+}
+
+pub(crate) fn profile_search_provider_keys(
+    profile: &crate::profiles::UserProfile,
+) -> HashMap<String, String> {
+    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+    profile
+        .config
+        .search
+        .as_ref()
+        .map(|search| {
+            search
+                .providers
+                .iter()
+                .filter_map(|(provider_id, provider)| {
+                    let source_key = provider.api_key_env.as_deref()?;
+                    let secret = resolved_env_vars
+                        .get(source_key)
+                        .cloned()
+                        .or_else(|| std::env::var(source_key).ok())?;
+                    Some((provider_id.clone(), secret))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn push_env_once(env: &mut Vec<(String, String)>, key: impl Into<String>, value: String) {
+    let key = key.into();
+    if value.is_empty() || env.iter().any(|(existing, _)| existing == &key) {
+        return;
+    }
+    env.push((key, value));
+}
+
+pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = profile_search_provider_keys(profile)
+        .into_iter()
+        .filter_map(|(provider_id, secret)| {
+            Some((
+                canonical_search_env(provider_id.as_str())?.to_string(),
+                secret,
+            ))
+        })
+        .collect();
+
+    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+    for key in FIRST_PARTY_SKILL_ENV_VARS {
+        if let Some(value) = resolved_env_vars
+            .get(*key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+        {
+            push_env_once(&mut env, *key, value);
+        }
+    }
+
+    if let Some(slides) = profile
+        .config
+        .apps
+        .as_ref()
+        .and_then(|apps| apps.slides.as_ref())
+    {
+        if let Some(template_dir) = slides.template_dir.as_ref() {
+            push_env_once(&mut env, "PPT_TEMPLATE_DIR", template_dir.clone());
+        }
+        if let Some(default_theme) = slides.default_theme.as_ref() {
+            push_env_once(&mut env, "PPT_DEFAULT_THEME", default_theme.clone());
+        }
+    }
+
+    env
+}
+
+fn discover_ominix_url() -> Option<String> {
+    std::env::var("OMINIX_API_URL").ok().or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
+        std::fs::read_to_string(discovery)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn push_runtime_plugin_env(
+    plugin_env: &mut Vec<(String, String)>,
+    data_dir: &std::path::Path,
+    octos_home: &std::path::Path,
+    profile_id: &str,
+    ominix_url: Option<&str>,
+) {
+    plugin_env.push((
+        "OCTOS_DATA_DIR".to_string(),
+        data_dir.to_string_lossy().to_string(),
+    ));
+    plugin_env.push((
+        "OCTOS_HOME".to_string(),
+        octos_home.to_string_lossy().to_string(),
+    ));
+    plugin_env.push(("OCTOS_PROFILE_ID".to_string(), profile_id.to_string()));
+    plugin_env.push((
+        "OCTOS_VOICE_DIR".to_string(),
+        data_dir
+            .join("voice_profiles")
+            .to_string_lossy()
+            .to_string(),
+    ));
+    if let Some(ominix_url) = ominix_url {
+        plugin_env.push(("OMINIX_API_URL".to_string(), ominix_url.to_string()));
+    }
+}
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
 /// (full LLM, provider name, adaptive router, strong-only LLM for slides)
@@ -384,6 +518,12 @@ impl ProfileActorFactoryBuilder {
             }
             let sandbox = octos_agent::create_sandbox(&sandbox_config);
             let mut tools = ToolRegistry::with_builtins_and_sandbox(&profile_data_dir, sandbox);
+            tools.set_output_dir_hint(
+                profile_data_dir
+                    .join("skill-output")
+                    .to_string_lossy()
+                    .to_string(),
+            );
             tools.inject_tool_config(self.tool_config.clone());
             if let Some(secs) = effective_profile.config.gateway.browser_timeout_secs {
                 tools.register(
@@ -402,17 +542,14 @@ impl ProfileActorFactoryBuilder {
             // Load plugins
             let plugin_work_dir = profile_data_dir.join("skill-output");
             let mut plugin_env = build_plugin_env(&profile_config, &provider_name);
-            plugin_env.push((
-                "OCTOS_DATA_DIR".to_string(),
-                profile_data_dir.to_string_lossy().to_string(),
-            ));
-            plugin_env.push((
-                "OCTOS_VOICE_DIR".to_string(),
-                profile_data_dir
-                    .join("voice_profiles")
-                    .to_string_lossy()
-                    .to_string(),
-            ));
+            plugin_env.extend(profile_plugin_env(&effective_profile));
+            push_runtime_plugin_env(
+                &mut plugin_env,
+                &profile_data_dir,
+                &self.project_dir,
+                profile_id,
+                discover_ominix_url().as_deref(),
+            );
             let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&profile_data_dir);
             if !plugin_dirs.is_empty() {
                 match octos_agent::PluginLoader::load_into_with_work_dir(
@@ -439,10 +576,19 @@ impl ProfileActorFactoryBuilder {
             }
             actor_plugin_dirs = plugin_dirs.clone();
             actor_plugin_env = plugin_env;
+            let search_provider_keys = profile_search_provider_keys(&effective_profile);
+            if !search_provider_keys.is_empty() {
+                tools.register(
+                    octos_agent::WebSearchTool::new()
+                        .with_config(self.tool_config.clone())
+                        .with_provider_keys(search_provider_keys.clone()),
+                );
+            }
 
-            tools.register(octos_agent::DeepSearchTool::new(
-                profile_data_dir.join("research"),
-            ));
+            tools.register(
+                octos_agent::DeepSearchTool::new(profile_data_dir.join("research"))
+                    .with_provider_keys(search_provider_keys),
+            );
             tools.register(octos_agent::SynthesizeResearchTool::new(
                 llm.clone(),
                 profile_data_dir.clone(),
@@ -675,8 +821,10 @@ impl ProfileActorFactoryBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::profile_identity_context;
-    use crate::profiles::{ProfileConfig, UserProfile};
+    use super::*;
+    use crate::profiles::{
+        AppsConfig, ProfileConfig, SearchConfig, SearchProviderConfig, SlidesAppConfig, UserProfile,
+    };
     use chrono::Utc;
 
     fn make_profile(name: &str, matrix_user_id: Option<&str>) -> UserProfile {
@@ -716,5 +864,62 @@ mod tests {
         let profile = make_profile("Alex", None);
 
         assert!(profile_identity_context(&profile).is_none());
+    }
+
+    #[test]
+    fn profile_plugin_env_forwards_canonical_skill_env_without_arbitrary_secrets() {
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                search: Some(SearchConfig {
+                    providers: [(
+                        "tavily".to_string(),
+                        SearchProviderConfig {
+                            api_key_env: Some("PROFILE_TAVILY_KEY".to_string()),
+                        },
+                    )]
+                    .into(),
+                }),
+                apps: Some(AppsConfig {
+                    slides: Some(SlidesAppConfig {
+                        template_dir: Some("/templates".to_string()),
+                        default_theme: Some("nb-pro".to_string()),
+                    }),
+                }),
+                env_vars: [
+                    ("PROFILE_TAVILY_KEY".to_string(), "tvly-profile".to_string()),
+                    ("GEMINI_API_KEY".to_string(), "gemini-profile".to_string()),
+                    (
+                        "DASHSCOPE_BASE_URL".to_string(),
+                        "https://dash.example/v1".to_string(),
+                    ),
+                    (
+                        "CUSTOM_SECRET_KEY".to_string(),
+                        "should-not-forward".to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(env.contains(&("TAVILY_API_KEY".to_string(), "tvly-profile".to_string())));
+        assert!(env.contains(&("GEMINI_API_KEY".to_string(), "gemini-profile".to_string())));
+        assert!(env.contains(&(
+            "DASHSCOPE_BASE_URL".to_string(),
+            "https://dash.example/v1".to_string()
+        )));
+        assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
+        assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
+        assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
     }
 }

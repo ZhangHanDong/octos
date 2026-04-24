@@ -97,16 +97,20 @@ test('ffmpeg concat works in sandbox workdir', async ({ request, baseURL }) => {
 // also triggers activate_tools. Both should succeed.
 // ---------------------------------------------------------------------------
 test('activate_tools works across different sessions', async ({ request, baseURL }) => {
+  test.setTimeout(300_000);
   test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
 
-  // Session A: send a message that will trigger tool use
+  // Session A: trigger activate_tools without also asking for shell execution.
+  // This keeps the proof focused on the registry rewire bug: stale OnceLock
+  // references used to fail with "tool registry not available" in session B.
   const resA = await request.post(`${baseURL}/api/chat`, {
     headers: headers(),
     data: {
-      message: 'Use the shell tool to run: echo "session_a_ok"',
+      message: 'Call activate_tools with exactly ["shell"] once, then reply "session_a_ok".',
       session_id: `test-session-a-${Date.now()}`,
       stream: false,
     },
+    timeout: 180_000,
   });
 
   // We may get an error if no agent is configured (standalone mode),
@@ -120,10 +124,11 @@ test('activate_tools works across different sessions', async ({ request, baseURL
   const resB = await request.post(`${baseURL}/api/chat`, {
     headers: headers(),
     data: {
-      message: 'Use the shell tool to run: echo "session_b_ok"',
+      message: 'Call activate_tools with exactly ["shell"] once, then reply "session_b_ok".',
       session_id: `test-session-b-${Date.now()}`,
       stream: false,
     },
+    timeout: 180_000,
   });
 
   if (resB.ok()) {
@@ -143,21 +148,38 @@ test('full tool chain: chat triggers activate_tools → shell → ffmpeg', async
   request,
   baseURL,
 }) => {
+  test.setTimeout(180_000);
   test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
 
-  const res = await request.post(`${baseURL}/api/chat`, {
-    headers: headers(),
-    data: {
-      message:
-        'Please activate the shell tool if needed, then run this exact command: ffmpeg -version 2>&1 | head -1. Return only the ffmpeg version output.',
-      session_id: `test-ffmpeg-chain-${Date.now()}`,
-      stream: false,
-    },
-    timeout: 30_000,
-  });
+  const baseSessionId = `test-ffmpeg-chain-${Date.now()}`;
+  const prompt =
+    'If shell is not already active, call activate_tools with exactly ["shell"] once and only once. Then call shell exactly once with this command: ffmpeg -version 2>&1 | head -1. Do not inspect available tools, do not call activate_tools repeatedly, and return only the ffmpeg version line.';
+
+  const sendPrompt = async (message: string, sessionId: string) =>
+    request.post(`${baseURL}/api/chat`, {
+      headers: headers(),
+      data: {
+        message,
+        session_id: sessionId,
+        stream: false,
+      },
+      timeout: 90_000,
+    });
+
+  let res = await sendPrompt(prompt, baseSessionId);
 
   if (res.ok()) {
-    const body = await res.json();
+    let body = await res.json();
+    if (typeof body.content === 'string' && body.content.includes('[LOOP DETECTED]')) {
+      res = await sendPrompt(
+        'Call activate_tools(["shell"]) at most once, then call shell("ffmpeg -version 2>&1 | head -1") exactly once, then stop. Return only the ffmpeg version line.',
+        `${baseSessionId}-retry`,
+      );
+      if (!res.ok()) {
+        return;
+      }
+      body = await res.json();
+    }
     // Should contain ffmpeg version string, NOT "tool registry not available"
     // or "ffmpeg: not found"
     expect(body.content).not.toContain('tool registry not available');

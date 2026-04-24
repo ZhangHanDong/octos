@@ -71,10 +71,9 @@ impl SendFileTool {
         }
     }
 
-    /// Bind the current session topic so API send_file deliveries are persisted
-    /// into the correct topic-scoped history instead of default.jsonl.
-    pub fn with_topic(mut self, topic: Option<String>) -> Self {
-        *self.default_topic.lock().unwrap_or_else(|e| e.into_inner()) = topic;
+    /// Set the default topic context for topic-scoped API sessions.
+    pub fn with_topic(self, topic: Option<impl Into<String>>) -> Self {
+        *self.default_topic.lock().unwrap_or_else(|e| e.into_inner()) = topic.map(Into::into);
         self
     }
 
@@ -117,6 +116,8 @@ struct Input {
     /// file events so the web client can link delivered files to their source message.
     #[serde(default)]
     tool_call_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 #[async_trait]
@@ -246,24 +247,18 @@ impl Tool for SendFileTool {
             });
         }
 
-        let default_channel = self
-            .default_channel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let default_chat_id = self
-            .default_chat_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let default_topic = self
-            .default_topic
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-
-        let channel = input.channel.unwrap_or_else(|| default_channel.clone());
-        let chat_id = input.chat_id.unwrap_or_else(|| default_chat_id.clone());
+        let channel = input.channel.unwrap_or_else(|| {
+            self.default_channel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        let chat_id = input.chat_id.unwrap_or_else(|| {
+            self.default_chat_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
 
         if channel.is_empty() || chat_id.is_empty() {
             return Ok(ToolResult {
@@ -280,10 +275,14 @@ impl Tool for SendFileTool {
                 serde_json::Value::String(tc_id.clone()),
             );
         }
-        if channel == default_channel && chat_id == default_chat_id {
-            if let Some(topic) = default_topic.filter(|value| !value.trim().is_empty()) {
-                metadata.insert("topic".to_string(), serde_json::Value::String(topic));
-            }
+        let topic = input.topic.or_else(|| {
+            self.default_topic
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        if let Some(topic) = topic {
+            metadata.insert("topic".to_string(), serde_json::Value::String(topic));
         }
 
         let msg = OutboundMessage {
@@ -455,9 +454,12 @@ mod tests {
     async fn test_base_dir_blocks_non_tmp_outside_path() {
         let base = tempfile::tempdir().unwrap();
 
-        // Create a file outside base_dir (but not in /tmp/) to test path validation.
-        // Use a second tempdir as the "outside" location so this works on all platforms.
-        let outside_dir = tempfile::tempdir().unwrap();
+        // Create a file outside base_dir and outside /tmp/, since /tmp/ is
+        // explicitly allowlisted for generated artifacts.
+        let outside_dir = tempfile::Builder::new()
+            .prefix("octos-send-file-outside-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
         let outside_file = outside_dir.path().join("secret.txt");
         std::fs::write(&outside_file, "secret").unwrap();
 
@@ -598,31 +600,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_include_topic_metadata_for_default_api_context() {
-        let (tx, mut rx) = mpsc::channel(16);
-        let tool =
-            SendFileTool::with_context(tx, "api", "sess-1").with_topic(Some("slides demo".into()));
-
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "deck").unwrap();
-        let path = tmp.path().to_string_lossy().to_string();
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "file_path": path,
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        let msg = rx.recv().await.unwrap();
-        assert_eq!(
-            msg.metadata.get("topic").and_then(|v| v.as_str()),
-            Some("slides demo"),
-        );
-    }
-
-    #[tokio::test]
     async fn should_omit_tool_call_id_from_metadata_when_absent() {
         let (tx, mut rx) = mpsc::channel(16);
         let tool = SendFileTool::with_context(tx, "api", "sess-1");
@@ -639,6 +616,31 @@ mod tests {
         assert!(result.success);
         let msg = rx.recv().await.unwrap();
         assert!(msg.metadata.get("tool_call_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn should_include_default_topic_in_metadata_when_configured() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1").with_topic(Some("slides demo"));
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "pptx data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+                "caption": "deck"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(
+            msg.metadata.get("topic").and_then(|v| v.as_str()),
+            Some("slides demo"),
+        );
     }
 
     #[test]

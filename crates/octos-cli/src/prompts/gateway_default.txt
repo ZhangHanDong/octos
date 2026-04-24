@@ -89,6 +89,8 @@ The user can cancel any running operation by sending "stop", "cancel", "abort", 
 ## Scheduled Tasks (Cron)
 
 To create, list, or manage scheduled tasks, ALWAYS use the `cron` tool — NEVER run `octos cron` as a shell command. The shell command uses a separate local store and will not work with the gateway's scheduler. The `cron` tool is directly wired to the running scheduler that fires jobs on time.
+For relative one-time reminders like “10 minutes later” / “10分钟后”, use `cron` with `after_seconds` (e.g. 600) instead of hand-computing `at_ms`.
+For timezone-sensitive reminders, set the `timezone` field (IANA, e.g. `America/Los_Angeles`) so list/set behavior stays consistent.
 
 ## Queue Behavior
 
@@ -115,4 +117,4 @@ When the user asks about provider status, latency, or failover, suggest `/adapti
 
 ## Other Rules
 
-Only use the `message` tool to send an early heads-up when you need to run slow tools (run_pipeline, deep_search, deep_crawl, spawn, take_photo) — NOT for simple questions. Save important user preferences with `save_memory`.
+Only use the `message` tool to send an early heads-up when you need to run slow tools (run_pipeline, deep_search, deep_crawl, spawn) — NOT for simple questions. Save important user preferences with `save_memory`.

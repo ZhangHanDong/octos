@@ -490,7 +490,7 @@ pub async fn start_gateway(
     // Validate LLM provider is configured (resolve inheritance for sub-accounts)
     let effective = crate::profiles::resolve_effective_profile(store, &profile)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if effective.config.provider.is_none() && effective.config.model.is_none() {
+    if effective.config.primary_provider().is_none() && effective.config.primary_model().is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             "Cannot start: LLM provider must be configured first".into(),
@@ -1042,6 +1042,27 @@ pub async fn test_search(
                 Err(format!("You.com API error ({status}): {body}"))
             }
         }
+        "serper" => {
+            let body = serde_json::json!({
+                "q": query,
+                "num": 1,
+            });
+            let resp = client
+                .post("https://google.serper.dev/search")
+                .header("X-API-KEY", &api_key)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            if resp.status().is_success() {
+                Ok("Serper Search API connected successfully".to_string())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("Serper API error ({status}): {body}"))
+            }
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1064,13 +1085,56 @@ pub async fn test_search(
     }
 }
 
+fn default_search_api_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "tavily" => Some("TAVILY_API_KEY"),
+        "perplexity" => Some("PERPLEXITY_API_KEY"),
+        "brave" => Some("BRAVE_API_KEY"),
+        "you" => Some("YDC_API_KEY"),
+        "serper" => Some("SERPER_API_KEY"),
+        _ => None,
+    }
+}
+
+fn resolve_profile_secret_with_keychain<F>(
+    env_name: &str,
+    stored_value: Option<&str>,
+    mut keychain_lookup: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let secret = match stored_value {
+        Some(value) if value == crate::auth::KEYCHAIN_MARKER => keychain_lookup(env_name),
+        Some(value) if !value.trim().is_empty() => Some(value.to_string()),
+        _ => None,
+    };
+
+    secret
+        .or_else(|| std::env::var(env_name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_profile_secret(env_name: &str, stored_value: Option<&str>) -> Option<String> {
+    resolve_profile_secret_with_keychain(env_name, stored_value, |name| {
+        crate::auth::keychain::get_secret(name).ok().flatten()
+    })
+}
+
 fn resolve_saved_search_key(
     state: &AppState,
     identity: &Option<axum::Extension<super::router::AuthIdentity>>,
     req: &TestSearchRequest,
 ) -> Result<String, (StatusCode, String)> {
-    let env_name = match &req.api_key_env {
-        Some(name) if !name.is_empty() => name,
+    let env_name = match req
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| default_search_api_env(req.provider.as_str()))
+    {
+        Some(name) => name,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1084,37 +1148,61 @@ fn resolve_saved_search_key(
         "profile store not configured".into(),
     ))?;
 
-    let profile_id: String = match identity {
-        Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
-        Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            super::auth_handlers::ADMIN_PROFILE_ID.into()
-        }
-        None => {
-            return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
-        }
-    };
+    let profile_id = resolve_test_search_profile_id(identity, req.profile_id.as_deref())?;
 
     let profile = ps
         .get(&profile_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "profile not found".into()))?;
 
-    Ok(profile
-        .config
-        .env_vars
-        .get(env_name)
-        .cloned()
-        .unwrap_or_default())
+    let stored = profile.config.env_vars.get(env_name).map(String::as_str);
+    Ok(resolve_profile_secret(env_name, stored).unwrap_or_default())
 }
 
 #[derive(Deserialize)]
 pub struct TestSearchRequest {
-    /// Search provider: "perplexity", "brave", "you"
+    /// Search provider: "tavily", "perplexity", "brave", "you", "serper"
     pub provider: String,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Optional profile id whose saved env vars should be used.
+    ///
+    /// Admin dashboard pages use this when testing a non-admin profile. Regular
+    /// users may only reference their own profile or child profiles.
+    #[serde(default)]
+    pub profile_id: Option<String>,
+}
+
+fn resolve_test_search_profile_id(
+    identity: &Option<axum::Extension<super::router::AuthIdentity>>,
+    requested_profile_id: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    let requested_profile_id = requested_profile_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+
+    match identity {
+        Some(axum::Extension(super::router::AuthIdentity::Admin)) => Ok(requested_profile_id
+            .unwrap_or(super::auth_handlers::ADMIN_PROFILE_ID)
+            .to_string()),
+        Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => {
+            let Some(requested) = requested_profile_id else {
+                return Ok(id.clone());
+            };
+            let child_prefix = format!("{id}--");
+            if requested == id || requested.starts_with(&child_prefix) {
+                Ok(requested.to_string())
+            } else {
+                Err((
+                    StatusCode::FORBIDDEN,
+                    "cannot test search keys for another profile".into(),
+                ))
+            }
+        }
+        None => Err((StatusCode::UNAUTHORIZED, "not authenticated".into())),
+    }
 }
 
 #[derive(Serialize)]
@@ -1522,6 +1610,187 @@ async fn scrape_gateway_metrics(client: &reqwest::Client, port: u16) -> Result<S
     response.text().await.map_err(|error| error.to_string())
 }
 
+// ── Operator harness task aggregation (`M4.5`) ───────────────────────
+
+/// Upper bound on sessions scanned per gateway. Bounded to keep fan-out
+/// predictable even on profiles with thousands of sessions.
+const MAX_SESSIONS_PER_GATEWAY: usize = 32;
+
+/// GET /api/admin/operator/tasks — aggregate active harness background tasks
+/// from every running gateway. The dashboard consumes this to render the
+/// operator harness view with lifecycle state, child session, artifacts,
+/// validator outcome, retries, and failure cause per task.
+pub async fn operator_tasks(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<super::metrics::OperatorTasksResponse>, StatusCode> {
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let mut statuses = pm.all_statuses().await.into_iter().collect::<Vec<_>>();
+    statuses.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut inputs: Vec<super::metrics::OperatorTaskInput> = Vec::new();
+    let mut sources: Vec<super::metrics::OperatorTaskSource> = Vec::new();
+
+    for (profile_id, _status) in statuses {
+        let api_port = pm.api_port(&profile_id).await;
+        let Some(port) = api_port else {
+            sources.push(super::metrics::OperatorTaskSource {
+                profile_id: profile_id.clone(),
+                status: "missing_api_port".into(),
+                error: None,
+                api_port: None,
+                session_count: 0,
+                task_count: 0,
+            });
+            continue;
+        };
+
+        match scrape_gateway_tasks(&state.http_client, port).await {
+            Ok((session_count, task_rows)) => {
+                let task_count = task_rows.len();
+                inputs.extend(
+                    task_rows
+                        .into_iter()
+                        .map(|row| task_row_to_input(&profile_id, row)),
+                );
+                sources.push(super::metrics::OperatorTaskSource {
+                    profile_id: profile_id.clone(),
+                    status: "ok".into(),
+                    error: None,
+                    api_port: Some(port),
+                    session_count,
+                    task_count,
+                });
+            }
+            Err(error) => {
+                sources.push(super::metrics::OperatorTaskSource {
+                    profile_id: profile_id.clone(),
+                    status: "failed".into(),
+                    error: Some(error),
+                    api_port: Some(port),
+                    session_count: 0,
+                    task_count: 0,
+                });
+            }
+        }
+    }
+
+    Ok(Json(super::metrics::build_operator_tasks_response(
+        inputs,
+        sources,
+        chrono::Utc::now(),
+        super::metrics::DEFAULT_TASK_STALE_SECS,
+    )))
+}
+
+/// Scrape background tasks from one gateway via its API channel.
+///
+/// Calls `GET /sessions` to enumerate sessions then fans out to
+/// `GET /sessions/<id>/tasks` for each. Returns (session_count, task_rows).
+async fn scrape_gateway_tasks(
+    client: &reqwest::Client,
+    port: u16,
+) -> Result<(usize, Vec<serde_json::Value>), String> {
+    let sessions_url = format!("http://127.0.0.1:{port}/sessions");
+    let response = client
+        .get(sessions_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("sessions http {}", response.status()));
+    }
+
+    let sessions: Vec<serde_json::Value> = response
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .map_err(|error| error.to_string())?;
+    let session_count = sessions.len();
+
+    let mut tasks = Vec::new();
+    for session in sessions.into_iter().take(MAX_SESSIONS_PER_GATEWAY) {
+        let Some(id) = session.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let encoded = octos_bus::session::encode_path_component(id);
+        let tasks_url = format!("http://127.0.0.1:{port}/sessions/{encoded}/tasks");
+        let resp = match client
+            .get(tasks_url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(rows) = resp.json::<Vec<serde_json::Value>>().await else {
+            continue;
+        };
+        tasks.extend(rows);
+    }
+
+    Ok((session_count, tasks))
+}
+
+fn task_row_to_input(
+    profile_id: &str,
+    row: serde_json::Value,
+) -> super::metrics::OperatorTaskInput {
+    let s = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    let session_key_full = s(&row, "session_key")
+        .or_else(|| s(&row, "parent_session_key"))
+        .unwrap_or_default();
+    // session_key looks like "profile:api:session_id". Extract the last segment.
+    let session_id = session_key_full
+        .rsplit_once(':')
+        .map(|(_prefix, tail)| tail.to_string())
+        .unwrap_or_else(|| session_key_full.clone());
+
+    let output_files = row
+        .get("output_files")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    super::metrics::OperatorTaskInput {
+        profile_id: profile_id.to_string(),
+        session_id,
+        task_id: s(&row, "id").unwrap_or_default(),
+        tool_name: s(&row, "tool_name").unwrap_or_default(),
+        lifecycle_state: s(&row, "lifecycle_state").unwrap_or_else(|| "unknown".into()),
+        runtime_state: s(&row, "runtime_state"),
+        workflow_kind: s(&row, "workflow_kind"),
+        current_phase: s(&row, "current_phase"),
+        child_session_key: s(&row, "child_session_key"),
+        child_terminal_state: s(&row, "child_terminal_state"),
+        child_join_state: s(&row, "child_join_state"),
+        child_failure_action: s(&row, "child_failure_action"),
+        output_files,
+        error: s(&row, "error"),
+        started_at: s(&row, "started_at"),
+        updated_at: s(&row, "updated_at"),
+        completed_at: s(&row, "completed_at"),
+    }
+}
+
 // ── Monitor control endpoints ────────────────────────────────────────
 
 /// GET /api/admin/monitor/status — returns watchdog/alerts status.
@@ -1596,6 +1865,7 @@ pub async fn list_profile_skills(
 
 #[derive(Deserialize)]
 pub struct InstallSkillRequest {
+    /// Skill source: GitHub shorthand, full Git URL, or local path.
     pub repo: String,
     #[serde(default)]
     pub force: bool,
@@ -1607,7 +1877,7 @@ fn default_branch() -> String {
     "main".to_string()
 }
 
-/// POST /api/admin/profiles/:id/skills — install a skill from GitHub.
+/// POST /api/admin/profiles/:id/skills — install a skill from GitHub shorthand, a full Git URL, or a local path.
 pub async fn install_profile_skill(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2698,6 +2968,7 @@ pub async fn config_check(
 
     // Check which env vars are set (names only, not values)
     let env_var_names: Vec<String> = profile.config.env_vars.keys().cloned().collect();
+    let env_var_refs = collect_env_var_refs(&profile.config);
 
     // Check email config
     let email_status = if let Some(ref email) = profile.config.email {
@@ -2739,8 +3010,8 @@ pub async fn config_check(
         .collect();
 
     // Check LLM provider
-    let provider = profile.config.provider.as_deref().unwrap_or("unknown");
-    let model = profile.config.model.as_deref().unwrap_or("unknown");
+    let provider = profile.config.primary_provider().unwrap_or("unknown");
+    let model = profile.config.primary_model().unwrap_or("unknown");
 
     // Check skills
     let skills_dir = data_dir.join("skills");
@@ -2778,6 +3049,12 @@ pub async fn config_check(
         "channels": channels,
         "email": email_status,
         "env_vars": env_var_names,
+        "env_var_refs": env_var_refs,
+        "env_var_semantics": {
+            "provisioning": "user_supplied",
+            "unset_status": "awaiting_user_secret",
+            "note": "Clean installs do not pre-provision LLM or tool API keys."
+        },
         "installed_skills": installed_skills,
         "sessions_count": sessions_count,
         "has_cron_jobs": has_cron,
@@ -2787,6 +3064,149 @@ pub async fn config_check(
             "uptime_secs": status.uptime_secs,
         },
     })))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EnvVarReferenceStatus {
+    name: String,
+    surfaces: Vec<String>,
+    configured: bool,
+    status: &'static str,
+    provisioning: &'static str,
+}
+
+fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut refs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut insert_ref = |name: &str, surface: &str| {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        refs.entry(trimmed.to_string())
+            .or_default()
+            .insert(surface.to_string());
+    };
+
+    if let Some(primary) = config
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.primary.as_ref())
+        .and_then(|selection| selection.route.as_ref())
+        .and_then(|route| route.api_key_env.as_deref())
+    {
+        insert_ref(primary, "llm");
+    }
+
+    if let Some(llm) = config.llm.as_ref() {
+        for fallback in &llm.fallbacks {
+            if let Some(api_key_env) = fallback
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key_env.as_deref())
+            {
+                insert_ref(api_key_env, "llm");
+            }
+        }
+    }
+
+    if let Some(search) = config.search.as_ref() {
+        for provider in search.providers.values() {
+            if let Some(api_key_env) = provider.api_key_env.as_deref() {
+                insert_ref(api_key_env, "tools");
+            }
+        }
+    }
+
+    if let Some(email) = config.email.as_ref() {
+        if let Some(password_env) = email.password_env.as_deref() {
+            insert_ref(password_env, "tools");
+        }
+        if let Some(feishu_secret_env) = email.feishu_app_secret_env.as_deref() {
+            insert_ref(feishu_secret_env, "tools");
+        }
+    }
+
+    for channel in &config.channels {
+        match channel {
+            crate::profiles::ChannelCredentials::Telegram { token_env, .. } => {
+                insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Discord { token_env, .. } => {
+                insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Slack {
+                bot_token_env,
+                app_token_env,
+            } => {
+                insert_ref(bot_token_env, "channels");
+                insert_ref(app_token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Feishu {
+                app_id_env,
+                app_secret_env,
+                verification_token_env,
+                encrypt_key_env,
+                ..
+            } => {
+                insert_ref(app_id_env, "channels");
+                insert_ref(app_secret_env, "channels");
+                insert_ref(verification_token_env, "channels");
+                insert_ref(encrypt_key_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Email {
+                username_env,
+                password_env,
+                ..
+            } => {
+                insert_ref(username_env, "channels");
+                insert_ref(password_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Twilio {
+                account_sid_env,
+                auth_token_env,
+                ..
+            } => {
+                insert_ref(account_sid_env, "channels");
+                insert_ref(auth_token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::WeComBot { secret_env, .. } => {
+                insert_ref(secret_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::QQBot {
+                client_secret_env, ..
+            } => {
+                insert_ref(client_secret_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::WeChat { token_env, .. } => {
+                insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::WhatsApp { .. }
+            | crate::profiles::ChannelCredentials::Api { .. }
+            | crate::profiles::ChannelCredentials::Matrix { .. } => {}
+        }
+    }
+
+    refs.into_iter()
+        .map(|(name, surfaces)| {
+            let configured = config
+                .env_vars
+                .get(&name)
+                .is_some_and(|value| !value.trim().is_empty());
+            EnvVarReferenceStatus {
+                name,
+                surfaces: surfaces.into_iter().collect(),
+                configured,
+                status: if configured {
+                    "set"
+                } else {
+                    "awaiting_user_secret"
+                },
+                provisioning: "user_supplied",
+            }
+        })
+        .collect()
 }
 
 /// GET /api/admin/model-limits — returns model catalog (runtime source of truth).
@@ -3641,6 +4061,8 @@ mod register_tenant_email_tests {
             broadcaster: Arc::new(SseBroadcaster::new(16)),
             started_at: chrono::Utc::now(),
             auth_token: None,
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,
@@ -3793,6 +4215,8 @@ mod register_flow_tests {
             broadcaster: Arc::new(SseBroadcaster::new(16)),
             started_at: chrono::Utc::now(),
             auth_token: None,
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,
@@ -4331,6 +4755,216 @@ mod tests {
         let result = admin_shell(Json(req)).await.unwrap();
         assert!(result.timed_out);
         assert_eq!(result.exit_code, -1);
+    }
+
+    #[test]
+    fn default_search_api_env_supports_serper() {
+        assert_eq!(default_search_api_env("tavily"), Some("TAVILY_API_KEY"));
+        assert_eq!(
+            default_search_api_env("perplexity"),
+            Some("PERPLEXITY_API_KEY")
+        );
+        assert_eq!(default_search_api_env("brave"), Some("BRAVE_API_KEY"));
+        assert_eq!(default_search_api_env("you"), Some("YDC_API_KEY"));
+        assert_eq!(default_search_api_env("serper"), Some("SERPER_API_KEY"));
+        assert_eq!(default_search_api_env("unknown"), None);
+    }
+
+    #[test]
+    fn test_search_profile_id_allows_admin_to_target_profile() {
+        let identity = Some(axum::Extension(crate::api::router::AuthIdentity::Admin));
+        let profile_id = resolve_test_search_profile_id(&identity, Some("dspfac")).unwrap();
+        assert_eq!(profile_id, "dspfac");
+    }
+
+    #[test]
+    fn test_search_profile_id_limits_user_to_own_tree() {
+        let identity = Some(axum::Extension(crate::api::router::AuthIdentity::User {
+            id: "dspfac".into(),
+            role: crate::user_store::UserRole::User,
+        }));
+
+        let own = resolve_test_search_profile_id(&identity, None).unwrap();
+        assert_eq!(own, "dspfac");
+
+        let child = resolve_test_search_profile_id(&identity, Some("dspfac--bot")).unwrap();
+        assert_eq!(child, "dspfac--bot");
+
+        let other = resolve_test_search_profile_id(&identity, Some("other")).unwrap_err();
+        assert_eq!(other.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn collect_env_var_refs_marks_unset_as_awaiting_user_secret() {
+        let config = crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("anthropic".into()),
+                    model_id: Some("claude-sonnet-4-20250514".into()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: vec![],
+            }),
+            search: Some(crate::profiles::SearchConfig {
+                providers: [(
+                    "tavily".into(),
+                    crate::profiles::SearchProviderConfig {
+                        api_key_env: Some("TAVILY_API_KEY".into()),
+                    },
+                )]
+                .into(),
+            }),
+            ..Default::default()
+        };
+
+        let refs = collect_env_var_refs(&config);
+        let anthropic = refs
+            .iter()
+            .find(|entry| entry.name == "ANTHROPIC_API_KEY")
+            .expect("primary llm key should be listed");
+        assert!(!anthropic.configured);
+        assert_eq!(anthropic.status, "awaiting_user_secret");
+        assert_eq!(anthropic.provisioning, "user_supplied");
+        assert_eq!(anthropic.surfaces, vec!["llm".to_string()]);
+
+        let tavily = refs
+            .iter()
+            .find(|entry| entry.name == "TAVILY_API_KEY")
+            .expect("search tool key should be listed");
+        assert!(!tavily.configured);
+        assert_eq!(tavily.status, "awaiting_user_secret");
+        assert_eq!(tavily.surfaces, vec!["tools".to_string()]);
+    }
+
+    #[test]
+    fn collect_env_var_refs_marks_set_keys_and_merges_surfaces() {
+        let config = crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("moonshot".into()),
+                    model_id: Some("kimi-k2.5".into()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        api_key_env: Some("SHARED_API_KEY".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: vec![],
+            }),
+            search: Some(crate::profiles::SearchConfig {
+                providers: [(
+                    "tavily".into(),
+                    crate::profiles::SearchProviderConfig {
+                        api_key_env: Some("SHARED_API_KEY".into()),
+                    },
+                )]
+                .into(),
+            }),
+            env_vars: [("SHARED_API_KEY".to_string(), "sk-live-123".to_string())].into(),
+            ..Default::default()
+        };
+
+        let refs = collect_env_var_refs(&config);
+        let shared = refs
+            .iter()
+            .find(|entry| entry.name == "SHARED_API_KEY")
+            .expect("shared key should be listed once");
+        assert!(shared.configured);
+        assert_eq!(shared.status, "set");
+        assert_eq!(shared.provisioning, "user_supplied");
+        assert_eq!(
+            shared.surfaces,
+            vec!["llm".to_string(), "tools".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_profile_secret_uses_keychain_value_when_marker_present() {
+        let secret = resolve_profile_secret_with_keychain(
+            "TAVILY_API_KEY",
+            Some(crate::auth::KEYCHAIN_MARKER),
+            |_| Some("tvly-real-secret".to_string()),
+        );
+        assert_eq!(secret.as_deref(), Some("tvly-real-secret"));
+    }
+
+    #[test]
+    fn resolve_profile_secret_uses_plaintext_value_without_keychain_lookup() {
+        let secret = resolve_profile_secret_with_keychain(
+            "PERPLEXITY_API_KEY",
+            Some("pplx-real-secret"),
+            |_| None,
+        );
+        assert_eq!(secret.as_deref(), Some("pplx-real-secret"));
+    }
+
+    #[test]
+    fn task_row_to_input_extracts_harness_fields() {
+        let row = serde_json::json!({
+            "id": "task-abc",
+            "tool_name": "podcast_generate",
+            "lifecycle_state": "verifying",
+            "runtime_state": "verifying_outputs",
+            "workflow_kind": "research_podcast",
+            "current_phase": "verify_contract",
+            "child_session_key": "alpha:api:session-1#child-123",
+            "child_terminal_state": "terminal_failed",
+            "child_join_state": "joined",
+            "child_failure_action": "escalate",
+            "output_files": ["pf/audio.mp3", "pf/transcript.txt"],
+            "error": "validator deny",
+            "started_at": "2026-04-19T12:00:00Z",
+            "updated_at": "2026-04-19T12:05:00Z",
+            "completed_at": null,
+            "session_key": "alpha:api:session-1",
+            "parent_session_key": "alpha:api:session-1",
+        });
+
+        let input = task_row_to_input("alpha", row);
+        assert_eq!(input.profile_id, "alpha");
+        assert_eq!(input.session_id, "session-1");
+        assert_eq!(input.task_id, "task-abc");
+        assert_eq!(input.tool_name, "podcast_generate");
+        assert_eq!(input.lifecycle_state, "verifying");
+        assert_eq!(input.runtime_state.as_deref(), Some("verifying_outputs"));
+        assert_eq!(input.workflow_kind.as_deref(), Some("research_podcast"));
+        assert_eq!(input.current_phase.as_deref(), Some("verify_contract"));
+        assert_eq!(
+            input.child_session_key.as_deref(),
+            Some("alpha:api:session-1#child-123")
+        );
+        assert_eq!(
+            input.child_terminal_state.as_deref(),
+            Some("terminal_failed")
+        );
+        assert_eq!(input.child_join_state.as_deref(), Some("joined"));
+        assert_eq!(input.child_failure_action.as_deref(), Some("escalate"));
+        assert_eq!(
+            input.output_files,
+            vec!["pf/audio.mp3".to_string(), "pf/transcript.txt".into()]
+        );
+        assert_eq!(input.error.as_deref(), Some("validator deny"));
+        assert_eq!(input.started_at.as_deref(), Some("2026-04-19T12:00:00Z"));
+        assert_eq!(input.updated_at.as_deref(), Some("2026-04-19T12:05:00Z"));
+        assert!(input.completed_at.is_none());
+    }
+
+    #[test]
+    fn task_row_to_input_fills_sensible_defaults_when_fields_missing() {
+        let row = serde_json::json!({
+            "id": "task-1",
+        });
+        let input = task_row_to_input("beta", row);
+        assert_eq!(input.profile_id, "beta");
+        assert_eq!(input.task_id, "task-1");
+        assert_eq!(input.tool_name, "");
+        assert_eq!(input.lifecycle_state, "unknown");
+        assert!(input.output_files.is_empty());
+        assert!(input.runtime_state.is_none());
     }
 }
 

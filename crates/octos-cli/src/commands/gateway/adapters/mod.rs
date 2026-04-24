@@ -59,25 +59,26 @@ mod whatsapp;
 ))]
 pub(crate) use super::prompt::settings_str;
 
-/// Context needed by adapters that require extra parameters beyond the common set.
-#[cfg(feature = "api")]
-type GatewayMetricsHandle = metrics_exporter_prometheus::PrometheusHandle;
-#[cfg(not(feature = "api"))]
-type GatewayMetricsHandle = ();
+pub type TaskQueryFn = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
+pub type SessionDeletedCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
-#[allow(dead_code, clippy::type_complexity)]
+/// Context needed by adapters that require extra parameters beyond the common set.
+#[allow(dead_code)]
 pub struct ChannelRegistrationCtx<'a> {
     pub shutdown: &'a Arc<AtomicBool>,
     pub media_dir: &'a Path,
     pub data_dir: &'a Path,
     pub session_mgr: &'a Arc<Mutex<SessionManager>>,
-    pub metrics_handle: Option<GatewayMetricsHandle>,
-    pub task_query: Option<Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>>,
+    #[cfg(feature = "api")]
+    pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    #[cfg(not(feature = "api"))]
+    pub metrics_handle: Option<()>,
+    pub task_query: Option<TaskQueryFn>,
     pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,
     pub wechat_bridge_url: Option<&'a str>,
     /// Callback to stop the session actor when a session is deleted via API.
-    pub on_session_deleted: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pub on_session_deleted: Option<SessionDeletedCallback>,
     #[cfg(feature = "matrix")]
     pub matrix_channel: &'a mut Option<Arc<octos_bus::MatrixChannel>>,
 }

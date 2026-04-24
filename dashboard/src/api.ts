@@ -18,6 +18,19 @@ import type {
 
 const BASE = '/api/admin'
 
+export interface SkillRegistryPackage {
+  name: string
+  description: string
+  repo: string
+  version: string | null
+  author: string | null
+  license: string | null
+  skills: string[]
+  requires: string[]
+  provides_tools: boolean
+  tags: string[]
+}
+
 function getHeaders(): HeadersInit {
   const headers: HeadersInit = { 'Content-Type': 'application/json' }
   const token = localStorage.getItem('octos_session_token')
@@ -38,6 +51,17 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
     throw new Error(text || `HTTP ${res.status}`)
   }
   return res.json()
+}
+
+async function requestNoContent(path: string, opts?: RequestInit): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: getHeaders(),
+    ...opts,
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(text || `HTTP ${res.status}`)
+  }
 }
 
 async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
@@ -190,7 +214,108 @@ export const api = {
 
   removeProfileSkill: (id: string, name: string) =>
     request<ActionResponse>(`/profiles/${id}/skills/${name}`, { method: 'DELETE' }),
+
+  // Setup wizard + admin token rotation
+  getTokenStatus: () => request<TokenStatus>('/token/status'),
+
+  rotateToken: (new_token: string) =>
+    requestNoContent('/token/rotate', {
+      method: 'POST',
+      body: JSON.stringify({ new_token }),
+    }),
+
+  getSetupState: () => request<SetupState>('/setup/state'),
+
+  postSetupStep: (step: number) =>
+    requestNoContent('/setup/step', {
+      method: 'POST',
+      body: JSON.stringify({ step }),
+    }),
+
+  completeSetup: () => requestNoContent('/setup/complete', { method: 'POST' }),
+
+  skipSetup: () => requestNoContent('/setup/skip', { method: 'POST' }),
+
+  // SMTP configuration (used by the setup wizard and future Settings pages)
+  getSmtp: () => request<SmtpSettings>('/smtp'),
+
+  saveSmtp: (data: SmtpSettingsBody) =>
+    requestNoContent('/smtp', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  testSmtp: (to: string) =>
+    request<SmtpTestResult>('/smtp/test', {
+      method: 'POST',
+      body: JSON.stringify({ to }),
+    }),
+
+  // Deployment mode (local / tenant / cloud)
+  getDeploymentMode: () => request<DeploymentModeBody>('/deployment-mode'),
+
+  saveDeploymentMode: (mode: DeploymentMode) =>
+    requestNoContent('/deployment-mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode }),
+    }),
+
+  detectDeploymentMode: () =>
+    request<DeploymentModeDetection>('/deployment-mode/detect'),
+
+  testProvider: (data: {
+    provider: string
+    model: string
+    api_key?: string
+    api_key_env?: string
+    base_url?: string
+  }) =>
+    request<{ ok: boolean; message?: string; error?: string }>('/test-provider', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 }
+
+// ── Setup wizard types ─────────────────────────────────────────────
+
+export type TokenStatus = { rotated: boolean }
+
+export type SetupState = {
+  wizard_completed_at: string | null
+  wizard_skipped: boolean
+  wizard_last_step_reached: number
+}
+
+// ── SMTP + deployment-mode types ───────────────────────────────────
+
+export type SmtpSettings = {
+  host: string
+  port: number
+  username: string
+  from_address: string
+  password_configured: boolean
+}
+
+export type SmtpSettingsBody = {
+  host: string
+  port: number
+  username: string
+  from_address: string
+  /** Leave undefined / empty to keep the existing password. */
+  password?: string
+}
+
+export type SmtpTestResult = {
+  ok: boolean
+  message?: string
+  error?: string
+}
+
+export type DeploymentMode = 'local' | 'tenant' | 'cloud'
+
+export type DeploymentModeBody = { mode: DeploymentMode }
+
+export type DeploymentModeDetection = { detected: DeploymentMode }
 
 // ── Auth API (public) ───────────────────────────────────────────────
 
@@ -248,6 +373,25 @@ export const myApi = {
   providerMetrics: () =>
     authedRequest<SharedMetrics | null>('/my/profile/metrics'),
 
+  listProfileSkills: () =>
+    authedRequest<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(
+      '/my/profile/skills',
+    ),
+
+  listProfileSkillRegistry: (query?: string) =>
+    authedRequest<{ packages: SkillRegistryPackage[] }>(
+      `/my/profile/skills/registry${query ? `?q=${encodeURIComponent(query)}` : ''}`,
+    ),
+
+  installProfileSkill: (data: { repo: string; force: boolean; branch: string }) =>
+    authedRequest<{ ok: boolean; installed: string[]; skipped: string[]; deps_installed: boolean }>(
+      '/my/profile/skills',
+      { method: 'POST', body: JSON.stringify(data) },
+    ),
+
+  removeProfileSkill: (name: string) =>
+    authedRequest<ActionResponse>(`/my/profile/skills/${name}`, { method: 'DELETE' }),
+
   testProvider: (data: { provider: string; model: string; api_key?: string; api_key_env?: string; base_url?: string }) =>
     authedRequest<{ ok: boolean; message?: string; error?: string; models?: string[] }>('/my/test-provider', {
       method: 'POST',
@@ -260,7 +404,7 @@ export const myApi = {
       body: JSON.stringify(data),
     }),
 
-  testSearch: (data: { provider: string; api_key?: string; api_key_env?: string }) =>
+  testSearch: (data: { provider: string; api_key?: string; api_key_env?: string; profile_id?: string }) =>
     authedRequest<{ ok: boolean; message?: string; error?: string }>('/my/test-search', {
       method: 'POST',
       body: JSON.stringify(data),

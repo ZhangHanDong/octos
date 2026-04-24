@@ -8,37 +8,55 @@ use octos_llm::ChatResponse;
 use tracing::{debug, info, warn};
 
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
-use crate::approval::{PendingApproval, PendingApprovalDraft, digest_tool_args};
+use crate::approval::{PendingApproval, digest_tool_args};
+use crate::harness_errors::HarnessError;
+use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
+use crate::tools::ToolResult;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
-use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext, ToolResult};
+use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
 use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
-
-pub(super) enum ToolExecutionOutcome {
-    Completed(
-        Vec<Message>,
-        Vec<std::path::PathBuf>,
-        Vec<std::path::PathBuf>,
-        TokenUsage,
-    ),
-    ApprovalRequested(PendingApprovalDraft),
-}
 
 fn should_auto_send_tool_files(
     suppress_auto_send_files: bool,
     explicit_send_file_requested: bool,
     tool_name: &str,
 ) -> bool {
-    !suppress_auto_send_files && !(explicit_send_file_requested && tool_name != "send_file")
+    !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
+}
+
+/// Produce the composite system-prompt text (worker prompt + realtime sensor
+/// summary) used at the top of every agent turn. Centralizing this in
+/// `execution.rs` keeps the message-building policy in a single location so
+/// the conversation loop and task loop compose the same prompt.
+///
+/// Returns the prompt text the caller should paste into the first system
+/// `Message`. When no realtime controller is attached this is byte-identical
+/// to the stored system prompt.
+pub(super) fn compose_system_prompt(agent: &Agent) -> String {
+    let mut content = agent.system_prompt_snapshot();
+    if let Some(summary) = agent.realtime_sensor_summary() {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(&summary);
+    }
+    content
 }
 
 impl Agent {
     pub(super) async fn execute_tools(
         &self,
         response: &ChatResponse,
-    ) -> Result<ToolExecutionOutcome> {
+    ) -> Result<(
+        Vec<Message>,
+        Vec<std::path::PathBuf>,
+        Vec<std::path::PathBuf>,
+        TokenUsage,
+    )> {
         // Log parallel tool execution details
         let tool_names: Vec<&str> = response
             .tool_calls
@@ -52,6 +70,10 @@ impl Agent {
             tool_names = %tool_names.join(", "),
             "executing tools in parallel"
         );
+
+        let turn_attachment_ctx = TURN_ATTACHMENT_CTX
+            .try_with(|ctx| ctx.clone())
+            .unwrap_or_default();
 
         // Spawn each tool as a separate tokio task so that if the agent-level
         // timeout fires, the tasks keep running and can perform their own cleanup
@@ -67,12 +89,12 @@ impl Agent {
                 let reporter = self.reporter();
                 let hooks = self.hooks.clone();
                 let hook_ctx = self.hook_ctx();
-                let approval_policy = self.config.approval_policy.clone();
                 let suppress_auto_send_files = self.config.suppress_auto_send_files;
-                let explicit_send_file_requested = explicit_send_file_requested;
                 let tc_name = tool_call.name.clone();
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
+                let attachment_ctx = turn_attachment_ctx.clone();
+                let harness_event_sink = self.harness_event_sink.clone();
 
                 tokio::spawn(async move {
                     let tool_start = Instant::now();
@@ -83,66 +105,8 @@ impl Agent {
                         tool_id: tc_id.clone(),
                     });
 
-                    let mut effective_args = tc_args.clone();
-                    let tool_is_callable = tools.get(&tc_name).is_some()
-                        && tools
-                            .provider_policy()
-                            .is_none_or(|policy| policy.is_allowed(&tc_name));
-
-                    if tool_is_callable {
-                        if let Some(ref approval_policy) = approval_policy {
-                            match approval_policy.draft_for_tool_call(
-                                &tc_name,
-                                &tc_id,
-                                effective_args.clone(),
-                                chrono::Utc::now(),
-                            ) {
-                                Ok(Some(pending)) => {
-                                    return (
-                                        Message {
-                                            role: MessageRole::Tool,
-                                            content: format!(
-                                                "[APPROVAL REQUESTED] Tool '{}' is waiting for approval.",
-                                                tc_name
-                                            ),
-                                            media: vec![],
-                                            tool_calls: None,
-                                            tool_call_id: Some(tc_id),
-                                            reasoning_content: None,
-                                            timestamp: chrono::Utc::now(),
-                                        },
-                                        Vec::new(),
-                                        Vec::new(),
-                                        None,
-                                        Some(pending),
-                                    );
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    return (
-                                        Message {
-                                            role: MessageRole::Tool,
-                                            content: format!(
-                                                "[APPROVAL POLICY ERROR] Tool '{}' requested invalid approval data: {}",
-                                                tc_name, err
-                                            ),
-                                            media: vec![],
-                                            tool_calls: None,
-                                            tool_call_id: Some(tc_id),
-                                            reasoning_content: None,
-                                            timestamp: chrono::Utc::now(),
-                                        },
-                                        Vec::new(),
-                                        Vec::new(),
-                                        None,
-                                        None,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
                     // Before-tool hook: may deny or modify args
+                    let mut effective_args = tc_args.clone();
                     if let Some(ref hooks) = hooks {
                         let payload = HookPayload::before_tool(
                             &tc_name,
@@ -175,57 +139,7 @@ impl Agent {
                                     Vec::new(),
                                     Vec::new(),
                                     None,
-                                    None,
                                 );
-                            }
-                            HookResult::ApprovalRequested(spec) => {
-                                match PendingApprovalDraft::from_spec(
-                                    &tc_name,
-                                    &tc_id,
-                                    effective_args.clone(),
-                                    spec,
-                                ) {
-                                    Ok(pending) => {
-                                        return (
-                                            Message {
-                                                role: MessageRole::Tool,
-                                                content: format!(
-                                                    "[APPROVAL REQUESTED] Tool '{}' is waiting for approval.",
-                                                    tc_name
-                                                ),
-                                                media: vec![],
-                                                tool_calls: None,
-                                                tool_call_id: Some(tc_id),
-                                                reasoning_content: None,
-                                                timestamp: chrono::Utc::now(),
-                                            },
-                                            Vec::new(),
-                                            Vec::new(),
-                                            None,
-                                            Some(pending),
-                                        );
-                                    }
-                                    Err(err) => {
-                                        return (
-                                            Message {
-                                                role: MessageRole::Tool,
-                                                content: format!(
-                                                    "[HOOK ERROR] Tool '{}' requested invalid approval data: {}",
-                                                    tc_name, err
-                                                ),
-                                                media: vec![],
-                                                tool_calls: None,
-                                                tool_call_id: Some(tc_id),
-                                                reasoning_content: None,
-                                                timestamp: chrono::Utc::now(),
-                                            },
-                                            Vec::new(),
-                                            Vec::new(),
-                                            None,
-                                            None,
-                                        );
-                                    }
-                                }
                             }
                             HookResult::Modified(new_args) => {
                                 tracing::info!(
@@ -255,21 +169,23 @@ impl Agent {
                         tools.mark_spawn_only_invoked();
                         let bg_supervisor = tools.supervisor();
                         let bg_reporter = reporter.clone();
+                        let bg_attachment_ctx = attachment_ctx.clone();
                         tokio::spawn(async move {
                             bg_supervisor.mark_running(&task_id);
                             let bg_started_at = std::time::SystemTime::now();
 
                             // Helper to create TOOL_CTX for plugin stderr progress streaming
-                            let attachment_ctx =
-                                TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
-                                attachment_paths: attachment_ctx.attachment_paths.clone(),
-                                audio_attachment_paths: attachment_ctx
+                                harness_event_sink: harness_event_sink.clone(),
+                                attachment_paths: bg_attachment_ctx.attachment_paths.clone(),
+                                audio_attachment_paths: bg_attachment_ctx
                                     .audio_attachment_paths
                                     .clone(),
-                                file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
+                                file_attachment_paths: bg_attachment_ctx
+                                    .file_attachment_paths
+                                    .clone(),
                             };
 
                             let mut result = TOOL_CTX
@@ -579,15 +495,13 @@ impl Agent {
                             Vec::new(),
                             Vec::new(),
                             None,
-                            None,
                         );
                     }
 
-                    let attachment_ctx =
-                        TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),
+                        harness_event_sink: harness_event_sink.clone(),
                         attachment_paths: attachment_ctx.attachment_paths.clone(),
                         audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
                         file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
@@ -685,9 +599,34 @@ impl Agent {
                             )
                         }
                         Err(e) => {
+                            // Classify the tool failure as a typed HarnessError.
+                            // Invariant #1 (#488): every raw tool error escape
+                            // must be routed through classification so the
+                            // metrics counter and the sink event both fire.
+                            let classified =
+                                HarnessError::classify_report(&e, Some(tc_name.as_str()));
+                            classified.record_metric();
+                            if let Some(sink) = harness_event_sink.as_deref() {
+                                if let Some(ctx) = lookup_event_sink_context(sink) {
+                                    let event = classified.to_event(
+                                        ctx.session_id,
+                                        ctx.task_id,
+                                        None,
+                                        None,
+                                    );
+                                    if let Err(error) = write_event_to_sink(sink, &event) {
+                                        tracing::debug!(
+                                            error = %error,
+                                            "failed to write tool-failure harness error event"
+                                        );
+                                    }
+                                }
+                            }
                             warn!(
                                 tool = %tc_name,
                                 error = %e,
+                                variant = classified.variant_name(),
+                                recovery = %classified.recovery_hint(),
                                 duration_ms = duration.as_millis() as u64,
                                 "tool failed"
                             );
@@ -741,7 +680,6 @@ impl Agent {
                         tool_files_modified,
                         tool_files_to_send,
                         tool_tokens,
-                        None,
                     )
                 })
             })
@@ -787,7 +725,6 @@ impl Agent {
                                     Vec::new(),
                                     Vec::new(),
                                     None,
-                                    None,
                                 )
                             })
                         })
@@ -818,20 +755,12 @@ impl Agent {
                             timestamp: chrono::Utc::now(),
                         });
                     }
-                    return Ok(ToolExecutionOutcome::Completed(
-                        messages,
-                        vec![],
-                        vec![],
-                        TokenUsage::default(),
-                    ));
+                    return Ok((messages, vec![], vec![], TokenUsage::default()));
                 }
             };
 
         // Log completion of all parallel tools
-        let result_sizes: Vec<usize> = results
-            .iter()
-            .map(|(m, _, _, _, _)| m.content.len())
-            .collect();
+        let result_sizes: Vec<usize> = results.iter().map(|(m, _, _, _)| m.content.len()).collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
             parallel_tools = results.len(),
@@ -845,11 +774,8 @@ impl Agent {
         let mut files_modified = Vec::new();
         let mut files_to_send = Vec::new();
         let mut tokens_used = TokenUsage::default();
-        let mut pending_approval = None;
 
-        for (message, tool_files_modified, tool_files_to_send, tool_tokens, maybe_pending) in
-            results
-        {
+        for (message, tool_files_modified, tool_files_to_send, tool_tokens) in results {
             messages.push(message);
             files_modified.extend(tool_files_modified);
             files_to_send.extend(tool_files_to_send);
@@ -857,21 +783,9 @@ impl Agent {
                 tokens_used.input_tokens += tokens.input_tokens;
                 tokens_used.output_tokens += tokens.output_tokens;
             }
-            if pending_approval.is_none() {
-                pending_approval = maybe_pending;
-            }
         }
 
-        if let Some(pending) = pending_approval {
-            Ok(ToolExecutionOutcome::ApprovalRequested(pending))
-        } else {
-            Ok(ToolExecutionOutcome::Completed(
-                messages,
-                files_modified,
-                files_to_send,
-                tokens_used,
-            ))
-        }
+        Ok((messages, files_modified, files_to_send, tokens_used))
     }
 
     pub async fn revalidate_pending_approval(
@@ -904,18 +818,6 @@ impl Agent {
                         Err("tool arguments changed since approval request was created".to_string())
                     }
                 }
-                HookResult::ApprovalRequested(spec) => {
-                    spec.validate()?;
-                    if spec
-                        .authorized_approvers
-                        .iter()
-                        .any(|approver| approver == sender_user_id)
-                    {
-                        Ok(())
-                    } else {
-                        Err("approver is not authorized by current policy".to_string())
-                    }
-                }
                 HookResult::Deny(reason) => {
                     if reason.is_empty() {
                         Err("current policy denied the approved tool call".to_string())
@@ -936,6 +838,7 @@ impl Agent {
         let ctx = ToolContext {
             tool_id: pending.tool_id.clone(),
             reporter,
+            harness_event_sink: None,
             attachment_paths: vec![],
             audio_attachment_paths: vec![],
             file_attachment_paths: vec![],
@@ -961,189 +864,6 @@ impl Agent {
         }
 
         Ok(result)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use async_trait::async_trait;
-    use octos_core::{AgentId, Message, ToolCall};
-    use octos_llm::{ChatConfig, LlmProvider, StopReason, ToolSpec};
-    use tempfile::TempDir;
-
-    use super::*;
-    use crate::AgentConfig;
-    use crate::approval::{
-        ApprovalPolicy, ApprovalRiskLevel, ApprovalRule, ApprovalTimeoutBehavior,
-    };
-    use crate::tools::{ToolPolicy, ToolRegistry};
-
-    struct NoopLlmProvider;
-
-    #[async_trait]
-    impl LlmProvider for NoopLlmProvider {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolSpec],
-            _config: &ChatConfig,
-        ) -> eyre::Result<octos_llm::ChatResponse> {
-            eyre::bail!("NoopLlmProvider should not be called in execution unit tests");
-        }
-
-        fn context_window(&self) -> u32 {
-            128_000
-        }
-
-        fn model_id(&self) -> &str {
-            "noop"
-        }
-
-        fn provider_name(&self) -> &str {
-            "noop"
-        }
-    }
-
-    fn approval_policy_for(tool: &str) -> ApprovalPolicy {
-        ApprovalPolicy::new(vec![ApprovalRule {
-            tools: vec![tool.to_string()],
-            risk_level: ApprovalRiskLevel::Critical,
-            authorized_approvers: vec!["@alice:example.org".to_string()],
-            expires_in_secs: 300,
-            on_timeout: ApprovalTimeoutBehavior::Notify,
-        }])
-    }
-
-    fn tool_use(name: &str, args: serde_json::Value) -> octos_llm::ChatResponse {
-        octos_llm::ChatResponse {
-            content: None,
-            reasoning_content: None,
-            tool_calls: vec![ToolCall {
-                id: "call_1".to_string(),
-                name: name.to_string(),
-                arguments: args,
-                metadata: None,
-            }],
-            stop_reason: StopReason::ToolUse,
-            usage: octos_llm::TokenUsage::default(),
-            provider_index: None,
-        }
-    }
-
-    async fn test_agent(
-        dir: &TempDir,
-        approval_policy: Option<ApprovalPolicy>,
-        tool_policy: Option<ToolPolicy>,
-    ) -> Agent {
-        let llm: Arc<dyn LlmProvider> = Arc::new(NoopLlmProvider);
-        let mut tools = ToolRegistry::with_builtins(dir.path());
-        if let Some(ref policy) = tool_policy {
-            tools.apply_policy(policy);
-        }
-        let memory = Arc::new(
-            octos_memory::EpisodeStore::open(dir.path().join(".octos"))
-                .await
-                .unwrap(),
-        );
-        Agent::new(AgentId::new("approval-test"), llm, tools, memory).with_config(AgentConfig {
-            save_episodes: false,
-            approval_policy,
-            ..Default::default()
-        })
-    }
-
-    #[tokio::test]
-    async fn test_tool_policy_deny_overrides_approval_policy() {
-        let dir = TempDir::new().unwrap();
-        let agent = test_agent(
-            &dir,
-            Some(approval_policy_for("shell")),
-            Some(ToolPolicy {
-                allow: vec![],
-                deny: vec!["shell".to_string()],
-                require_tags: vec![],
-            }),
-        )
-        .await;
-
-        let response = tool_use("shell", serde_json::json!({"command": "touch blocked.txt"}));
-        let outcome = agent.execute_tools(&response).await.unwrap();
-
-        match outcome {
-            ToolExecutionOutcome::Completed(messages, _, _, _) => {
-                assert!(messages[0].content.contains("unknown tool"));
-                assert!(!dir.path().join("blocked.txt").exists());
-            }
-            ToolExecutionOutcome::ApprovalRequested(_) => {
-                panic!("denied tool should not become a pending approval");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_approval_policy_creates_pending_approval_before_tool_execution() {
-        let dir = TempDir::new().unwrap();
-        let agent = test_agent(&dir, Some(approval_policy_for("shell")), None).await;
-        let response = tool_use("shell", serde_json::json!({"command": "touch blocked.txt"}));
-
-        let outcome = agent.execute_tools(&response).await.unwrap();
-
-        match outcome {
-            ToolExecutionOutcome::ApprovalRequested(pending) => {
-                assert_eq!(pending.request.tool_name, "shell");
-                assert_eq!(
-                    pending.request.authorized_approvers,
-                    vec!["@alice:example.org".to_string()]
-                );
-                assert!(!dir.path().join("blocked.txt").exists());
-            }
-            ToolExecutionOutcome::Completed(..) => {
-                panic!("matching approval policy should create a pending approval");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_approval_policy_non_matching_tool_executes_normally() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("hello.txt"), "world").unwrap();
-        let agent = test_agent(&dir, Some(approval_policy_for("shell")), None).await;
-        let response = tool_use("read_file", serde_json::json!({"path": "hello.txt"}));
-
-        let outcome = agent.execute_tools(&response).await.unwrap();
-
-        match outcome {
-            ToolExecutionOutcome::Completed(messages, _, _, _) => {
-                assert!(messages[0].content.contains("world"));
-            }
-            ToolExecutionOutcome::ApprovalRequested(..) => {
-                panic!("non-matching tools should bypass approval policy");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_approval_policy_does_not_require_hook_exit_3() {
-        let dir = TempDir::new().unwrap();
-        let agent = test_agent(&dir, Some(approval_policy_for("write_file")), None).await;
-        let response = tool_use(
-            "write_file",
-            serde_json::json!({"path": "needs-approval.txt", "content": "hello"}),
-        );
-
-        let outcome = agent.execute_tools(&response).await.unwrap();
-
-        match outcome {
-            ToolExecutionOutcome::ApprovalRequested(pending) => {
-                assert_eq!(pending.request.tool_name, "write_file");
-                assert!(!dir.path().join("needs-approval.txt").exists());
-            }
-            ToolExecutionOutcome::Completed(..) => {
-                panic!("approval policy should work without requiring hook exit code 3");
-            }
-        }
     }
 }
 

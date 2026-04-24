@@ -11,8 +11,9 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::behaviour::{ActionContext, ActionResult, evaluate_actions_with_context};
+use crate::validators::{ValidatorLedger, ValidatorOutcome, ValidatorStatus};
 use crate::workspace_policy::{
-    WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
+    Validator, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
     WorkspaceVersionControlProvider, read_workspace_policy,
 };
 
@@ -116,6 +117,18 @@ pub struct WorkspaceContractStatus {
     pub turn_end_checks: Vec<WorkspaceCheckStatus>,
     pub completion_checks: Vec<WorkspaceCheckStatus>,
     pub artifacts: Vec<WorkspaceArtifactStatus>,
+    /// Latest typed validator outcomes (harness M4.3). Read from the persisted
+    /// ledger on each inspect, so replay survives reload/restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validator_outcomes: Vec<crate::validators::ValidatorOutcome>,
+    /// Number of optional validator failures recorded in the most recent
+    /// ledger entries. Operator-visible warning counter.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub optional_validator_warnings: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -534,28 +547,15 @@ pub(crate) fn resolve_preferred_workspace_contract_artifact_path(
     project_root: &Path,
     artifact_name: &str,
 ) -> Result<Option<PathBuf>> {
-    let mut candidates = resolve_workspace_contract_artifact_paths(project_root, artifact_name)?;
-    if let Some(preferred) = preferred_contract_basename(artifact_name) {
-        let exact = candidates
-            .iter()
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.eq_ignore_ascii_case(preferred))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !exact.is_empty() {
-            candidates = exact;
-        }
-    }
-
-    Ok(candidates.into_iter().max_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
-    }))
+    Ok(
+        resolve_workspace_contract_artifact_paths(project_root, artifact_name)?
+            .into_iter()
+            .max_by_key(|path| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            }),
+    )
 }
 
 pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStatus {
@@ -578,6 +578,8 @@ pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStat
                 turn_end_checks: Vec::new(),
                 completion_checks: Vec::new(),
                 artifacts: Vec::new(),
+                validator_outcomes: Vec::new(),
+                optional_validator_warnings: 0,
             };
         }
         Err(error) => {
@@ -593,6 +595,8 @@ pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStat
                 turn_end_checks: Vec::new(),
                 completion_checks: Vec::new(),
                 artifacts: Vec::new(),
+                validator_outcomes: Vec::new(),
+                optional_validator_warnings: 0,
             };
         }
     };
@@ -614,6 +618,8 @@ pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStat
             turn_end_checks: Vec::new(),
             completion_checks: Vec::new(),
             artifacts: Vec::new(),
+            validator_outcomes: Vec::new(),
+            optional_validator_warnings: 0,
         };
     }
 
@@ -652,9 +658,16 @@ fn inspect_managed_workspace_contract(
         &artifact_context,
         &policy.validation.on_completion,
     );
+
+    let validator_outcomes = latest_validator_outcomes(&repo.root, &policy.validation.validators);
+    let validator_gate_passed =
+        required_validators_satisfied(&policy.validation.validators, &validator_outcomes);
+    let optional_validator_warnings = count_optional_validator_warnings(&validator_outcomes);
+
     let ready = check_list_passed(&turn_end_checks)
         && check_list_passed(&completion_checks)
-        && artifacts.iter().all(|artifact| artifact.present);
+        && artifacts.iter().all(|artifact| artifact.present)
+        && validator_gate_passed;
 
     WorkspaceContractStatus {
         repo_label,
@@ -668,7 +681,77 @@ fn inspect_managed_workspace_contract(
         turn_end_checks,
         completion_checks,
         artifacts,
+        validator_outcomes,
+        optional_validator_warnings,
     }
+}
+
+/// Path of the validator ledger scoped to a workspace repo.
+pub fn workspace_validator_ledger_path(project_root: &Path) -> PathBuf {
+    project_root.join(".octos").join("validator_outcomes.jsonl")
+}
+
+/// Open (or create) the validator ledger for `project_root`.
+pub fn open_workspace_validator_ledger(project_root: &Path) -> Result<ValidatorLedger> {
+    ValidatorLedger::open(workspace_validator_ledger_path(project_root))
+}
+
+fn latest_validator_outcomes(project_root: &Path, declared: &[Validator]) -> Vec<ValidatorOutcome> {
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let ledger_path = workspace_validator_ledger_path(project_root);
+    let ledger = match ValidatorLedger::open(&ledger_path) {
+        Ok(ledger) => ledger,
+        Err(_) => return Vec::new(),
+    };
+    let all = ledger.read_all().unwrap_or_default();
+    let declared_ids: std::collections::HashSet<&str> = declared
+        .iter()
+        .map(|validator| validator.id.as_str())
+        .collect();
+
+    // Reduce to latest outcome per declared validator id.
+    let mut latest: HashMap<String, ValidatorOutcome> = HashMap::new();
+    for outcome in all {
+        if !declared_ids.contains(outcome.validator_id.as_str()) {
+            continue;
+        }
+        let slot = latest
+            .entry(outcome.validator_id.clone())
+            .or_insert_with(|| outcome.clone());
+        if outcome.started_at > slot.started_at {
+            *slot = outcome;
+        }
+    }
+    // Preserve declared order for stable UI output.
+    declared
+        .iter()
+        .filter_map(|validator| latest.remove(validator.id.as_str()))
+        .collect()
+}
+
+fn required_validators_satisfied(declared: &[Validator], outcomes: &[ValidatorOutcome]) -> bool {
+    for validator in declared {
+        if !validator.required {
+            continue;
+        }
+        let outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.validator_id == validator.id);
+        match outcome {
+            Some(outcome) if outcome.status == ValidatorStatus::Pass => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn count_optional_validator_warnings(outcomes: &[ValidatorOutcome]) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| !outcome.required && outcome.status != ValidatorStatus::Pass)
+        .count()
 }
 
 fn evaluate_check_specs(
@@ -750,14 +833,6 @@ fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
     matches.sort();
     matches.dedup();
     matches
-}
-
-fn preferred_contract_basename(artifact_name: &str) -> Option<&'static str> {
-    match artifact_name {
-        "deck" => Some("deck.pptx"),
-        "entrypoint" => Some("index.html"),
-        _ => None,
-    }
 }
 
 fn git_head_revision(project_root: &Path) -> Option<String> {
@@ -1176,7 +1251,7 @@ mod tests {
         assert!(status.ready);
         assert!(status.revision.is_some());
         assert!(!status.dirty);
-        assert_eq!(status.artifacts.len(), 2);
+        assert_eq!(status.artifacts.len(), 3);
         assert!(status.artifacts.iter().all(|artifact| artifact.present));
         assert!(status.turn_end_checks.iter().all(|check| check.passed));
         assert!(status.completion_checks.iter().all(|check| check.passed));

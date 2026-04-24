@@ -13,8 +13,20 @@ use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
 use super::extras::{SkillExtras, resolve_extras};
-use super::manifest::PluginManifest;
+use super::manifest::{PluginManifest, PluginToolDef};
 use super::tool::PluginTool;
+
+const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
+const GENERATIVE_SKILL_ENV_ALLOWLIST: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "GEMINI_API_KEY",
+    "GEMINI_BASE_URL",
+    "GOOGLE_API_KEY",
+    "GOOGLE_BASE_URL",
+    "DASHSCOPE_API_KEY",
+    "DASHSCOPE_BASE_URL",
+];
 
 /// Aggregated result from loading plugins across directories.
 #[derive(Debug, Default)]
@@ -49,7 +61,9 @@ impl PluginLoader {
     /// - `manifest.json` — plugin metadata and tool definitions
     /// - An executable file (same name as directory, or `main`)
     ///
-    /// `extra_env` is injected into every plugin process (e.g. provider base URLs, API keys).
+    /// `extra_env` is injected into plugin processes. Secret-like entries
+    /// (API keys, passwords, tokens, secrets) are only injected when the tool
+    /// manifest explicitly allowlists that environment variable.
     ///
     /// Returns a `PluginLoadResult` with tool count and any resolved extras
     /// (MCP servers, hooks, prompt fragments).
@@ -178,40 +192,24 @@ impl PluginLoader {
             return Ok((vec![], extras));
         }
 
-        // Find executable: try manifest name, dir name, "main", then any executable in dir
-        let dir_name = plugin_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("main");
-        let executable = [&manifest.name as &str, dir_name, "main"]
-            .iter()
-            .map(|name| plugin_dir.join(name))
-            .find(|p| p.exists() && is_executable(p))
-            .or_else(|| {
-                // Fallback: find any executable file in the plugin dir
-                std::fs::read_dir(plugin_dir).ok()?.flatten().find_map(|e| {
-                    let p = e.path();
-                    if p.is_file() && is_executable(&p) {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        // Skip hidden files and known non-executables
-                        if !name.starts_with('.') && !name.ends_with(".json") && !name.ends_with(".md") && !name.ends_with(".toml") && !name.ends_with(".tar.gz") {
-                            return Some(p);
-                        }
-                    }
-                    None
-                })
-            })
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "no executable found in plugin '{}' (tried '{}', '{}', 'main', and directory scan)",
-                    manifest.name,
-                    manifest.name,
-                    dir_name
-                )
-            })?;
+        if find_plugin_executable(plugin_dir, &manifest.name).is_none() {
+            let _ = ensure_plugin_executable_for_manifest(plugin_dir, &manifest)?;
+        }
+
+        let executable = find_plugin_executable(plugin_dir, &manifest.name).ok_or_else(|| {
+            let dir_name = plugin_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("main");
+            eyre::eyre!(
+                "no executable found in plugin '{}' (tried '{}', '{}', 'main', and directory scan)",
+                manifest.name,
+                manifest.name,
+                dir_name
+            )
+        })?;
 
         // Reject oversized executables (100 MB limit) before reading into memory.
-        const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
         let exe_meta = std::fs::metadata(&executable)
             .map_err(|e| eyre::eyre!("cannot stat plugin executable: {e}"))?;
         if exe_meta.len() > MAX_EXECUTABLE_SIZE {
@@ -260,14 +258,16 @@ impl PluginLoader {
             ".{}_verified",
             executable.file_name().unwrap_or_default().to_string_lossy()
         ));
-        // Remove existing verified file first (it has 0o500 perms and can't be overwritten)
+        // Remove existing verified file first so we can refresh the copy on restart.
         let _ = std::fs::remove_file(&verified_exe);
         std::fs::write(&verified_exe, &exe_bytes)
             .map_err(|e| eyre::eyre!("cannot write verified executable: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&verified_exe, std::fs::Permissions::from_mode(0o500))?;
+            // Keep the verified copy executable by the runtime user even when
+            // the skill directory itself is root-owned.
+            std::fs::set_permissions(&verified_exe, std::fs::Permissions::from_mode(0o755))?;
         }
 
         // Collect env vars to filter out
@@ -297,11 +297,13 @@ impl PluginLoader {
             })
             .collect();
 
+        let plugin_name = manifest.name.clone();
         let tools: Vec<PluginTool> = manifest
             .tools
             .into_iter()
             .map(|def| {
-                let mut tool = PluginTool::new(manifest.name.clone(), def, verified_exe.clone())
+                let def = apply_builtin_env_allowlist(&plugin_name, def);
+                let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
                     .with_timeout(timeout);
@@ -319,6 +321,335 @@ impl PluginLoader {
 
         Ok((tools, extras))
     }
+}
+
+fn apply_builtin_env_allowlist(plugin_name: &str, mut def: PluginToolDef) -> PluginToolDef {
+    let envs = match (plugin_name, def.name.as_str()) {
+        ("mofa-slides", "mofa_slides") | ("mofa-infographic", "mofa_infographic") => {
+            GENERATIVE_SKILL_ENV_ALLOWLIST
+        }
+        _ => return def,
+    };
+
+    for env in envs {
+        if !def.env.iter().any(|existing| existing == env) {
+            def.env.push((*env).to_string());
+        }
+    }
+    def
+}
+
+/// Ensure a plugin directory has a runnable executable for manifests that
+/// declare tools. Returns `true` if a fallback executable was created.
+pub(crate) fn ensure_plugin_executable(plugin_dir: &Path) -> Result<bool> {
+    let manifest_path = plugin_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
+    let manifest: PluginManifest =
+        serde_json::from_str(&content).map_err(|e| eyre::eyre!("invalid manifest.json: {e}"))?;
+    ensure_plugin_executable_for_manifest(plugin_dir, &manifest)
+}
+
+fn ensure_plugin_executable_for_manifest(
+    plugin_dir: &Path,
+    manifest: &PluginManifest,
+) -> Result<bool> {
+    if manifest.tools.is_empty() {
+        return Ok(false);
+    }
+    if find_plugin_executable(plugin_dir, &manifest.name).is_some() {
+        return Ok(false);
+    }
+    if manifest
+        .sha256
+        .as_ref()
+        .is_some_and(|hash| !hash.trim().is_empty())
+    {
+        return Ok(false);
+    }
+
+    let main_path = plugin_dir.join("main");
+
+    // mofa-publish: shell-script skill with JSON-over-stdin plugin protocol.
+    if manifest.name == "mofa-publish"
+        && manifest
+            .tools
+            .iter()
+            .any(|tool| tool.name == "mofa_publish")
+        && plugin_dir.join("scripts/publish_site.sh").exists()
+    {
+        write_executable_wrapper(&main_path, mofa_publish_wrapper_script())?;
+        info!(
+            plugin = %manifest.name,
+            executable = %main_path.display(),
+            "generated fallback executable wrapper"
+        );
+        return Ok(true);
+    }
+
+    // mofa-site: scaffold helper scripts routed through a thin wrapper.
+    if manifest.name == "mofa-site"
+        && manifest.tools.iter().any(|tool| tool.name == "mofa_site")
+        && plugin_dir
+            .join("scripts/bootstrap_quarto_lesson.sh")
+            .exists()
+        && plugin_dir.join("scripts/bootstrap_template.sh").exists()
+    {
+        write_executable_wrapper(&main_path, mofa_site_wrapper_script())?;
+        info!(
+            plugin = %manifest.name,
+            executable = %main_path.display(),
+            "generated fallback executable wrapper"
+        );
+        return Ok(true);
+    }
+
+    // Cargo-based skills: create a lazy launcher so runtime can self-heal if
+    // install-time build/download was skipped or unavailable.
+    if plugin_dir.join("Cargo.toml").exists()
+        && let Some(bin_name) = detect_cargo_bin_name(plugin_dir)
+    {
+        write_executable_wrapper(&main_path, &lazy_cargo_wrapper_script(&bin_name))?;
+        info!(
+            plugin = %manifest.name,
+            executable = %main_path.display(),
+            bin = %bin_name,
+            "generated lazy cargo fallback executable"
+        );
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn find_plugin_executable(plugin_dir: &Path, manifest_name: &str) -> Option<PathBuf> {
+    let dir_name = plugin_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("main");
+
+    [manifest_name, dir_name, "main"]
+        .iter()
+        .map(|name| plugin_dir.join(name))
+        .find(|p| p.exists() && is_executable(p))
+        .or_else(|| {
+            std::fs::read_dir(plugin_dir).ok()?.flatten().find_map(|e| {
+                let p = e.path();
+                if p.is_file() && is_executable(&p) {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if !name.starts_with('.')
+                        && !name.ends_with(".json")
+                        && !name.ends_with(".md")
+                        && !name.ends_with(".toml")
+                        && !name.ends_with(".tar.gz")
+                    {
+                        return Some(p);
+                    }
+                }
+                None
+            })
+        })
+}
+
+fn detect_cargo_bin_name(plugin_dir: &Path) -> Option<String> {
+    let cargo_toml = std::fs::read_to_string(plugin_dir.join("Cargo.toml")).ok()?;
+    let parsed: toml::Value = toml::from_str(&cargo_toml).ok()?;
+
+    if let Some(bin_name) = parsed
+        .get("bin")
+        .and_then(|v| v.as_array())
+        .and_then(|bins| {
+            bins.iter()
+                .find_map(|bin| bin.get("name").and_then(|name| name.as_str()))
+        })
+    {
+        return Some(bin_name.to_string());
+    }
+
+    parsed
+        .get("package")
+        .and_then(|pkg| pkg.get("name"))
+        .and_then(|name| name.as_str())
+        .map(str::to_string)
+}
+
+fn write_executable_wrapper(path: &Path, content: &str) -> Result<()> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+fn mofa_publish_wrapper_script() -> &'static str {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL="${1:-}"
+
+if [[ "$TOOL" != "mofa_publish" ]]; then
+  printf '{"output":"Unknown tool: %s","success":false}\n' "$TOOL"
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '{"output":"python3 is required to run mofa-publish.","success":false}\n'
+  exit 0
+fi
+
+INPUT="$(cat)"
+OCTOS_PLUGIN_INPUT="$INPUT" python3 - "$SCRIPT_DIR/scripts/publish_site.sh" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+script_path = sys.argv[1]
+raw = (os.environ.get("OCTOS_PLUGIN_INPUT") or "").strip() or "{}"
+try:
+    payload = json.loads(raw)
+except Exception as exc:
+    print(f'{{"output":"invalid JSON input: {exc}","success":false}}')
+    sys.exit(0)
+
+cmd = ["bash", script_path]
+
+def add_value(key: str, flag: str) -> None:
+    value = payload.get(key)
+    if value is None:
+        return
+    if isinstance(value, bool):
+        if value:
+            cmd.append(flag)
+        return
+    text = str(value).strip()
+    if text:
+        cmd.extend([flag, text])
+
+add_value("site_dir", "--site-dir")
+add_value("target", "--target")
+add_value("slug", "--slug")
+add_value("repo", "--repo")
+add_value("repo_root", "--repo-root")
+add_value("mini_host", "--mini-host")
+add_value("mini_user", "--mini-user")
+add_value("ssh_key", "--ssh-key")
+add_value("ssh_password_env", "--ssh-password-env")
+add_value("ssh_port", "--ssh-port")
+add_value("remote_root", "--remote-root")
+add_value("cname", "--cname")
+add_value("setup_ci", "--setup-ci")
+
+proc = subprocess.run(cmd)
+sys.exit(proc.returncode)
+PY
+"#
+}
+
+fn mofa_site_wrapper_script() -> &'static str {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL="${1:-}"
+
+if [[ "$TOOL" != "mofa_site" ]]; then
+  printf '{"output":"Unknown tool: %s","success":false}\n' "$TOOL"
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '{"output":"python3 is required to run mofa-site.","success":false}\n'
+  exit 0
+fi
+
+INPUT="$(cat)"
+OCTOS_PLUGIN_INPUT="$INPUT" python3 - \
+  "$SCRIPT_DIR/scripts/bootstrap_quarto_lesson.sh" \
+  "$SCRIPT_DIR/scripts/bootstrap_template.sh" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+quarto_script = sys.argv[1]
+template_script = sys.argv[2]
+raw = (os.environ.get("OCTOS_PLUGIN_INPUT") or "").strip() or "{}"
+try:
+    payload = json.loads(raw)
+except Exception as exc:
+    print(f'{{"output":"invalid JSON input: {exc}","success":false}}')
+    sys.exit(0)
+
+template = str(payload.get("template") or "quarto-lesson").strip() or "quarto-lesson"
+title = str(payload.get("title") or "Generated Site").strip() or "Generated Site"
+content_dir = payload.get("content_dir")
+out_dir = payload.get("out_dir")
+if not out_dir:
+    if isinstance(content_dir, str) and content_dir.strip():
+        out_dir = os.path.join(content_dir, "site")
+    else:
+        out_dir = "skill-output/mofa-site"
+
+language = payload.get("language")
+theme = payload.get("theme")
+description = payload.get("description")
+
+if template == "quarto-lesson":
+    cmd = ["bash", quarto_script, "--out-dir", str(out_dir), "--title", title]
+    if isinstance(description, str) and description.strip():
+        cmd.extend(["--description", description.strip()])
+    if isinstance(theme, str) and theme.strip():
+        cmd.extend(["--theme", theme.strip()])
+    if isinstance(language, str) and language.strip():
+        cmd.extend(["--language", language.strip()])
+else:
+    cmd = [
+        "bash",
+        template_script,
+        "--template",
+        template,
+        "--out-dir",
+        str(out_dir),
+        "--site-name",
+        title,
+    ]
+    if isinstance(description, str) and description.strip():
+        cmd.extend(["--description", description.strip()])
+    if isinstance(language, str) and language.strip():
+        cmd.extend(["--locale", language.strip()])
+
+proc = subprocess.run(cmd)
+sys.exit(proc.returncode)
+PY
+"#
+}
+
+fn lazy_cargo_wrapper_script(bin_name: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+BIN="$SCRIPT_DIR/target/release/{bin_name}"
+
+if [[ ! -x "$BIN" ]]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    printf '{{"output":"Skill binary is missing and cargo is not installed. Run: cargo build --release in {bin_name}","success":false}}\n'
+    exit 0
+  fi
+  if ! (cd "$SCRIPT_DIR" && cargo build --release >/dev/null 2>&1); then
+    printf '{{"output":"Failed to build skill binary with cargo build --release.","success":false}}\n'
+    exit 0
+  fi
+fi
+
+exec "$BIN" "$@"
+"#
+    )
 }
 
 /// Compute SHA-256 hex digest of a file.
@@ -350,6 +681,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_load_nonexistent_dir() {
@@ -517,5 +849,187 @@ mod tests {
             result.tool_count, 0,
             "symlink executable should be rejected"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_loader_bootstraps_script_skill_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-publish");
+        std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "mofa-publish",
+  "version": "0.1.0",
+  "tools": [{"name": "mofa_publish", "description": "deploy"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("scripts/publish_site.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 1);
+        assert!(plugin_dir.join("main").exists());
+    }
+
+    #[test]
+    fn test_builtin_env_allowlist_augments_first_party_mofa_tools_only() {
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            spawn_only: false,
+            env: vec!["EXISTING_ENV".to_string(), "GEMINI_API_KEY".to_string()],
+            spawn_only_message: None,
+        };
+
+        let augmented = apply_builtin_env_allowlist("mofa-slides", def);
+        assert!(augmented.env.iter().any(|env| env == "GEMINI_API_KEY"));
+        assert!(augmented.env.iter().any(|env| env == "DASHSCOPE_API_KEY"));
+        assert!(augmented.env.iter().any(|env| env == "OPENAI_BASE_URL"));
+        assert_eq!(
+            augmented
+                .env
+                .iter()
+                .filter(|env| env.as_str() == "GEMINI_API_KEY")
+                .count(),
+            1
+        );
+
+        let untrusted = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let untrusted = apply_builtin_env_allowlist("custom-plugin", untrusted);
+        assert!(untrusted.env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_plugin_executable_creates_lazy_cargo_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-podcast");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "mofa-podcast",
+  "version": "0.4.5",
+  "tools": [{"name": "podcast_generate", "description": "podcast"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-podcast"
+version = "0.4.5"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+
+        let changed = ensure_plugin_executable(&plugin_dir).unwrap();
+        assert!(changed);
+        let wrapper = std::fs::read_to_string(plugin_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-podcast"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mofa_publish_wrapper_executes_script() {
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mofa-publish");
+        std::fs::create_dir_all(plugin_dir.join("scripts")).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "mofa-publish",
+  "version": "0.1.0",
+  "tools": [{"name": "mofa_publish", "description": "deploy"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("scripts/publish_site.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+        )
+        .unwrap();
+
+        ensure_plugin_executable(&plugin_dir).unwrap();
+        let mut child = Command::new(plugin_dir.join("main"))
+            .arg("mofa_publish")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(br#"{"site_dir":"./docs","slug":"demo","setup_ci":true}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success());
+        assert!(stdout.contains("--site-dir ./docs"));
+        assert!(stdout.contains("--slug demo"));
+        assert!(stdout.contains("--setup-ci"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verified_executable_is_world_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("perm-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "perm-plugin",
+  "version": "0.1.0",
+  "tools": [{"name": "perm_tool", "description": "perm"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("perm-plugin"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho '{\"output\":\"ok\",\"success\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            plugin_dir.join("perm-plugin"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 1);
+
+        let verified = plugin_dir.join(".perm-plugin_verified");
+        let mode = std::fs::metadata(&verified).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }

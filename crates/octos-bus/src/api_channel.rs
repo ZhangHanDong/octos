@@ -26,7 +26,7 @@ use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage, SessionKey,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::SessionManager;
@@ -42,12 +42,17 @@ pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
 /// The gateway runtime wires this to stop the session actor.
 type OnSessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+const SSE_CHANNEL_CAPACITY: usize = 1024;
+
+type SseSender = broadcast::Sender<String>;
+type SseReceiver = broadcast::Receiver<String>;
+
 /// Shared state for the API channel's HTTP handlers.
 #[derive(Clone)]
 struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
-    pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
-    watchers: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<String>>>>>,
+    pending: Arc<Mutex<HashMap<String, SseSender>>>,
+    watchers: Arc<Mutex<HashMap<String, SseSender>>>,
     auth_token: Option<String>,
     profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
@@ -61,6 +66,58 @@ fn watcher_key(chat_id: &str, topic: Option<&str>) -> String {
         Some(topic) => format!("{chat_id}::{}", topic.trim()),
         None => chat_id.to_string(),
     }
+}
+
+fn new_sse_channel() -> (SseSender, SseReceiver) {
+    broadcast::channel(SSE_CHANNEL_CAPACITY)
+}
+
+fn session_result_seq_from_payload(payload: &str) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if value.get("type")?.as_str()? != "session_result" {
+        return None;
+    }
+    value
+        .get("message")?
+        .get("seq")?
+        .as_u64()
+        .and_then(|seq| usize::try_from(seq).ok())
+}
+
+fn should_drop_replayed_session_result(
+    payload: &str,
+    max_replayed_session_seq: Option<usize>,
+) -> bool {
+    let Some(max_seq) = max_replayed_session_seq else {
+        return false;
+    };
+    session_result_seq_from_payload(payload).is_some_and(|seq| seq <= max_seq)
+}
+
+fn sse_stream_from_receiver(
+    rx: SseReceiver,
+    max_replayed_session_seq: Option<usize>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    stream::unfold(rx, move |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(data) => {
+                    if should_drop_replayed_session_result(&data, max_replayed_session_seq) {
+                        record_duplicate_result_suppressed(
+                            "replayed_session_result_already_streamed",
+                        );
+                        continue;
+                    }
+                    let event: Result<Event, Infallible> = Ok(Event::default().data(data));
+                    return Some((event, rx));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "dropping lagged SSE events");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
 }
 
 fn record_replay(kind: &'static str, outcome: &'static str, count: usize) {
@@ -92,6 +149,22 @@ fn record_duplicate_result_suppressed(reason: &'static str) {
     .increment(1);
 }
 
+fn is_slides_topic(topic: Option<&str>) -> bool {
+    topic.is_some_and(|value| value.starts_with("slides"))
+}
+
+fn path_looks_like_presentation(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".pptx") || lower.contains(".pptx?")
+}
+
+fn message_has_presentation_media(message: &Message) -> bool {
+    message
+        .media
+        .iter()
+        .any(|path| path_looks_like_presentation(path))
+}
+
 /// Request body for POST /chat.
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -118,8 +191,8 @@ pub struct ApiChannel {
     auth_token: Option<String>,
     profile_id: Option<String>,
     shutdown: Arc<AtomicBool>,
-    pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
-    watchers: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<String>>>>>,
+    pending: Arc<Mutex<HashMap<String, SseSender>>>,
+    watchers: Arc<Mutex<HashMap<String, SseSender>>>,
     /// Track last sent content per chat_id for delta computation.
     last_content: Arc<Mutex<HashMap<String, String>>>,
     sessions: Arc<Mutex<SessionManager>>,
@@ -191,6 +264,40 @@ impl ApiChannel {
         name.replace(['/', '\\', '\0'], "_")
     }
 
+    fn find_matching_artifact_copy(
+        artifact_dir: &Path,
+        source: &Path,
+        safe_name: &str,
+    ) -> Option<PathBuf> {
+        let source_meta = std::fs::metadata(source).ok()?;
+        let source_len = source_meta.len();
+        let source_bytes = std::fs::read(source).ok()?;
+
+        std::fs::read_dir(artifact_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|item| item.path()))
+            .find(|candidate| {
+                if !candidate.is_file() {
+                    return false;
+                }
+                let Some(name) = candidate.file_name().and_then(|value| value.to_str()) else {
+                    return false;
+                };
+                if name != safe_name && !name.ends_with(&format!("-{safe_name}")) {
+                    return false;
+                }
+                let Ok(candidate_meta) = std::fs::metadata(candidate) else {
+                    return false;
+                };
+                if candidate_meta.len() != source_len {
+                    return false;
+                }
+                std::fs::read(candidate)
+                    .map(|bytes| bytes == source_bytes)
+                    .unwrap_or(false)
+            })
+    }
+
     fn copy_media_into_session_artifacts(artifact_dir: &Path, media: &[String]) -> Vec<String> {
         if let Err(error) = std::fs::create_dir_all(artifact_dir) {
             warn!(
@@ -225,6 +332,13 @@ impl ApiChannel {
                 }
 
                 let safe_name = Self::sanitize_artifact_name(&canonical_source);
+                if let Some(existing) = Self::find_matching_artifact_copy(
+                    &canonical_artifact_dir,
+                    &canonical_source,
+                    &safe_name,
+                ) {
+                    return existing.to_string_lossy().to_string();
+                }
                 let dest =
                     canonical_artifact_dir.join(format!("{}-{safe_name}", uuid::Uuid::now_v7()));
 
@@ -295,9 +409,8 @@ impl ApiChannel {
 
         let mut watchers = self.watchers.lock().await;
         let key = watcher_key(chat_id, topic);
-        if let Some(subscribers) = watchers.get_mut(&key) {
-            subscribers.retain(|tx| tx.send(payload.clone()).is_ok());
-            if subscribers.is_empty() {
+        if let Some(tx) = watchers.get(&key) {
+            if tx.send(payload).is_err() {
                 watchers.remove(&key);
             }
         }
@@ -365,6 +478,46 @@ fn build_task_status_event(task: serde_json::Value, topic: Option<&str>) -> serd
         "topic": topic,
         "task": task,
     })
+}
+
+fn compatibility_tool_name_for_task(task: &serde_json::Value) -> Option<&'static str> {
+    match task.get("tool_name").and_then(|value| value.as_str()) {
+        Some("Direct TTS") => Some("fm_tts"),
+        _ => None,
+    }
+}
+
+fn build_bg_task_tool_start_events(tasks: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::HashSet::new();
+    tasks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|task| {
+            matches!(
+                task.get("status").and_then(|value| value.as_str()),
+                Some("spawned" | "running")
+            )
+        })
+        .filter_map(|task| {
+            compatibility_tool_name_for_task(task).map(|tool_name| {
+                let tool_call_id = task
+                    .get("tool_call_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (tool_name, tool_call_id)
+            })
+        })
+        .filter(|(tool_name, _)| seen.insert((*tool_name).to_string()))
+        .map(|(tool_name, tool_call_id)| {
+            serde_json::json!({
+                "type": "tool_start",
+                "tool": tool_name,
+                "tool_call_id": tool_call_id,
+            })
+        })
+        .collect()
 }
 
 fn build_replay_complete_event(topic: Option<&str>) -> serde_json::Value {
@@ -461,6 +614,21 @@ impl Channel for ApiChannel {
         let topic = msg.metadata.get("topic").and_then(|v| v.as_str());
 
         if !msg.media.is_empty() {
+            if !history_already_persisted
+                && self
+                    .should_suppress_duplicate_slides_delivery(&msg.chat_id, topic, &msg.media)
+                    .await
+            {
+                record_duplicate_result_suppressed("slides_duplicate_deck_same_user_turn");
+                info!(
+                    chat_id = %msg.chat_id,
+                    topic = topic.unwrap_or_default(),
+                    media = ?msg.media,
+                    "suppressing duplicate slides deck delivery in same user turn"
+                );
+                return Ok(());
+            }
+
             let data_dir = {
                 let sess = self.sessions.lock().await;
                 sess.data_dir()
@@ -472,6 +640,11 @@ impl Channel for ApiChannel {
             } else {
                 msg.media.clone()
             };
+            let tool_call_id = msg
+                .metadata
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(|value| value.to_string());
 
             // File message — persist to session history AND send SSE event.
             let committed_message = if !history_already_persisted {
@@ -484,7 +657,7 @@ impl Channel for ApiChannel {
                     content: msg.content.clone(),
                     media: persisted_media.clone(),
                     tool_calls: None,
-                    tool_call_id: None,
+                    tool_call_id: tool_call_id.clone(),
                     reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 };
@@ -622,6 +795,19 @@ impl Channel for ApiChannel {
                     .get("has_bg_tasks")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if has_bg {
+                    if let Some(query_fn) = self.task_query.as_ref() {
+                        let tasks = query_tasks_for_session_candidates(
+                            query_fn.as_ref(),
+                            self.profile_id.as_deref(),
+                            &msg.chat_id,
+                            topic,
+                        );
+                        for event in build_bg_task_tool_start_events(&tasks) {
+                            let _ = tx.send(event.to_string());
+                        }
+                    }
+                }
                 let done = serde_json::json!({
                     "type": "done",
                     "content": "",
@@ -631,6 +817,7 @@ impl Channel for ApiChannel {
                     "endpoint": msg.metadata.get("endpoint").cloned().unwrap_or(serde_json::Value::Null),
                     "tokens_in": msg.metadata.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
                     "tokens_out": msg.metadata.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "session_cost": msg.metadata.get("session_cost").cloned().unwrap_or(serde_json::Value::Null),
                     "duration_s": msg.metadata.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
                     "has_bg_tasks": has_bg,
                 });
@@ -731,6 +918,33 @@ async fn handle_metrics(State(state): State<ApiState>) -> String {
 }
 
 impl ApiChannel {
+    async fn should_suppress_duplicate_slides_delivery(
+        &self,
+        chat_id: &str,
+        topic: Option<&str>,
+        media: &[String],
+    ) -> bool {
+        if !is_slides_topic(topic) || !media.iter().any(|path| path_looks_like_presentation(path)) {
+            return false;
+        }
+
+        let key =
+            current_profile_api_session_key_with_topic(self.profile_id.as_deref(), chat_id, topic);
+        let mut sess = self.sessions.lock().await;
+        let history = sess.get_or_create(&key).await.get_history(256).to_vec();
+
+        for message in history.iter().rev() {
+            if message.role == MessageRole::User {
+                break;
+            }
+            if message.role == MessageRole::Assistant && message_has_presentation_media(message) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Persist a message to the session JSONL for the given chat_id and
     /// return the authoritative committed message shape when available.
     async fn persist_to_session(
@@ -764,13 +978,7 @@ impl ApiChannel {
         let base_key = key.base_key();
         let encoded = crate::session::encode_path_component(base_key);
         let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
-        let topic_name = topic
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("default");
-        let per_user_path = per_user_dir.join(format!(
-            "{}.jsonl",
-            crate::session::encode_path_component(topic_name)
-        ));
+        let per_user_path = per_user_dir.join("default.jsonl");
         if per_user_path.exists() {
             if let Ok(msg_json) = serde_json::to_string(&message) {
                 let path_clone = per_user_path.clone();
@@ -827,10 +1035,7 @@ async fn handle_chat(
     let rx = {
         let mut pending = state.pending.lock().await;
         let stale = if let Some(old_tx) = pending.get(&session_id) {
-            // Test if the receiver is still alive by sending a keepalive
-            old_tx
-                .send(serde_json::json!({"type":"keepalive"}).to_string())
-                .is_err()
+            old_tx.receiver_count() == 0
         } else {
             false
         };
@@ -842,7 +1047,7 @@ async fn handle_chat(
             // Previous stream still active — queue on existing
             None
         } else {
-            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let (tx, rx) = new_sse_channel();
             for event in initial_sse_events(!req.media.is_empty()) {
                 let _ = tx.send(event);
             }
@@ -896,18 +1101,7 @@ async fn handle_chat(
         .into_response();
     };
 
-    // Return SSE stream that forwards events from the unbounded receiver
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                let event: Result<Event, Infallible> = Ok(Event::default().data(data));
-                Some((event, rx))
-            }
-            None => None, // Channel closed (sender dropped) → stream ends
-        }
-    });
-
-    Sse::new(stream)
+    Sse::new(sse_stream_from_receiver(rx, None))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -928,32 +1122,30 @@ async fn handle_session_event_stream(
         }
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-    {
+    let rx = {
         let mut watchers = state.watchers.lock().await;
         watchers
             .entry(watcher_key(&id, params.topic.as_deref()))
-            .or_default()
-            .push(tx);
-    }
+            .or_insert_with(|| {
+                let (tx, _rx) = new_sse_channel();
+                tx
+            })
+            .subscribe()
+    };
 
     let mut replay_events = replay_task_status_events(&state, &id, params.topic.as_deref()).await;
     replay_events.extend(
         replay_committed_session_results(&state, &id, params.since_seq, params.topic.as_deref())
             .await,
     );
+    let max_replayed_session_seq = replay_events
+        .iter()
+        .filter_map(|payload| session_result_seq_from_payload(payload))
+        .max();
     replay_events.push(build_replay_complete_event(params.topic.as_deref()).to_string());
     record_replay("stream", "opened", 1);
 
-    let live_stream = stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                let event: Result<Event, Infallible> = Ok(Event::default().data(data));
-                Some((event, rx))
-            }
-            None => None,
-        }
-    });
+    let live_stream = sse_stream_from_receiver(rx, max_replayed_session_seq);
 
     let replay_stream = stream::iter(
         replay_events
@@ -982,6 +1174,8 @@ struct MessageInfo {
     role: String,
     content: String,
     timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     media: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1020,10 +1214,6 @@ fn task_list_has_active_tasks(tasks: &serde_json::Value) -> bool {
     })
 }
 
-fn current_profile_api_session_key(profile_id: Option<&str>, chat_id: &str) -> SessionKey {
-    current_profile_api_session_key_with_topic(profile_id, chat_id, None)
-}
-
 fn current_profile_api_session_key_with_topic(
     profile_id: Option<&str>,
     chat_id: &str,
@@ -1044,34 +1234,73 @@ fn api_session_key_candidates(
     id: &str,
     topic: Option<&str>,
 ) -> Vec<SessionKey> {
-    let mut keys = Vec::with_capacity(3);
+    let mut keys = Vec::with_capacity(4);
+    let raw_id = api_chat_id_from_session_key(id).unwrap_or(id);
+
+    if raw_id != id && topic.filter(|value| !value.is_empty()).is_none() {
+        keys.push(SessionKey(id.to_string()));
+    }
 
     if let Some(topic) = topic.filter(|value| !value.is_empty()) {
         if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
-            keys.push(SessionKey::with_profile_topic(profile_id, "api", id, topic));
+            keys.push(SessionKey::with_profile_topic(
+                profile_id, "api", raw_id, topic,
+            ));
         }
         keys.push(SessionKey::with_profile_topic(
             MAIN_PROFILE_ID,
             "api",
-            id,
+            raw_id,
             topic,
         ));
-        keys.push(SessionKey::with_topic("api", id, topic));
+        keys.push(SessionKey::with_topic("api", raw_id, topic));
     } else {
         if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
-            keys.push(SessionKey::with_profile(profile_id, "api", id));
+            keys.push(SessionKey::with_profile(profile_id, "api", raw_id));
         }
-        keys.push(SessionKey::with_profile(MAIN_PROFILE_ID, "api", id));
-        keys.push(SessionKey::new("api", id));
+        keys.push(SessionKey::with_profile(MAIN_PROFILE_ID, "api", raw_id));
+        keys.push(SessionKey::new("api", raw_id));
     }
 
     keys.dedup_by(|left, right| left.0 == right.0);
     keys
 }
 
+fn query_tasks_for_session_candidates(
+    query_fn: &TaskQueryFn,
+    profile_id: Option<&str>,
+    id: &str,
+    topic: Option<&str>,
+) -> serde_json::Value {
+    for session_key in api_session_key_candidates(profile_id, id, topic) {
+        let tasks = query_fn(&session_key.0);
+        if tasks.as_array().is_some_and(|entries| !entries.is_empty()) {
+            return tasks;
+        }
+    }
+    serde_json::json!([])
+}
+
 fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
-    id.strip_prefix("api:")
+    let chat_id = id
+        .strip_prefix("api:")
         .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))
+        .or_else(|| (!id.contains(':')).then_some(id))?;
+    if is_internal_api_chat_id(chat_id) {
+        None
+    } else {
+        Some(chat_id)
+    }
+}
+
+fn is_internal_api_chat_id(chat_id: &str) -> bool {
+    chat_id
+        .split_once('#')
+        .is_some_and(|(_, topic)| is_internal_session_topic(topic))
+}
+
+fn is_internal_session_topic(topic: &str) -> bool {
+    topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
 }
 
 fn response_path_for_session_file(data_dir: &Path, path: &Path) -> Option<String> {
@@ -1117,6 +1346,7 @@ fn message_info_from_history_message(
         role: message.role.to_string(),
         content: sanitize_message_file_markers(&message.content, data_dir),
         timestamp: message.timestamp.to_rfc3339(),
+        tool_call_id: message.tool_call_id.clone(),
         media: message
             .media
             .iter()
@@ -1135,21 +1365,49 @@ fn message_info_from_history_message(
     }
 }
 
+async fn snapshot_session_disk_loader(
+    sessions: &Arc<Mutex<SessionManager>>,
+) -> Option<(PathBuf, SessionManager)> {
+    let data_dir = {
+        let sess = sessions.lock().await;
+        sess.data_dir()
+    };
+
+    match SessionManager::open(&data_dir) {
+        Ok(loader) => Some((data_dir, loader)),
+        Err(error) => {
+            warn!(
+                path = %data_dir.display(),
+                error = %error,
+                "failed to prepare session disk loader"
+            );
+            None
+        }
+    }
+}
+
+fn assistant_message_has_displayable_content(message: &Message) -> bool {
+    !message.content.trim().is_empty() || !message.media.is_empty()
+}
+
 async fn replay_task_status_events(state: &ApiState, id: &str, topic: Option<&str>) -> Vec<String> {
     let Some(ref query_fn) = state.task_query else {
         record_replay("task_status", "disabled", 1);
         return Vec::new();
     };
 
-    let session_key =
-        current_profile_api_session_key_with_topic(state.profile_id.as_deref(), id, topic);
-    let events: Vec<String> = query_fn(&session_key.0)
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|task| build_task_status_event(task, topic).to_string())
-        .collect();
+    let events: Vec<String> = query_tasks_for_session_candidates(
+        query_fn.as_ref(),
+        state.profile_id.as_deref(),
+        id,
+        topic,
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+    .into_iter()
+    .map(|task| build_task_status_event(task, topic).to_string())
+    .collect();
     if events.is_empty() {
         record_replay("task_status", "empty", 1);
     } else {
@@ -1165,11 +1423,13 @@ async fn replay_committed_session_results(
     topic: Option<&str>,
 ) -> Vec<String> {
     let candidates = api_session_key_candidates(state.profile_id.as_deref(), id, topic);
-    let sess = state.sessions.lock().await;
-    let data_dir = sess.data_dir();
+    let Some((data_dir, session_loader)) = snapshot_session_disk_loader(&state.sessions).await
+    else {
+        return Vec::new();
+    };
 
     for candidate in &candidates {
-        if let Some(session) = sess.load(candidate).await {
+        if let Some(session) = session_loader.load(candidate).await {
             let events: Vec<String> = session
                 .messages
                 .iter()
@@ -1177,6 +1437,7 @@ async fn replay_committed_session_results(
                 .filter(|(seq, message)| {
                     since_seq.is_none_or(|since| *seq > since)
                         && message.role == MessageRole::Assistant
+                        && assistant_message_has_displayable_content(message)
                 })
                 .map(|(seq, message)| {
                     build_session_result_event_from_message(
@@ -1210,12 +1471,12 @@ async fn handle_session_status(
         pending.contains_key(&id)
     };
     let has_bg_tasks = state.task_query.as_ref().is_some_and(|query_fn| {
-        let session_key = current_profile_api_session_key_with_topic(
+        task_list_has_active_tasks(&query_tasks_for_session_candidates(
+            query_fn.as_ref(),
             state.profile_id.as_deref(),
             &id,
             params.topic.as_deref(),
-        );
-        task_list_has_active_tasks(&query_fn(&session_key.0))
+        ))
     });
     Json(serde_json::json!({
         "active": active,
@@ -1235,12 +1496,12 @@ async fn handle_session_tasks(
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
-    let session_key = current_profile_api_session_key_with_topic(
+    let tasks = query_tasks_for_session_candidates(
+        query_fn.as_ref(),
         state.profile_id.as_deref(),
         &id,
         params.topic.as_deref(),
     );
-    let tasks = query_fn(&session_key.0);
     Json(tasks).into_response()
 }
 
@@ -1279,19 +1540,29 @@ async fn handle_session_messages(
     };
     let candidates =
         api_session_key_candidates(state.profile_id.as_deref(), &id, params.topic.as_deref());
+    let Some((data_dir, session_loader)) = snapshot_session_disk_loader(&state.sessions).await
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session storage unavailable",
+        )
+            .into_response();
+    };
 
     // source=full reads the append-only JSONL file (complete history).
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
-        let sess = state.sessions.lock().await;
-        let data_dir = sess.data_dir();
         for candidate in &candidates {
-            if let Some(session) = sess.load(candidate).await {
+            if let Some(session) = session_loader.load(candidate).await {
                 let messages: Vec<MessageInfo> = session
                     .messages
                     .iter()
                     .enumerate()
-                    .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
+                    .filter(|(seq, message)| {
+                        params.since_seq.is_none_or(|since| *seq > since)
+                            && (message.role != MessageRole::Assistant
+                                || assistant_message_has_displayable_content(message))
+                    })
                     .skip(offset)
                     .take(limit)
                     .map(|(seq, message)| {
@@ -1304,10 +1575,8 @@ async fn handle_session_messages(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
-    let sess = state.sessions.lock().await;
-    let data_dir = sess.data_dir();
     for candidate in &candidates {
-        if let Some(session) = sess.load(candidate).await {
+        if let Some(session) = session_loader.load(candidate).await {
             let total_messages = session.messages.len();
             let history = session.get_history(fetch_count).to_vec();
             let base_seq = total_messages.saturating_sub(history.len());
@@ -1317,6 +1586,10 @@ async fn handle_session_messages(
                 .filter(|(seq, _)| {
                     let absolute_seq = base_seq + *seq;
                     params.since_seq.is_none_or(|since| absolute_seq > since)
+                })
+                .filter(|(_, message)| {
+                    message.role != MessageRole::Assistant
+                        || assistant_message_has_displayable_content(message)
                 })
                 .skip(offset)
                 .take(limit)
@@ -1338,24 +1611,30 @@ async fn handle_delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let mut sess = state.sessions.lock().await;
-    let mut cleared = false;
+    let mut deleted = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
-        if sess.clear(&candidate).await.is_ok() {
-            cleared = true;
-            // Notify the gateway runtime to stop the session actor so it doesn't
-            // serve stale context if new messages arrive for this session ID.
-            if let Some(ref cb) = state.on_session_deleted {
-                cb(&id);
+        if sess.load(&candidate).await.is_some() {
+            match sess.clear(&candidate).await {
+                Ok(()) => deleted = true,
+                Err(error) => tracing::error!(
+                    session_key = %candidate,
+                    error = %error,
+                    "delete session from gateway store failed"
+                ),
             }
-            return StatusCode::NO_CONTENT.into_response();
         }
     }
-    if cleared {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        // No session found — still return 204 (idempotent delete)
-        StatusCode::NO_CONTENT.into_response()
+    drop(sess);
+
+    if deleted {
+        // Notify the gateway runtime to stop the session actor so it doesn't
+        // serve stale context if new messages arrive for this session ID.
+        if let Some(ref cb) = state.on_session_deleted {
+            cb(&id);
+        }
     }
+    // No session found — still return 204 (idempotent delete).
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.
@@ -1570,6 +1849,7 @@ async fn handle_admin_shell(
     }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -1623,6 +1903,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("octos-bus-tests-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         test_sessions_in(&dir)
+    }
+
+    fn assistant_tool_call_message(tool_name: &str, arguments: serde_json::Value) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![octos_core::ToolCall {
+                id: format!("call-{tool_name}"),
+                name: tool_name.to_string(),
+                arguments,
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        }
     }
 
     #[test]
@@ -1746,6 +2043,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_status_accepts_profiled_api_session_ids() {
+        let app = Router::new()
+            .route("/sessions/{id}/status", get(handle_session_status))
+            .route("/sessions/{id}/tasks", get(handle_session_tasks))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: Some(Arc::new(|session_key| {
+                    if session_key == "dspfac:api:web-profiled" {
+                        serde_json::json!([
+                            { "id": "task-1", "tool_name": "Deep research", "status": "running" }
+                        ])
+                    } else {
+                        serde_json::json!([])
+                    }
+                })),
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/dspfac:api:web-profiled/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(status.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload
+                .get("has_bg_tasks")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+
+        let tasks = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/dspfac:api:web-profiled/tasks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tasks.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(tasks.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.as_array().map(Vec::len), Some(1));
+        assert_eq!(payload[0]["tool_name"], "Deep research");
+    }
+
     #[test]
     fn message_info_from_history_message_hides_absolute_paths() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -1866,12 +2228,52 @@ mod tests {
     }
 
     #[test]
+    fn copy_media_into_session_artifacts_reuses_existing_copy_for_identical_file() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact_dir = root.path().join(".artifacts");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+
+        let source = root
+            .path()
+            .join("slides")
+            .join("demo")
+            .join("output")
+            .join("deck.pptx");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"same deck bytes").unwrap();
+
+        let first = ApiChannel::copy_media_into_session_artifacts(
+            &artifact_dir,
+            &[source.display().to_string()],
+        );
+        let second = ApiChannel::copy_media_into_session_artifacts(
+            &artifact_dir,
+            &[source.display().to_string()],
+        );
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0], second[0]);
+        assert!(std::path::Path::new(&first[0]).exists());
+    }
+
+    #[test]
     fn api_session_key_candidates_prefer_current_profile() {
         let keys = api_session_key_candidates(Some("dspfac--newsbot"), "web-123", None);
 
         assert_eq!(keys[0].0, "dspfac--newsbot:api:web-123");
         assert_eq!(keys[1].0, "_main:api:web-123");
         assert_eq!(keys[2].0, "api:web-123");
+    }
+
+    #[test]
+    fn api_session_key_candidates_do_not_double_prefix_profiled_ids() {
+        let keys = api_session_key_candidates(Some("dspfac"), "dspfac:api:web-123", None);
+        let rendered = keys.iter().map(|key| key.0.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "dspfac:api:web-123");
+        assert!(rendered.contains(&"api:web-123"));
+        assert!(!rendered.contains(&"dspfac:api:dspfac:api:web-123"));
     }
 
     #[test]
@@ -1885,6 +2287,28 @@ mod tests {
             Some("web-123")
         );
         assert_eq!(api_chat_id_from_session_key("api:web-123"), Some("web-123"));
+    }
+
+    #[test]
+    fn api_chat_id_from_session_key_hides_internal_runtime_topics() {
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac:api:web-123#child-task-1"),
+            None
+        );
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac:api:web-123#default.tasks"),
+            None
+        );
+        assert_eq!(api_chat_id_from_session_key("web-123#default.tasks"), None);
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac:api:web-123#research"),
+            Some("web-123#research")
+        );
+        assert_eq!(
+            api_chat_id_from_session_key("web-123#research"),
+            Some("web-123#research")
+        );
+        assert_eq!(api_chat_id_from_session_key("telegram:123"), None);
     }
 
     #[test]
@@ -1934,6 +2358,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_channel_bounds_buffer_and_drops_oldest_events() {
+        let (tx, mut rx) = new_sse_channel();
+        for i in 0..=SSE_CHANNEL_CAPACITY {
+            let _ = tx.send(i.to_string());
+        }
+
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
+        assert_eq!(rx.recv().await.unwrap(), "1");
+    }
+
+    #[test]
+    fn build_bg_task_tool_start_events_adds_tts_compatibility_event() {
+        let tasks = serde_json::json!([
+            { "id": "task-1", "tool_name": "Direct TTS", "tool_call_id": "call_tts_1", "status": "running" },
+            { "id": "task-2", "tool_name": "Direct TTS", "status": "spawned" },
+            { "id": "task-3", "tool_name": "Research Podcast", "status": "running" }
+        ]);
+
+        let events = build_bg_task_tool_start_events(&tasks);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "tool_start");
+        assert_eq!(events[0]["tool"], "fm_tts");
+        assert_eq!(events[0]["tool_call_id"], "call_tts_1");
+    }
+
+    #[tokio::test]
     async fn send_to_pending_client() {
         let ch = ApiChannel::new(
             8091,
@@ -1942,7 +2396,7 @@ mod tests {
             test_sessions(),
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-chat".into(), tx);
@@ -1975,7 +2429,7 @@ mod tests {
             sessions,
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-chat".into(), tx);
@@ -2020,7 +2474,8 @@ mod tests {
     async fn replay_committed_session_results_replays_only_newer_assistant_messages() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
-        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "test-chat");
+        let key =
+            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "test-chat", None);
 
         {
             let mut manager = sessions.lock().await;
@@ -2033,7 +2488,10 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("second result"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant("✓ report completed — file delivered"),
+                )
                 .await
                 .unwrap();
         }
@@ -2057,7 +2515,10 @@ mod tests {
         assert_eq!(parsed["type"], "session_result");
         assert_eq!(parsed["message"]["seq"], 2);
         assert_eq!(parsed["message"]["role"], "assistant");
-        assert_eq!(parsed["message"]["content"], "second result");
+        assert_eq!(
+            parsed["message"]["content"],
+            "✓ report completed — file delivered"
+        );
     }
 
     #[tokio::test]
@@ -2069,6 +2530,9 @@ mod tests {
             "test-chat",
             Some("slides launch"),
         );
+        let deck_path = data_dir.path().join("slides").join("final-deck.pptx");
+        std::fs::create_dir_all(deck_path.parent().unwrap()).unwrap();
+        std::fs::write(&deck_path, b"deck").unwrap();
 
         {
             let mut manager = sessions.lock().await;
@@ -2081,7 +2545,18 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("second result"))
+                .add_message_with_seq(
+                    &key,
+                    Message {
+                        role: MessageRole::Assistant,
+                        content: "final deck".to_string(),
+                        media: vec![deck_path.to_string_lossy().into_owned()],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        timestamp: chrono::Utc::now(),
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -2108,7 +2583,233 @@ mod tests {
         assert_eq!(first["type"], "session_result");
         assert_eq!(first["topic"], "slides launch");
         assert_eq!(first["message"]["seq"], 1);
+        assert_eq!(first["message"]["content"], "first result");
+        assert_eq!(second["type"], "session_result");
+        assert_eq!(second["topic"], "slides launch");
         assert_eq!(second["message"]["seq"], 2);
+        let media = second["message"]["media"].as_array().unwrap();
+        assert_eq!(media.len(), 1);
+        assert!(media[0].as_str().unwrap().starts_with("pf/"));
+    }
+
+    #[test]
+    fn should_drop_replayed_session_result_only_for_already_replayed_seq() {
+        let replayed = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "seq": 7,
+                "role": "assistant",
+                "content": "done",
+            }
+        })
+        .to_string();
+        let newer = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "seq": 8,
+                "role": "assistant",
+                "content": "later",
+            }
+        })
+        .to_string();
+        let replace = serde_json::json!({
+            "type": "replace",
+            "text": "partial",
+        })
+        .to_string();
+
+        assert!(should_drop_replayed_session_result(&replayed, Some(7)));
+        assert!(should_drop_replayed_session_result(&replayed, Some(9)));
+        assert!(!should_drop_replayed_session_result(&newer, Some(7)));
+        assert!(!should_drop_replayed_session_result(&replace, Some(7)));
+        assert!(!should_drop_replayed_session_result(&replayed, None));
+    }
+
+    #[test]
+    fn session_result_seq_from_payload_reads_message_seq() {
+        let payload = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "seq": 3,
+                "role": "assistant",
+                "content": "hello",
+            }
+        })
+        .to_string();
+        let no_seq = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "role": "assistant",
+                "content": "hello",
+            }
+        })
+        .to_string();
+
+        assert_eq!(session_result_seq_from_payload(&payload), Some(3));
+        assert_eq!(session_result_seq_from_payload(&no_seq), None);
+        assert_eq!(session_result_seq_from_payload("{not-json"), None);
+    }
+
+    #[tokio::test]
+    async fn replay_committed_session_results_skips_empty_assistant_tool_trace_messages() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "tool-heavy-chat",
+            None,
+        );
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("查一下他的背景 John Ternus"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "deep_search",
+                        serde_json::json!({"query": "John Ternus 背景"}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "get_time",
+                        serde_json::json!({
+                            "timezone": "America/Los_Angeles",
+                            "current_date": "2026-04-20"
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "activate_tools",
+                        serde_json::json!({"tools": ["cron"]}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message("cron", serde_json::json!({"action": "list"})),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant("John Ternus is Apple's SVP of hardware engineering."),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("你有哪些定时任务"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message("cron", serde_json::json!({"action": "list"})),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("提醒我 10 分钟后喝水，我在 PDT 时区"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "get_time",
+                        serde_json::json!({"timezone": "America/Los_Angeles"}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "activate_tools",
+                        serde_json::json!({"tools": ["cron"]}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "cron",
+                        serde_json::json!({"action": "add", "in_minutes": 10}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("记住我的时区"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant("好的，已记住你的时区为 PDT（America/Los_Angeles）。"),
+                )
+                .await
+                .unwrap();
+            // Trailing empty tool-trace assistant message previously could overwrite
+            // the visible final answer in client reconciliation.
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message("cron", serde_json::json!({"action": "list"})),
+                )
+                .await
+                .unwrap();
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        let replayed =
+            replay_committed_session_results(&state, "tool-heavy-chat", None, None).await;
+
+        assert_eq!(replayed.len(), 2);
+        for event in &replayed {
+            let parsed: serde_json::Value = serde_json::from_str(event).unwrap();
+            let content = parsed["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            assert!(!content.is_empty());
+        }
+        let last: serde_json::Value = serde_json::from_str(replayed.last().unwrap()).unwrap();
+        assert_eq!(
+            last["message"]["content"],
+            "好的，已记住你的时区为 PDT（America/Los_Angeles）。"
+        );
     }
 
     #[tokio::test]
@@ -2154,7 +2855,7 @@ mod tests {
             test_sessions(),
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-chat".into(), tx);
@@ -2174,6 +2875,7 @@ mod tests {
                 "endpoint": "autodl.art",
                 "tokens_in": 123,
                 "tokens_out": 456,
+                "session_cost": 0.0228,
             }),
         };
         ch.send(&msg).await.unwrap();
@@ -2188,9 +2890,13 @@ mod tests {
         assert_eq!(parsed["endpoint"], "autodl.art");
         assert_eq!(parsed["tokens_in"], 123);
         assert_eq!(parsed["tokens_out"], 456);
+        assert_eq!(parsed["session_cost"], 0.0228);
 
         // Sender was removed — next recv returns None
-        assert!(rx.recv().await.is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -2208,7 +2914,7 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
         let source = source_dir.join("test.mp3");
         std::fs::write(&source, b"bg-audio").unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-bg".into(), tx);
@@ -2232,7 +2938,10 @@ mod tests {
         assert_eq!(parsed["has_bg_tasks"], true);
 
         // SSE closes immediately — client will poll session history
-        assert!(rx.recv().await.is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
 
         // Background file arrives later — persisted to session history
         let file_msg = OutboundMessage {
@@ -2258,6 +2967,51 @@ mod tests {
             .expect("expected persisted artifact path");
         assert_ne!(stored, source.to_string_lossy().to_string());
         assert!(Path::new(&stored).exists());
+    }
+
+    #[tokio::test]
+    async fn send_completion_with_bg_tasks_emits_compat_tool_start_before_done() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        )
+        .with_task_query(Arc::new(|_| {
+            serde_json::json!([
+                {
+                    "id": "task-1",
+                    "tool_name": "Direct TTS",
+                    "tool_call_id": "call_tts_1",
+                    "status": "running"
+                }
+            ])
+        }));
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-bg-compat".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-bg-compat".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({"_completion": true, "has_bg_tasks": true}),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let first: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+
+        assert_eq!(first["type"], "tool_start");
+        assert_eq!(first["tool"], "fm_tts");
+        assert_eq!(first["tool_call_id"], "call_tts_1");
+        assert_eq!(second["type"], "done");
+        assert_eq!(second["has_bg_tasks"], true);
     }
 
     #[tokio::test]
@@ -2303,44 +3057,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_file_message_persists_to_topic_scoped_session() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let sessions = test_sessions_in(data_dir.path());
-        let ch = ApiChannel::new(
-            8091,
-            None,
-            Arc::new(AtomicBool::new(false)),
-            sessions.clone(),
-            Some(TEST_PROFILE_ID.to_string()),
-        );
-        let source_dir = data_dir.path().join("source");
-        std::fs::create_dir_all(&source_dir).unwrap();
-        let source = source_dir.join("deck.pptx");
-        std::fs::write(&source, b"pptx").unwrap();
-
-        let msg = OutboundMessage {
-            channel: "api".into(),
-            chat_id: "slides-topic".into(),
-            content: String::new(),
-            reply_to: None,
-            media: vec![source.to_string_lossy().to_string()],
-            metadata: serde_json::json!({ "topic": "slides demo" }),
-        };
-        ch.send(&msg).await.unwrap();
-
-        let mut sess = sessions.lock().await;
-        let topic_key =
-            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-topic", "slides demo");
-        let topic_session = sess.get_or_create(&topic_key).await;
-        assert_eq!(topic_session.get_history(10).len(), 1);
-        assert_eq!(topic_session.get_history(10)[0].media.len(), 1);
-
-        let base_key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "slides-topic");
-        let base_session = sess.get_or_create(&base_key).await;
-        assert!(base_session.get_history(10).is_empty());
-    }
-
-    #[tokio::test]
     async fn send_file_message_emits_committed_session_result_event() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
@@ -2351,7 +3067,7 @@ mod tests {
             sessions.clone(),
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-file".into(), tx);
@@ -2368,7 +3084,7 @@ mod tests {
             content: "Generated report".into(),
             reply_to: None,
             media: vec![source.to_string_lossy().to_string()],
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({"tool_call_id": "call_report_1"}),
         };
         ch.send(&msg).await.unwrap();
 
@@ -2386,6 +3102,10 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .contains("Generated report")
+        );
+        assert_eq!(
+            message.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_report_1")
         );
         let media = message
             .get("media")
@@ -2473,6 +3193,181 @@ mod tests {
         let persisted = std::fs::canonicalize(&history[0].media[0]).unwrap();
         let existing = std::fs::canonicalize(&existing).unwrap();
         assert_eq!(persisted, existing);
+    }
+
+    #[tokio::test]
+    async fn send_file_message_with_topic_persists_to_topic_session() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("deck.pptx");
+        std::fs::write(&source, b"pptx").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "topic-file-chat".into(),
+            content: "".into(),
+            reply_to: None,
+            media: vec![source.to_string_lossy().to_string()],
+            metadata: serde_json::json!({ "topic": "slides demo" }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let topic_key = SessionKey::with_profile_topic(
+            TEST_PROFILE_ID,
+            "api",
+            "topic-file-chat",
+            "slides demo",
+        );
+        let base_key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "topic-file-chat");
+        let topic_history = sess
+            .get_or_create(&topic_key)
+            .await
+            .get_history(10)
+            .to_vec();
+        let base_history = sess.get_or_create(&base_key).await.get_history(10).to_vec();
+
+        assert_eq!(topic_history.len(), 1);
+        assert!(base_history.is_empty());
+        assert_eq!(topic_history[0].media.len(), 1);
+        assert!(topic_history[0].media[0].contains(".artifacts"));
+        assert!(topic_history[0].media[0].contains("deck.pptx"));
+    }
+
+    #[tokio::test]
+    async fn slides_topic_suppresses_duplicate_deck_delivery_until_new_user_message() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+
+        let topic_key =
+            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-chat", "slides demo");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("go"))
+                .await
+                .unwrap();
+        }
+
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let first = source_dir.join("deck-one.pptx");
+        let second = source_dir.join("deck-two.pptx");
+        std::fs::write(&first, b"pptx-one").unwrap();
+        std::fs::write(&second, b"pptx-two").unwrap();
+
+        for source in [&first, &second] {
+            let msg = OutboundMessage {
+                channel: "api".into(),
+                chat_id: "slides-chat".into(),
+                content: String::new(),
+                reply_to: None,
+                media: vec![source.to_string_lossy().to_string()],
+                metadata: serde_json::json!({ "topic": "slides demo" }),
+            };
+            ch.send(&msg).await.unwrap();
+        }
+
+        let mut sess = sessions.lock().await;
+        let history = sess
+            .get_or_create(&topic_key)
+            .await
+            .get_history(10)
+            .to_vec();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, MessageRole::User);
+        assert_eq!(history[1].role, MessageRole::Assistant);
+        assert_eq!(history[1].media.len(), 1);
+        assert!(history[1].media[0].contains("deck-one.pptx"));
+    }
+
+    #[tokio::test]
+    async fn slides_topic_allows_new_deck_after_new_user_message() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+
+        let topic_key =
+            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-chat-2", "slides demo");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("go"))
+                .await
+                .unwrap();
+        }
+
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let first = source_dir.join("deck-one.pptx");
+        let second = source_dir.join("deck-two.pptx");
+        std::fs::write(&first, b"pptx-one").unwrap();
+        std::fs::write(&second, b"pptx-two").unwrap();
+
+        let first_msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "slides-chat-2".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![first.to_string_lossy().to_string()],
+            metadata: serde_json::json!({ "topic": "slides demo" }),
+        };
+        ch.send(&first_msg).await.unwrap();
+
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("regenerate"))
+                .await
+                .unwrap();
+        }
+
+        let second_msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "slides-chat-2".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![second.to_string_lossy().to_string()],
+            metadata: serde_json::json!({ "topic": "slides demo" }),
+        };
+        ch.send(&second_msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let history = sess
+            .get_or_create(&topic_key)
+            .await
+            .get_history(10)
+            .to_vec();
+        let assistant_media = history
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .flat_map(|message| message.media.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 4);
+        assert_eq!(assistant_media.len(), 2);
+        assert!(assistant_media[0].contains("deck-one.pptx"));
+        assert!(assistant_media[1].contains("deck-two.pptx"));
     }
 
     #[tokio::test]
@@ -2617,6 +3512,279 @@ mod tests {
             .filter(|entry| entry.get("id").and_then(|id| id.as_str()) == Some("slides-123"))
             .collect();
         assert_eq!(matching.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_hides_internal_child_and_task_ledger_sessions() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let parent = SessionKey::with_profile("dspfac", "api", "web-123");
+        let child = SessionKey::with_profile_topic("dspfac", "api", "web-123", "child-task-1");
+        let task_ledger =
+            SessionKey::with_profile_topic("dspfac", "api", "web-123", "default.tasks");
+        let raw_parent = SessionKey("web-raw".to_string());
+        let raw_task_ledger = SessionKey("web-raw#default.tasks".to_string());
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&parent, Message::user("parent"))
+                .await
+                .unwrap();
+            sess.add_message(&child, Message::user("child"))
+                .await
+                .unwrap();
+            sess.add_message(&task_ledger, Message::user("task ledger"))
+                .await
+                .unwrap();
+            sess.add_message(&raw_parent, Message::user("raw parent"))
+                .await
+                .unwrap();
+            sess.add_message(&raw_task_ledger, Message::user("raw task ledger"))
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route("/sessions", get(handle_list_sessions))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some("dspfac".into()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = sessions
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+            .collect();
+
+        assert_eq!(ids, vec!["web-123", "web-raw"]);
+    }
+
+    #[tokio::test]
+    async fn session_messages_full_source_reads_from_disk_snapshot() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key =
+            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "web-history", None);
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("hello"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("first result"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("second result"))
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}/messages", get(handle_session_messages))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some(TEST_PROFILE_ID.into()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/web-history/messages?source=full&since_seq=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["seq"], 2);
+        assert_eq!(messages[0]["content"], "second result");
+    }
+
+    #[tokio::test]
+    async fn session_messages_default_source_returns_recent_window_with_absolute_seq() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key =
+            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "web-history", None);
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("one"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("two"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("three"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("four"))
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}/messages", get(handle_session_messages))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some(TEST_PROFILE_ID.into()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/web-history/messages?limit=1&offset=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["seq"], 3);
+        assert_eq!(messages[0]["content"], "four");
+    }
+
+    #[tokio::test]
+    async fn delete_session_checks_all_profile_candidates() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let id = "web-delete-fallback";
+        let main_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", id);
+
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&main_key, Message::user("hello"))
+                .await
+                .unwrap();
+            assert!(sess.load(&main_key).await.is_some());
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}", delete(handle_delete_session))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions: sessions.clone(),
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let sess = sessions.lock().await;
+        assert!(sess.load(&main_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_session_accepts_listed_topic_session_id() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let id = "web-delete-topic";
+        let topic_key = SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", id, "research");
+
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("hello"))
+                .await
+                .unwrap();
+            assert!(sess.load(&topic_key).await.is_some());
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}", delete(handle_delete_session))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions: sessions.clone(),
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/sessions/web-delete-topic%23research")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let fresh = SessionManager::open(data_dir.path()).unwrap();
+        assert!(fresh.load(&topic_key).await.is_none());
     }
 
     #[tokio::test]
