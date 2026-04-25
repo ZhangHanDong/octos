@@ -175,6 +175,72 @@ fn finalize_assistant_content(
     format!("{content}\n\nPreview URL: {preview_url}")
 }
 
+fn canonical_media_path(path: &Path, user_workspace: &Path) -> Option<String> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        user_workspace.join(path)
+    };
+    std::fs::canonicalize(&candidate)
+        .or_else(|_| {
+            if candidate.exists() {
+                Ok(candidate.clone())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "media path not found",
+                ))
+            }
+        })
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn is_terminal_media_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("pptx" | "pdf" | "mp3" | "wav" | "zip")
+    )
+}
+
+fn collect_terminal_reply_media(
+    response: &octos_agent::ConversationResponse,
+    user_workspace: &Path,
+) -> Vec<String> {
+    let mut media = Vec::new();
+
+    let mut push_path = |path: &Path| {
+        if !is_terminal_media_path(path) {
+            return;
+        }
+        if let Some(resolved) = canonical_media_path(path, user_workspace) {
+            if !media.iter().any(|existing| existing == &resolved) {
+                media.push(resolved);
+            }
+        }
+    };
+
+    for path in &response.files_to_send {
+        push_path(path);
+    }
+    for path in &response.files_modified {
+        push_path(path);
+    }
+    for message in &response.messages {
+        if message.role != MessageRole::Tool {
+            continue;
+        }
+        for token in message.content.split_whitespace() {
+            let token = token.trim_matches(|ch: char| {
+                matches!(ch, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}')
+            });
+            push_path(Path::new(token));
+        }
+    }
+
+    media
+}
+
 async fn send_outbound_with_timeout(
     session_key: &SessionKey,
     out_tx: &mpsc::Sender<OutboundMessage>,
@@ -4066,6 +4132,8 @@ impl SessionActor {
                     &self.user_workspace,
                     &conv_response.content,
                 );
+                let terminal_media =
+                    collect_terminal_reply_media(&conv_response, &self.user_workspace);
                 // Save tool calls, tool results, and assistant reply to history.
                 // Skip the first message (user msg) — we already saved it before
                 // spawning to maintain chronological ordering.
@@ -4092,7 +4160,7 @@ impl SessionActor {
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,
                             content: final_content.clone(),
-                            media: vec![],
+                            media: terminal_media.clone(),
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
@@ -4267,7 +4335,7 @@ impl SessionActor {
                                 chat_id: self.chat_id.clone(),
                                 content: display_content,
                                 reply_to: inbound_message_id.clone(),
-                                media: vec![],
+                                media: terminal_media,
                                 metadata: serde_json::json!({}),
                             })
                             .await;
@@ -4527,6 +4595,8 @@ impl SessionActor {
                         &user_workspace,
                         &conv_response.content,
                     );
+                    let terminal_media =
+                        collect_terminal_reply_media(&conv_response, &user_workspace);
                     // Save ONLY the final assistant reply to session history.
                     // Intermediate tool_call/tool_result messages are NOT saved
                     // to avoid tool_call ID collisions when multiple overflow
@@ -4536,7 +4606,7 @@ impl SessionActor {
                         let final_reply = Message {
                             role: MessageRole::Assistant,
                             content: final_content.clone(),
-                            media: vec![],
+                            media: terminal_media.clone(),
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
@@ -4578,7 +4648,7 @@ impl SessionActor {
                                 chat_id: chat_id.clone(),
                                 content: reply,
                                 reply_to: overflow_reply_to.clone(),
-                                media: vec![],
+                                media: terminal_media,
                                 metadata: serde_json::json!({}),
                             })
                             .await;
@@ -4871,6 +4941,8 @@ impl SessionActor {
                     &self.user_workspace,
                     &conv_response.content,
                 );
+                let terminal_media =
+                    collect_terminal_reply_media(&conv_response, &self.user_workspace);
                 // Save all messages from the agent (user msg, tool calls, tool
                 // results, assistant replies) so the full context is preserved
                 // for subsequent calls.
@@ -4909,7 +4981,7 @@ impl SessionActor {
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,
                             content: final_content.clone(),
-                            media: vec![],
+                            media: terminal_media.clone(),
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
@@ -5013,7 +5085,7 @@ impl SessionActor {
                                 chat_id: self.chat_id.clone(),
                                 content: display_content,
                                 reply_to: inbound_message_id.clone(),
-                                media: vec![],
+                                media: terminal_media,
                                 metadata: serde_json::json!({}),
                             })
                             .await;
