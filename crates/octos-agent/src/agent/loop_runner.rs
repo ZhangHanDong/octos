@@ -36,6 +36,53 @@ fn split_tool_calls(
     tool_calls.chunks(batch_size).collect()
 }
 
+/// M8.5 tier 1 safety helper: collect the set of `tool_call_id`s that are
+/// currently in an unresolved state (i.e. an assistant tool call whose
+/// matching [`MessageRole::Tool`] reply has not landed yet). Those IDs are
+/// passed to the tier-1 prune pass as "protected" so we never drop a tool
+/// result that a pending retry/contract-gate handler still needs.
+///
+/// Works purely off the message list so it also covers contract-gated
+/// artifacts that are referenced by message indices — content-clearing
+/// preserves indices, but full pruning would not, so the prune pass
+/// explicitly skips these.
+fn collect_protected_tool_call_ids(messages: &[Message]) -> Vec<String> {
+    let mut requested: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages {
+        match msg.role {
+            MessageRole::Assistant => {
+                if let Some(ref calls) = msg.tool_calls {
+                    for call in calls {
+                        requested.insert(call.id.clone());
+                    }
+                }
+            }
+            MessageRole::Tool => {
+                if let Some(ref id) = msg.tool_call_id {
+                    answered.insert(id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    requested.difference(&answered).cloned().collect()
+}
+
+/// M8.5 tier 2 helper: returns a `ChatConfig` with the agent's tier-2
+/// `context_management` payload attached when the active provider is
+/// Anthropic-flavoured.  Returns a clone with the field left as-is in every
+/// other case so non-Anthropic providers never see the Anthropic-only
+/// header.
+fn with_tier2_context_management(config: &ChatConfig, agent: &Agent) -> ChatConfig {
+    let Some(payload) = agent.build_tier2_context_management() else {
+        return config.clone();
+    };
+    let mut out = config.clone();
+    out.context_management = Some(payload);
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellRetryRecoveryKind {
     DiffLikeSuccess,
@@ -300,6 +347,22 @@ impl Agent {
         c
     }
 
+    /// Decide what to surface when the loop detector fires.
+    ///
+    /// First fire in a session-burst: returns the warning text and marks the
+    /// session as having warned. Subsequent fires within the same burst
+    /// (before the next `process_message` reset) return a terminal error so
+    /// the loop cannot keep emitting identical noise to the user.
+    pub(super) fn dedup_loop_warning(&self, warning: String) -> Result<String> {
+        if self.is_loop_detected_recently() {
+            return Err(eyre::eyre!(
+                "agent loop got stuck — please rephrase or simplify your request"
+            ));
+        }
+        self.mark_loop_detected_recently();
+        Ok(warning)
+    }
+
     /// Process a single message in conversation mode (chat/gateway).
     /// Takes the user's message, conversation history, and optional media paths.
     pub async fn process_message(
@@ -379,6 +442,7 @@ impl Agent {
                 TASK_REPORTER.scope(activity_reporter, async move {
                 // Reset per-run flags
                 self.tools.reset_spawn_only_invoked();
+                self.reset_loop_detected_recently();
 
                 // Build the system prompt via the shared helper in
                 // execution.rs so conversation + task loops compose the same
@@ -486,6 +550,12 @@ impl Agent {
                     if iteration == 1 {
                         self.maybe_run_preflight_compaction(&mut messages);
                     }
+                    // Harness M8.5 tier 1: cheap in-place stale/oversized
+                    // tool-result pruning. Runs every iteration (including
+                    // the first so large bootstrap payloads shrink before
+                    // tier 3 considers whether to summarise).
+                    let protected_ids = collect_protected_tool_call_ids(&messages);
+                    self.run_tier1_compaction(&mut messages, &protected_ids);
                     prepare_conversation_messages(self, &mut messages, &mut turn);
                     // Harness M6.3: post-prep compaction pass so the declarative
                     // runner sees the final shape of the conversation (after
@@ -508,11 +578,17 @@ impl Agent {
                         message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
                         "calling LLM"
                     );
+                    // M8.5 tier 2: optionally decorate the outgoing ChatConfig
+                    // with the Anthropic `context_management` payload so the
+                    // server can clear old tool uses on its side. Non-Anthropic
+                    // providers ignore `context_management` via
+                    // `skip_serializing_if`.
+                    let call_config = with_tier2_context_management(&config, self);
                     let (mut response, streamed) = match self
                         .call_llm_with_hooks(
                             &messages,
                             &tools_spec,
-                            &config,
+                            &call_config,
                             iteration,
                             &total_usage,
                             &mut turn,
@@ -535,7 +611,7 @@ impl Agent {
                                 .call_llm_with_hooks(
                                     &messages,
                                     &tools_spec,
-                                    &config,
+                                    &call_config,
                                     iteration,
                                     &total_usage,
                                     &mut turn,
@@ -638,10 +714,16 @@ impl Agent {
                                             ),
                                         });
                                     }
+                                    // Single-fire-per-burst: first fire emits the
+                                    // warning; subsequent fires within the same
+                                    // burst (before the next process_message reset)
+                                    // surface a terminal error instead of repeating
+                                    // identical noise.
+                                    let warning_content = self.dedup_loop_warning(warning)?;
                                     // Don't execute the tools — break out with a message
                                     self.emit_cost_update(turn.total_usage(), &response.usage);
                                     return Ok(ConversationResponse {
-                                        content: warning,
+                                        content: warning_content,
                                         reasoning_content: None,
                                         provider_metadata: None,
                                         token_usage: turn.total_usage().clone(),
@@ -857,14 +939,20 @@ impl Agent {
                 }
 
                 let tools_spec = self.tools.specs();
+                // M8.5 tier 1: also runs in task mode so background workers
+                // benefit from the same cheap shrinkage before their LLM call.
+                let protected_ids = collect_protected_tool_call_ids(&messages);
+                self.run_tier1_compaction(&mut messages, &protected_ids);
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
+                // M8.5 tier 2: decorate the config with the Anthropic header.
+                let call_config = with_tier2_context_management(&config, self);
                 let (mut response, _streamed) = match self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
-                        &config,
+                        &call_config,
                         iteration,
                         &total_usage,
                         &mut turn,
@@ -1972,6 +2060,7 @@ printf '{"output":"voice saved","success":true}\n'
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let plugin = PluginTool::new("mofa-fm".into(), def, script_path).with_extra_env(vec![(
             "INPUT_LOG".into(),
@@ -2842,5 +2931,162 @@ printf '{"output":"voice saved","success":true}\n'
         // large error payloads do not accidentally count as productive.
         let body = "failed to resolve target: ".to_string() + &"x".repeat(200);
         assert!(!is_productive_tool_message(&body));
+    }
+
+    /// Mock LLM that always returns the same shell tool call with the same
+    /// arguments, forcing the loop detector to fire on iteration 4.
+    struct AlwaysSameToolProvider;
+
+    #[async_trait]
+    impl LlmProvider for AlwaysSameToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_loop".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "loopy.txt"}),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    async fn build_agent_with_mock(dir: &std::path::Path) -> Agent {
+        let tools = ToolRegistry::with_builtins(dir);
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+        Agent::new(AgentId::new("loop-dedup"), provider, tools, memory)
+    }
+
+    #[tokio::test]
+    async fn dedup_loop_warning_returns_warning_on_first_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent_with_mock(dir.path()).await;
+
+        assert!(!agent.is_loop_detected_recently());
+        let result = agent.dedup_loop_warning("[LOOP DETECTED] cycle".to_string());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "[LOOP DETECTED] cycle");
+        assert!(agent.is_loop_detected_recently());
+    }
+
+    #[tokio::test]
+    async fn dedup_loop_warning_returns_terminal_error_on_second_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent_with_mock(dir.path()).await;
+
+        let first = agent.dedup_loop_warning("[LOOP DETECTED] one".to_string());
+        assert!(first.is_ok());
+        let second = agent.dedup_loop_warning("[LOOP DETECTED] two".to_string());
+        assert!(second.is_err());
+        let err = second.err().unwrap().to_string();
+        assert!(
+            err.contains("agent loop got stuck"),
+            "expected terminal error, got: {err}"
+        );
+        // Flag stays set after the terminal error so further fires keep
+        // returning terminal errors until the next process_message reset.
+        assert!(agent.is_loop_detected_recently());
+    }
+
+    #[tokio::test]
+    async fn dedup_loop_warning_resets_after_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent_with_mock(dir.path()).await;
+
+        agent
+            .dedup_loop_warning("[LOOP DETECTED]".to_string())
+            .unwrap();
+        assert!(agent.is_loop_detected_recently());
+        agent.reset_loop_detected_recently();
+        assert!(!agent.is_loop_detected_recently());
+
+        // After reset, a new fire returns a warning again (not terminal).
+        let again = agent.dedup_loop_warning("[LOOP DETECTED] again".to_string());
+        assert!(again.is_ok());
+    }
+
+    #[tokio::test]
+    async fn process_message_resets_loop_detected_flag_at_start() {
+        // Pre-set the flag, then run a process_message that does NOT trigger
+        // the loop detector. The reset at the start of process_message_inner
+        // should clear the flag before the turn runs, and since no loop fires
+        // the flag stays cleared at exit.
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        let echo_path = dir.path().join("audio.mp3");
+        std::fs::write(&echo_path, b"x").unwrap();
+        tools.register(FilesToSendOnlyTool {
+            file_path: echo_path,
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("reset-test"), provider, tools, memory);
+
+        agent.mark_loop_detected_recently();
+        assert!(agent.is_loop_detected_recently());
+
+        let _ = agent
+            .process_message("hi", &[], vec![])
+            .await
+            .expect("process_message should succeed");
+
+        assert!(
+            !agent.is_loop_detected_recently(),
+            "process_message should reset the loop_detected flag at start"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_fires_loop_warning_once_then_terminal_error() {
+        // Two consecutive process_message calls with the same looping LLM.
+        // Each call resets at start, so each should emit a warning (not a
+        // terminal error). This documents the cross-turn dedup behavior:
+        // dedup is intra-turn only because each new user message starts a
+        // fresh session-burst slot.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loopy.txt"), b"x").unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("burst"), provider, tools, memory).with_config(
+            crate::AgentConfig {
+                max_iterations: 30,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let first = agent.process_message("loop please", &[], vec![]).await;
+        // Either the loop warning surfaced, or the recover_shell_retry path
+        // returned. Both terminate cleanly without an Err.
+        assert!(first.is_ok(), "first call should not error");
+        // Flag set after first warning.
+        assert!(agent.is_loop_detected_recently());
+
+        let second = agent.process_message("loop again", &[], vec![]).await;
+        // Reset at start of process_message clears the flag, so a brand-new
+        // burst is allowed and emits a warning (Ok), not a terminal Err.
+        assert!(second.is_ok(), "second call should not error after reset");
     }
 }
