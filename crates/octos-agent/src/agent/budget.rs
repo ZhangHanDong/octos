@@ -335,6 +335,7 @@ mod tests {
             streamed: false,
             pending_approval: None,
             messages: vec![],
+            tool_results: vec![],
         };
         let cloned = resp.clone();
         assert_eq!(cloned.content, "test");
