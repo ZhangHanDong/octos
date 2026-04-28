@@ -941,6 +941,7 @@ impl Config {
 
         // Expand environment variables in config values
         config.expand_env_vars();
+        config.validate_approval_policy()?;
 
         // Log if migration changed something (don't silently rewrite user's config)
         if migrated {
@@ -953,6 +954,27 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    fn validate_approval_policy(&self) -> Result<()> {
+        let Some(policy) = &self.approval_policy else {
+            return Ok(());
+        };
+        for (idx, rule) in policy.rules.iter().enumerate() {
+            if rule.tools.is_empty() {
+                eyre::bail!("approval_policy.rules[{idx}].tools must not be empty");
+            }
+            if !rule.require_approval {
+                eyre::bail!("approval_policy.rules[{idx}].require_approval must be true");
+            }
+            if rule.authorized_approvers.is_empty() {
+                eyre::bail!("approval_policy.rules[{idx}].authorized_approvers must not be empty");
+            }
+            if rule.expires_in_secs == 0 {
+                eyre::bail!("approval_policy.rules[{idx}].expires_in_secs must be > 0");
+            }
+        }
+        Ok(())
     }
 
     /// Expand environment variables in config values.
