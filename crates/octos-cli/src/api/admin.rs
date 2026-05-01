@@ -734,6 +734,7 @@ pub async fn test_provider(
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }];
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,
@@ -4065,6 +4066,7 @@ mod register_tenant_email_tests {
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
@@ -4202,6 +4204,7 @@ mod register_flow_tests {
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
             deployment_mode: mode,

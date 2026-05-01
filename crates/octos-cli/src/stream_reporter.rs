@@ -44,18 +44,52 @@ pub enum StreamProgressEvent {
 ///
 /// Because `ProgressReporter::report()` is synchronous, we use `unbounded_send()`
 /// which never blocks. The receiving async task handles actual channel I/O.
+///
+/// M8.10 PR #2: every emitted SSE payload includes `thread_id` (the
+/// client_message_id of the user message that owns this turn). Reporters are
+/// constructed per-turn so the thread_id is bound for the reporter's lifetime.
+/// When `thread_id` is `None`, the field is omitted (preserves wire compat for
+/// non-API channels and pre-cmid clients).
 pub struct ChannelStreamReporter {
     tx: mpsc::UnboundedSender<StreamProgressEvent>,
+    thread_id: Option<String>,
 }
 
 impl ChannelStreamReporter {
     pub fn new(tx: mpsc::UnboundedSender<StreamProgressEvent>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            thread_id: None,
+        }
+    }
+
+    /// Bind a `thread_id` (typically the user message's `client_message_id`)
+    /// to every SSE payload this reporter emits.
+    pub fn with_thread_id(mut self, thread_id: Option<String>) -> Self {
+        self.thread_id = thread_id.filter(|s| !s.is_empty());
+        self
+    }
+}
+
+/// Insert the bound `thread_id` into a JSON object payload (if any). Mutates
+/// the value in place. No-op when `thread_id` is `None` or the value is not
+/// an object.
+fn inject_thread_id(value: &mut serde_json::Value, thread_id: Option<&str>) {
+    if let (Some(tid), Some(obj)) = (thread_id, value.as_object_mut()) {
+        obj.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(tid.to_string()),
+        );
     }
 }
 
 impl ProgressReporter for ChannelStreamReporter {
+    fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
     fn report(&self, event: ProgressEvent) {
+        let thread_id = self.thread_id.as_deref();
         let mapped = match event {
             ProgressEvent::StreamChunk { text, iteration } => {
                 StreamProgressEvent::Chunk { text, iteration }
@@ -68,13 +102,14 @@ impl ProgressReporter for ChannelStreamReporter {
                 ref tool_id,
             } => {
                 // Also send raw SSE for web client status indicators
+                let mut payload = serde_json::json!({
+                    "type": "tool_start",
+                    "tool": name,
+                    "tool_call_id": tool_id,
+                });
+                inject_thread_id(&mut payload, thread_id);
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({
-                        "type": "tool_start",
-                        "tool": name,
-                        "tool_call_id": tool_id,
-                    })
-                    .to_string(),
+                    json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolStarted { name: name.clone() }
             }
@@ -84,14 +119,15 @@ impl ProgressReporter for ChannelStreamReporter {
                 success,
                 ..
             } => {
+                let mut payload = serde_json::json!({
+                    "type": "tool_end",
+                    "tool": name,
+                    "tool_call_id": tool_id,
+                    "success": success,
+                });
+                inject_thread_id(&mut payload, thread_id);
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({
-                        "type": "tool_end",
-                        "tool": name,
-                        "tool_call_id": tool_id,
-                        "success": success,
-                    })
-                    .to_string(),
+                    json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolCompleted {
                     name: name.clone(),
@@ -103,14 +139,15 @@ impl ProgressReporter for ChannelStreamReporter {
                 ref tool_id,
                 ref message,
             } => {
+                let mut payload = serde_json::json!({
+                    "type": "tool_progress",
+                    "tool": name,
+                    "tool_call_id": tool_id,
+                    "message": message,
+                });
+                inject_thread_id(&mut payload, thread_id);
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({
-                        "type": "tool_progress",
-                        "tool": name,
-                        "tool_call_id": tool_id,
-                        "message": message,
-                    })
-                    .to_string(),
+                    json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolProgress {
                     name: name.clone(),
@@ -121,26 +158,37 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::FileModified { path } => StreamProgressEvent::FileWritten { path },
             ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             // Forward discrete progress events as raw SSE JSON for the web client.
-            ProgressEvent::Thinking { iteration } => StreamProgressEvent::RawSse {
-                json: serde_json::json!({"type": "thinking", "iteration": iteration}).to_string(),
-            },
-            ProgressEvent::Response { iteration, .. } => StreamProgressEvent::RawSse {
-                json: serde_json::json!({"type": "response", "iteration": iteration}).to_string(),
-            },
+            ProgressEvent::Thinking { iteration } => {
+                let mut payload = serde_json::json!({"type": "thinking", "iteration": iteration});
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
+            ProgressEvent::Response { iteration, .. } => {
+                let mut payload = serde_json::json!({"type": "response", "iteration": iteration});
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             ProgressEvent::CostUpdate {
                 session_input_tokens,
                 session_output_tokens,
                 session_cost,
                 ..
-            } => StreamProgressEvent::RawSse {
-                json: serde_json::json!({
+            } => {
+                let mut payload = serde_json::json!({
                     "type": "cost_update",
                     "input_tokens": session_input_tokens,
                     "output_tokens": session_output_tokens,
                     "session_cost": session_cost,
-                })
-                .to_string(),
-            },
+                });
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             _ => return,
         };
         let _ = self.tx.send(mapped);
@@ -249,6 +297,16 @@ async fn is_session_active(
 /// `active_sessions` + `session_key` — used to check if this session is currently
 /// active before sending/editing channel messages. When inactive, all direct
 /// channel operations are skipped to prevent cross-session message leaks.
+///
+/// `thread_id` — #649 follow-up (rapid-fire): the originating turn's
+/// `client_message_id`, captured ONCE at forwarder construction. Every
+/// `send_with_id` / `edit_message` call this forwarder issues stamps the
+/// outbound metadata with this value so the channel does not have to
+/// fall back to the per-chat sticky map. Under rapid-fire 5 concurrent
+/// turns, sticky has rotated to the LATEST cmid by the time an earlier
+/// turn produces its first chunk — pre-fix that earlier chunk's encoded
+/// message_id captured the rotated value and every subsequent edit
+/// inherited the wrong thread_id, collapsing 4 turns onto one bubble.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn run_stream_forwarder(
     mut rx: mpsc::UnboundedReceiver<StreamProgressEvent>,
@@ -261,6 +319,7 @@ pub async fn run_stream_forwarder(
     sender_user_id: Option<String>,
     operation_updater: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     matrix_app_reply_tools: Arc<HashSet<String>>,
+    thread_id: Option<String>,
 ) -> StreamResult {
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
@@ -337,6 +396,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                         last_edit = Instant::now();
@@ -362,6 +422,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                     }
@@ -391,6 +452,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                     }
@@ -425,6 +487,7 @@ pub async fn run_stream_forwarder(
                                 &mut message_id,
                                 &mut no_edit_support,
                                 sender_user_id.as_deref(),
+                                thread_id.as_deref(),
                             )
                             .await;
                         }
@@ -466,6 +529,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                     }
@@ -501,6 +565,7 @@ pub async fn run_stream_forwarder(
                         &mut message_id,
                         &mut no_edit_support,
                         sender_user_id.as_deref(),
+                        thread_id.as_deref(),
                     )
                     .await;
                     last_edit = Instant::now();
@@ -528,6 +593,7 @@ pub async fn run_stream_forwarder(
                                 &mut message_id,
                                 &mut no_edit_support,
                                 sender_user_id.as_deref(),
+                                thread_id.as_deref(),
                             )
                             .await;
                         }
@@ -568,6 +634,7 @@ pub async fn run_stream_forwarder(
                 &mut message_id,
                 &mut no_edit_support,
                 sender_user_id.as_deref(),
+                thread_id.as_deref(),
             )
             .await;
         }
@@ -584,6 +651,7 @@ pub async fn run_stream_forwarder(
 /// If `send_with_id` returns `None` (channel doesn't support message editing),
 /// sets `no_edit_support` to true so the caller stops attempting to stream.
 /// The final reply will go through the normal `out_tx` path instead.
+#[allow(clippy::too_many_arguments)]
 async fn flush_to_channel(
     channel: &Arc<dyn Channel>,
     chat_id: &str,
@@ -591,6 +659,7 @@ async fn flush_to_channel(
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
     sender_user_id: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     do_flush(
         channel,
@@ -600,6 +669,7 @@ async fn flush_to_channel(
         no_edit_support,
         false,
         sender_user_id,
+        thread_id,
     )
     .await;
 }
@@ -608,6 +678,7 @@ async fn flush_to_channel(
 ///
 /// Channels that need special finalization (e.g. WeCom `finish: true`) will
 /// receive this via `Channel::finish_stream()`.
+#[allow(clippy::too_many_arguments)]
 async fn finish_flush_to_channel(
     channel: &Arc<dyn Channel>,
     chat_id: &str,
@@ -615,6 +686,7 @@ async fn finish_flush_to_channel(
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
     sender_user_id: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     // Preserve the asserted virtual-user identity when the final flush is the
     // first send; otherwise Matrix falls back to the main bot user.
@@ -626,10 +698,12 @@ async fn finish_flush_to_channel(
         no_edit_support,
         true,
         sender_user_id,
+        thread_id,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_flush(
     channel: &Arc<dyn Channel>,
     chat_id: &str,
@@ -638,6 +712,7 @@ async fn do_flush(
     no_edit_support: &mut bool,
     finish: bool,
     sender_user_id: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     if let Some(mid) = message_id.as_ref() {
         let result = if finish {
@@ -650,15 +725,34 @@ async fn do_flush(
         }
     } else {
         // Send new message and capture its ID
+        //
+        // #649 follow-up (rapid-fire): stamp the originating turn's
+        // `thread_id` into the outbound metadata so the API channel's
+        // `send_with_id` captures THIS turn's cmid into the encoded
+        // message_id rather than falling back to the per-chat sticky
+        // map (which has been rotated by every concurrent rapid-fire
+        // request that arrived between this turn's bind and first chunk).
+        let mut metadata = match sender_user_id {
+            Some(uid) => {
+                serde_json::json!({ METADATA_SENDER_USER_ID: uid, "streaming": true })
+            }
+            None => serde_json::json!({ "streaming": true }),
+        };
+        if let Some(tid) = thread_id.filter(|s| !s.is_empty()) {
+            if let Some(map) = metadata.as_object_mut() {
+                map.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+            }
+        }
         let msg = OutboundMessage {
             channel: channel.name().to_string(),
             chat_id: chat_id.to_string(),
             content: text.to_string(),
             reply_to: None,
             media: vec![],
-            metadata: sender_user_id
-                .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid, "streaming": true }))
-                .unwrap_or_else(|| serde_json::json!({ "streaming": true })),
+            metadata,
         };
         match channel.send_with_id(&msg).await {
             Ok(Some(mid)) => {
@@ -745,6 +839,97 @@ mod tests {
         assert!(matches!(event, StreamProgressEvent::BufferReset));
     }
 
+    /// M8.10 PR #2: every raw SSE payload emitted by the reporter must
+    /// include a `thread_id` field equal to the bound cmid. Drives every
+    /// variant that produces a `RawSse` event to confirm none are missed.
+    #[test]
+    fn should_inject_thread_id_into_every_raw_sse_event() {
+        use octos_agent::progress::ProgressEvent;
+        use std::time::Duration;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter =
+            ChannelStreamReporter::new(tx).with_thread_id(Some("cmid-thread-A".to_string()));
+
+        reporter.report(ProgressEvent::ToolStarted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+        });
+        reporter.report(ProgressEvent::ToolCompleted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            success: true,
+            output_preview: "ok".into(),
+            duration: Duration::from_millis(5),
+        });
+        reporter.report(ProgressEvent::ToolProgress {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            message: "step 1".into(),
+        });
+        reporter.report(ProgressEvent::Thinking { iteration: 0 });
+        reporter.report(ProgressEvent::Response {
+            content: "answer".into(),
+            iteration: 1,
+        });
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 10,
+            session_output_tokens: 20,
+            response_cost: None,
+            session_cost: None,
+        });
+
+        let mut raw_payloads: Vec<String> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamProgressEvent::RawSse { json } = event {
+                raw_payloads.push(json);
+            }
+        }
+
+        // ToolStarted, ToolCompleted, ToolProgress emit RawSse + a typed
+        // mapped event each, so 6 reports → 6 RawSse JSON payloads.
+        assert_eq!(
+            raw_payloads.len(),
+            6,
+            "expected 6 RawSse payloads, got {}: {:?}",
+            raw_payloads.len(),
+            raw_payloads
+        );
+        for json in &raw_payloads {
+            let parsed: serde_json::Value = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("payload `{json}` failed to parse: {e}"));
+            assert_eq!(
+                parsed.get("thread_id").and_then(|v| v.as_str()),
+                Some("cmid-thread-A"),
+                "payload `{json}` missing `thread_id` field",
+            );
+        }
+    }
+
+    /// When the reporter is constructed without a thread_id (or with an
+    /// empty string), payloads must NOT carry a `thread_id` field. This
+    /// preserves wire compatibility with non-API channels and pre-cmid
+    /// clients that expect the field to be absent.
+    #[test]
+    fn should_omit_thread_id_when_not_bound() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::Thinking { iteration: 0 });
+
+        if let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() {
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(
+                parsed.get("thread_id").is_none(),
+                "thread_id field must be absent when reporter has no bound id, got {parsed}"
+            );
+        } else {
+            panic!("expected RawSse for Thinking event");
+        }
+    }
+
     #[test]
     fn should_strip_think_tags_from_buffer() {
         assert_eq!(
@@ -785,6 +970,7 @@ mod tests {
             &mut message_id,
             &mut no_edit_support,
             Some("@bot_mybot:localhost"),
+            None,
         )
         .await;
 
@@ -813,6 +999,7 @@ mod tests {
             &mut message_id,
             &mut no_edit_support,
             Some("@bot_mybot:localhost"),
+            None,
         )
         .await;
 
@@ -866,11 +1053,145 @@ mod tests {
             Arc::new(std::collections::HashSet::from([
                 "show_weather_card".to_string()
             ])),
+            None,
         )
         .await;
 
         assert!(result.message_id.is_none());
         assert!(result.text.is_empty());
         assert!(mock.sent.lock().await.is_empty());
+    }
+
+    /// #649 follow-up (rapid-fire): the streaming path must stamp the
+    /// originating turn's `thread_id` into the OutboundMessage metadata
+    /// every time `do_flush` opens a new bubble via `send_with_id`. Pre-fix
+    /// the metadata was `{streaming: true}` only, so under rapid-fire the
+    /// API channel's `send_with_id` fell back to the per-chat sticky map
+    /// (rotated to the LATEST cmid by every concurrent `handle_chat`
+    /// arrival) and 4 of 5 turns mis-tagged onto a single bubble.
+    ///
+    /// This test drives the exact pre-fix shape (per-turn `thread_id`
+    /// captured at forwarder construction) and asserts the wire-side
+    /// outbound carries it. Pre-fix the assert fails — the metadata only
+    /// has `streaming: true`. Post-fix the assert passes.
+    #[tokio::test]
+    async fn flush_to_channel_stamps_outbound_with_thread_id() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        flush_to_channel(
+            &channel,
+            "chat-rapid-fire",
+            "first chunk",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-A"),
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent
+            .first()
+            .expect("stream message should be sent through send_with_id");
+        assert_eq!(
+            first.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-A"),
+            "outbound metadata must carry the per-turn thread_id so \
+             ApiChannel does not fall back to the rotated sticky map. \
+             Got metadata: {}",
+            first.metadata
+        );
+    }
+
+    /// #649 follow-up (rapid-fire): same property for the FINAL flush
+    /// path (StreamDone). The final outbound also goes through
+    /// `send_with_id` when the bubble was never opened, so it must
+    /// stamp `thread_id`.
+    #[tokio::test]
+    async fn finish_flush_to_channel_stamps_outbound_with_thread_id() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        finish_flush_to_channel(
+            &channel,
+            "chat-rapid-fire",
+            "final chunk",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-E"),
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent
+            .first()
+            .expect("final stream message should be sent through send_with_id");
+        assert_eq!(
+            first.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-E"),
+            "final-flush outbound metadata must carry the per-turn thread_id"
+        );
+    }
+
+    /// Backwards-compat: when `thread_id` is None or empty, the outbound
+    /// metadata MUST NOT include a `thread_id` field so non-API channels
+    /// (Matrix, Telegram, …) and pre-cmid clients keep observing the
+    /// pre-fix wire shape.
+    #[tokio::test]
+    async fn flush_omits_thread_id_when_unbound() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        flush_to_channel(
+            &channel,
+            "chat-legacy",
+            "hello",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            None,
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent.first().expect("stream message should be sent");
+        assert!(
+            first.metadata.get("thread_id").is_none(),
+            "thread_id field must be absent when forwarder has no bound id, got {}",
+            first.metadata
+        );
+
+        // Also verify empty-string thread_id is treated as absent (legacy
+        // pre-cmid clients send `client_message_id: ""` on some paths).
+        drop(sent);
+        let mock2 = Arc::new(MockChannel::default());
+        let channel2: Arc<dyn Channel> = mock2.clone();
+        let mut message_id2 = None;
+        let mut no_edit_support2 = false;
+        flush_to_channel(
+            &channel2,
+            "chat-legacy-empty",
+            "hello",
+            &mut message_id2,
+            &mut no_edit_support2,
+            None,
+            Some(""),
+        )
+        .await;
+        let sent2 = mock2.sent.lock().await;
+        let first2 = sent2.first().expect("stream message should be sent");
+        assert!(
+            first2.metadata.get("thread_id").is_none(),
+            "empty-string thread_id must be treated as absent, got {}",
+            first2.metadata
+        );
     }
 }

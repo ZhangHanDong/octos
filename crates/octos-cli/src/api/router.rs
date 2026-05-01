@@ -21,6 +21,7 @@ use super::metrics;
 use super::purge;
 use super::static_files;
 use super::swarm as swarm_api;
+use super::ui_protocol;
 use super::user_admin;
 use super::webhook_proxy;
 use crate::user_store::UserRole;
@@ -97,6 +98,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/chat/stream", get(handlers::chat_stream))
         .route("/api/events/harness", get(events_harness::events_harness))
         .route("/api/ws", get(handlers::ws_handler))
+        .route("/api/ui-protocol/ws", get(ui_protocol::ws_handler))
         .route(
             "/api/upload",
             post(handlers::upload).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
@@ -305,6 +307,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // First-run setup wizard
         .route("/api/admin/token/status", get(admin_setup::token_status))
         .route("/api/admin/token/rotate", post(admin_setup::rotate_token))
+        .route(
+            "/api/admin/token/email",
+            post(admin_setup::post_token_email),
+        )
         .route("/api/admin/setup/state", get(admin_setup::get_setup_state))
         .route("/api/admin/setup/step", post(admin_setup::post_setup_step))
         .route(
@@ -714,6 +720,7 @@ async fn user_auth_middleware(
         // Only allow proxy auth for chat-related endpoints, not admin
         if uri_str.starts_with("/api/chat")
             || uri_str.starts_with("/api/ws")
+            || uri_str.starts_with("/api/ui-protocol")
             || uri_str.starts_with("/api/upload")
             || uri_str.starts_with("/api/sessions")
             || uri_str.starts_with("/api/files")
@@ -908,6 +915,7 @@ mod tests {
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             tenant_store: Some(store),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,

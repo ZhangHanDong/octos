@@ -198,6 +198,7 @@ impl Agent {
                                 tool_call_id: Some(tc_id),
                                 reasoning_content: None,
                                 client_message_id: None,
+                                thread_id: None,
                                 timestamp: chrono::Utc::now(),
                             },
                             Vec::new(),
@@ -222,6 +223,49 @@ impl Agent {
             // tokio task and return immediately. The tool's files_to_send
             // auto-delivers the result to the user. No subagent LLM needed.
             if tools.is_spawn_only(&tc_name) {
+                // PR #688 follow-up — MEDIUM #3: enforce the registry's
+                // provider policy at the spawn_only intercept site, BEFORE
+                // `tokio::spawn`. Without this, a denied stale tool call is
+                // silently spawned and only fails async inside the
+                // background task — the foreground turn observes a fake
+                // "started successfully" and the deny is invisible to the
+                // LLM. Mirror the deny behaviour of the foreground path
+                // (registry.rs `execute_with_context`) so the LLM sees one
+                // synthetic Tool message and stops retrying.
+                if let Some(policy) = tools.provider_policy() {
+                    if let crate::tools::policy::PolicyDecision::Deny { reason } =
+                        policy.evaluate(&tc_name)
+                    {
+                        tracing::warn!(
+                            tool = %tc_name,
+                            reason = %reason,
+                            "provider policy denied spawn_only tool at intercept"
+                        );
+                        let deny_msg = format!(
+                            "[POLICY DENIED] Tool '{}' is blocked by provider policy ({}). Do not retry.",
+                            tc_name, reason
+                        );
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: deny_msg,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tc_id),
+                                reasoning_content: None,
+                                client_message_id: None,
+                                thread_id: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            false, // policy denial is a failure — cascade in serial mode
+                            None,
+                        );
+                    }
+                }
+
                 tracing::info!(
                     tool = %tc_name,
                     "running spawn_only tool in background"
@@ -236,6 +280,14 @@ impl Agent {
                 tools.mark_spawn_only_invoked();
                 let bg_supervisor = tools.supervisor();
                 let bg_reporter = reporter.clone();
+                // M8.10 follow-up (#649): snapshot the originating turn's
+                // thread_id NOW, before any other turn can swap reporters
+                // or rotate the api_channel sticky map. Late-arriving
+                // background results stamp this onto their OutboundMessage
+                // metadata so the wire-side SSE event lands under the
+                // correct turn even after subsequent unrelated user turns
+                // have advanced the per-chat sticky thread_id.
+                let bg_originating_thread_id = bg_reporter.thread_id().map(str::to_string);
                 // F004 B2: bridge supervised runtime-state transitions onto
                 // the per-request reporter so spawn_only tasks emit
                 // ToolProgress events keyed by `tool_call_id`. This is what
@@ -412,6 +464,7 @@ impl Agent {
                                             content: String::new(),
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
+                                            originating_thread_id: bg_originating_thread_id.clone(),
                                         })
                                         .await
                                     } else {
@@ -440,6 +493,8 @@ impl Agent {
                                                     ),
                                                     kind: BackgroundResultKind::Notification,
                                                     media: vec![],
+                                                    originating_thread_id: bg_originating_thread_id
+                                                        .clone(),
                                                 })
                                                 .await;
                                             }
@@ -478,6 +533,7 @@ impl Agent {
                                             content,
                                             kind: BackgroundResultKind::Notification,
                                             media: vec![],
+                                            originating_thread_id: bg_originating_thread_id.clone(),
                                         })
                                         .await;
                                     }
@@ -500,6 +556,8 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
                                             })
                                             .await;
                                         }
@@ -535,6 +593,8 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
                                             })
                                             .await;
                                         }
@@ -634,6 +694,8 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
                                             })
                                             .await;
                                         }
@@ -660,6 +722,8 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        originating_thread_id:
+                                                            bg_originating_thread_id.clone(),
                                                     })
                                                     .await;
                                                 }
@@ -680,6 +744,8 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        originating_thread_id:
+                                                            bg_originating_thread_id.clone(),
                                                     })
                                                     .await;
                                                 }
@@ -703,6 +769,7 @@ impl Agent {
                                     content: format!("✗ {} failed: {}", bg_name, r.output),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    originating_thread_id: bg_originating_thread_id.clone(),
                                 })
                                 .await;
                             }
@@ -720,6 +787,7 @@ impl Agent {
                                     content: format!("✗ {} error: {}", bg_name, e),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    originating_thread_id: bg_originating_thread_id.clone(),
                                 })
                                 .await;
                             }
@@ -757,6 +825,7 @@ impl Agent {
                         tool_call_id: Some(tc_id),
                         reasoning_content: None,
                         client_message_id: None,
+                        thread_id: None,
                         timestamp: chrono::Utc::now(),
                     },
                     Vec::new(),
@@ -984,6 +1053,7 @@ impl Agent {
                     tool_call_id: Some(tc_id),
                     reasoning_content: None,
                     client_message_id: None,
+                    thread_id: None,
                     timestamp: chrono::Utc::now(),
                 },
                 tool_files_modified,
@@ -1101,6 +1171,7 @@ impl Agent {
                             tool_call_id: Some(tc.id.clone()),
                             reasoning_content: None,
                             client_message_id: None,
+                            thread_id: None,
                             timestamp: chrono::Utc::now(),
                         })
                         .collect();
@@ -1317,6 +1388,7 @@ impl Agent {
                             tool_call_id: Some(tool_call.id.clone()),
                             reasoning_content: None,
                             client_message_id: None,
+                            thread_id: None,
                             timestamp: chrono::Utc::now(),
                         },
                         Vec::new(),
@@ -1358,6 +1430,7 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
             tool_call_id: Some(tool_call.id.clone()),
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         },
         Vec::new(),
@@ -1379,6 +1452,7 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
             tool_call_id: Some(tool_call.id.clone()),
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         },
         Vec::new(),
