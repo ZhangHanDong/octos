@@ -839,9 +839,9 @@ mod tests {
             crate::tools::ConcurrencyClass::Exclusive,
         );
 
-        // Unknown values fall back to `Exclusive` (fail-safe — typo in
+        // Unknown values fall back to `Exclusive` (fail-safe — invalid
         // operator config must not silently downgrade enforcement).
-        let typo_json = r#"{"concurrency_class": "exlusive"}"#;
+        let typo_json = r#"{"concurrency_class": "not-a-valid-class"}"#;
         let typo: McpServerConfig = serde_json::from_str(typo_json).unwrap();
         assert_eq!(
             typo.resolved_concurrency_class(),
