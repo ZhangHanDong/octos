@@ -49,6 +49,7 @@ const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 const CONTENT_EXPLICIT_ROOM: &str = "org.octos.explicit_room";
 const CONTENT_BROADCAST_TARGETS: &str = "org.octos.broadcast_targets";
 const CONTENT_ACTIONS: &str = "org.octos.actions";
+const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
 const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
 const CONTENT_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
 const CONTENT_APP: &str = "org.octos.app";
@@ -1298,6 +1299,9 @@ async fn handle_transaction(
         // Route to bot profile: explicit target first, then @mention,
         // then explicit-room suppression, then room mapping fallback.
         let mut metadata = json!({});
+        if let Some(action_response) = content.get(CONTENT_ACTION_RESPONSE) {
+            metadata[CONTENT_ACTION_RESPONSE] = action_response.clone();
+        }
         if let Some(approval_response) = content.get(CONTENT_APPROVAL_RESPONSE) {
             metadata[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
         }
@@ -2230,6 +2234,9 @@ impl MatrixChannel {
         }
         if let Some(approval_response) = metadata.get(CONTENT_APPROVAL_RESPONSE) {
             body[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
+        }
+        if let Some(action_response) = metadata.get(CONTENT_ACTION_RESPONSE) {
+            body[CONTENT_ACTION_RESPONSE] = action_response.clone();
         }
         // Agent-to-app envelope: mini-app payload consumed by capable
         // clients (see robrix2:specs/task-agent-to-app-system.spec.md).
@@ -4674,6 +4681,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_matrix_send_projects_action_response_metadata_into_event_content() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "Action response received".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({
+                CONTENT_ACTION_RESPONSE: {
+                    "action_id": "approve_plan",
+                    "value": true,
+                    "app": {
+                        "type": "mission_room",
+                        "version": 1,
+                        "scope": "room",
+                        "app_id": "mission-alpha"
+                    }
+                },
+            }),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let send_req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert_eq!(
+            send_req.body[CONTENT_ACTION_RESPONSE]["action_id"],
+            "approve_plan"
+        );
+        assert_eq!(
+            send_req.body[CONTENT_ACTION_RESPONSE]["app"]["app_id"],
+            "mission-alpha"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn test_matrix_edit_message() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
@@ -6703,6 +6762,81 @@ mod tests {
         assert_eq!(
             msg.metadata[CONTENT_APPROVAL_RESPONSE]["request_id"],
             "req_123"
+        );
+        assert_eq!(
+            msg.metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|value| value.as_str()),
+            Some("botfather")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_copies_action_response_into_metadata() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "botfather")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$action-response-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "Approve plan",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.action_response": {
+                        "action_id": "approve_plan",
+                        "value": true,
+                        "message": "Looks good",
+                        "app": {
+                            "type": "mission_room",
+                            "version": 1,
+                            "scope": "room",
+                            "app_id": "mission-alpha"
+                        }
+                    }
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-action-response-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata["org.octos.action_response"]["action_id"],
+            "approve_plan"
+        );
+        assert_eq!(
+            msg.metadata["org.octos.action_response"]["app"]["app_id"],
+            "mission-alpha"
         );
         assert_eq!(
             msg.metadata

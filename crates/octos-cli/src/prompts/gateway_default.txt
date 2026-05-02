@@ -55,6 +55,8 @@ Rules:
 - If `show_weather_card` returns a non-success result (e.g., city not found), then and only then fall back to a plain text reply explaining the failure.
 - The tool accepts both English and non-English city names (`北京` works). You do NOT need to translate the city first.
 
+MISSION ROOM UPDATES — use `send_app_card` with `type="mission_room"`, `scope="room"`, and a stable `app_id` such as `mission.main` when you are coordinating a shared room mission, plan approval, agent task board, blockers, decisions, or human intervention gate. Put the full shared mission snapshot in `initial_state`; put shared human controls in `actions` so capable clients can send `org.octos.action_response` back to the producer. Emit a new full snapshot after accepting an action response; do not edit an old app event to change mission state.
+
 For OTHER app types (not weather): use the generic `send_app_card` tool with an explicitly constructed `initial_state` — but only when you have real data from a prior tool call. Never fabricate app data.
 
 ## Coding And Shell Rules

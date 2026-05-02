@@ -40,6 +40,9 @@ use tokio::sync::mpsc;
 use super::{Tool, ToolResult};
 
 const APP_REPLY_TAGS: &[&str] = &["gateway", "app_reply"];
+const APP_METADATA_KEY: &str = "org.octos.app";
+const ACTIONS_METADATA_KEY: &str = "org.octos.actions";
+const MISSION_ROOM_TYPE: &str = "mission_room";
 
 /// Tool for delivering structured mini-app payloads to the current channel.
 pub struct SendAppCardTool {
@@ -100,6 +103,15 @@ struct Input {
     /// `location` (string), `temp_c` (number), `condition` (one of
     /// sunny / cloudy / rainy / snowy / stormy / foggy).
     initial_state: serde_json::Value,
+    /// Optional app scope. `mission_room` requires `room`.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Stable app instance id for room/account scoped apps.
+    #[serde(default)]
+    app_id: Option<String>,
+    /// Optional shared action buttons projected into `org.octos.actions`.
+    #[serde(default)]
+    actions: Option<serde_json::Value>,
     /// User-facing fallback text for clients without the type registry
     /// (also shown in notifications and chat previews).
     body: String,
@@ -155,6 +167,13 @@ impl Tool for SendAppCardTool {
          - `body`: a concise one-line natural language summary for clients \
          without the app registry, e.g. `\"Beijing 22°C partly cloudy\"`.\n\
          \n\
+         MISSION ROOM TYPE (type=\"mission_room\"):\n\
+         You MUST set `scope` to `room` and provide a stable `app_id` such as \
+         `mission.main`. Put the full shared mission snapshot in \
+         `initial_state`, and put shared human controls in `actions` as an \
+         array of `{id, label, style}` objects. Use this for room-scoped \
+         planning, approval, execution, review, and blocker updates.\n\
+         \n\
          If the user wrote a non-English city name, pass it to `get_weather` \
          in English (that tool requires English). Use the original language \
          of the user's request for the `body` fallback text and for `location` \
@@ -192,6 +211,21 @@ impl Tool for SendAppCardTool {
                         optional feels_like_c: number, humidity: integer 0..100, \
                         wind_kph: number >= 0, updated_at: RFC 3339 UTC string, \
                         forecast: array up to 7 of {day, high_c, low_c, condition}}."
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional app scope. Required as 'room' for \
+                        mission_room and other room-scoped apps."
+                },
+                "app_id": {
+                    "type": "string",
+                    "description": "Stable app instance id. Required for \
+                        room/account scoped apps, e.g. 'mission.main'."
+                },
+                "actions": {
+                    "type": "array",
+                    "description": "Optional shared OctOS action buttons. \
+                        Each item should include id, label, and optional style."
                 },
                 "body": {
                     "type": "string",
@@ -262,17 +296,47 @@ impl Tool for SendAppCardTool {
             });
         }
 
+        let scope = input.scope.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let app_id = input.app_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if input.r#type == MISSION_ROOM_TYPE && (scope != Some("room") || app_id.is_none()) {
+            return Ok(ToolResult {
+                output: "Error: mission_room app cards require scope='room' and a stable app_id."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        if let Some(actions) = &input.actions {
+            if !actions.is_array() {
+                return Ok(ToolResult {
+                    output: "Error: actions must be a JSON array.".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         // Build the metadata payload. The matrix channel's
         // `send_matrix_message` path extracts the `"org.octos.app"` key
         // and copies it verbatim into the outgoing Matrix event content.
         // Non-Matrix channels ignore the metadata and send only `body`.
-        let metadata = serde_json::json!({
-            "org.octos.app": {
-                "type": input.r#type,
-                "version": input.version,
-                "initial_state": input.initial_state,
-            }
+        let mut app = serde_json::json!({
+            "type": input.r#type,
+            "version": input.version,
+            "initial_state": input.initial_state,
         });
+        if let Some(scope) = scope {
+            app["scope"] = serde_json::json!(scope);
+        }
+        if let Some(app_id) = app_id {
+            app["app_id"] = serde_json::json!(app_id);
+        }
+        let mut metadata = serde_json::json!({
+            APP_METADATA_KEY: app
+        });
+        if let Some(actions) = input.actions {
+            metadata[ACTIONS_METADATA_KEY] = actions;
+        }
 
         let msg = OutboundMessage {
             channel: channel.clone(),
@@ -393,5 +457,66 @@ mod tests {
                 .and_then(|v| v.get("version")),
             Some(&json!(1))
         );
+    }
+
+    #[tokio::test]
+    async fn mission_room_payload_includes_scope_app_id_and_actions() {
+        let (tool, mut rx) = make_tool();
+        let result = tool
+            .execute(&json!({
+                "type": "mission_room",
+                "version": 1,
+                "scope": "room",
+                "app_id": "mission.main",
+                "initial_state": {
+                    "goal": {"title": "Ship agent2view runtime", "status": "planning"},
+                    "phase": "planning",
+                    "tasks": [],
+                    "agents": [],
+                    "pending_human_actions": [
+                        {"id": "approve_plan", "label": "Approve plan"}
+                    ],
+                    "decisions": [],
+                    "blockers": []
+                },
+                "actions": [
+                    {"id": "approve_plan", "label": "Approve plan", "style": "primary"},
+                    {"id": "request_plan_changes", "label": "Request changes", "style": "secondary"}
+                ],
+                "body": "Mission update: plan is waiting for approval."
+            }))
+            .await
+            .expect("tool run ok");
+        assert!(result.success, "expected success, got: {}", result.output);
+
+        let msg = rx.recv().await.expect("message should have been sent");
+        let app = msg
+            .metadata
+            .get("org.octos.app")
+            .expect("metadata should carry org.octos.app");
+        assert_eq!(app.get("type"), Some(&json!("mission_room")));
+        assert_eq!(app.get("scope"), Some(&json!("room")));
+        assert_eq!(app.get("app_id"), Some(&json!("mission.main")));
+        assert_eq!(
+            msg.metadata["org.octos.actions"][0]["id"],
+            "approve_plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_room_requires_room_scope_and_app_id() {
+        let (tool, _rx) = make_tool();
+        let result = tool
+            .execute(&json!({
+                "type": "mission_room",
+                "initial_state": {},
+                "body": "Mission update"
+            }))
+            .await
+            .expect("tool run ok");
+
+        assert!(!result.success);
+        assert!(result.output.contains("mission_room"));
+        assert!(result.output.contains("scope"));
     }
 }
