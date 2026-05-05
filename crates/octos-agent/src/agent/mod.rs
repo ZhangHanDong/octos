@@ -23,7 +23,6 @@ use octos_core::{AgentId, Message, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
-use crate::approval::{ApprovalPolicy, PendingApprovalDraft};
 use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
@@ -64,8 +63,6 @@ pub struct AgentConfig {
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
-    /// Native approval policy for turning matching tool calls into pending approvals.
-    pub approval_policy: Option<ApprovalPolicy>,
     /// Suppress the generic auto-send loop for tool `files_to_send`.
     /// Background spawned workers rely on their outer workflow/session runtime
     /// to persist terminal results exactly once.
@@ -92,7 +89,6 @@ impl Default for AgentConfig {
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             chat_max_tokens: None,
-            approval_policy: None,
             suppress_auto_send_files: false,
         }
     }
@@ -110,7 +106,6 @@ pub struct ConversationResponse {
     pub files_modified: Vec<PathBuf>,
     pub files_to_send: Vec<PathBuf>,
     pub streamed: bool,
-    pub pending_approval: Option<PendingApprovalDraft>,
     /// All messages generated during processing (assistant replies, tool calls,
     /// tool results). Includes the user message at the front. Callers should
     /// persist these to session history so subsequent calls see the full context.

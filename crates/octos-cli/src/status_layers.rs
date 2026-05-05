@@ -295,7 +295,6 @@ impl StatusComposer {
     ///
     /// Creates all layers based on `user_config`, starts the compose loop,
     /// and returns a handle for updating layers and stopping.
-    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         chat_id: String,
@@ -304,7 +303,37 @@ impl StatusComposer {
         voice_transcript: Option<String>,
         user_config: &UserStatusConfig,
         sender_user_id: Option<String>,
-        persist_visible_status: bool,
+    ) -> ComposerHandle {
+        self.start_with_thread(
+            chat_id,
+            message_text,
+            tracker,
+            voice_transcript,
+            user_config,
+            sender_user_id,
+            None,
+        )
+    }
+
+    /// PR F (M8.10): start variant that binds an originating `thread_id`
+    /// to every status edit. Codex's PR-F review (P1 #1) flagged that
+    /// the API status composer was the last unbound wire path — under
+    /// slow rapid-fire turns, a late bound-A event could rotate sticky
+    /// back to A and B's unbound status send would emit under A.
+    /// Threading the bound id through to `edit_message_bound` /
+    /// `send_with_id` metadata closes that gap. Non-API channels'
+    /// default `_bound` impls forward to the legacy method, so this is
+    /// additive and zero-risk for them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_thread(
+        &self,
+        chat_id: String,
+        message_text: &str,
+        tracker: Arc<TokenTracker>,
+        voice_transcript: Option<String>,
+        user_config: &UserStatusConfig,
+        sender_user_id: Option<String>,
+        thread_id: Option<String>,
     ) -> ComposerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         let status_msg_id = Arc::new(Mutex::new(None::<String>));
@@ -355,6 +384,7 @@ impl StatusComposer {
         let metrics_visible = user_config.metrics_visible;
         let provider_visible = user_config.provider_visible;
         let sender_user_id_for_loop = sender_user_id.clone();
+        let thread_id_for_loop = thread_id.clone().filter(|s| !s.is_empty());
 
         tokio::spawn(async move {
             run_compose_loop(
@@ -369,7 +399,7 @@ impl StatusComposer {
                 metrics_visible,
                 provider_visible,
                 sender_user_id_for_loop,
-                persist_visible_status,
+                thread_id_for_loop,
             )
             .await;
         });
@@ -582,6 +612,10 @@ fn find_layer<'a>(layers: &'a [StatusLayer], id: &str) -> Option<&'a StatusLayer
 // Compose loop
 // ---------------------------------------------------------------------------
 
+// PR F (M8.10): `thread_id` is the originating turn's id, threaded through
+// to `edit_message_bound` and stamped into the initial `send_with_id`
+// metadata so the API channel binds the status bubble to the correct turn
+// under rapid-fire concurrent writes.
 #[allow(clippy::too_many_arguments)]
 async fn run_compose_loop(
     channel: Arc<dyn Channel>,
@@ -595,7 +629,7 @@ async fn run_compose_loop(
     metrics_visible: bool,
     provider_visible: bool,
     sender_user_id: Option<String>,
-    persist_visible_status: bool,
+    thread_id: Option<String>,
 ) {
     let start = Instant::now();
     let mut last_edit = Instant::now() - EDIT_THROTTLE;
@@ -615,7 +649,7 @@ async fn run_compose_loop(
     }
 
     // Compose and send initial message
-    if !persist_visible_status || !channel.supports_edit() {
+    if !channel.supports_edit() {
         // Can't edit — skip status message entirely
         // Just keep sending typing indicators
         loop {
@@ -687,19 +721,41 @@ async fn run_compose_loop(
         if composed != last_composed && last_edit.elapsed() >= EDIT_THROTTLE {
             let mid = status_msg_id.lock().await.clone();
             if let Some(ref mid) = mid {
-                let _ = channel.edit_message(&chat_id, mid, &composed).await;
+                // PR F (M8.10): forward the turn's bound thread_id so
+                // the API channel routes the wire event under THIS
+                // turn's bubble, not whatever sticky has rotated to.
+                let _ = channel
+                    .edit_message_bound(&chat_id, mid, &composed, thread_id.as_deref())
+                    .await;
             } else {
                 // Send initial status message
+                //
+                // PR F (M8.10): stamp `thread_id` into the metadata so
+                // the API channel's `send_with_id` encoder captures
+                // the bound id (and seeds the sticky map with it),
+                // pinning subsequent edit_message_bound calls to the
+                // same bubble.
+                let mut metadata = sender_user_id
+                    .as_ref()
+                    .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let Some(ref tid) = thread_id {
+                    if !tid.is_empty() {
+                        if let Some(map) = metadata.as_object_mut() {
+                            map.insert(
+                                "thread_id".to_string(),
+                                serde_json::Value::String(tid.clone()),
+                            );
+                        }
+                    }
+                }
                 let msg = OutboundMessage {
                     channel: channel.name().to_string(),
                     chat_id: chat_id.clone(),
                     content: composed.clone(),
                     reply_to: None,
                     media: vec![],
-                    metadata: sender_user_id
-                        .as_ref()
-                        .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
-                        .unwrap_or_else(|| serde_json::json!({})),
+                    metadata,
                 };
                 match channel.send_with_id(&msg).await {
                     Ok(Some(mid)) => {
@@ -1006,7 +1062,6 @@ mod tests {
             None,
             &UserStatusConfig::default(),
             Some("@bot_mybot:localhost".to_string()),
-            true,
         );
 
         tokio::time::sleep(Duration::from_millis(3300)).await;
@@ -1036,7 +1091,6 @@ mod tests {
             None,
             &UserStatusConfig::default(),
             Some("@bot_mybot:localhost".to_string()),
-            true,
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1062,7 +1116,6 @@ mod tests {
             None,
             &UserStatusConfig::default(),
             Some("@bot_mybot:localhost".to_string()),
-            true,
         );
 
         handle.stop().await;
@@ -1072,29 +1125,6 @@ mod tests {
             stop_calls.first().and_then(|v| v.as_deref()),
             Some("@bot_mybot:localhost")
         );
-    }
-
-    #[tokio::test]
-    async fn matrix_typing_only_mode_skips_persisted_status_message() {
-        let channel = Arc::new(MockChannel::default());
-        let composer = StatusComposer::new(channel.clone(), vec!["✦ Thinking...".to_string()]);
-        let tracker = Arc::new(TokenTracker::new());
-
-        let handle = composer.start(
-            "!room:localhost".to_string(),
-            "今天天气怎么样",
-            tracker,
-            None,
-            &UserStatusConfig::default(),
-            Some("@bot_mybot:localhost".to_string()),
-            false,
-        );
-
-        tokio::time::sleep(Duration::from_millis(2200)).await;
-        handle.stop().await;
-
-        assert!(channel.sent.lock().await.is_empty());
-        assert!(!channel.typing_senders.lock().await.is_empty());
     }
 
     #[test]

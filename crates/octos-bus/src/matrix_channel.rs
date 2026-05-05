@@ -34,30 +34,21 @@ const CHANNEL_NAME: &str = "matrix";
 const EVENT_ROOM_MESSAGE: &str = "m.room.message";
 const EVENT_ROOM_MEMBER: &str = "m.room.member";
 const MSGTYPE_TEXT: &str = "m.text";
-const MSGTYPE_IMAGE: &str = "m.image";
-const MSGTYPE_AUDIO: &str = "m.audio";
-const MSGTYPE_VIDEO: &str = "m.video";
-const MSGTYPE_FILE: &str = "m.file";
 const MEMBERSHIP_INVITE: &str = "invite";
 const REL_TYPE_REPLACE: &str = "m.replace";
 const LIVE_MARKER: &str = "org.matrix.msc4357.live";
 const HTML_FORMAT: &str = "org.matrix.custom.html";
 const METADATA_TARGET_PROFILE_ID: &str = "target_profile_id";
 const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
-const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
-const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
-const CONTENT_EXPLICIT_ROOM: &str = "org.octos.explicit_room";
-const CONTENT_BROADCAST_TARGETS: &str = "org.octos.broadcast_targets";
+const CONTENT_APP: &str = "org.octos.app";
 const CONTENT_ACTIONS: &str = "org.octos.actions";
 const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
-const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
-const CONTENT_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
-const CONTENT_APP: &str = "org.octos.app";
+const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
+const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
 #[cfg(test)]
 const MAX_EVENT_SENDER_CACHE: usize = 4;
-const MAX_ALLBOTS_TARGETS: usize = 8;
 
 // ── Bot Manager trait ────────────────────────────────────────────────────────
 
@@ -83,21 +74,6 @@ pub trait BotManager: Send + Sync {
 
     /// List all registered bots. Returns a formatted list.
     async fn list_bots(&self, sender: &str) -> Result<String>;
-
-    /// Create a natural-language schedule for the current room context.
-    async fn schedule_bot_task(&self, request: &str, sender: &str, room_id: &str)
-    -> Result<String>;
-
-    /// List schedule jobs visible to the current room context.
-    async fn list_schedules(&self, sender: &str, room_id: &str) -> Result<String>;
-
-    /// Remove a schedule job visible to the current room context.
-    async fn unschedule_bot_task(
-        &self,
-        job_id: &str,
-        sender: &str,
-        room_id: &str,
-    ) -> Result<String>;
 }
 
 // ── Bot Router ───────────────────────────────────────────────────────────────
@@ -252,9 +228,7 @@ impl BotRouter {
     pub async fn route_by_mention(&self, text: &str) -> Option<String> {
         let routes = self.routes.read().await;
         for (bot_user_id, entry) in routes.iter() {
-            if contains_exact_matrix_user_id_mention(text, bot_user_id)
-                || contains_matrix_localpart_mention(text, bot_user_id)
-            {
+            if contains_exact_matrix_user_id_mention(text, bot_user_id) {
                 return Some(entry.profile_id.clone());
             }
         }
@@ -433,43 +407,6 @@ fn contains_exact_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
     false
 }
 
-fn is_matrix_localpart_mention_char(c: char) -> bool {
-    // `:` is included because a `:` immediately after `@localpart` means the
-    // text is actually a full user ID `@localpart:homeserver`, not a standalone
-    // localpart-style mention. Without this, `@bot_weather:homeserverB` in a
-    // message would spuriously match a bot registered as `@bot_weather:homeserverA`,
-    // leaking messages across homeserver boundaries.
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | '/' | ':')
-}
-
-fn contains_matrix_localpart_mention(text: &str, user_id: &str) -> bool {
-    let Some(localpart) = user_id
-        .strip_prefix('@')
-        .and_then(|rest| rest.split(':').next())
-        .filter(|localpart| !localpart.is_empty())
-    else {
-        return false;
-    };
-
-    let mention = format!("@{localpart}");
-    for (idx, _) in text.match_indices(&mention) {
-        let start_ok = text[..idx]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !is_matrix_localpart_mention_char(c));
-        let end_idx = idx + mention.len();
-        let end_ok = text[end_idx..]
-            .chars()
-            .next()
-            .is_none_or(|c| !is_matrix_localpart_mention_char(c));
-        if start_ok && end_ok {
-            return true;
-        }
-    }
-
-    false
-}
-
 async fn route_by_explicit_target(bot_router: &BotRouter, content: &Value) -> Option<String> {
     let target_user_id = content
         .get(CONTENT_TARGET_USER_ID)
@@ -477,30 +414,6 @@ async fn route_by_explicit_target(bot_router: &BotRouter, content: &Value) -> Op
         .and_then(|v| v.as_str())
         .filter(|value| !value.is_empty())?;
     bot_router.route(target_user_id).await
-}
-
-fn has_explicit_room_marker(content: &Value) -> bool {
-    content
-        .get(CONTENT_EXPLICIT_ROOM)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-fn broadcast_target_matrix_user_ids(content: &Value) -> Vec<String> {
-    let Some(targets) = content
-        .get(CONTENT_BROADCAST_TARGETS)
-        .and_then(|value| value.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut deduped = Vec::new();
-    for target in targets.iter().filter_map(|value| value.as_str()) {
-        if !deduped.iter().any(|existing| existing == target) {
-            deduped.push(target.to_string());
-        }
-    }
-    deduped
 }
 
 async fn route_by_matrix_mention(
@@ -550,7 +463,6 @@ struct AppserviceState {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: Option<Arc<dyn BotManager>>,
-    media_dir: PathBuf,
 }
 
 fn error_json_response(
@@ -595,8 +507,6 @@ pub struct MatrixChannel {
     /// Bounded FIFO of event_id → sender_user_id so edit_message can reuse the correct identity
     /// without growing unbounded over a long-lived gateway process.
     event_senders: Arc<RwLock<VecDeque<(String, String)>>>,
-    /// Directory for downloaded media files (inbound images, files, audio).
-    media_dir: PathBuf,
     /// M7.3 swarm supervisor state. `None` means the supervisor contract is
     /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
@@ -633,15 +543,8 @@ impl MatrixChannel {
             bot_manager: std::sync::OnceLock::new(),
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
-            media_dir: std::env::temp_dir().join("octos-matrix-media"),
             swarm_supervisor: None,
         }
-    }
-
-    /// Set the directory for downloaded media files.
-    pub fn with_media_dir(mut self, media_dir: PathBuf) -> Self {
-        self.media_dir = media_dir;
-        self
     }
 
     /// Restrict bot-management slash commands to the given Matrix user IDs.
@@ -672,13 +575,6 @@ impl MatrixChannel {
     /// Returns a reference to the bot router.
     pub fn bot_router(&self) -> &Arc<BotRouter> {
         &self.bot_router
-    }
-
-    /// Register the primary Matrix bot MXID so `@mainbot` mentions route to this profile too.
-    pub async fn register_primary_bot_route(&self, profile_id: &str) -> Result<()> {
-        self.bot_router
-            .register_entry(&self.bot_user_id, profile_id, "", BotVisibility::Public)
-            .await
     }
 
     /// Register a bot mapping and provision the Matrix virtual user on the homeserver.
@@ -1225,67 +1121,20 @@ async fn handle_transaction(
             .get("msgtype")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-
-        // Accept text and media message types; skip everything else (e.g. m.location, m.notice from other bots)
-        let is_media = matches!(
-            msgtype,
-            MSGTYPE_IMAGE | MSGTYPE_FILE | MSGTYPE_AUDIO | MSGTYPE_VIDEO
-        );
-        if msgtype != MSGTYPE_TEXT && !is_media {
+        if msgtype != MSGTYPE_TEXT {
             continue;
         }
 
         let body_text = content.get("body").and_then(|v| v.as_str()).unwrap_or("");
-
-        // For media messages, download the file from mxc:// URL
-        let mut media = vec![];
-        if is_media {
-            if let Some(mxc_url) = content.get("url").and_then(|v| v.as_str()) {
-                // Use filename field if available, fallback to body (which is filename per Matrix spec)
-                let filename = content
-                    .get("filename")
-                    .and_then(|v| v.as_str())
-                    .or(Some(body_text))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("file");
-
-                let download_url = format!(
-                    "{}/_matrix/media/v3/download/{}",
-                    state.homeserver,
-                    mxc_url.strip_prefix("mxc://").unwrap_or(mxc_url),
-                );
-                let unique_filename = format!(
-                    "matrix_{}_{}",
-                    chrono::Utc::now().timestamp_millis(),
-                    filename,
-                );
-                match crate::media::download_media(
-                    &state.http,
-                    &download_url,
-                    &[("Authorization", &format!("Bearer {}", state.as_token))],
-                    &state.media_dir,
-                    &unique_filename,
-                )
-                .await
-                {
-                    Ok(local_path) => {
-                        info!(
-                            mxc_url,
-                            filename,
-                            ?local_path,
-                            "downloaded Matrix media file"
-                        );
-                        media.push(local_path.to_string_lossy().into_owned());
-                    }
-                    Err(e) => {
-                        warn!(mxc_url, error = %e, "failed to download Matrix media file, continuing without media");
-                    }
-                }
-            }
+        if body_text.is_empty() {
+            continue;
         }
 
-        // For text messages, body must be non-empty. For media, allow empty body.
-        if !is_media && body_text.is_empty() {
+        // Intercept slash commands before routing to agent
+        if let Some(response) = handle_slash_command(&state, sender, room_id, body_text).await {
+            if let Err(e) = send_text_to_room(&state, room_id, &response).await {
+                warn!(error = %e, room_id, "failed to send slash command response");
+            }
             continue;
         }
 
@@ -1294,16 +1143,10 @@ async fn handle_transaction(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let explicit_room = has_explicit_room_marker(content);
-
-        // Route to bot profile: explicit target first, then @mention,
-        // then explicit-room suppression, then room mapping fallback.
+        // Route to bot profile: explicit target first, then @mention, then DM room mapping
         let mut metadata = json!({});
         if let Some(action_response) = content.get(CONTENT_ACTION_RESPONSE) {
             metadata[CONTENT_ACTION_RESPONSE] = action_response.clone();
-        }
-        if let Some(approval_response) = content.get(CONTENT_APPROVAL_RESPONSE) {
-            metadata[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
         }
         if let Some(profile_id) = route_by_explicit_target(&state.bot_router, content).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
@@ -1311,19 +1154,8 @@ async fn handle_transaction(
             route_by_matrix_mention(&state.bot_router, content, body_text).await
         {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
-        } else if !explicit_room {
-            if let Some(profile_id) = state.bot_router.route_by_room(room_id).await {
-                metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
-            }
-        }
-
-        if explicit_room
-            && metadata
-                .get(METADATA_TARGET_PROFILE_ID)
-                .and_then(|value| value.as_str())
-                .is_none()
-        {
-            continue;
+        } else if let Some(profile_id) = state.bot_router.route_by_room(room_id).await {
+            metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
         }
 
         if let Some(profile_id) = metadata
@@ -1356,41 +1188,13 @@ async fn handle_transaction(
             }
         }
 
-        if let Some(response) = handle_slash_command(
-            &state,
-            sender,
-            room_id,
-            body_text,
-            metadata
-                .get(METADATA_TARGET_MATRIX_USER_ID)
-                .and_then(|value| value.as_str()),
-            content,
-            event_id.as_deref(),
-        )
-        .await
-        {
-            if !response.trim().is_empty() {
-                if let Err(e) = send_text_to_room(&state, room_id, &response).await {
-                    warn!(error = %e, room_id, "failed to send slash command response");
-                }
-            }
-            continue;
-        }
-
-        // For media messages with empty body, provide a descriptive placeholder
-        let content_text = if body_text.is_empty() && !media.is_empty() {
-            "[User sent a file]".to_string()
-        } else {
-            body_text.to_string()
-        };
-
         let inbound = InboundMessage {
             channel: CHANNEL_NAME.into(),
             sender_id: sender.to_string(),
             chat_id: room_id.to_string(),
-            content: content_text,
+            content: body_text.to_string(),
             timestamp: Utc::now(),
-            media,
+            media: vec![],
             metadata,
             message_id: event_id,
         };
@@ -1411,17 +1215,10 @@ async fn handle_transaction(
 async fn handle_slash_command(
     state: &AppserviceState,
     sender: &str,
-    room_id: &str,
+    _room_id: &str,
     body: &str,
-    target_matrix_user_id: Option<&str>,
-    content: &Value,
-    source_event_id: Option<&str>,
 ) -> Option<String> {
     let bot_manager = state.bot_manager.as_ref()?;
-
-    if target_matrix_user_id.is_some_and(|target| target != state.bot_user_id) {
-        return None;
-    }
 
     let trimmed = body.trim();
     if !trimmed.starts_with('/') {
@@ -1436,21 +1233,7 @@ async fn handle_slash_command(
         "/createbot" => Some(dispatch_createbot(bot_manager.as_ref(), args_str, sender).await),
         "/deletebot" => Some(dispatch_deletebot(bot_manager.as_ref(), args_str, sender).await),
         "/listbots" | "/listbot" => Some(dispatch_listbots(bot_manager.as_ref(), sender).await),
-        "/schedule" => {
-            Some(dispatch_schedule(bot_manager.as_ref(), args_str, sender, room_id).await)
-        }
-        "/schedules" => Some(dispatch_schedules(bot_manager.as_ref(), sender, room_id).await),
-        "/unschedule" => {
-            Some(dispatch_unschedule(bot_manager.as_ref(), args_str, sender, room_id).await)
-        }
         "/bothelp" => Some(SLASH_HELP.to_string()),
-        "/allbots" => {
-            match dispatch_allbots(state, sender, room_id, args_str, content, source_event_id).await
-            {
-                Ok(()) => Some(String::new()),
-                Err(error) => Some(error),
-            }
-        }
         _ => None,
     }
 }
@@ -1462,148 +1245,9 @@ const SLASH_HELP: &str = "\
 • Missing visibility defaults to `private`
 • `/deletebot <matrix_user_id>`
 • `/listbots` (public bots + your private bots)
-• `/schedule <task>` (natural-language scheduling in this chat)
-• `/schedules` (list this chat's schedules)
-• `/unschedule <job-id>`
-• `/allbots <message>` (management rooms only)
 • `/bothelp`
 
 **Tip:** I'm BotFather — you can chat with me directly, or create your own bot with `/createbot` for a dedicated AI assistant.";
-
-async fn dispatch_allbots(
-    state: &AppserviceState,
-    sender: &str,
-    room_id: &str,
-    args_str: &str,
-    content: &Value,
-    source_event_id: Option<&str>,
-) -> std::result::Result<(), String> {
-    if args_str.is_empty() {
-        return Err("Usage: `/allbots <message>`".to_string());
-    }
-
-    let target_matrix_user_ids = broadcast_target_matrix_user_ids(content)
-        .into_iter()
-        .filter(|user_id| user_id != &state.bot_user_id)
-        .collect::<Vec<_>>();
-
-    if target_matrix_user_ids.is_empty() {
-        return Err("No bound child bots were found for this room.".to_string());
-    }
-
-    if target_matrix_user_ids.len() > MAX_ALLBOTS_TARGETS {
-        return Err(format!(
-            "/allbots can target at most {MAX_ALLBOTS_TARGETS} bound child bots at once."
-        ));
-    }
-
-    let mut deliveries = Vec::new();
-    let mut unresolved_targets = Vec::new();
-    for target_matrix_user_id in target_matrix_user_ids {
-        let Some(entry) = state.bot_router.get_entry(&target_matrix_user_id).await else {
-            unresolved_targets.push(target_matrix_user_id);
-            continue;
-        };
-
-        if entry.visibility == BotVisibility::Private && sender != entry.owner {
-            return Err(format!(
-                "You do not have permission to broadcast to private bot `{target_matrix_user_id}`."
-            ));
-        }
-
-        deliveries.push((target_matrix_user_id, entry.profile_id));
-    }
-
-    if deliveries.is_empty() {
-        if !unresolved_targets.is_empty() {
-            return Err(format!(
-                "Could not resolve any bound child bots for /allbots. Stale bindings: {}",
-                unresolved_targets.join(", ")
-            ));
-        }
-        return Err("No bound child bots were found for this room.".to_string());
-    }
-
-    let request_id = source_event_id.unwrap_or("allbots");
-    info!(
-        requester = sender,
-        room_id,
-        request_id,
-        targets = ?deliveries.iter().map(|(target, _)| target).collect::<Vec<_>>(),
-        "dispatching /allbots broadcast"
-    );
-    if !unresolved_targets.is_empty() {
-        warn!(
-            requester = sender,
-            room_id,
-            request_id,
-            stale_targets = ?unresolved_targets,
-            "skipping unresolved stale /allbots bindings"
-        );
-    }
-
-    for (target_matrix_user_id, profile_id) in deliveries {
-        let inbound = InboundMessage {
-            channel: CHANNEL_NAME.into(),
-            sender_id: sender.to_string(),
-            chat_id: room_id.to_string(),
-            content: args_str.to_string(),
-            timestamp: Utc::now(),
-            media: vec![],
-            metadata: json!({
-                METADATA_TARGET_PROFILE_ID: profile_id,
-                METADATA_TARGET_MATRIX_USER_ID: target_matrix_user_id,
-                "org.octos.broadcast_request_id": request_id,
-                "org.octos.broadcast_origin_room_id": room_id,
-                "org.octos.broadcast_source_event_id": source_event_id,
-            }),
-            message_id: source_event_id.map(str::to_string),
-        };
-
-        state.inbound_tx.send(inbound).await.map_err(|_| {
-            "broadcast dispatch failed because the inbound channel is closed".to_string()
-        })?;
-    }
-
-    Ok(())
-}
-
-async fn dispatch_schedule(
-    bot_manager: &dyn BotManager,
-    request: &str,
-    sender: &str,
-    room_id: &str,
-) -> String {
-    if request.trim().is_empty() {
-        return "Usage: `/schedule <natural-language task>`".to_string();
-    }
-    bot_manager
-        .schedule_bot_task(request.trim(), sender, room_id)
-        .await
-        .unwrap_or_else(|e| format!("Failed to create schedule: {e}"))
-}
-
-async fn dispatch_schedules(bot_manager: &dyn BotManager, sender: &str, room_id: &str) -> String {
-    bot_manager
-        .list_schedules(sender, room_id)
-        .await
-        .unwrap_or_else(|e| format!("Failed to list schedules: {e}"))
-}
-
-async fn dispatch_unschedule(
-    bot_manager: &dyn BotManager,
-    job_id: &str,
-    sender: &str,
-    room_id: &str,
-) -> String {
-    if job_id.trim().is_empty() {
-        return "Usage: `/unschedule <job-id>`".to_string();
-    }
-    bot_manager
-        .unschedule_bot_task(job_id.trim(), sender, room_id)
-        .await
-        .unwrap_or_else(|e| format!("Failed to remove schedule: {e}"))
-}
 
 async fn dispatch_createbot(mgr: &dyn BotManager, args: &str, sender: &str) -> String {
     if args.is_empty() {
@@ -1886,7 +1530,6 @@ impl Channel for MatrixChannel {
             dedup: self.dedup.clone(),
             bot_router: self.bot_router.clone(),
             bot_manager: self.bot_manager.get().cloned(),
-            media_dir: self.media_dir.clone(),
         };
 
         let app = Router::new()
@@ -1940,89 +1583,6 @@ impl Channel for MatrixChannel {
             }
         }
 
-        // Handle media files (images, documents, audio, video)
-        if !msg.media.is_empty() {
-            let caption = if msg.content.is_empty() {
-                None
-            } else {
-                Some(msg.content.as_str())
-            };
-            let mut last_event_id = None;
-
-            for (i, path_str) in msg.media.iter().enumerate() {
-                let file_path = std::path::Path::new(path_str);
-                let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
-                let filename = file_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file");
-
-                // Determine content type from extension
-                let ext = file_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let content_type = match ext.as_str() {
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "png" => "image/png",
-                    "gif" => "image/gif",
-                    "webp" => "image/webp",
-                    "svg" => "image/svg+xml",
-                    "mp3" => "audio/mpeg",
-                    "ogg" | "oga" | "opus" => "audio/ogg",
-                    "wav" => "audio/wav",
-                    "m4a" => "audio/mp4",
-                    "flac" => "audio/flac",
-                    "mp4" => "video/mp4",
-                    "webm" => "video/webm",
-                    "mov" => "video/quicktime",
-                    "pdf" => "application/pdf",
-                    _ => "application/octet-stream",
-                };
-
-                info!(
-                    path = path_str,
-                    size = file_size,
-                    content_type,
-                    "sending media file via Matrix"
-                );
-
-                let mxc_url = self
-                    .upload_media(file_path, content_type, sender_user_id)
-                    .await?;
-
-                // Only the first file gets the caption
-                let cap = if i == 0 { caption } else { None };
-                let event_id = self
-                    .send_media_message(
-                        &msg.chat_id,
-                        &mxc_url,
-                        filename,
-                        content_type,
-                        file_size,
-                        cap,
-                        sender_user_id,
-                    )
-                    .await?;
-                last_event_id = Some(event_id);
-            }
-
-            // Remember which sender sent this event
-            if let (Some(uid), Some(event_id)) = (sender_user_id, &last_event_id) {
-                let mut event_senders = self.event_senders.write().await;
-                if let Some(pos) = event_senders.iter().position(|(id, _)| id == event_id) {
-                    event_senders.remove(pos);
-                }
-                event_senders.push_back((event_id.clone(), uid.to_string()));
-                while event_senders.len() > MAX_EVENT_SENDER_CACHE {
-                    event_senders.pop_front();
-                }
-            }
-
-            return Ok(last_event_id);
-        }
-
         let live = msg
             .metadata
             .get("streaming")
@@ -2032,9 +1592,9 @@ impl Channel for MatrixChannel {
             .send_matrix_message(
                 &msg.chat_id,
                 &msg.content,
-                &msg.metadata,
                 sender_user_id,
                 live,
+                &msg.metadata,
             )
             .await?;
 
@@ -2066,51 +1626,6 @@ impl Channel for MatrixChannel {
     ) -> Result<()> {
         self.send_replace_event(chat_id, message_id, final_content, false)
             .await
-    }
-
-    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
-        let sender = self
-            .event_senders
-            .read()
-            .await
-            .iter()
-            .rev()
-            .find(|(event_id, _)| event_id == message_id)
-            .map(|(_, sender)| sender.clone())
-            .unwrap_or_else(|| self.bot_user_id.clone());
-
-        let txn_id = uuid::Uuid::now_v7().to_string();
-        let url = self.make_api_url(&format!(
-            "/_matrix/client/v3/rooms/{}/redact/{}/{}?user_id={}",
-            percent_encode_path(chat_id),
-            percent_encode_path(message_id),
-            percent_encode_path(&txn_id),
-            percent_encode_path(&sender),
-        ));
-
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&self.as_token)
-            .json(&json!({}))
-            .send()
-            .await
-            .wrap_err("failed to send redact event to Matrix")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let resp_body = resp.text().await.unwrap_or_default();
-            return Err(eyre::eyre!(
-                "Matrix redact event failed: status={status} body={resp_body}"
-            ));
-        }
-
-        self.event_senders
-            .write()
-            .await
-            .retain(|(event_id, _)| event_id != message_id);
-
-        Ok(())
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<()> {
@@ -2204,9 +1719,9 @@ impl MatrixChannel {
         &self,
         room_id: &str,
         content: &str,
-        metadata: &serde_json::Value,
         sender_user_id: Option<&str>,
         live: bool,
+        metadata: &Value,
     ) -> Result<String> {
         let txn_id = uuid::Uuid::now_v7().to_string();
         let effective_sender_user_id = sender_user_id.unwrap_or(&self.bot_user_id);
@@ -2226,27 +1741,17 @@ impl MatrixChannel {
             "format": HTML_FORMAT,
             "formatted_body": formatted_body,
         });
-        if let Some(actions) = metadata.get(CONTENT_ACTIONS) {
-            body[CONTENT_ACTIONS] = actions.clone();
+        if live {
+            body[LIVE_MARKER] = json!({});
         }
-        if let Some(approval_request) = metadata.get(CONTENT_APPROVAL_REQUEST) {
-            body[CONTENT_APPROVAL_REQUEST] = approval_request.clone();
-        }
-        if let Some(approval_response) = metadata.get(CONTENT_APPROVAL_RESPONSE) {
-            body[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
-        }
-        if let Some(action_response) = metadata.get(CONTENT_ACTION_RESPONSE) {
-            body[CONTENT_ACTION_RESPONSE] = action_response.clone();
-        }
-        // Agent-to-app envelope: mini-app payload consumed by capable
-        // clients (see robrix2:specs/task-agent-to-app-system.spec.md).
-        // Robrix's type registry renders this as a native GPU card;
-        // other clients ignore it and show only the `body` text.
         if let Some(app) = metadata.get(CONTENT_APP) {
             body[CONTENT_APP] = app.clone();
         }
-        if live {
-            body[LIVE_MARKER] = json!({});
+        if let Some(actions) = metadata.get(CONTENT_ACTIONS) {
+            body[CONTENT_ACTIONS] = actions.clone();
+        }
+        if let Some(action_response) = metadata.get(CONTENT_ACTION_RESPONSE) {
+            body[CONTENT_ACTION_RESPONSE] = action_response.clone();
         }
 
         let resp = self
@@ -2285,184 +1790,6 @@ impl MatrixChannel {
             .to_string();
 
         Ok(event_id)
-    }
-
-    /// Upload a file to the Matrix media repository and return the `mxc://` URI.
-    async fn upload_media(
-        &self,
-        file_path: &std::path::Path,
-        content_type: &str,
-        sender_user_id: Option<&str>,
-    ) -> Result<String> {
-        let data = std::fs::read(file_path)
-            .wrap_err_with(|| format!("failed to read media file: {}", file_path.display()))?;
-
-        let filename = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
-
-        let effective_sender = sender_user_id.unwrap_or(&self.bot_user_id);
-        let url = self.make_api_url(&format!(
-            "/_matrix/media/v3/upload?filename={}&user_id={}",
-            percent_encode_path(filename),
-            percent_encode_path(effective_sender),
-        ));
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.as_token)
-            .header("Content-Type", content_type)
-            .body(data)
-            .send()
-            .await
-            .wrap_err("failed to upload media to Matrix")?;
-
-        let status = resp.status();
-        let resp_body: Value = resp
-            .json()
-            .await
-            .wrap_err("failed to parse Matrix upload response")?;
-
-        if !status.is_success() {
-            let errcode = resp_body
-                .get("errcode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let error = resp_body
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            return Err(eyre::eyre!(
-                "Matrix media upload failed: status={status} errcode={errcode} error={error}"
-            ));
-        }
-
-        let content_uri = resp_body
-            .get("content_uri")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre::eyre!("Matrix upload response missing content_uri"))?
-            .to_string();
-
-        Ok(content_uri)
-    }
-
-    /// Send a media message (`m.image`, `m.audio`, `m.video`, or `m.file`) to a Matrix room.
-    async fn send_media_message(
-        &self,
-        room_id: &str,
-        mxc_url: &str,
-        filename: &str,
-        content_type: &str,
-        file_size: u64,
-        caption: Option<&str>,
-        sender_user_id: Option<&str>,
-    ) -> Result<String> {
-        let txn_id = uuid::Uuid::now_v7().to_string();
-        let effective_sender = sender_user_id.unwrap_or(&self.bot_user_id);
-        let mut path = format!(
-            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            percent_encode_path(room_id),
-            percent_encode_path(&txn_id),
-        );
-        path.push_str("?user_id=");
-        path.push_str(&percent_encode_path(effective_sender));
-        let url = self.make_api_url(&path);
-
-        // Select msgtype by MIME type prefix
-        let msgtype = if content_type.starts_with("image/") {
-            MSGTYPE_IMAGE
-        } else if content_type.starts_with("audio/") {
-            MSGTYPE_AUDIO
-        } else if content_type.starts_with("video/") {
-            MSGTYPE_VIDEO
-        } else {
-            MSGTYPE_FILE
-        };
-
-        let body_text = caption.unwrap_or(filename);
-
-        let body = json!({
-            "msgtype": msgtype,
-            "body": body_text,
-            "url": mxc_url,
-            "filename": filename,
-            "info": {
-                "mimetype": content_type,
-                "size": file_size,
-            },
-        });
-
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&self.as_token)
-            .json(&body)
-            .send()
-            .await
-            .wrap_err("failed to send media message to Matrix")?;
-
-        let status = resp.status();
-        let resp_body: Value = resp
-            .json()
-            .await
-            .wrap_err("failed to parse Matrix send response")?;
-
-        if !status.is_success() {
-            let errcode = resp_body
-                .get("errcode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let error = resp_body
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            return Err(eyre::eyre!(
-                "Matrix media send failed: status={status} errcode={errcode} error={error}"
-            ));
-        }
-
-        let event_id = resp_body
-            .get("event_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Ok(event_id)
-    }
-
-    /// Download media from a Matrix `mxc://` URI to a local file.
-    async fn download_mxc_media(
-        &self,
-        mxc_url: &str,
-        filename: &str,
-        media_dir: &std::path::Path,
-    ) -> Result<PathBuf> {
-        // Parse mxc://server_name/media_id
-        let mxc_path = mxc_url
-            .strip_prefix("mxc://")
-            .ok_or_else(|| eyre::eyre!("invalid mxc URL: {mxc_url}"))?;
-
-        let url = self.make_api_url(&format!(
-            "/_matrix/media/v3/download/{}",
-            percent_encode_path(mxc_path),
-        ));
-
-        let unique_filename = format!(
-            "matrix_{}_{}",
-            chrono::Utc::now().timestamp_millis(),
-            filename,
-        );
-
-        crate::media::download_media(
-            &self.http,
-            &url,
-            &[("Authorization", &format!("Bearer {}", self.as_token))],
-            media_dir,
-            &unique_filename,
-        )
-        .await
     }
 
     /// Send `m.replace`. When `live`, includes MSC4357 marker for streaming.
@@ -3532,23 +2859,7 @@ mod tests {
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
             bot_manager: None,
-            media_dir: PathBuf::from("/tmp/octos-test-media"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_register_primary_bot_route_routes_main_bot_mentions() {
-        let ch = make_channel();
-        ch.register_primary_bot_route("botfather").await.unwrap();
-
-        assert_eq!(
-            ch.bot_router().route(ch.bot_user_id()).await,
-            Some("botfather".to_string()),
-        );
-        assert_eq!(
-            ch.bot_router().route_by_mention("@octos_bot 你是谁").await,
-            Some("botfather".to_string()),
-        );
     }
 
     #[derive(Clone, Debug)]
@@ -3630,10 +2941,6 @@ mod tests {
             )
             .route(
                 "/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}",
-                any(capture_homeserver_request),
-            )
-            .route(
-                "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
                 any(capture_homeserver_request),
             )
             .route(
@@ -4627,7 +3934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_send_projects_approval_metadata_into_event_content() {
+    async fn test_matrix_send_projects_app_metadata_into_event_content() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
             &homeserver,
@@ -4642,74 +3949,25 @@ mod tests {
         let msg = OutboundMessage {
             channel: "matrix".into(),
             chat_id: "!room:localhost".into(),
-            content: "Approval required".into(),
+            content: "mission update".into(),
             reply_to: None,
             media: vec![],
             metadata: json!({
-                CONTENT_APPROVAL_REQUEST: {
-                    "request_id": "req_123",
-                    "tool_name": "shell",
-                    "tool_args_digest": "sha256:deadbeef",
-                    "title": "Execute shell command",
-                    "summary": "rm -rf /tmp/cache",
-                    "risk_level": "critical",
-                    "authorized_approvers": ["@alice:localhost"],
-                    "expires_at": "2026-04-14T12:00:00Z",
-                    "on_timeout": "notify",
+                CONTENT_APP: {
+                    "type": "mission_room",
+                    "version": 1,
+                    "scope": "room",
+                    "app_id": "mission:alpha",
+                    "initial_state": { "status": "green" }
                 },
-                CONTENT_ACTIONS: [
-                    {"id": "approve", "label": "Approve", "style": "primary"},
-                    {"id": "deny", "label": "Deny", "style": "danger"},
-                ],
-            }),
-        };
-
-        ch.send_with_id(&msg).await.unwrap();
-
-        wait_for_request_count(&requests, 1).await;
-        let reqs = requests.lock().await;
-        let send_req = reqs
-            .iter()
-            .find(|r| r.path.contains("/send/"))
-            .expect("should have a send request");
-        assert_eq!(
-            send_req.body[CONTENT_APPROVAL_REQUEST]["request_id"],
-            "req_123"
-        );
-        assert_eq!(send_req.body[CONTENT_ACTIONS][0]["id"], "approve");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_matrix_send_projects_action_response_metadata_into_event_content() {
-        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
-        let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let msg = OutboundMessage {
-            channel: "matrix".into(),
-            chat_id: "!room:localhost".into(),
-            content: "Action response received".into(),
-            reply_to: None,
-            media: vec![],
-            metadata: json!({
+                CONTENT_ACTIONS: [{
+                    "id": "ack",
+                    "label": "Acknowledge"
+                }],
                 CONTENT_ACTION_RESPONSE: {
-                    "action_id": "approve_plan",
-                    "value": true,
-                    "app": {
-                        "type": "mission_room",
-                        "version": 1,
-                        "scope": "room",
-                        "app_id": "mission-alpha"
-                    }
-                },
+                    "action_id": "ack",
+                    "state": { "acknowledged": true }
+                }
             }),
         };
 
@@ -4717,18 +3975,17 @@ mod tests {
 
         wait_for_request_count(&requests, 1).await;
         let reqs = requests.lock().await;
-        let send_req = reqs
+        let req = reqs
             .iter()
             .find(|r| r.path.contains("/send/"))
             .expect("should have a send request");
+        assert_eq!(req.body[CONTENT_APP]["type"], json!("mission_room"));
+        assert_eq!(req.body[CONTENT_ACTIONS][0]["id"], json!("ack"));
         assert_eq!(
-            send_req.body[CONTENT_ACTION_RESPONSE]["action_id"],
-            "approve_plan"
+            req.body[CONTENT_ACTION_RESPONSE]["state"]["acknowledged"],
+            json!(true)
         );
-        assert_eq!(
-            send_req.body[CONTENT_ACTION_RESPONSE]["app"]["app_id"],
-            "mission-alpha"
-        );
+
         handle.abort();
     }
 
@@ -4809,59 +4066,6 @@ mod tests {
         assert!(sends[2].body.get(LIVE_MARKER).is_none());
         assert!(sends[2].body["m.new_content"].get(LIVE_MARKER).is_none());
         assert_eq!(sends[2].body["m.new_content"]["body"], "done");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_matrix_delete_message_sends_redact_event() {
-        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
-        let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
-            Arc::new(AtomicBool::new(false)),
-        );
-
-        ch.event_senders.write().await.push_back((
-            "$stream_event".to_string(),
-            "@octos_weather:localhost".to_string(),
-        ));
-
-        ch.delete_message("!room:localhost", "$stream_event")
-            .await
-            .unwrap();
-
-        wait_for_request_count(&requests, 1).await;
-        let reqs = requests.lock().await;
-        let redact_req = reqs
-            .iter()
-            .find(|r| r.path.contains("/redact/"))
-            .expect("should have a redact request");
-        assert_eq!(redact_req.method, Method::PUT);
-        assert!(
-            redact_req.path.starts_with(
-                "/_matrix/client/v3/rooms/%21room%3Alocalhost/redact/%24stream_event/"
-            )
-        );
-        assert!(
-            redact_req
-                .query
-                .as_deref()
-                .is_some_and(|q| q.contains("user_id=%40octos_weather%3Alocalhost"))
-        );
-        assert_eq!(redact_req.body, json!({}));
-        assert!(
-            ch.event_senders
-                .read()
-                .await
-                .iter()
-                .all(|(event_id, _)| event_id != "$stream_event")
-        );
-
         handle.abort();
     }
 
@@ -5050,79 +4254,6 @@ mod tests {
         assert_eq!(send_req.body["format"], HTML_FORMAT);
         assert!(send_req.body["formatted_body"].is_string());
         assert_eq!(send_req.body["body"], "**bold** text");
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_matrix_send_injects_org_octos_app_from_metadata() {
-        // Given an OutboundMessage whose metadata carries an
-        // `org.octos.app` envelope (produced by the send_app_card tool in
-        // octos-agent), the Matrix channel must copy that envelope verbatim
-        // into the outgoing Matrix event content alongside `msgtype`,
-        // `body`, `format`, and `formatted_body`. This test pins the
-        // end-to-end contract between the producer (send_app_card tool →
-        // OutboundMessage.metadata) and the consumer (Robrix's
-        // org.octos.app type registry); without it, future refactors could
-        // silently strip the envelope and regress the weather card path.
-        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
-        let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
-            Arc::new(AtomicBool::new(false)),
-        );
-
-        let app_envelope = json!({
-            "type": "weather",
-            "version": 1,
-            "initial_state": {
-                "location": "Beijing",
-                "temp_c": 22,
-                "condition": "sunny",
-                "humidity": 65
-            }
-        });
-
-        let msg = OutboundMessage {
-            channel: "matrix".to_string(),
-            chat_id: "!room:localhost".to_string(),
-            content: "Beijing 22°C sunny".to_string(),
-            reply_to: None,
-            media: vec![],
-            metadata: json!({ "org.octos.app": app_envelope.clone() }),
-        };
-
-        ch.send_with_id(&msg).await.unwrap();
-
-        wait_for_request_count(&requests, 1).await;
-        let reqs = requests.lock().await;
-        let send_req = reqs
-            .iter()
-            .find(|r| r.path.contains("/send/"))
-            .expect("should have a send request");
-        // The fallback body text must be preserved for non-Robrix clients.
-        assert_eq!(send_req.body["body"], "Beijing 22°C sunny");
-        assert_eq!(send_req.body["msgtype"], MSGTYPE_TEXT);
-        // The app envelope must be injected verbatim into the event content
-        // under the `org.octos.app` key.
-        assert_eq!(
-            send_req.body["org.octos.app"], app_envelope,
-            "org.octos.app envelope should be copied verbatim into event content"
-        );
-        // Drill into the initial_state to make sure nested fields survive.
-        assert_eq!(
-            send_req.body["org.octos.app"]["initial_state"]["location"],
-            "Beijing"
-        );
-        assert_eq!(
-            send_req.body["org.octos.app"]["initial_state"]["temp_c"],
-            22
-        );
 
         handle.abort();
     }
@@ -6354,62 +5485,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_transaction_localpart_mention_routes_to_target_bot() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-
-        let router = BotRouter::new(None);
-        router
-            .register("@octos_mybot:localhost", "profile-mybot")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$mentions-localpart-1",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "@octos_mybot 你是谁"
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-mentions-localpart-1?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let msg = inbound_rx.try_recv().unwrap();
-        assert_eq!(
-            msg.metadata
-                .get(METADATA_TARGET_PROFILE_ID)
-                .and_then(|v| v.as_str()),
-            Some("profile-mybot"),
-            "@localpart mention should route to the selected bot"
-        );
-    }
-
-    #[tokio::test]
     async fn test_handle_transaction_explicit_target_user_id() {
         use axum::body::Body;
         use axum::http::Request;
@@ -6463,6 +5538,57 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("profile-weather"),
             "explicit target_user_id should route to the selected bot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_copies_action_response_into_metadata() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let state = make_test_state(inbound_tx);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$action-response-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "ack",
+                    "org.octos.action_response": {
+                        "action_id": "ack",
+                        "app_id": "mission:alpha",
+                        "state": { "acknowledged": true }
+                    }
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-action-response?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata[CONTENT_ACTION_RESPONSE]["state"]["acknowledged"],
+            json!(true)
         );
     }
 
@@ -6531,382 +5657,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_handle_transaction_explicit_room_skips_room_fallback() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-
-        let router = BotRouter::new(None);
-        router
-            .register("@bot_weather:localhost", "profile-weather")
-            .await
-            .unwrap();
-        router
-            .add_room_bot("!room:localhost", "profile-weather")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$explicit-room-1",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "hello room",
-                    "org.octos.explicit_room": true
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-explicit-room-1?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        assert!(
-            inbound_rx.try_recv().is_err(),
-            "explicit_room should suppress single-bot room fallback and avoid bot dispatch",
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_transaction_explicit_room_preserves_mention_routing() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-
-        let router = BotRouter::new(None);
-        router
-            .register("@bot_weather:localhost", "profile-weather")
-            .await
-            .unwrap();
-        router
-            .add_room_bot("!room:localhost", "profile-weather")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$explicit-room-2",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "@bot_weather:localhost hello",
-                    "org.octos.explicit_room": true
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-explicit-room-2?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let msg = inbound_rx.try_recv().unwrap();
-        assert_eq!(
-            msg.metadata
-                .get(METADATA_TARGET_PROFILE_ID)
-                .and_then(|v| v.as_str()),
-            Some("profile-weather"),
-            "explicit_room should not suppress explicit bot mentions"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_transaction_explicit_room_preserves_explicit_target_priority() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-
-        let router = BotRouter::new(None);
-        router
-            .register("@bot_weather:localhost", "profile-weather")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$explicit-room-3",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "hello weather",
-                    "org.octos.explicit_room": true,
-                    "org.octos.target_user_id": "@bot_weather:localhost"
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-explicit-room-3?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let msg = inbound_rx.try_recv().unwrap();
-        assert_eq!(
-            msg.metadata
-                .get(METADATA_TARGET_PROFILE_ID)
-                .and_then(|v| v.as_str()),
-            Some("profile-weather"),
-            "explicit target should still win when explicit_room is present"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_transaction_copies_approval_response_into_metadata() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-
-        let router = BotRouter::new(None);
-        router
-            .register("@octos_bot:localhost", "botfather")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$approval-response-1",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "Approve",
-                    "org.octos.target_user_id": "@octos_bot:localhost",
-                    "org.octos.approval_response": {
-                        "request_id": "req_123",
-                        "decision": "approve"
-                    }
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-approval-response-1?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let msg = inbound_rx.try_recv().unwrap();
-        assert_eq!(
-            msg.metadata[CONTENT_APPROVAL_RESPONSE]["request_id"],
-            "req_123"
-        );
-        assert_eq!(
-            msg.metadata
-                .get(METADATA_TARGET_PROFILE_ID)
-                .and_then(|value| value.as_str()),
-            Some("botfather")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_transaction_copies_action_response_into_metadata() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-
-        let router = BotRouter::new(None);
-        router
-            .register("@octos_bot:localhost", "botfather")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$action-response-1",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "Approve plan",
-                    "org.octos.target_user_id": "@octos_bot:localhost",
-                    "org.octos.action_response": {
-                        "action_id": "approve_plan",
-                        "value": true,
-                        "message": "Looks good",
-                        "app": {
-                            "type": "mission_room",
-                            "version": 1,
-                            "scope": "room",
-                            "app_id": "mission-alpha"
-                        }
-                    }
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-action-response-1?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let msg = inbound_rx.try_recv().unwrap();
-        assert_eq!(
-            msg.metadata["org.octos.action_response"]["action_id"],
-            "approve_plan"
-        );
-        assert_eq!(
-            msg.metadata["org.octos.action_response"]["app"]["app_id"],
-            "mission-alpha"
-        );
-        assert_eq!(
-            msg.metadata
-                .get(METADATA_TARGET_PROFILE_ID)
-                .and_then(|value| value.as_str()),
-            Some("botfather")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_transaction_invalid_explicit_room_marker_ignored() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-
-        let router = BotRouter::new(None);
-        router
-            .register("@bot_weather:localhost", "profile-weather")
-            .await
-            .unwrap();
-        router
-            .add_room_bot("!room:localhost", "profile-weather")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$explicit-room-4",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "hello fallback",
-                    "org.octos.explicit_room": "true"
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-explicit-room-4?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let msg = inbound_rx.try_recv().unwrap();
-        assert_eq!(
-            msg.metadata
-                .get(METADATA_TARGET_PROFILE_ID)
-                .and_then(|v| v.as_str()),
-            Some("profile-weather"),
-            "non-boolean explicit_room marker should be ignored"
-        );
-    }
-
     // ── Slash command parsing tests ──────────────────────────────────
 
     #[test]
@@ -6964,16 +5714,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let state = make_test_state(tx);
         // bot_manager is None, so slash commands should not be intercepted
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/listbots",
-            None,
-            &json!({}),
-            None,
-        )
-        .await;
+        let result =
+            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
         assert!(result.is_none());
     }
 
@@ -6983,16 +5725,9 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "hello world",
-            None,
-            &json!({}),
-            None,
-        )
-        .await;
+        let result =
+            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "hello world")
+                .await;
         assert!(result.is_none());
     }
 
@@ -7002,16 +5737,8 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/listbots",
-            None,
-            &json!({}),
-            None,
-        )
-        .await;
+        let result =
+            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -7027,9 +5754,6 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --prompt \"你是天气助手\"",
-            None,
-            &json!({}),
-            None,
         )
         .await;
         assert!(result.is_some());
@@ -7048,9 +5772,6 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot",
-            None,
-            &json!({}),
-            None,
         )
         .await;
 
@@ -7073,9 +5794,6 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --public",
-            None,
-            &json!({}),
-            None,
         )
         .await;
 
@@ -7095,9 +5813,6 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/deletebot @bot_weather:localhost",
-            None,
-            &json!({}),
-            None,
         )
         .await;
         assert!(result.is_some());
@@ -7110,16 +5825,8 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/createbot",
-            None,
-            &json!({}),
-            None,
-        )
-        .await;
+        let result =
+            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/createbot").await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -7130,16 +5837,8 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/deletebot",
-            None,
-            &json!({}),
-            None,
-        )
-        .await;
+        let result =
+            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/deletebot").await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -7150,16 +5849,8 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/listbot",
-            None,
-            &json!({}),
-            None,
-        )
-        .await;
+        let result =
+            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbot").await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -7170,366 +5861,11 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/unknown",
-            None,
-            &json!({}),
-            None,
-        )
-        .await;
+        let result =
+            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/unknown").await;
         assert!(
             result.is_none(),
             "unknown slash commands should pass through to agent"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_slash_command_not_intercepted_for_explicit_child_bot_target() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/listbots",
-            Some("@bot_weather:localhost"),
-            &json!({}),
-            None,
-        )
-        .await;
-
-        assert!(
-            result.is_none(),
-            "explicit child-bot target should bypass BotFather slash interception"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_slash_command_intercepted_for_primary_bot_target() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/listbots",
-            Some("@octos_bot:localhost"),
-            &json!({}),
-            None,
-        )
-        .await;
-
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("mock list"));
-    }
-
-    #[tokio::test]
-    async fn test_schedule_command_intercepted_for_primary_bot_target() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/schedule 每天早上 9 点提醒我看天气",
-            Some("@octos_bot:localhost"),
-            &json!({}),
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            Some("mock schedule: 每天早上 9 点提醒我看天气".to_string()),
-        );
-    }
-
-    #[tokio::test]
-    async fn test_schedules_command_intercepted_for_primary_bot_target() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/schedules",
-            Some("@octos_bot:localhost"),
-            &json!({}),
-            None,
-        )
-        .await;
-
-        assert_eq!(result, Some("mock schedules".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_unschedule_command_intercepted_for_primary_bot_target() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/unschedule cron_deadbeef",
-            Some("@octos_bot:localhost"),
-            &json!({}),
-            None,
-        )
-        .await;
-
-        assert_eq!(result, Some("mock unschedule: cron_deadbeef".to_string()),);
-    }
-
-    #[tokio::test]
-    async fn test_handle_slash_command_allbots_requires_message_body() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/allbots",
-            Some("@octos_bot:localhost"),
-            &json!({}),
-            None,
-        )
-        .await;
-
-        assert_eq!(result, Some("Usage: `/allbots <message>`".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_handle_slash_command_allbots_rejects_empty_broadcast_targets() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/allbots summarize this issue",
-            Some("@octos_bot:localhost"),
-            &json!({}),
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            Some("No bound child bots were found for this room.".to_string()),
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_slash_command_allbots_enforces_target_cap() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let targets = (0..=MAX_ALLBOTS_TARGETS)
-            .map(|i| format!("@octos_child_{i}:localhost"))
-            .collect::<Vec<_>>();
-
-        let result = handle_slash_command(
-            &state,
-            "@alice:localhost",
-            "!room:localhost",
-            "/allbots summarize this issue",
-            Some("@octos_bot:localhost"),
-            &json!({
-                "org.octos.broadcast_targets": targets,
-            }),
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            Some(format!(
-                "/allbots can target at most {MAX_ALLBOTS_TARGETS} bound child bots at once."
-            )),
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_transaction_allbots_fans_out_to_bound_child_bots() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let router = BotRouter::new(None);
-        router
-            .register("@octos_bot:localhost", "profile-parent")
-            .await
-            .unwrap();
-        router
-            .register("@octos_alex:localhost", "profile-alex")
-            .await
-            .unwrap();
-        router
-            .register("@octos_bob:localhost", "profile-bob")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$allbots-fanout-1",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "/allbots summarize this issue",
-                    "org.octos.target_user_id": "@octos_bot:localhost",
-                    "org.octos.broadcast_targets": [
-                        "@octos_alex:localhost",
-                        "@octos_bob:localhost"
-                    ]
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-allbots-fanout-1?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let mut seen = Vec::new();
-        while let Ok(msg) = inbound_rx.try_recv() {
-            seen.push((
-                msg.content,
-                msg.metadata
-                    .get(METADATA_TARGET_PROFILE_ID)
-                    .and_then(|value| value.as_str())
-                    .map(ToOwned::to_owned),
-            ));
-        }
-
-        seen.sort();
-
-        assert_eq!(
-            seen,
-            vec![
-                (
-                    "summarize this issue".to_string(),
-                    Some("profile-alex".to_string()),
-                ),
-                (
-                    "summarize this issue".to_string(),
-                    Some("profile-bob".to_string()),
-                ),
-            ],
-            "/allbots should internally fan out to the bound child bots",
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_transaction_allbots_skips_unresolved_stale_bindings() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-        let mut state = make_test_state(inbound_tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let router = BotRouter::new(None);
-        router
-            .register("@octos_bot:localhost", "profile-parent")
-            .await
-            .unwrap();
-        router
-            .register("@octos_alexbot:localhost", "profile-alex")
-            .await
-            .unwrap();
-        state.bot_router = Arc::new(router);
-
-        let app = Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txn_id}",
-                put(handle_transaction),
-            )
-            .with_state(state);
-
-        let body = serde_json::json!({
-            "events": [{
-                "type": "m.room.message",
-                "sender": "@alice:localhost",
-                "room_id": "!room:localhost",
-                "event_id": "$allbots-fanout-stale-1",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "/allbots summarize this issue",
-                    "org.octos.target_user_id": "@octos_bot:localhost",
-                    "org.octos.broadcast_targets": [
-                        "@octos_alex:localhost",
-                        "@octos_alexbot:localhost"
-                    ]
-                }
-            }]
-        });
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/_matrix/app/v1/transactions/txn-allbots-fanout-stale-1?access_token=test_token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let mut seen = Vec::new();
-        while let Ok(msg) = inbound_rx.try_recv() {
-            seen.push((
-                msg.content,
-                msg.metadata
-                    .get(METADATA_TARGET_PROFILE_ID)
-                    .and_then(|value| value.as_str())
-                    .map(ToOwned::to_owned),
-            ));
-        }
-
-        assert_eq!(
-            seen,
-            vec![(
-                "summarize this issue".to_string(),
-                Some("profile-alex".to_string()),
-            )],
-            "/allbots should skip stale bindings and still fan out to valid child bots",
         );
     }
 
@@ -7557,25 +5893,6 @@ mod tests {
         async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
         }
-        async fn schedule_bot_task(
-            &self,
-            request: &str,
-            _sender: &str,
-            _room_id: &str,
-        ) -> Result<String> {
-            Ok(format!("mock schedule: {request}"))
-        }
-        async fn list_schedules(&self, _sender: &str, _room_id: &str) -> Result<String> {
-            Ok("mock schedules".to_string())
-        }
-        async fn unschedule_bot_task(
-            &self,
-            job_id: &str,
-            _sender: &str,
-            _room_id: &str,
-        ) -> Result<String> {
-            Ok(format!("mock unschedule: {job_id}"))
-        }
     }
 
     #[async_trait]
@@ -7597,25 +5914,6 @@ mod tests {
 
         async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
-        }
-        async fn schedule_bot_task(
-            &self,
-            request: &str,
-            _sender: &str,
-            _room_id: &str,
-        ) -> Result<String> {
-            Ok(format!("mock schedule: {request}"))
-        }
-        async fn list_schedules(&self, _sender: &str, _room_id: &str) -> Result<String> {
-            Ok("mock schedules".to_string())
-        }
-        async fn unschedule_bot_task(
-            &self,
-            job_id: &str,
-            _sender: &str,
-            _room_id: &str,
-        ) -> Result<String> {
-            Ok(format!("mock unschedule: {job_id}"))
         }
     }
 }

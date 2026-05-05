@@ -343,7 +343,6 @@ mod tests {
             files_modified: vec![],
             files_to_send: vec![],
             streamed: false,
-            pending_approval: None,
             messages: vec![],
             tool_results: vec![],
         };

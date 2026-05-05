@@ -4,7 +4,6 @@
 //! enabling real-time LLM text streaming to Telegram, WhatsApp, etc.
 //! Text is accumulated and the channel message is edited at a throttled rate.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -318,7 +317,6 @@ pub async fn run_stream_forwarder(
     session_key: SessionKey,
     sender_user_id: Option<String>,
     operation_updater: Option<Arc<dyn Fn(&str) + Send + Sync>>,
-    matrix_app_reply_tools: Arc<HashSet<String>>,
     thread_id: Option<String>,
 ) -> StreamResult {
     let mut buffer = String::new();
@@ -326,9 +324,6 @@ pub async fn run_stream_forwarder(
     let mut last_edit = Instant::now() - EDIT_THROTTLE; // allow immediate first edit
     let mut first_chunk = true;
     let mut last_chunk_iteration: u32 = 0;
-    let suppress_matrix_transient_status =
-        channel.name() == "matrix" && !matrix_app_reply_tools.is_empty();
-    let mut suppress_follow_up_text_after_app_reply = false;
     // When true, the channel doesn't support send_with_id (returned None),
     // so we stop streaming edits and let the final reply go through out_tx.
     let mut no_edit_support = false;
@@ -336,9 +331,6 @@ pub async fn run_stream_forwarder(
     while let Some(event) = rx.recv().await {
         match event {
             StreamProgressEvent::Chunk { text, iteration } => {
-                if suppress_follow_up_text_after_app_reply {
-                    continue;
-                }
                 // When a new LLM iteration starts streaming, clear tool progress
                 // markers from the buffer so the final response is clean.
                 // This prevents testers from capturing "✓ shell ✓ read_file..."
@@ -404,9 +396,6 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::StreamDone { .. } => {
-                if suppress_follow_up_text_after_app_reply {
-                    continue;
-                }
                 // Flush remaining buffer — strip think tags. Use finish flush
                 // so channels like WeCom can send `finish: true`.
                 if !no_edit_support
@@ -429,9 +418,6 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::ToolStarted { name } => {
-                if suppress_matrix_transient_status {
-                    continue;
-                }
                 // Update status bar operation layer with tool name
                 if let Some(ref updater) = operation_updater {
                     updater(&format!("Running {name}"));
@@ -460,14 +446,6 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::ToolCompleted { name, success } => {
-                if success && matrix_app_reply_tools.contains(&name) {
-                    suppress_follow_up_text_after_app_reply = true;
-                    buffer.clear();
-                    continue;
-                }
-                if suppress_matrix_transient_status {
-                    continue;
-                }
                 let icon = if success { "✓" } else { "✗" };
                 // Update tool status in the existing message
                 if !no_edit_support && !buffer.is_empty() {
@@ -496,9 +474,6 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::ToolProgress { name, message } => {
-                if suppress_follow_up_text_after_app_reply || suppress_matrix_transient_status {
-                    continue;
-                }
                 // Update the tool status line with the progress message
                 let pending = format!("⚙ `{name}`...");
                 let progress = format!("⚙ `{name}`: {message}");
@@ -537,9 +512,6 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::LlmStatus { message } => {
-                if suppress_follow_up_text_after_app_reply || suppress_matrix_transient_status {
-                    continue;
-                }
                 // Cancel the status indicator before showing retry/failover info
                 if first_chunk {
                     first_chunk = false;
@@ -572,9 +544,6 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::FileWritten { path } => {
-                if suppress_follow_up_text_after_app_reply || suppress_matrix_transient_status {
-                    continue;
-                }
                 // Show file-saved notification immediately so the user knows
                 // the file was written even if the final LLM response is slow.
                 let filename = std::path::Path::new(&path)
@@ -602,9 +571,6 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::BufferReset => {
-                if suppress_follow_up_text_after_app_reply {
-                    continue;
-                }
                 // Clear accumulated text so a retry starts fresh.
                 // Keep the message_id so the retry edits the same message
                 // instead of creating a new one.
@@ -613,7 +579,15 @@ pub async fn run_stream_forwarder(
             StreamProgressEvent::RawSse { json } => {
                 // Forward raw SSE JSON directly to the channel.
                 // Only ApiChannel implements this; other channels ignore it.
-                let _ = channel.send_raw_sse(&chat_id, &json).await;
+                //
+                // PR F (M8.10 thread-binding chain): use the `_bound`
+                // variant so the originating turn's `thread_id`
+                // (captured at this forwarder's task spawn) overrides
+                // any stale `thread_id` field embedded in `json` and
+                // short-circuits the api_channel's sticky-map fallback.
+                let _ = channel
+                    .send_raw_sse_bound(&chat_id, &json, thread_id.as_deref())
+                    .await;
             }
         }
     }
@@ -715,10 +689,23 @@ async fn do_flush(
     thread_id: Option<&str>,
 ) {
     if let Some(mid) = message_id.as_ref() {
+        // PR F (M8.10 thread-binding chain `#649 → #740`): use the
+        // `_bound` variants so the originating turn's `thread_id`
+        // (captured at this forwarder's task spawn and threaded through
+        // `flush_to_channel`/`finish_flush_to_channel`) is the ONLY
+        // input to the api_channel's wire-side `thread_id` resolution
+        // when the bound id is present. Falling back to the legacy
+        // (non-bound) trait methods here re-opens LEAK 2 — the sticky
+        // map rotates under rapid-fire so late deltas of an earlier
+        // turn would mis-route to a later turn's bubble.
         let result = if finish {
-            channel.finish_stream(chat_id, mid, text).await
+            channel
+                .finish_stream_bound(chat_id, mid, text, thread_id)
+                .await
         } else {
-            channel.edit_message(chat_id, mid, text).await
+            channel
+                .edit_message_bound(chat_id, mid, text, thread_id)
+                .await
         };
         if let Err(e) = result {
             warn!("stream edit failed: {e}");
@@ -783,13 +770,18 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use octos_bus::ActiveSessionStore;
     use octos_core::{InboundMessage, METADATA_SENDER_USER_ID};
-    use tokio::sync::{Mutex, RwLock, mpsc};
+    use tokio::sync::{Mutex, mpsc};
+
+    /// PR F (M8.10): record every `_bound` call's `thread_id`
+    /// argument so the test can assert the forwarder threads it
+    /// through the trait correctly.
+    type BoundCall = (&'static str, Option<String>);
 
     #[derive(Default)]
     struct MockChannel {
         sent: Arc<Mutex<Vec<OutboundMessage>>>,
+        bound_thread_ids: Arc<Mutex<Vec<BoundCall>>>,
     }
 
     #[async_trait]
@@ -814,6 +806,47 @@ mod tests {
 
         fn supports_edit(&self) -> bool {
             true
+        }
+
+        async fn edit_message_bound(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _new_content: &str,
+            thread_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.bound_thread_ids
+                .lock()
+                .await
+                .push(("edit_message_bound", thread_id.map(str::to_string)));
+            Ok(())
+        }
+
+        async fn finish_stream_bound(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _final_content: &str,
+            thread_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.bound_thread_ids
+                .lock()
+                .await
+                .push(("finish_stream_bound", thread_id.map(str::to_string)));
+            Ok(())
+        }
+
+        async fn send_raw_sse_bound(
+            &self,
+            _chat_id: &str,
+            _json: &str,
+            thread_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.bound_thread_ids
+                .lock()
+                .await
+                .push(("send_raw_sse_bound", thread_id.map(str::to_string)));
+            Ok(())
         }
     }
 
@@ -1014,54 +1047,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn matrix_app_reply_success_skips_transcript_and_follow_up_chunks() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let active_sessions = Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap()));
-        let mock = Arc::new(MockChannel::default());
-        let channel: Arc<dyn Channel> = mock.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        tx.send(StreamProgressEvent::ToolStarted {
-            name: "show_weather_card".to_string(),
-        })
-        .unwrap();
-        tx.send(StreamProgressEvent::ToolCompleted {
-            name: "show_weather_card".to_string(),
-            success: true,
-        })
-        .unwrap();
-        tx.send(StreamProgressEvent::Chunk {
-            text: "hallucinated weather summary".to_string(),
-            iteration: 1,
-        })
-        .unwrap();
-        tx.send(StreamProgressEvent::StreamDone { iteration: 1 })
-            .unwrap();
-        drop(tx);
-
-        let result = run_stream_forwarder(
-            rx,
-            channel,
-            "!room:localhost".to_string(),
-            None,
-            None,
-            active_sessions,
-            octos_core::SessionKey::new("matrix", "!room:localhost"),
-            Some("@octosbot:localhost".to_string()),
-            None,
-            Arc::new(std::collections::HashSet::from([
-                "show_weather_card".to_string()
-            ])),
-            None,
-        )
-        .await;
-
-        assert!(result.message_id.is_none());
-        assert!(result.text.is_empty());
-        assert!(mock.sent.lock().await.is_empty());
-    }
-
     /// #649 follow-up (rapid-fire): the streaming path must stamp the
     /// originating turn's `thread_id` into the OutboundMessage metadata
     /// every time `do_flush` opens a new bubble via `send_with_id`. Pre-fix
@@ -1192,6 +1177,62 @@ mod tests {
             first2.metadata.get("thread_id").is_none(),
             "empty-string thread_id must be treated as absent, got {}",
             first2.metadata
+        );
+    }
+
+    /// PR F (M8.10 thread-binding chain `#649 → #740`): when
+    /// `do_flush` (via `flush_to_channel`/`finish_flush_to_channel`)
+    /// receives a non-`None` `thread_id`, it must thread that through
+    /// the `_bound` Channel trait methods rather than the legacy
+    /// `edit_message`/`finish_stream` (which fall back to the
+    /// api_channel's per-chat sticky map). The mock asserts the actual
+    /// argument observed.
+    #[tokio::test]
+    async fn do_flush_passes_thread_id_to_bound_methods() {
+        let mock = Arc::new(MockChannel::default());
+        let bound_calls = Arc::clone(&mock.bound_thread_ids);
+        let channel: Arc<dyn Channel> = mock.clone();
+
+        // edit path: message_id is set so do_flush dispatches to
+        // `edit_message_bound`. The forwarder's captured `thread_id` is
+        // forwarded as Some("cmid-A").
+        let mut message_id = Some("$stream-1".to_string());
+        let mut no_edit_support = false;
+        flush_to_channel(
+            &channel,
+            "chat-A",
+            "hello",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-A"),
+        )
+        .await;
+        // finish path: dispatches to `finish_stream_bound`.
+        finish_flush_to_channel(
+            &channel,
+            "chat-A",
+            "hello (final)",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-A"),
+        )
+        .await;
+
+        let calls = bound_calls.lock().await.clone();
+        assert!(
+            calls.iter().any(
+                |(name, tid)| *name == "edit_message_bound" && tid.as_deref() == Some("cmid-A")
+            ),
+            "expected edit_message_bound call with thread_id=cmid-A, got: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(name, tid)| *name == "finish_stream_bound"
+                    && tid.as_deref() == Some("cmid-A")),
+            "expected finish_stream_bound call with thread_id=cmid-A, got: {calls:?}"
         );
     }
 }

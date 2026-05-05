@@ -10,7 +10,6 @@
 pub mod abi_schema;
 mod agent;
 pub mod agents;
-pub mod approval;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
@@ -73,11 +72,6 @@ pub use agent::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
-};
-pub use approval::{
-    ApprovalDecision, ApprovalPolicy, ApprovalRequestEnvelope, ApprovalResponsePayload,
-    ApprovalRiskLevel, ApprovalRule, ApprovalTimeoutBehavior, PendingApproval,
-    PendingApprovalDraft, PendingApprovalStore,
 };
 pub use compaction_tiered::{
     ApiMicroCompactionConfig, DEFAULT_TIER1_MAX_AGE_TURNS, DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT,

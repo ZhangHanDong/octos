@@ -19,8 +19,6 @@ use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
-#[cfg(feature = "matrix")]
-use octos_core::MAIN_PROFILE_ID;
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
     QosCatalog, RetryProvider, SwappableProvider,
@@ -1307,7 +1305,6 @@ impl GatewayRuntime {
                         parent_profile_id: profile_id
                             .clone()
                             .unwrap_or_else(|| MAIN_PROFILE_ID.to_string()),
-                        cron_service: cron_service.clone(),
                     });
                     channel.set_bot_manager(bot_mgr);
                     info!("matrix slash commands enabled (/createbot, /deletebot, /listbots)");

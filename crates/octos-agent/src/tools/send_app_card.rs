@@ -296,8 +296,16 @@ impl Tool for SendAppCardTool {
             });
         }
 
-        let scope = input.scope.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let app_id = input.app_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let scope = input
+            .scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let app_id = input
+            .app_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         if input.r#type == MISSION_ROOM_TYPE && (scope != Some("room") || app_id.is_none()) {
             return Ok(ToolResult {
                 output: "Error: mission_room app cards require scope='room' and a stable app_id."
@@ -497,10 +505,7 @@ mod tests {
         assert_eq!(app.get("type"), Some(&json!("mission_room")));
         assert_eq!(app.get("scope"), Some(&json!("room")));
         assert_eq!(app.get("app_id"), Some(&json!("mission.main")));
-        assert_eq!(
-            msg.metadata["org.octos.actions"][0]["id"],
-            "approve_plan"
-        );
+        assert_eq!(msg.metadata["org.octos.actions"][0]["id"], "approve_plan");
     }
 
     #[tokio::test]

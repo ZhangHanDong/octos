@@ -86,9 +86,6 @@ pub struct ProfileConfig {
     /// Lifecycle hooks for agent events (per-profile).
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
-    /// Native approval policy for tool calls that require human confirmation.
-    #[serde(default)]
-    pub approval_policy: Option<crate::config::ApprovalPolicyConfig>,
     /// Admin mode: when true, gateway registers only admin management tools
     /// (no shell, file, web, browser tools). Used for the admin bot profile.
     #[serde(default)]
@@ -1435,7 +1432,6 @@ pub(crate) fn config_from_profile(
         mcp_servers: vec![],
         sandbox: profile.config.sandbox.clone(),
         tool_policy: None,
-        approval_policy: profile.config.approval_policy.clone(),
         tool_policy_by_provider: Default::default(),
         embedding: None,
         hooks: profile.config.hooks.clone(),
@@ -1909,24 +1905,112 @@ mod tests {
     }
 
     #[test]
-    fn test_config_from_profile_approval_policy_passthrough() {
+    fn test_save_persists_structured_llm_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
         let profile = UserProfile {
-            id: "approval-test".into(),
-            public_subdomain: None,
-            name: "Approval".into(),
+            id: "legacy-llm".into(),
+            name: "Legacy LLM".into(),
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
-                approval_policy: Some(crate::config::ApprovalPolicyConfig {
-                    default: crate::config::ApprovalPolicyDefault::Allow,
-                    rules: vec![crate::config::ApprovalRuleConfig {
-                        tools: vec!["shell".into()],
-                        require_approval: true,
-                        risk_level: crate::config::ApprovalPolicyRiskLevel::Critical,
-                        authorized_approvers: vec!["@alex:127.0.0.1:8128".into()],
-                        expires_in_secs: 300,
-                        on_timeout: crate::config::ApprovalPolicyTimeoutBehavior::Notify,
+                llm: Some(llm_profile(
+                    llm_selection(
+                        "moonshot",
+                        "kimi-k2.5",
+                        Some("AUTODL_API_KEY"),
+                        Some("https://www.autodl.art/api/v1"),
+                    ),
+                    vec![LlmModelSelectionConfig {
+                        family_id: Some("minimax".into()),
+                        model_id: Some("MiniMax-M2.5-highspeed".into()),
+                        route: Some(LlmRouteConfig {
+                            route_id: Some("wisemodel".into()),
+                            label: Some("WiseModel".into()),
+                            base_url: Some("https://api.wisemodel.cn/v1".into()),
+                            api_key_env: Some("WISEMODEL_API_KEY".into()),
+                            api_type: Some("openai".into()),
+                        }),
+                        cost_per_m: Some(3.2),
+                        strong: Some(true),
+                        ..Default::default()
+                    }],
+                )),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.save(&profile).unwrap();
+        let loaded = store.get("legacy-llm").unwrap().unwrap();
+        let llm = loaded.config.llm.expect("normalized llm contract");
+        let primary = llm.primary.expect("primary selection");
+        assert_eq!(primary.family_id.as_deref(), Some("moonshot"));
+        assert_eq!(primary.model_id.as_deref(), Some("kimi-k2.5"));
+        assert_eq!(
+            primary.route.and_then(|route| route.base_url).as_deref(),
+            Some("https://www.autodl.art/api/v1")
+        );
+        assert_eq!(llm.fallbacks.len(), 1);
+        assert_eq!(llm.fallbacks[0].family_id.as_deref(), Some("minimax"));
+        assert_eq!(
+            llm.fallbacks[0].model_id.as_deref(),
+            Some("MiniMax-M2.5-highspeed")
+        );
+    }
+
+    #[test]
+    fn test_config_from_profile_uses_structured_llm_contract() {
+        let profile = UserProfile {
+            id: "structured-llm".into(),
+            name: "Structured LLM".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("moonshot".into()),
+                        model_id: Some("kimi-k2.5".into()),
+                        route: Some(LlmRouteConfig {
+                            route_id: Some("autodl".into()),
+                            label: Some("AutoDL".into()),
+                            base_url: Some("https://www.autodl.art/api/v1".into()),
+                            api_key_env: Some("AUTODL_API_KEY".into()),
+                            api_type: Some("openai".into()),
+                        }),
+                        model_hints: Some(octos_llm::openai::ModelHints {
+                            uses_completion_tokens: true,
+                            fixed_temperature: false,
+                            lacks_vision: false,
+                            merge_system_messages: false,
+                        }),
+                        cost_per_m: Some(4.5),
+                        strong: Some(true),
+                    }),
+                    fallbacks: vec![LlmModelSelectionConfig {
+                        family_id: Some("minimax".into()),
+                        model_id: Some("MiniMax-M2.5-highspeed".into()),
+                        route: Some(LlmRouteConfig {
+                            route_id: Some("wisemodel".into()),
+                            label: Some("WiseModel".into()),
+                            base_url: Some("https://api.wisemodel.cn/v1".into()),
+                            api_key_env: Some("WISEMODEL_API_KEY".into()),
+                            api_type: Some("openai".into()),
+                        }),
+                        model_hints: Some(octos_llm::openai::ModelHints {
+                            uses_completion_tokens: false,
+                            fixed_temperature: false,
+                            lacks_vision: false,
+                            merge_system_messages: true,
+                        }),
+                        cost_per_m: Some(3.2),
+                        strong: Some(true),
                     }],
                 }),
                 ..Default::default()
@@ -1936,14 +2020,155 @@ mod tests {
         };
 
         let config = config_from_profile(&profile, None, None);
-        let policy = config
-            .approval_policy
-            .expect("approval_policy should passthrough");
-        assert_eq!(policy.rules.len(), 1);
-        assert_eq!(policy.rules[0].tools, vec!["shell".to_string()]);
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
         assert_eq!(
-            policy.rules[0].authorized_approvers,
-            vec!["@alex:127.0.0.1:8128".to_string()]
+            config.base_url.as_deref(),
+            Some("https://www.autodl.art/api/v1")
+        );
+        assert_eq!(config.api_key_env.as_deref(), Some("AUTODL_API_KEY"));
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+        assert_eq!(
+            config
+                .model_hints
+                .as_ref()
+                .map(|h| h.uses_completion_tokens),
+            Some(true)
+        );
+        assert_eq!(config.fallback_models.len(), 1);
+        assert_eq!(config.fallback_models[0].provider.as_str(), "minimax");
+        assert_eq!(
+            config.fallback_models[0].model.as_deref(),
+            Some("MiniMax-M2.5-highspeed")
+        );
+        assert_eq!(
+            config.fallback_models[0].base_url.as_deref(),
+            Some("https://api.wisemodel.cn/v1")
+        );
+        assert_eq!(
+            config.fallback_models[0]
+                .model_hints
+                .as_ref()
+                .map(|h| h.merge_system_messages),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_profile_config_patch_applies_typed_sections_without_wiping_gateway() {
+        let mut config = ProfileConfig {
+            gateway: GatewaySettings {
+                max_history: Some(42),
+                system_prompt: Some("keep me".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.apply_patch(ProfileConfigPatch {
+            gateway: Some(GatewaySettingsPatch {
+                max_history: PatchField::Value(100),
+                ..Default::default()
+            }),
+            search: PatchField::Value(SearchConfig {
+                providers: [(
+                    "tavily".into(),
+                    SearchProviderConfig {
+                        api_key_env: Some("TAVILY_API_KEY".into()),
+                    },
+                )]
+                .into(),
+            }),
+            deep_crawl: PatchField::Value(DeepCrawlConfig {
+                page_settle_ms: Some(1500),
+                max_output_chars: Some(32_000),
+            }),
+            apps: PatchField::Value(AppsConfig {
+                slides: Some(SlidesAppConfig {
+                    template_dir: Some("/opt/octos/slides".into()),
+                    default_theme: Some("crew".into()),
+                }),
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(config.gateway.max_history, Some(100));
+        assert_eq!(config.gateway.system_prompt.as_deref(), Some("keep me"));
+        assert_eq!(
+            config
+                .search
+                .as_ref()
+                .and_then(|search| search.providers.get("tavily"))
+                .and_then(|provider| provider.api_key_env.as_deref()),
+            Some("TAVILY_API_KEY")
+        );
+        assert_eq!(
+            config
+                .deep_crawl
+                .as_ref()
+                .and_then(|cfg| cfg.page_settle_ms),
+            Some(1500)
+        );
+        assert_eq!(
+            config
+                .apps
+                .as_ref()
+                .and_then(|apps| apps.slides.as_ref())
+                .and_then(|slides| slides.default_theme.as_deref()),
+            Some("crew")
+        );
+    }
+
+    #[test]
+    fn test_profile_config_patch_clears_structured_llm_contract() {
+        let mut config = ProfileConfig {
+            llm: Some(llm_profile(
+                llm_selection("openai", "gpt-4.1", None, None),
+                vec![],
+            )),
+            ..Default::default()
+        };
+
+        config.apply_patch(ProfileConfigPatch {
+            llm: PatchField::Clear,
+            ..Default::default()
+        });
+
+        assert!(config.llm.is_none());
+        assert!(!config.has_llm_selection());
+    }
+
+    #[test]
+    fn test_profile_config_patch_replaces_structured_llm_contract() {
+        let mut config = ProfileConfig {
+            llm: Some(llm_profile(
+                llm_selection("openai", "gpt-4.1", None, None),
+                vec![],
+            )),
+            ..Default::default()
+        };
+
+        config.apply_patch(ProfileConfigPatch {
+            llm: PatchField::Value(llm_profile(
+                llm_selection("moonshot", "kimi-k2.5", Some("MOONSHOT_API_KEY"), None),
+                vec![],
+            )),
+            ..Default::default()
+        });
+
+        let primary = config
+            .llm
+            .as_ref()
+            .and_then(|llm| llm.primary.as_ref())
+            .expect("rebuilt primary selection");
+        assert_eq!(primary.family_id.as_deref(), Some("moonshot"));
+        assert_eq!(primary.model_id.as_deref(), Some("kimi-k2.5"));
+        assert_eq!(
+            primary
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key_env.as_deref()),
+            Some("MOONSHOT_API_KEY")
         );
     }
 

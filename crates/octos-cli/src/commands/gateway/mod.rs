@@ -180,16 +180,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::sync::{Mutex, RwLock, mpsc};
 
-    fn test_cron_service(dir: &std::path::Path) -> Arc<octos_bus::CronService> {
-        let (cron_in_tx, _cron_in_rx) = mpsc::channel(1);
-        Arc::new(octos_bus::CronService::new(dir.join("cron"), cron_in_tx))
-    }
-
     fn make_profile(id: &str, system_prompt: Option<&str>) -> crate::profiles::UserProfile {
         crate::profiles::UserProfile {
             id: id.to_string(),
             name: id.to_string(),
-            public_subdomain: None,
             enabled: false,
             data_dir: None,
             parent_id: None,
@@ -278,7 +272,6 @@ mod tests {
             plugin_prompt_fragments: vec![],
             no_retry: false,
             sandbox_config: octos_agent::SandboxConfig::default(),
-            task_query_store: crate::session_actor::SessionTaskQueryStore::default(),
         };
 
         let factory = builder.build("botfather--researcher").await.unwrap();
@@ -525,7 +518,6 @@ mod tests {
             store: store.clone(),
             channel: channel.clone(),
             parent_profile_id: parent.id.clone(),
-            cron_service: test_cron_service(dir.path()),
         };
 
         let result = manager
@@ -602,7 +594,6 @@ mod tests {
             store: store.clone(),
             channel: channel.clone(),
             parent_profile_id: parent.id.clone(),
-            cron_service: test_cron_service(dir.path()),
         };
 
         let result = manager
@@ -676,7 +667,6 @@ mod tests {
             store: store.clone(),
             channel: channel.clone(),
             parent_profile_id: parent.id.clone(),
-            cron_service: test_cron_service(dir.path()),
         };
 
         let result = manager

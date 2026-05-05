@@ -1,4 +1,5 @@
 import { expect, type Page } from '@playwright/test';
+import type { CaptureHandle } from '../lib/capture-replay';
 
 const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
 const PROFILE_ID = process.env.OCTOS_PROFILE || 'dspfac';
@@ -15,90 +16,171 @@ const BASE_URL = process.env.OCTOS_TEST_URL || 'http://localhost:3000';
 const STRONG_ADMIN_TOKEN =
   process.env.OCTOS_TEST_ADMIN_TOKEN || 'Octos-E2E-Strong-Token-2026-XYZ-123!';
 
-let tokenRotationPromise: Promise<string> | null = null;
+// Cache of `host -> effective token`. The token rotation flow is per-host
+// because every mini in the fleet has its own `admin_token.json`. Memoising
+// across hosts (the previous module-scope `tokenRotationPromise`) caused
+// every spec in a single Playwright process to inherit the FIRST host's
+// answer — which broke as soon as different specs targeted different hosts
+// or the page's actual `baseURL` differed from the env-derived `BASE_URL`.
+const tokenCacheByHost: Map<string, Promise<string>> = new Map();
 
 /**
- * Rotate the bootstrap admin token to a known strong value if the daemon is
- * still in bootstrap mode. Returns the token that callers should use for all
- * subsequent auth — either the rotated strong token, or the original token
- * if rotation isn't needed (or isn't possible because it was already rotated
- * to a different value).
+ * Resolve a working admin Bearer token for the SPA auth surface (i.e. one
+ * that `/api/auth/me` accepts as `AuthIdentity::Admin`).
  *
- * The returned token is memoised at the module level so multiple specs in
- * the same Playwright process share the work.
+ * The dashboard SPA's `AuthGuard` runs `syncMe()` (calls `/api/auth/me`) on
+ * every page load that has a token in localStorage. If the token doesn't
+ * authenticate, AuthGuard CLEARS localStorage and redirects to `/login`.
+ * That redirect is what makes `[data-testid='chat-input']` never appear and
+ * the helper time out.
+ *
+ * Failure modes the previous helper missed:
+ *
+ *  1. **Already-rotated mini**: production minis have a hashed
+ *     `admin_token.json` whose hash does NOT match the bootstrap value
+ *     (`octos-admin-2026`). The bootstrap token returns 401 against
+ *     `/api/auth/me` — even though `/api/sessions` still serves traffic
+ *     because the Caddy proxy injects `X-Profile-Id` from the subdomain
+ *     and that bypasses the admin gate.
+ *
+ *  2. **Wrong base URL**: the previous probe used the env-derived
+ *     `BASE_URL` (default `http://localhost:3000`). When tests run against
+ *     a remote mini without `OCTOS_TEST_URL` set, the probe hit a
+ *     non-existent local daemon and silently returned the bootstrap token
+ *     unchanged — guaranteeing 401 against the actual target.
+ *
+ * The fix probes BOTH candidate tokens against `/api/auth/me` (the same
+ * endpoint the SPA uses) on the requested host. The strong token is tried
+ * first because it's the steady-state on every production mini. If both
+ * fail we fall back to the bootstrap-rotation flow used on freshly
+ * provisioned daemons.
  */
 export async function ensureAdminTokenRotated(
   baseUrl: string = BASE_URL,
   currentToken: string = AUTH_TOKEN,
 ): Promise<string> {
-  if (!tokenRotationPromise) {
-    tokenRotationPromise = (async () => {
-      const probe = async (token: string): Promise<{ rotated?: boolean } | null> => {
-        try {
-          const resp = await fetch(`${baseUrl}/api/admin/token/status`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          if (!resp.ok) return null;
-          return (await resp.json().catch(() => null)) as
-            | { rotated?: boolean }
-            | null;
-        } catch {
-          return null;
-        }
-      };
+  const host = normaliseHost(baseUrl);
+  let cached = tokenCacheByHost.get(host);
+  if (cached) return cached;
 
-      // 1) Probe with the caller-provided token first.
-      const currentStatus = await probe(currentToken);
-
-      if (currentStatus) {
-        if (!currentStatus.rotated) {
-          // Bootstrap mode — rotate to the strong token now.
-          const rotateResp = await fetch(`${baseUrl}/api/admin/token/rotate`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${currentToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ new_token: STRONG_ADMIN_TOKEN }),
-          });
-          if (!rotateResp.ok) {
-            // Cross-worker race: another Playwright worker process may have
-            // rotated first, which leaves us with a 401 (current bootstrap
-            // token now invalid) or a 409 (token store already populated).
-            // In both cases, probe with STRONG_ADMIN_TOKEN; if it works,
-            // the other worker rotated to the same target and we're done.
-            const fallbackStatus = await probe(STRONG_ADMIN_TOKEN);
-            if (fallbackStatus) return STRONG_ADMIN_TOKEN;
-            if (rotateResp.status !== 409) {
-              const text = await rotateResp.text().catch(() => '');
-              throw new Error(
-                `failed to rotate admin token: ${rotateResp.status} ${text}`,
-              );
-            }
-          }
-          return STRONG_ADMIN_TOKEN;
-        }
-        // Already rotated and the current token still works — caller passed
-        // the rotated token directly. Use it as-is.
-        return currentToken;
+  cached = (async () => {
+    // `/api/auth/me` is the authoritative gate the SPA uses. A token that
+    // returns 200 here will satisfy AuthGuard and let `/chat` render. The
+    // server accepts both admin tokens and email-OTP user sessions on
+    // this endpoint, but we want admin specifically — non-admin sessions
+    // fail downstream when specs hit `/admin/*` SPA routes (e.g.
+    // live-mofa-skills, live-realtime-status). Require `role === 'admin'`
+    // so we don't silently degrade.
+    const meProbe = async (token: string): Promise<boolean> => {
+      try {
+        const resp = await fetch(`${host}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!resp.ok) return false;
+        const body = (await resp.json().catch(() => null)) as
+          | { user?: { role?: string } }
+          | null;
+        return body?.user?.role === 'admin';
+      } catch {
+        return false;
       }
+    };
 
-      // 2) currentToken didn't authenticate. Common case after the first
-      //    run on a host: the bootstrap token is gone but the caller is
-      //    still passing it. Fall back to the strong token we previously
-      //    rotated to (or that someone matching `OCTOS_TEST_ADMIN_TOKEN`
-      //    rotated to). If THAT works, use it.
-      const strongStatus = await probe(STRONG_ADMIN_TOKEN);
-      if (strongStatus) {
-        return STRONG_ADMIN_TOKEN;
+    // 0) Steady state on production minis: STRONG_ADMIN_TOKEN matches the
+    //    rotated `admin_token.json`. Try this first — both `currentToken`
+    //    and `STRONG_ADMIN_TOKEN` are equally likely to be the right one
+    //    depending on how the host was bootstrapped, but in practice any
+    //    long-lived deploy has already been rotated.
+    if (await meProbe(STRONG_ADMIN_TOKEN)) return STRONG_ADMIN_TOKEN;
+
+    // 1) Caller passed the right token directly (e.g. fresh local daemon
+    //    where `currentToken` IS the bootstrap token AND no rotation has
+    //    happened yet, OR the caller threaded a known-rotated token via
+    //    `OCTOS_AUTH_TOKEN`).
+    if (await meProbe(currentToken)) return currentToken;
+
+    // 2) Bootstrap mode — `/api/admin/token/status` says `rotated: false`,
+    //    so we own the rotation. This branch only runs against fresh local
+    //    daemons; on production minis step 0 already returned.
+    const statusProbe = async (token: string): Promise<{ rotated?: boolean } | null> => {
+      try {
+        const resp = await fetch(`${host}/api/admin/token/status`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!resp.ok) return null;
+        return (await resp.json().catch(() => null)) as
+          | { rotated?: boolean }
+          | null;
+      } catch {
+        return null;
       }
+    };
 
-      // 3) Neither token works. Return currentToken so the spec fails
-      //    with the original auth error rather than a silent fallback.
-      return currentToken;
-    })();
+    const currentStatus = await statusProbe(currentToken);
+    if (currentStatus && !currentStatus.rotated) {
+      const rotateResp = await fetch(`${host}/api/admin/token/rotate`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${currentToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ new_token: STRONG_ADMIN_TOKEN }),
+      });
+      if (rotateResp.ok || rotateResp.status === 409) {
+        // 409 = another worker rotated first; STRONG_ADMIN_TOKEN should
+        // now work either way.
+        if (await meProbe(STRONG_ADMIN_TOKEN)) return STRONG_ADMIN_TOKEN;
+      }
+    }
+
+    // 3) Neither known token authenticates and we couldn't rotate. Return
+    //    the strong token rather than the bootstrap value: the spec will
+    //    still fail at the chat-input wait, but the surfaced auth error
+    //    will hint at "rotated to a different secret" rather than the
+    //    misleading "bootstrap token expired".
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[live-browser-helpers] no admin Bearer authenticates against ${host}/api/auth/me ` +
+        `(tried STRONG_ADMIN_TOKEN and OCTOS_AUTH_TOKEN). Set OCTOS_TEST_ADMIN_TOKEN ` +
+        `to the rotated admin secret for this host.`,
+    );
+    return STRONG_ADMIN_TOKEN;
+  })();
+
+  tokenCacheByHost.set(host, cached);
+  return cached;
+}
+
+function normaliseHost(input: string): string {
+  try {
+    const u = new URL(input);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return input.replace(/\/+$/, '');
   }
-  return tokenRotationPromise;
+}
+
+/**
+ * Best-effort recovery of the page's effective base URL. Playwright stores
+ * it on `BrowserContext._options.baseURL` which is not on the public type,
+ * so we fall back to `page.url()` when the page has navigated, then to the
+ * env-derived `BASE_URL` constant.
+ */
+function pageBaseUrl(page: Page): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ctxBase = (page.context() as any)?._options?.baseURL as
+    | string
+    | undefined;
+  if (ctxBase) return ctxBase;
+  const current = page.url();
+  if (current && current !== 'about:blank') {
+    try {
+      return new URL(current).origin;
+    } catch {
+      // fall through
+    }
+  }
+  return BASE_URL;
 }
 
 /**
@@ -106,9 +188,14 @@ export async function ensureAdminTokenRotated(
  * `octos_session_token` / `octos_auth_token` localStorage entries. Resolves
  * to the rotated strong token when the helper had to bootstrap the daemon,
  * otherwise to whatever `OCTOS_AUTH_TOKEN` was passed in.
+ *
+ * Pass `baseUrl` when the caller targets a host that doesn't match
+ * `OCTOS_TEST_URL` (e.g. when a spec uses its own `BASE` constant or
+ * threads the page baseURL through). Defaults preserve the previous
+ * env-only behaviour so this call is backward compatible.
  */
-export async function getEffectiveAdminToken(): Promise<string> {
-  return ensureAdminTokenRotated();
+export async function getEffectiveAdminToken(baseUrl?: string): Promise<string> {
+  return ensureAdminTokenRotated(baseUrl);
 }
 
 export const SEL = {
@@ -128,10 +215,13 @@ export const SEL = {
 } as const;
 
 export async function login(page: Page) {
-  // Bootstrap-mode daemons reject every `/admin/*` page until the admin
-  // token has been rotated. Do this once per Playwright process and use the
-  // rotated value everywhere below.
-  const effectiveToken = await ensureAdminTokenRotated();
+  // The dashboard SPA `AuthGuard` calls `/api/auth/me` on mount. If that
+  // returns 401 it CLEARS localStorage and redirects to `/login` — which is
+  // why merely stuffing a Bearer into localStorage isn't enough. The token
+  // we stuff has to authenticate as `AuthIdentity::Admin` against
+  // `/api/auth/me` on THIS host. Resolve the right token (per host)
+  // before we navigate.
+  const effectiveToken = await ensureAdminTokenRotated(pageBaseUrl(page));
 
   await page.addInitScript(
     ({ token, profile }) => {
@@ -273,14 +363,128 @@ export async function countAssistantBubbles(page: Page) {
   return page.locator(SEL.assistantMessage).count();
 }
 
+/**
+ * Trailing wall-clock timestamp the SPA renders as the LAST line of every
+ * assistant bubble (`YYYY-MM-DD HH:MM:SS`). Anchored to trailing position
+ * (optionally with whitespace) so it doesn't strip a date the LLM
+ * actually emitted INSIDE its answer (e.g. "Today is 2026-05-01") —
+ * which the previous global regex would have eaten and falsely
+ * classified as placeholder-only.
+ */
+const TRAILING_TIMESTAMP_RE = /\s*\d{4}-\d{2}-\d{2}[T\s]+\d{2}:\d{2}:\d{2}\s*$/;
+
+/**
+ * "Thinking" placeholder the SPA renders WHILE the assistant is iterating
+ * but before any tokens have streamed. The legacy renderer emits it as
+ * `.\n.\n.\nThinking (iteration N)` (parens), the newer renderer as
+ * `Thinking... (iteration N)` (ellipsis-then-parens). Match both shapes
+ * with optional dots/ellipsis between "Thinking" and the iteration.
+ * Counted as "filled" by naive `text.length > 1` waits — which made
+ * tests like `live-overflow-stress` exit before real responses arrived.
+ */
+const THINKING_PLACEHOLDER_RE = /Thinking[\s.…]*\(iteration\s+\d+\)/i;
+
+/**
+ * Spawn-only ack messages emitted by `run_pipeline` / `deep_research`
+ * spawn_only flows. PR #688 made these flows return TWO bubbles per turn:
+ * one ack within ~1-3s ("X started in background…"), one result minutes
+ * later (often a `.md` attachment). Harness predicates need to treat
+ * bubbles whose entire body is the ack as "still pending result".
+ *
+ * Detected by a small set of locale-aware ack phrases the daemon emits in
+ * `crates/octos-cli/src/workflows/*.rs`. Anchored phrases are preferred
+ * over unbounded substrings to avoid false-classifying legitimate
+ * results that mention "background" or "在后台" in prose as ack-only.
+ * The `<200` chars guard in `isSpawnAckOnly` provides a defense-in-
+ * depth backstop — if a real result happens to contain an ack-shaped
+ * phrase, the body length almost certainly exceeds the bare ack.
+ *
+ * NB: long-term the cleaner contract is server/SSE metadata
+ * (`message_kind: "spawn_ack" | "assistant_result"` or
+ * `metadata.is_spawn_ack`) surfaced as a DOM data attr; per codex
+ * review on 2026-05-01 these regexes are explicitly the compatibility
+ * fallback, not the final ABI.
+ */
+const SPAWN_ACK_PATTERNS: RegExp[] = [
+  /^.{0,30}已在后台启动/,
+  /^.{0,30}已在後台啟動/,
+  /^.{0,30}已在后台运行/,
+  /^.{0,30}已在後台運行/,
+  /^.{0,80}\b(?:has\s+)?started\s+in\s+(?:the\s+)?background\b/i,
+  /^.{0,80}\b(?:is\s+now\s+)?running\s+in\s+(?:the\s+)?background\b/i,
+];
+
+/**
+ * Strip timestamp + placeholder noise so callers can compare against
+ * "did real content arrive yet" predicates without hand-rolling the
+ * cleanup at every call-site.
+ */
+export function normalizeBubbleText(raw: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(TRAILING_TIMESTAMP_RE, '')
+    .replace(THINKING_PLACEHOLDER_RE, '')
+    .replace(/[.\s]+/g, ' ') // collapse the `.\n.\n.` Thinking pre-pad
+    .trim();
+}
+
+/**
+ * True iff the bubble has nothing but SPA chrome (timestamp, "Thinking
+ * (iteration N)" placeholder, dot-pre-pad). Used by stress harnesses
+ * that need to wait for REAL content rather than the chrome that ships
+ * with every assistant slot.
+ */
+export function isPlaceholderOnly(raw: string): boolean {
+  return normalizeBubbleText(raw).length === 0;
+}
+
+/**
+ * True iff the bubble's only meaningful text is a spawn-only ack. Such a
+ * bubble means the result is still in flight — callers waiting on the
+ * RESULT (not the ack) should treat it as pending.
+ *
+ * `expected_in_response` markers in some specs (e.g. `'research'` for a
+ * deep-research prompt) can incidentally match the Chinese ack
+ * "深度研究已在后台启动" because both share the substring 研究. The fix is
+ * to detect the ack shape independently and require a non-ack signal
+ * (text marker after stripping ack OR `.md` attachment href) before
+ * declaring the spawn_only turn satisfied.
+ */
+export function isSpawnAckOnly(raw: string): boolean {
+  const normalized = normalizeBubbleText(raw);
+  if (normalized.length === 0) return false;
+  if (!SPAWN_ACK_PATTERNS.some((re) => re.test(normalized))) return false;
+  // Ack body is short — a few sentences. If the bubble is much longer
+  // than the ack itself, the result has streamed in alongside it (rare
+  // for spawn_only, but defensive).
+  return normalized.length < 200;
+}
+
 export async function sendAndWait(
   page: Page,
   message: string,
-  opts: { maxWait?: number; label?: string; throwOnTimeout?: boolean } = {},
+  opts: {
+    maxWait?: number;
+    label?: string;
+    throwOnTimeout?: boolean;
+    /**
+     * Optional capture handle (from `attachCapture`). When provided, the
+     * helper marks the user-sent event in the capture timeline so the
+     * resulting fixture correlates the prompt with the SSE frames that
+     * follow. No-op if the capture is disabled (`opts.capture.enabled ===
+     * false`). Backward compatible: existing callers pass no `capture`
+     * and observe the previous behaviour.
+     */
+    capture?: CaptureHandle;
+  } = {},
 ) {
-  const { maxWait = 120_000, label = '', throwOnTimeout = true } = opts;
+  const { maxWait = 120_000, label = '', throwOnTimeout = true, capture } = opts;
   const input = getInput(page);
   const sendBtn = getSendButton(page);
+
+  if (capture?.enabled) {
+    await capture.recordUserSent(message);
+  }
 
   await input.fill(message);
   await sendBtn.click();

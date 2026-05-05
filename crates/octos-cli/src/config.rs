@@ -76,10 +76,6 @@ pub struct Config {
     #[serde(default)]
     pub tool_policy: Option<octos_agent::ToolPolicy>,
 
-    /// Native approval policy for tool calls that require human confirmation.
-    #[serde(default)]
-    pub approval_policy: Option<ApprovalPolicyConfig>,
-
     /// Per-provider tool policies. Key = model ID or provider name prefix.
     /// Example: `{"gemini": {"deny": ["diff_edit"]}}`.
     #[serde(default)]
@@ -298,84 +294,6 @@ pub struct FallbackModel {
 
 pub fn default_true() -> bool {
     true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalPolicyDefault {
-    #[default]
-    Allow,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalPolicyRiskLevel {
-    Normal,
-    Critical,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalPolicyTimeoutBehavior {
-    Notify,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalRuleConfig {
-    pub tools: Vec<String>,
-    pub require_approval: bool,
-    pub risk_level: ApprovalPolicyRiskLevel,
-    pub authorized_approvers: Vec<String>,
-    pub expires_in_secs: u64,
-    pub on_timeout: ApprovalPolicyTimeoutBehavior,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ApprovalPolicyConfig {
-    #[serde(default)]
-    pub default: ApprovalPolicyDefault,
-    #[serde(default)]
-    pub rules: Vec<ApprovalRuleConfig>,
-}
-
-impl ApprovalPolicyRiskLevel {
-    pub fn to_runtime(self) -> octos_agent::ApprovalRiskLevel {
-        match self {
-            Self::Normal => octos_agent::ApprovalRiskLevel::Normal,
-            Self::Critical => octos_agent::ApprovalRiskLevel::Critical,
-        }
-    }
-}
-
-impl ApprovalPolicyTimeoutBehavior {
-    pub fn to_runtime(self) -> octos_agent::ApprovalTimeoutBehavior {
-        match self {
-            Self::Notify => octos_agent::ApprovalTimeoutBehavior::Notify,
-        }
-    }
-}
-
-impl ApprovalRuleConfig {
-    pub fn to_runtime(&self) -> octos_agent::ApprovalRule {
-        octos_agent::ApprovalRule {
-            tools: self.tools.clone(),
-            risk_level: self.risk_level.clone().to_runtime(),
-            authorized_approvers: self.authorized_approvers.clone(),
-            expires_in_secs: self.expires_in_secs,
-            on_timeout: self.on_timeout.clone().to_runtime(),
-        }
-    }
-}
-
-impl ApprovalPolicyConfig {
-    pub fn to_runtime_policy(&self) -> octos_agent::ApprovalPolicy {
-        octos_agent::ApprovalPolicy::new(
-            self.rules
-                .iter()
-                .map(ApprovalRuleConfig::to_runtime)
-                .collect(),
-        )
-    }
 }
 
 /// A sub-provider available for subagent spawning via the spawn tool.
@@ -972,7 +890,6 @@ impl Config {
 
         // Expand environment variables in config values
         config.expand_env_vars();
-        config.validate_approval_policy()?;
 
         // Log if migration changed something (don't silently rewrite user's config)
         if migrated {
@@ -985,27 +902,6 @@ impl Config {
         }
 
         Ok(config)
-    }
-
-    fn validate_approval_policy(&self) -> Result<()> {
-        let Some(policy) = &self.approval_policy else {
-            return Ok(());
-        };
-        for (idx, rule) in policy.rules.iter().enumerate() {
-            if rule.tools.is_empty() {
-                eyre::bail!("approval_policy.rules[{idx}].tools must not be empty");
-            }
-            if !rule.require_approval {
-                eyre::bail!("approval_policy.rules[{idx}].require_approval must be true");
-            }
-            if rule.authorized_approvers.is_empty() {
-                eyre::bail!("approval_policy.rules[{idx}].authorized_approvers must not be empty");
-            }
-            if rule.expires_in_secs == 0 {
-                eyre::bail!("approval_policy.rules[{idx}].expires_in_secs must be > 0");
-            }
-        }
-        Ok(())
     }
 
     /// Expand environment variables in config values.
@@ -1495,114 +1391,6 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.tool_policy_by_provider.is_empty());
-    }
-
-    #[test]
-    fn test_config_deserializes_approval_policy() {
-        let json = r#"{
-            "provider": "anthropic",
-            "approval_policy": {
-                "default": "allow",
-                "rules": [{
-                    "tools": ["shell"],
-                    "require_approval": true,
-                    "risk_level": "critical",
-                    "authorized_approvers": ["@alice:example.org"],
-                    "expires_in_secs": 300,
-                    "on_timeout": "notify"
-                }]
-            }
-        }"#;
-        let config: Config = serde_json::from_str(json).unwrap();
-        let policy = config.approval_policy.unwrap();
-        assert_eq!(policy.rules.len(), 1);
-        assert_eq!(policy.rules[0].tools, vec!["shell"]);
-        assert_eq!(
-            policy.rules[0].authorized_approvers,
-            vec!["@alice:example.org"]
-        );
-        assert_eq!(policy.rules[0].expires_in_secs, 300);
-    }
-
-    #[test]
-    fn test_config_rejects_approval_policy_with_empty_authorized_approvers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "provider": "anthropic",
-                "approval_policy": {
-                    "default": "allow",
-                    "rules": [{
-                        "tools": ["shell"],
-                        "require_approval": true,
-                        "risk_level": "critical",
-                        "authorized_approvers": [],
-                        "expires_in_secs": 300,
-                        "on_timeout": "notify"
-                    }]
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let err = Config::from_file(&path).unwrap_err().to_string();
-        assert!(err.contains("authorized_approvers"));
-    }
-
-    #[test]
-    fn test_config_rejects_approval_policy_with_require_approval_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "provider": "anthropic",
-                "approval_policy": {
-                    "default": "allow",
-                    "rules": [{
-                        "tools": ["shell"],
-                        "require_approval": false,
-                        "risk_level": "critical",
-                        "authorized_approvers": ["@alice:example.org"],
-                        "expires_in_secs": 300,
-                        "on_timeout": "notify"
-                    }]
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let err = Config::from_file(&path).unwrap_err().to_string();
-        assert!(err.contains("require_approval"));
-    }
-
-    #[test]
-    fn test_config_rejects_approval_policy_with_empty_tools() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "provider": "anthropic",
-                "approval_policy": {
-                    "default": "allow",
-                    "rules": [{
-                        "tools": [],
-                        "require_approval": true,
-                        "risk_level": "critical",
-                        "authorized_approvers": ["@alice:example.org"],
-                        "expires_in_secs": 300,
-                        "on_timeout": "notify"
-                    }]
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let err = Config::from_file(&path).unwrap_err().to_string();
-        assert!(err.contains(".tools"));
     }
 
     #[test]

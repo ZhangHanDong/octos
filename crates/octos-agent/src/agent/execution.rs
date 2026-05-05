@@ -32,13 +32,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
-use crate::approval::{PendingApproval, digest_tool_args};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
-use crate::tools::ToolResult;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
 use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
@@ -275,10 +273,6 @@ impl Agent {
                 let bg_args = effective_args.clone();
                 let bg_sender = tools.background_result_sender();
                 let bg_tc_id = tc_id.clone();
-                let task_id =
-                    tools.register_task_with_input(&tc_name, &tc_id, Some(effective_args.clone()));
-                tools.mark_spawn_only_invoked();
-                let bg_supervisor = tools.supervisor();
                 let bg_reporter = reporter.clone();
                 // M8.10 follow-up (#649): snapshot the originating turn's
                 // thread_id NOW, before any other turn can swap reporters
@@ -288,6 +282,20 @@ impl Agent {
                 // correct turn even after subsequent unrelated user turns
                 // have advanced the per-chat sticky thread_id.
                 let bg_originating_thread_id = bg_reporter.thread_id().map(str::to_string);
+                // Issue #738 fix: thread the originating cmid into task
+                // registration so any SpawnOnlyFailureSignal emitted for
+                // this task carries it to the M8.9 synthetic recovery
+                // turn. Without this, the recovery turn mints a fresh
+                // UUIDv7 and the eventual successful retry's deliverables
+                // land under an orphan thread_id with no DOM bubble.
+                let task_id = tools.register_task_with_input_and_cmid(
+                    &tc_name,
+                    &tc_id,
+                    Some(effective_args.clone()),
+                    bg_originating_thread_id.clone(),
+                );
+                tools.mark_spawn_only_invoked();
+                let bg_supervisor = tools.supervisor();
                 // F004 B2: bridge supervised runtime-state transitions onto
                 // the per-request reporter so spawn_only tasks emit
                 // ToolProgress events keyed by `tool_call_id`. This is what
@@ -1229,95 +1237,6 @@ impl Agent {
             tokens_used,
             structured_metadata,
         ))
-    }
-
-    pub async fn revalidate_pending_approval(
-        &self,
-        pending: &PendingApproval,
-        sender_user_id: &str,
-    ) -> Result<(), String> {
-        if !pending
-            .request
-            .authorized_approvers
-            .iter()
-            .any(|approver| approver == sender_user_id)
-        {
-            return Err("approver is not authorized".to_string());
-        }
-
-        if let Some(ref hooks) = self.hooks {
-            let payload = HookPayload::before_tool(
-                &pending.request.tool_name,
-                pending.tool_args.clone(),
-                &pending.tool_id,
-                self.hook_ctx().as_ref(),
-            );
-            match hooks.run(HookEvent::BeforeToolCall, &payload).await {
-                HookResult::Allow => Ok(()),
-                HookResult::Modified(new_args) => {
-                    if digest_tool_args(&new_args) == pending.request.tool_args_digest {
-                        Ok(())
-                    } else {
-                        Err("tool arguments changed since approval request was created".to_string())
-                    }
-                }
-                HookResult::Deny(reason) => {
-                    if reason.is_empty() {
-                        Err("current policy denied the approved tool call".to_string())
-                    } else {
-                        Err(reason)
-                    }
-                }
-                HookResult::Error(err) => Err(err),
-            }
-        } else {
-            Ok(())
-        }
-    }
-
-    pub async fn execute_approved_tool(&self, pending: &PendingApproval) -> Result<ToolResult> {
-        let tool_start = Instant::now();
-        let reporter = std::sync::Arc::new(crate::progress::SilentReporter);
-        let ctx = ToolContext {
-            tool_id: pending.tool_id.clone(),
-            reporter,
-            harness_event_sink: None,
-            attachment_paths: vec![],
-            audio_attachment_paths: vec![],
-            file_attachment_paths: vec![],
-            agent_definitions: self.agent_definitions.clone(),
-            file_state_cache: self.file_state_cache.clone(),
-            permissions: self
-                .profile
-                .as_deref()
-                .map(crate::tools::ToolPermissions::from_profile)
-                .unwrap_or_default(),
-            ..ToolContext::zero()
-        };
-        let result = TOOL_CTX
-            .scope(
-                ctx.clone(),
-                self.tools.execute_with_context(
-                    &ctx,
-                    &pending.request.tool_name,
-                    &pending.tool_args,
-                ),
-            )
-            .await?;
-
-        if let Some(ref hooks) = self.hooks {
-            let payload = HookPayload::after_tool(
-                &pending.request.tool_name,
-                &pending.tool_id,
-                octos_core::truncated_utf8(&result.output, 500, "..."),
-                result.success,
-                tool_start.elapsed().as_millis() as u64,
-                self.hook_ctx().as_ref(),
-            );
-            let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
-        }
-
-        Ok(result)
     }
 
     /// Serial dispatch for batches that contain at least one Exclusive tool (M8.8).

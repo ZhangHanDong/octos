@@ -225,6 +225,27 @@ impl ToolRegistry {
         )
     }
 
+    /// Issue #738 fix: register a background task while also threading
+    /// the originating user turn's `client_message_id`. Used by the
+    /// spawn_only execution path so the synthetic recovery turn (M8.9)
+    /// can stamp the original cmid into its `InboundMessage` metadata
+    /// instead of minting an orphan UUIDv7.
+    pub fn register_task_with_input_and_cmid(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        tool_input: Option<serde_json::Value>,
+        originating_client_message_id: Option<String>,
+    ) -> String {
+        self.supervisor.register_with_input_and_cmid(
+            tool_name,
+            tool_call_id,
+            self.session_key.as_deref(),
+            tool_input,
+            originating_client_message_id,
+        )
+    }
+
     /// Return the number of currently active background tasks.
     pub fn bg_task_count(&self) -> u32 {
         self.supervisor.task_count() as u32
@@ -347,15 +368,6 @@ impl ToolRegistry {
     /// Get a tool by name.
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
-    }
-
-    /// Return the names of tools that advertise a given tag.
-    pub fn names_with_tag(&self, tag: &str) -> Vec<String> {
-        self.tools
-            .iter()
-            .filter(|(_, tool)| tool.tags().contains(&tag))
-            .map(|(name, _)| name.clone())
-            .collect()
     }
 
     /// Number of registered tools.

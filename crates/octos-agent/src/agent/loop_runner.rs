@@ -687,7 +687,6 @@ impl Agent {
                                 streamed: false,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
-                                pending_approval: None,
                             });
                         }
                     }
@@ -862,7 +861,6 @@ impl Agent {
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
-                                pending_approval: None,
                             });
                         }
                         StopReason::ToolUse => {
@@ -896,7 +894,6 @@ impl Agent {
                                                 history.len(),
                                             ),
                                             tool_results: tool_structured_metadata.clone(),
-                                            pending_approval: None,
                                         });
                                     }
                                     // Single-fire-per-burst: first fire emits the
@@ -920,7 +917,6 @@ impl Agent {
                                             history.len(),
                                         ),
                                         tool_results: tool_structured_metadata.clone(),
-                                        pending_approval: None,
                                     });
                                 }
                             }
@@ -975,7 +971,6 @@ impl Agent {
                                         history.len(),
                                     ),
                                     tool_results: tool_structured_metadata.clone(),
-                                    pending_approval: None,
                                 });
                             }
 
@@ -1013,7 +1008,6 @@ impl Agent {
                                     streamed,
                                     messages: LoopTurnState::new_messages(&messages, history.len()),
                                     tool_results: tool_structured_metadata.clone(),
-                                    pending_approval: None,
                                 });
                             }
                         }
@@ -1031,7 +1025,6 @@ impl Agent {
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
-                                pending_approval: None,
                             });
                         }
                         StopReason::ContentFiltered => {
@@ -1055,7 +1048,6 @@ impl Agent {
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
-                                pending_approval: None,
                             });
                         }
                     }
