@@ -166,6 +166,20 @@ impl UiProtocolLedgerEvent {
                 UiNotification::MessagePersisted(persisted) => {
                     persisted.cursor = cursor;
                 }
+                // M10 Phase 1: stamp the ledger cursor onto the
+                // `turn/spawn_complete` envelope so cursor-driven
+                // clients can resume cleanly. The flat `seq` field is
+                // intentionally NOT overwritten here — it carries the
+                // committed-row index from the persistence path
+                // (matching `MessagePersistedEvent.seq`), which the
+                // producer set before append (codex P2 follow-up).
+                // The persisted-row seq and the UI-ledger cursor seq
+                // are different scales — conflating them would make
+                // upgraded clients dedupe / anchor against a
+                // non-existent message row on hydrate.
+                UiNotification::TurnSpawnComplete(spawn_complete) => {
+                    spawn_complete.cursor = cursor;
+                }
                 _ => {}
             }
         }
@@ -1481,6 +1495,9 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::TurnError(event) => &event.session_id,
         UiNotification::ReplayLossy(event) => &event.session_id,
         UiNotification::MessagePersisted(event) => &event.session_id,
+        UiNotification::TurnSpawnComplete(event) => &event.session_id,
+        UiNotification::FileAttached(event) => &event.session_id,
+        UiNotification::SessionEventBridged(event) => &event.session_id,
     }
 }
 
@@ -1621,6 +1638,9 @@ mod tests {
                 session_id,
                 turn_id,
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             }));
 
         assert!(matches!(

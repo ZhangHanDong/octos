@@ -597,6 +597,7 @@ pub mod manage_skills;
 pub mod mcp_agent;
 pub mod message;
 pub mod read_file;
+pub mod read_task_output;
 pub mod recall_memory;
 pub mod research_utils;
 pub mod save_memory;
@@ -646,6 +647,7 @@ pub use mcp_agent::{
 };
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
+pub use read_task_output::ReadTaskOutputTool;
 pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
 pub use send_app_card::SendAppCardTool;

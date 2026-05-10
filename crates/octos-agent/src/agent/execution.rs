@@ -331,6 +331,12 @@ impl Agent {
                 // depth into the spawn_only TOOL_CTX builder.
                 let bg_spawn_depth = spawn_depth;
                 let bg_session_id_for_watcher = format!("agent:{}", tc_id);
+                // M10 Phase 4: keep a copy of the task_id so the synthesized
+                // tool-result message returned to the LLM (built after this
+                // `tokio::spawn` moves `task_id` into the closure) can carry
+                // the same handle the supervisor and the SubAgentOutputRouter
+                // know it by.
+                let task_id_for_handle = task_id.clone();
                 tokio::spawn(async move {
                     bg_supervisor.mark_running(&task_id);
                     // M8.7 (item 4): start a periodic-summary watcher for
@@ -472,7 +478,9 @@ impl Agent {
                                             content: String::new(),
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
+                                            envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
+                                            task_id: Some(task_id.clone()),
                                         })
                                         .await
                                     } else {
@@ -501,8 +509,10 @@ impl Agent {
                                                     ),
                                                     kind: BackgroundResultKind::Notification,
                                                     media: vec![],
+                                                    envelope_media: vec![],
                                                     originating_thread_id: bg_originating_thread_id
                                                         .clone(),
+                                                    task_id: Some(task_id.clone()),
                                                 })
                                                 .await;
                                             }
@@ -541,7 +551,9 @@ impl Agent {
                                             content,
                                             kind: BackgroundResultKind::Notification,
                                             media: vec![],
+                                            envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
+                                            task_id: Some(task_id.clone()),
                                         })
                                         .await;
                                     }
@@ -564,8 +576,10 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                envelope_media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -601,8 +615,10 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                envelope_media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -635,11 +651,40 @@ impl Agent {
                                         );
                                         let send_args = serde_json::json!({
                                             "file_path": path_str,
-                                            "tool_call_id": bg_tc_id
+                                            "tool_call_id": bg_tc_id,
                                         });
+                                        // M10 Phase 5a (coalesce): enter the
+                                        // `spawn_complete_companion` task-local
+                                        // scope so the in-flight `send_file`
+                                        // emits an OutboundMessage carrying
+                                        // `metadata.spawn_complete_companion =
+                                        // true`. The api/serve consumer reads
+                                        // the flag and persists each per-file
+                                        // row with
+                                        // `MessagePersistedSource::Background`,
+                                        // letting dual-negotiated clients
+                                        // suppress the duplicate at the
+                                        // `live_event_passes_capability_filter`
+                                        // gate in favour of the single
+                                        // `turn/spawn_complete` envelope (which
+                                        // carries the same media via
+                                        // `BackgroundResultPayload.envelope_media`
+                                        // populated below). Internal-only by
+                                        // design: the scope is keyed on a
+                                        // `tokio::task_local!`, NOT on tool
+                                        // args, so an LLM cannot spoof the
+                                        // flag through generated JSON. Old
+                                        // clients without
+                                        // `event.spawn_complete.v1` still
+                                        // receive the per-file rows
+                                        // unchanged.
                                         let mut delivered = false;
                                         for attempt in 0..3 {
-                                            match bg_tools.execute("send_file", &send_args).await {
+                                            match crate::tools::send_file::with_spawn_complete_companion_scope(
+                                                bg_tools.execute("send_file", &send_args),
+                                            )
+                                            .await
+                                            {
                                                 Ok(sr) if sr.success => {
                                                     tracing::info!(
                                                         tool = %bg_name,
@@ -702,8 +747,10 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                envelope_media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -722,6 +769,48 @@ impl Agent {
                                                         .join(", ")
                                                 );
                                                 if let Some(ref sender) = bg_sender {
+                                                    // M10 Phase 5a (coalesce):
+                                                    // - `media: vec![]` keeps
+                                                    //   the persisted row's
+                                                    //   wire shape
+                                                    //   byte-identical to the
+                                                    //   pre-Phase-5a
+                                                    //   "spawn-ack with text
+                                                    //   only" row that old
+                                                    //   clients already render.
+                                                    //   Each `sent_files`
+                                                    //   entry has its OWN
+                                                    //   per-file
+                                                    //   `message/persisted`
+                                                    //   row from the
+                                                    //   `send_file` consumer
+                                                    //   above; double-listing
+                                                    //   them here would render
+                                                    //   the same attachments
+                                                    //   twice for old clients.
+                                                    // - `envelope_media:
+                                                    //   sent_files.clone()`
+                                                    //   surfaces those files
+                                                    //   on the
+                                                    //   `turn/spawn_complete`
+                                                    //   envelope so
+                                                    //   dual-negotiated
+                                                    //   clients (which
+                                                    //   suppress the per-file
+                                                    //   `Background` rows in
+                                                    //   `live_event_passes_capability_filter`)
+                                                    //   still see the
+                                                    //   attachments inline on
+                                                    //   the single completion
+                                                    //   bubble.
+                                                    //
+                                                    // Splitting persist-media
+                                                    // from envelope-media is
+                                                    // what lets the same
+                                                    // producer serve both
+                                                    // wire shapes correctly
+                                                    // without regressing
+                                                    // either.
                                                     let _ = sender(BackgroundResultPayload {
                                                         task_label: bg_name.clone(),
                                                         content: format!(
@@ -730,8 +819,10 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        envelope_media: sent_files.clone(),
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
                                                     })
                                                     .await;
                                                 }
@@ -752,8 +843,10 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        envelope_media: vec![],
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
                                                     })
                                                     .await;
                                                 }
@@ -777,7 +870,9 @@ impl Agent {
                                     content: format!("✗ {} failed: {}", bg_name, r.output),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
+                                    task_id: Some(task_id.clone()),
                                 })
                                 .await;
                             }
@@ -795,7 +890,9 @@ impl Agent {
                                     content: format!("✗ {} error: {}", bg_name, e),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
+                                    task_id: Some(task_id.clone()),
                                 })
                                 .await;
                             }
@@ -824,10 +921,29 @@ impl Agent {
                     output_preview: "Running in background — audio will be sent when ready.".into(),
                     duration: tool_start.elapsed(),
                 });
+                // M10 Phase 4 — agent context isolation: hand the LLM a
+                // small `task_handle` JSON envelope instead of the full
+                // tool output. The full result is still persisted via the
+                // M8.7 router and delivered to the SPA via
+                // `turn.spawn_complete`; the agent now reads selectively
+                // via `read_task_output`.
+                //
+                // Codex P2 (round 1+2): gate the envelope on the
+                // `read_task_output` tool actually being VISIBLE to the
+                // LLM in this turn — registered AND not filtered out by
+                // provider policy / deferred set / context tag filter.
+                // Otherwise the envelope advertises a tool the LLM was
+                // not offered. Fall back to the legacy free-text message
+                // for those entry points.
+                let handle_payload = if tools.is_tool_visible("read_task_output") {
+                    tools.spawn_only_handle_message(&tc_name, &task_id_for_handle, &[])
+                } else {
+                    tools.spawn_only_message(&tc_name)
+                };
                 return (
                     Message {
                         role: MessageRole::Tool,
-                        content: tools.spawn_only_message(&tc_name),
+                        content: handle_payload,
                         media: vec![],
                         tool_calls: None,
                         tool_call_id: Some(tc_id),
