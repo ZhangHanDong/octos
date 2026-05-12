@@ -1,20 +1,15 @@
 //! Serve command: start the REST API server.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Args;
 use colored::Colorize;
 use eyre::{Result, WrapErr};
-use octos_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use octos_bus::SessionManager;
-use octos_core::AgentId;
-use octos_llm::{LlmProvider, RetryProvider};
-use octos_memory::{EpisodeStore, MemoryStore};
 
 use super::Executable;
-use super::chat::create_provider;
-use crate::api::metrics::MetricsReporter;
 use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
 use crate::config::Config;
 
@@ -302,20 +297,29 @@ impl ServeCommand {
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 
-        // Try to create the LLM provider + agent, but don't fail if no API key.
-        // The admin dashboard works without it.
-        let agent_and_sessions = self
-            .try_create_agent(&config, &cwd, &data_dir, broadcaster.clone())
-            .await;
-
-        let (agent, sessions) = match agent_and_sessions {
-            Ok((a, s)) => (Some(Arc::new(a)), Some(s)),
-            Err(e) => {
-                tracing::warn!("LLM agent not available: {e}");
-                tracing::info!("Admin dashboard will still work. Configure profiles via /admin/");
-                (None, None)
-            }
-        };
+        // M11-F: per-profile LLM, credentials, tool registry, plugins,
+        // MCP, and memory are built once per profile below via
+        // `ProfileRuntime::bootstrap`. There is no longer a
+        // server-wide agent; an unregistered profile returns 503 at
+        // the handler.
+        //
+        // We still open a process-wide `SessionManager` against the
+        // top-level data dir so the read-only REST endpoints
+        // (`/api/sessions`, `/api/sessions/:id/messages`, …) and the UI
+        // Protocol audit writer have a single shared handle for the
+        // canonical JSONL store.
+        let sessions: Option<Arc<tokio::sync::Mutex<SessionManager>>> =
+            match SessionManager::open(&data_dir) {
+                Ok(mgr) => Some(Arc::new(tokio::sync::Mutex::new(mgr))),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to open process-wide SessionManager; \
+                         REST session listing endpoints will return empty"
+                    );
+                    None
+                }
+            };
         let metrics_handle = Some(init_metrics());
 
         // Security: warn if binding to non-localhost without auth token
@@ -358,6 +362,82 @@ impl ServeCommand {
             crate::profiles::ProfileStore::open(&data_dir)
                 .wrap_err("failed to open profile store")?,
         );
+
+        // M11-F regression fix REG-4: bootstrap bundled app-skills
+        // (`crates/app-skills/`) and platform-skills (`crates/platform-
+        // skills/`) into `<octos_home>/{bundled-app-skills,platform-
+        // skills}/` so every `ProfileRuntime` we build below can scan
+        // them via `Config::plugin_dirs_from_project`. Pre-M11-F
+        // `serve.rs::try_create_agent` did this unconditionally per
+        // agent build; M11-F deleted the helper and never restored the
+        // call, so a clean install of `octos serve` came up with zero
+        // bundled skills available to `/api/chat` (weather, time, news,
+        // deep-search) and zero platform skills (voice). Doing it once
+        // at process startup matches the gateway flow and keeps the
+        // per-profile loop free of redundant disk writes.
+        octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
+        octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+
+        // M11-D — build the per-profile runtime catalog. For every
+        // enabled profile that has an active primary LLM selection,
+        // call `ProfileRuntime::bootstrap` and stash the resulting
+        // `Arc<ProfileRuntime>` under its profile id. Failures are
+        // logged and skipped so a single bad profile cannot 503 the
+        // whole server.
+        //
+        // `ProfileRuntime::bootstrap` opens a per-profile
+        // `EpisodeStore` / `MemoryStore` / `ToolConfigStore` against
+        // the profile's data dir. M11-F removed the legacy
+        // server-wide `Agent`, so these are now the only redb opens
+        // against the profile data dir from `octos serve` — no lock
+        // contention.
+        let mut profile_runtimes: HashMap<String, Arc<crate::runtime::ProfileRuntime>> =
+            HashMap::new();
+        let all_profiles = profile_store.list().unwrap_or_default();
+        for profile in &all_profiles {
+            if !profile.enabled || profile.parent_id.is_some() {
+                continue;
+            }
+            if !profile.config.has_llm_selection() {
+                tracing::debug!(
+                    profile_id = %profile.id,
+                    "skipping ProfileRuntime bootstrap: no LLM selection",
+                );
+                continue;
+            }
+            let profile_data_dir = profile_store.resolve_data_dir(profile);
+            match crate::runtime::ProfileRuntime::bootstrap(
+                profile,
+                &profile_data_dir,
+                Some(&data_dir),
+                crate::runtime::BootstrapRole::Serve,
+            )
+            .await
+            {
+                Ok(rt) => {
+                    tracing::info!(
+                        profile_id = %profile.id,
+                        provider = %rt.provider_name,
+                        model = %rt.primary_model_id,
+                        tools = rt.tool_specs.specs().len(),
+                        "ProfileRuntime bootstrapped for /api/chat",
+                    );
+                    profile_runtimes.insert(profile.id.clone(), rt);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        profile_id = %profile.id,
+                        %error,
+                        "ProfileRuntime bootstrap failed — /api/chat will return 503 for this profile",
+                    );
+                }
+            }
+        }
+        let session_cache = Arc::new(crate::runtime::SessionRuntimeCache::new(
+            64,
+            std::time::Duration::from_secs(1800),
+        ));
+
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
@@ -479,7 +559,8 @@ impl ServeCommand {
         .wrap_err("failed to build swarm state")?;
 
         let state = Arc::new(AppState {
-            agent,
+            profiles: profile_runtimes,
+            session_cache,
             sessions,
             broadcaster,
             started_at: chrono::Utc::now(),
@@ -824,260 +905,6 @@ impl ServeCommand {
         std::process::exit(0);
     }
 
-    /// Try to create an Agent + SessionManager. Returns Err if API key is missing etc.
-    async fn try_create_agent(
-        &self,
-        config: &Config,
-        cwd: &std::path::Path,
-        data_dir: &std::path::Path,
-        broadcaster: Arc<crate::api::EventBroadcaster>,
-    ) -> Result<(Agent, Arc<tokio::sync::Mutex<SessionManager>>)> {
-        let model = self.model.clone().or(config.model.clone());
-        let base_url = config.base_url.clone();
-        let provider_name = self
-            .provider
-            .clone()
-            .or(config.provider.clone())
-            .or_else(|| {
-                model
-                    .as_deref()
-                    .and_then(crate::config::detect_provider)
-                    .map(String::from)
-            })
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "no LLM provider configured. Run `octos init` or set provider in config.json"
-                )
-            })?;
-
-        let base_provider: Arc<dyn LlmProvider> =
-            create_provider(&provider_name, config, model, base_url)?;
-
-        let llm: Arc<dyn LlmProvider> = if self.no_retry {
-            base_provider
-        } else {
-            Arc::new(RetryProvider::new(base_provider))
-        };
-
-        let memory = Arc::new(
-            EpisodeStore::open(data_dir)
-                .await
-                .wrap_err("failed to open episode store")?,
-        );
-
-        let memory_store = Arc::new(
-            MemoryStore::open(data_dir)
-                .await
-                .wrap_err("failed to open memory store")?,
-        );
-
-        let sandbox = octos_agent::create_sandbox(&config.sandbox);
-        let mut tools = ToolRegistry::with_builtins_and_sandbox(cwd, sandbox);
-
-        // Open tool config store for user-customizable tool defaults
-        let tool_config = std::sync::Arc::new(
-            octos_agent::ToolConfigStore::open(data_dir)
-                .await
-                .wrap_err("failed to open tool config store")?,
-        );
-        tools.inject_tool_config(tool_config);
-
-        // Memory bank tools
-        tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
-        tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
-
-        // Cron service — jobs persist to cron.json but fire through the API channel.
-        // The inbound_tx is a dummy sender; actual cron firing requires gateway mode.
-        // This still enables cron CRUD (create/list/delete) for later execution.
-        let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-        let cron_service = Arc::new(octos_bus::CronService::new(
-            data_dir.join("cron.json"),
-            cron_tx,
-        ));
-        cron_service.start();
-        let cron_tool = crate::cron_tool::CronTool::with_context(cron_service.clone(), "api", "");
-        tools.register(cron_tool);
-
-        // MCP tools
-        if !config.mcp_servers.is_empty() {
-            match octos_agent::McpClient::start(&config.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => tracing::warn!("MCP initialization failed: {e}"),
-            }
-        }
-
-        // Bootstrap bundled app-skills and platform skills
-        let octos_home = cwd.join(".octos");
-        octos_agent::bootstrap::bootstrap_bundled_skills(&octos_home);
-        octos_agent::bootstrap::bootstrap_platform_skills(&octos_home);
-
-        // Plugins (includes bootstrapped skills from bundled-app-skills/)
-        let mut plugin_dirs = Config::plugin_dirs_from_project(&octos_home);
-        // Platform skills are admin-only — add them here (not in Config::plugin_dirs_from_project)
-        let platform_dir = octos_home.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
-        if platform_dir.exists() {
-            plugin_dirs.push(platform_dir);
-        }
-        let mut plugin_result = octos_agent::PluginLoadResult::default();
-        if !plugin_dirs.is_empty() {
-            if let Ok(result) = octos_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[])
-            {
-                plugin_result = result;
-            }
-        }
-
-        // Start MCP servers declared in skill manifests
-        if !plugin_result.mcp_servers.is_empty() {
-            match octos_agent::McpClient::start(&plugin_result.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => tracing::warn!("skill MCP initialization failed: {e}"),
-            }
-        }
-
-        // Pin core builtins + plugin tools as base so the LRU evictor in
-        // `auto_evict()` does not remove them after a few unused iterations.
-        // `ToolRegistry::with_builtins_and_sandbox()` registers core tools but
-        // does NOT seed `base_tools`, so without this call every core tool
-        // (shell, file ops, web_*, browser, workspace_*) is evictable. Mirrors
-        // gateway's `set_base_tools(...)` + `add_base_tools(plugin tool names)`
-        // pair at `gateway_runtime.rs:1002` and `:1022`. Only includes tools
-        // actually registered in the api/serve path — `run_pipeline`, `spawn`,
-        // `send_file`, `message`, `activate_tools` are gateway-only and live
-        // in a follow-up PR.
-        let mut base_tools: Vec<&str> = vec![
-            "shell",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "diff_edit",
-            "glob",
-            "grep",
-            "list_dir",
-            "web_search",
-            "web_fetch",
-            "browser",
-            "check_workspace_contract",
-            "workspace_log",
-            "workspace_show",
-            "workspace_diff",
-        ];
-        if cfg!(feature = "git") {
-            base_tools.push("git");
-        }
-        if cfg!(feature = "ast") {
-            base_tools.push("code_structure");
-        }
-        tools.set_base_tools(base_tools);
-        if !plugin_result.tool_names.is_empty() {
-            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
-        }
-
-        // #713 codex finding (Medium): apply `config.tool_policy` to the
-        // api-mode `ToolRegistry`, mirroring the chat path
-        // (`commands/chat.rs::297`). Without this, the swarm dispatch
-        // policy (which now inherits `config.tool_policy` per #713) is
-        // strictly stricter than the native server's tool registry,
-        // breaking the parity claim. Runs AFTER MCP + plugin tools are
-        // registered so a `deny: ["dangerous_tool"]` entry catches
-        // both built-in and skill-declared tools. `apply_policy` is a
-        // no-op when `config.tool_policy` is `None`/empty, preserving
-        // legacy behaviour for operators who never set the field.
-        if let Some(ref policy) = config.tool_policy {
-            tools.apply_policy(policy);
-        }
-
-        let reporter: Arc<dyn octos_agent::ProgressReporter> =
-            Arc::new(MetricsReporter::new(broadcaster));
-
-        // M8 fix-first item 8 (gap 1): give the api agent a real
-        // FileStateCache so file tools short-circuit on repeat reads.
-        // Mirrors the chat path so behaviour is identical across CLI
-        // entry points.
-        let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
-
-        // M8 fix-first item 8 (gap 2): wire the M8.7 SubAgentOutputRouter
-        // and AgentSummaryGenerator so the spawn_only background branch
-        // routes output to disk and starts/stops the periodic summary
-        // watcher per task. The router is rooted under the data dir so
-        // dashboards can read the per-task tail files.
-        let subagent_output_root = data_dir.join("subagent-outputs");
-        let subagent_output_router =
-            Arc::new(octos_agent::SubAgentOutputRouter::new(subagent_output_root));
-        let supervisor_for_summary = (*tools.supervisor()).clone();
-        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
-            llm.clone(),
-            subagent_output_router.clone(),
-            supervisor_for_summary,
-        ));
-
-        let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
-            .with_config(AgentConfig {
-                max_iterations: 20,
-                save_episodes: true,
-                chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
-                ..Default::default()
-            })
-            .with_reporter(reporter)
-            .with_file_state_cache(file_state_cache)
-            .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator)
-            // M9 review fix (HIGH #1): record the effective sandbox config so
-            // the AppUi `session_tool_registry` rebind path inherits the
-            // running server's sandbox policy when re-creating the per-session
-            // ShellTool sandbox, instead of silently dropping back to
-            // `SandboxConfig::default()` (which disables network and overrides
-            // read paths).
-            .with_sandbox_config(config.sandbox.clone());
-
-        // Tier-2 of the AppUi `session_tool_registry` fallback chain: when
-        // operators set `appui.default_session_cwd` in `config.json`, anchor
-        // the API agent's tool registry to that path so clients without the
-        // `session.workspace_cwd.v1` capability (e.g. octos-app, which sends
-        // `cwd: None`) inherit the folder transparently. Tier-1
-        // (capability-gated client-sent cwds) still wins for clients that
-        // do advertise it, e.g. octos-tui.
-        //
-        // We do not canonicalize here — the path is recorded as-is on the
-        // tool registry and reused verbatim by `session_tool_registry`'s
-        // rebind path. Operators must use absolute paths; tilde (`~`) is
-        // not expanded. A `warn!` log on a missing/non-directory path
-        // surfaces config drift early without aborting startup, since the
-        // path may be created later (or may live under a network mount
-        // that mounts asynchronously).
-        if let Some(cwd) = config.appui.default_session_cwd.as_ref() {
-            if !cwd.is_dir() {
-                tracing::warn!(
-                    cwd = %cwd.display(),
-                    "appui.default_session_cwd does not point at an existing directory; \
-                     sessions will fail authorization until it is created",
-                );
-            }
-            agent = agent.with_workspace_root(cwd.clone());
-            tracing::info!(
-                cwd = %cwd.display(),
-                "appui: anchoring api agent to operator-configured default cwd",
-            );
-        }
-
-        // Inject skill prompt fragments
-        for fragment in &plugin_result.prompt_fragments {
-            agent.append_system_prompt(fragment);
-        }
-
-        // Merge config hooks with skill-declared hooks
-        let mut all_hooks = config.hooks.clone();
-        all_hooks.extend(plugin_result.hooks);
-        if !all_hooks.is_empty() {
-            agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
-        }
-
-        let sessions = Arc::new(tokio::sync::Mutex::new(
-            SessionManager::open(data_dir).wrap_err("failed to open session manager")?,
-        ));
-
-        Ok((agent, sessions))
-    }
-
     /// F-010: construct an `Option<Arc<SwarmState>>` from the
     /// `--swarm-backend*` CLI flags. Returns `Ok(None)` when no
     /// `--swarm-backend` is set (legacy opt-out — handlers return 503).
@@ -1095,8 +922,8 @@ impl ServeCommand {
     /// the native side already applies:
     ///
     /// - **tool-name policy** — same `config.tool_policy` value the
-    ///   api agent's `ToolRegistry` is filtered with (see
-    ///   `try_create_agent`).
+    ///   per-profile `ProfileRuntime::tool_specs` registry is
+    ///   filtered with at bootstrap.
     /// - **injection-env denylist** — the workspace-shared
     ///   [`octos_agent::sandbox::BLOCKED_ENV_VARS`] set the agent's
     ///   sandbox + MCP subprocess paths use to scrub child env.
@@ -1174,9 +1001,8 @@ impl ServeCommand {
         //
         // - `tool_policy`: cloned from `config.tool_policy` upstream so
         //   a `deny: ["dangerous_tool"]` entry blocks both the native
-        //   registry execution (re-applied at the api agent registry,
-        //   see the `tools.apply_policy(...)` call earlier in
-        //   `try_create_agent`) AND swarm dispatch.
+        //   registry execution (applied per-profile by
+        //   `ProfileRuntime::bootstrap`) AND swarm dispatch.
         // - `block_injection_env_vars: true`: adds `LD_PRELOAD`,
         //   `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, ... to the env
         //   denylist so a contract carrying those keys fails closed

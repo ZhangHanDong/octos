@@ -11,12 +11,12 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
-use octos_agent::{Agent, inspect_workspace_contract};
+use octos_agent::inspect_workspace_contract;
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_core::{MAIN_PROFILE_ID, Message, SessionKey};
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
@@ -338,36 +338,6 @@ pub async fn chat(
     }
 }
 
-fn validate_chat_request(
-    state: &AppState,
-    req: &ChatRequest,
-) -> Result<
-    (
-        Arc<Agent>,
-        Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
-    ),
-    (StatusCode, String),
-> {
-    let agent = state.agent.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "No LLM provider configured. Set up a profile with an API key first.".into(),
-    ))?;
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-
-    if req.message.len() > MAX_MESSAGE_LEN {
-        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
-        ));
-    }
-
-    Ok((agent.clone(), sessions.clone()))
-}
-
 /// Persist a `Message` to the canonical per-user `<topic>.jsonl` and
 /// invalidate the `SessionManager` LRU cache for the key.
 ///
@@ -406,14 +376,15 @@ async fn chat_sync(
     headers: HeaderMap,
     req: ChatRequest,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    let (agent, sessions) = validate_chat_request(&state, &req)?;
+    if req.message.len() > MAX_MESSAGE_LEN {
+        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
+        ));
+    }
 
-    tracing::info!(
-        session = req.session_id.as_deref().unwrap_or("default"),
-        msg_len = req.message.len(),
-        "chat: processing message"
-    );
-
+    let profile_id = api_profile_id_from_headers(&state, &headers);
     let session_key = standalone_api_session_key_with_topic(
         &state,
         &headers,
@@ -421,13 +392,86 @@ async fn chat_sync(
         req.topic.as_deref(),
     );
 
+    tracing::info!(
+        profile_id = %profile_id,
+        session = req.session_id.as_deref().unwrap_or("default"),
+        msg_len = req.message.len(),
+        "chat: processing message"
+    );
+
+    // M11-F: every read path resolves through `state.profiles` +
+    // `state.session_cache`. An unregistered profile is a configuration
+    // bug, not a runtime fallback — `octos serve` bootstraps every
+    // profile in `ProfileStore::list()` at startup, so if a profile id
+    // arrives at `/api/chat` that the catalog doesn't know about, it
+    // means the request routed against a profile that failed (or never
+    // had) bootstrap. Fail closed with 503 rather than silently fall
+    // through to a server-wide agent (which M11-F removed).
+    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "No LLM provider configured for profile '{profile_id}'. \
+                 Set up the profile with an API key in the dashboard.",
+            ),
+        ));
+    };
+    chat_sync_via_session_runtime(state, profile_runtime, session_key, req).await
+}
+
+/// `/api/chat` dispatcher: resolves the per-session
+/// [`crate::runtime::SessionRuntime`] from the cache (constructing it
+/// on first use), runs the agent against the session-bound workspace,
+/// and persists the response through the canonical per-user JSONL.
+///
+/// M11-F: the only `/api/chat` path. The legacy server-wide
+/// `state.agent` fallback was removed; unregistered profile → 503 in
+/// the caller.
+async fn chat_sync_via_session_runtime(
+    state: Arc<AppState>,
+    profile_runtime: Arc<crate::runtime::ProfileRuntime>,
+    session_key: SessionKey,
+    req: ChatRequest,
+) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    // Acquire (or build on first use) the per-session runtime.
+    //
+    // M11-F regression fix REG-6: when no client cwd is supplied,
+    // forward `state.appui_default_session_cwd` (mirrored from
+    // `config.appui.default_session_cwd`) as the workspace hint. The
+    // pre-M11-F serve path wired this into the server-wide agent via
+    // `agent.with_workspace_root(default_cwd)`; we now thread the
+    // same operator default through the per-session bootstrap. When
+    // the operator sets nothing, this is `None` and the bootstrap
+    // falls back to the canonical
+    // `<profile_data_dir>/users/<encoded session base>/workspace`
+    // layout — preserving the M11 fix for the
+    // `"workspace policy not found"` failure on yangmi voice clone.
+    let workspace_hint = state.appui_default_session_cwd.clone();
+    let session_runtime = state
+        .session_cache
+        .get_or_init(&profile_runtime, session_key.clone(), workspace_hint)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                profile_id = %profile_runtime.profile_id,
+                session = %session_key,
+                "chat: SessionRuntime::bootstrap failed",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to bootstrap session runtime: {e}"),
+            )
+        })?;
+
     let history: Vec<Message> = {
-        let mut sess = sessions.lock().await;
+        let mut sess = session_runtime.sessions.lock().await;
         let session = sess.get_or_create(&session_key).await;
         session.get_history(50).to_vec()
     };
 
-    let response = agent
+    let response = session_runtime
+        .agent
         .process_message(&req.message, &history, vec![])
         .await
         .map_err(|e| {
@@ -438,14 +482,18 @@ async fn chat_sync(
     tracing::info!(
         input_tokens = response.token_usage.input_tokens,
         output_tokens = response.token_usage.output_tokens,
-        "chat: response generated"
+        profile_id = %profile_runtime.profile_id,
+        session = %session_key,
+        "chat: response generated via SessionRuntime",
     );
 
-    // Save all conversation messages to the canonical per-user JSONL.
-    // Funnels through the same helper the gateway-side `ApiChannel` uses so
-    // standalone deployments don't split-brain into the legacy flat layout.
     for msg in &response.messages {
-        let _ = persist_chat_message_through_canonical(&sessions, &session_key, msg.clone()).await;
+        let _ = persist_chat_message_through_canonical(
+            &session_runtime.sessions,
+            &session_key,
+            msg.clone(),
+        )
+        .await;
     }
 
     Ok(Json(ChatResponse {
@@ -2558,11 +2606,13 @@ pub struct StatusResponse {
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = chrono::Utc::now() - state.started_at;
-    let (model, provider) = match &state.agent {
-        Some(agent) => (
-            agent.model_id().to_string(),
-            agent.provider_name().to_string(),
-        ),
+    // M11-F: surface a profile-aware status. The legacy server-wide
+    // `state.agent` was removed; report the canonical "_main" profile
+    // when present, falling back to "none" so the dashboard can still
+    // render an unconfigured-server placeholder.
+    let main_runtime = state.profiles.get(octos_core::MAIN_PROFILE_ID).cloned();
+    let (model, provider) = match &main_runtime {
+        Some(rt) => (rt.primary_model_id.clone(), rt.provider_name.clone()),
         None => ("none".to_string(), "none".to_string()),
     };
     let base_domain = state
@@ -2574,7 +2624,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         model,
         provider,
         uptime_secs: uptime.num_seconds(),
-        agent_configured: state.agent.is_some(),
+        agent_configured: main_runtime.is_some() || !state.profiles.is_empty(),
         base_domain,
     })
 }
@@ -2712,32 +2762,65 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
-                } else if let Ok((agent, sessions)) = validate_chat_request(
-                    &state,
-                    &ChatRequest {
-                        message: content.clone(),
-                        session_id: Some(session_id.clone()),
-                        topic: None,
-                        stream: true,
-                        media: media.clone(),
-                        attach_only: false,
-                        client_message_id: None,
-                    },
-                ) {
-                    // Standalone agent mode — run the agent directly.
+                } else {
+                    // M11-F: standalone (non-gateway) mode now routes through
+                    // the per-profile `ProfileRuntime` + per-session
+                    // `SessionRuntime` cache instead of the deleted
+                    // `state.agent` legacy field. We resolve the profile id
+                    // from the request headers (matching what `chat_sync`
+                    // does), pull the `ProfileRuntime` out of `state.profiles`,
+                    // and ask the cache for the per-session view.
+                    let profile_id = api_profile_id_from_headers(&state, &headers);
+                    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": format!(
+                                "No LLM provider configured for profile '{profile_id}'. \
+                                 Set up the profile with an API key in the dashboard.",
+                            ),
+                        });
+                        let _ = send_ws(&ws_tx, &err.to_string()).await;
+                        continue;
+                    };
+                    let session_key =
+                        SessionKey::with_profile(&profile_runtime.profile_id, "api", &session_id);
+                    // M11-F regression fix REG-6: forward
+                    // `config.appui.default_session_cwd` (mirrored on
+                    // `AppState::appui_default_session_cwd`) as the
+                    // workspace hint when no client cwd is available.
+                    // Pre-M11-F serve.rs wired this into the server-wide
+                    // agent via `agent.with_workspace_root(default_cwd)`;
+                    // M11-F's deletion of that helper left the standalone
+                    // WS chat path falling back to the canonical
+                    // `<data_dir>/users/<encoded base>/workspace` instead
+                    // of the operator-configured directory (e.g.
+                    // octos-app uses this for the per-machine coding
+                    // workspace).
+                    let workspace_hint = state.appui_default_session_cwd.clone();
+                    let session_runtime = match state
+                        .session_cache
+                        .get_or_init(&profile_runtime, session_key.clone(), workspace_hint)
+                        .await
+                    {
+                        Ok(rt) => rt,
+                        Err(error) => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": format!(
+                                    "failed to bootstrap session runtime: {error}"
+                                ),
+                            });
+                            let _ = send_ws(&ws_tx, &err.to_string()).await;
+                            continue;
+                        }
+                    };
                     let ws_tx2 = ws_tx.clone();
                     let _abort_ref = abort_handle.clone();
                     let handle = tokio::spawn(async move {
-                        ws_standalone_agent(ws_tx2, agent, sessions, &session_id, &content, media)
+                        ws_standalone_agent(ws_tx2, session_runtime, &session_id, &content, media)
                             .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
-                } else {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": "No LLM provider configured",
-                    });
-                    let _ = send_ws(&ws_tx, &err.to_string()).await;
                 }
             }
             WsClientMsg::Abort => {
@@ -2836,15 +2919,22 @@ async fn ws_proxy_to_gateway(
 }
 
 /// Run the standalone agent for a WebSocket request and stream events back.
+///
+/// M11-F: takes a `SessionRuntime` (sourced from `state.session_cache`)
+/// instead of the deleted server-wide `state.agent`. The runtime carries
+/// the per-session workspace-bound tool registry, the profile's LLM, the
+/// agent's config/system-prompt snapshot, and the per-session
+/// `SessionManager`.
 async fn ws_standalone_agent(
     ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
-    base_agent: Arc<Agent>,
-    sessions: Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    session_runtime: Arc<crate::runtime::SessionRuntime>,
     session_id: &str,
     message: &str,
     media: Vec<String>,
 ) {
-    let session_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id);
+    let profile_id = session_runtime.profile.profile_id.clone();
+    let session_key = SessionKey::with_profile(&profile_id, "api", session_id);
+    let sessions = session_runtime.sessions.clone();
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -2858,8 +2948,9 @@ async fn ws_standalone_agent(
         Arc::new(ChannelReporter::new(tx.clone())),
     ));
 
-    let request_agent = Agent::new_shared(
-        AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
+    let base_agent = session_runtime.agent.clone();
+    let mut request_agent = octos_agent::Agent::new_shared(
+        octos_core::AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
         base_agent.llm_provider(),
         base_agent.tool_registry().clone(),
         base_agent.memory_store(),
@@ -2867,10 +2958,29 @@ async fn ws_standalone_agent(
     .with_config(base_agent.agent_config())
     .with_system_prompt(base_agent.system_prompt_snapshot())
     .with_reporter(reporter);
+    // M11-F regression fix REG-3: forward the profile-scope hook
+    // executor onto the per-request rebuilt agent so the standalone
+    // WS chat path observes the same `before_tool_call` /
+    // `after_tool_call` / LLM hooks as the cached `SessionRuntime`'s
+    // agent. Without this, every WS message would bypass the hook
+    // pipeline because `base_agent`'s `hooks` field is not carried
+    // forward by the `Agent::new_shared` constructor.
+    if let Some(hooks) = base_agent.hooks() {
+        request_agent = request_agent.with_hooks(hooks);
+    }
+    // M11-F regression fix REG-1 follow-up (codex review): wire the
+    // `activate_tools` back-reference on this rebuilt agent so the
+    // deferred non-core tool groups (`group:admin`, `group:sessions`,
+    // `group:web`, `group:runtime`, `group:media`) are actually
+    // activatable. `Agent::new_shared` does not re-execute the wiring,
+    // so without this the LLM observes the deferred groups via
+    // `tools.specs()` but `activate_tools` itself is a no-op stub.
+    // Gateway wires the equivalent at `session_actor.rs:2500`.
+    request_agent.wire_activate_tools();
 
     let message = message.to_string();
     let session_id = session_id.to_string();
-    let session_key2 = SessionKey::with_profile(MAIN_PROFILE_ID, "api", &session_id);
+    let session_key2 = SessionKey::with_profile(&profile_id, "api", &session_id);
 
     // Spawn the agent task
     tokio::spawn(async move {
@@ -4353,5 +4463,247 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // ────────── M11-D `/api/chat` routes through `SessionRuntime` ──────────
+
+    /// Minimal stub LLM that returns a fixed assistant reply. Used to drive
+    /// the M11-D `/api/chat` route through `SessionRuntime::bootstrap` +
+    /// `Agent::process_message` without hitting a real provider.
+    struct EchoLlm {
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EchoLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some(self.reply.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 11,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "m11d-echo"
+        }
+
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn context_window(&self) -> u32 {
+            64_000
+        }
+    }
+
+    async fn make_m11d_profile(
+        data_dir: &std::path::Path,
+        reply: &str,
+    ) -> Arc<crate::runtime::ProfileRuntime> {
+        std::fs::create_dir_all(data_dir).unwrap();
+        let memory = Arc::new(octos_memory::EpisodeStore::open(data_dir).await.unwrap());
+        let memory_store = Arc::new(octos_memory::MemoryStore::open(data_dir).await.unwrap());
+        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(data_dir).await.unwrap());
+        let sandbox = octos_agent::SandboxConfig::default();
+        let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            data_dir,
+            octos_agent::create_sandbox(&sandbox),
+        );
+        Arc::new(crate::runtime::ProfileRuntime {
+            profile_id: MAIN_PROFILE_ID.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            llm: Arc::new(EchoLlm {
+                reply: reply.to_string(),
+            }),
+            adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "m11d-echo".to_string(),
+            provider_name: "stub".to_string(),
+            credentials: HashMap::new(),
+            skills_dir: None,
+            plugin_env_template: Vec::new(),
+            tool_policy: None,
+            default_sandbox: sandbox,
+            tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
+            system_prompt: "test-system-prompt".to_string(),
+            memory,
+            memory_store,
+            tool_config,
+            cron_service: None,
+            hook_executor: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn chat_routes_through_session_runtime_when_profile_registered() {
+        // Acceptance evidence (M11-D Part 3): a `/api/chat` request lands
+        // in `chat_sync_via_session_runtime` whenever the routed profile
+        // is registered in `state.profiles`. The route is the exact
+        // structural path the live yangmi flow takes — it implies
+        // `SessionRuntime::bootstrap` ran, which writes the per-session
+        // `.octos-workspace.toml` (closing the "workspace policy not
+        // found" failure mode without any hotfix file at the daemon
+        // cwd).
+        let data_dir = tempfile::tempdir().unwrap();
+        let profile_data_dir = data_dir.path().join("profile-data");
+        let profile_runtime = make_m11d_profile(&profile_data_dir, "yangmi reply ack").await;
+
+        let mut profiles = HashMap::new();
+        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
+        let state = Arc::new(AppState {
+            profiles,
+            ..AppState::empty_for_tests()
+        });
+
+        let req = ChatRequest {
+            message: "用 yangmi 语音说北京今天天气晴朗".to_string(),
+            session_id: Some("yangmi-trace-001".to_string()),
+            topic: None,
+            stream: false,
+            media: Vec::new(),
+            attach_only: false,
+            client_message_id: None,
+        };
+
+        let response = chat_sync(state.clone(), HeaderMap::new(), req)
+            .await
+            .expect("chat_sync must succeed via SessionRuntime path");
+        assert_eq!(response.content, "yangmi reply ack");
+        assert_eq!(response.input_tokens, 7);
+        assert_eq!(response.output_tokens, 11);
+
+        // The session runtime was materialized into the cache — a second
+        // call for the same session reuses the same `Arc<SessionRuntime>`.
+        let cache_len = state.session_cache.len().await;
+        assert_eq!(cache_len, 1, "session cache must hold one entry");
+
+        // The per-session workspace policy bootstrap actually ran — i.e.
+        // the yangmi gap is closed at the structural level.
+        let encoded = octos_bus::session::encode_path_component(&format!(
+            "{MAIN_PROFILE_ID}:api:yangmi-trace-001"
+        ));
+        let policy_path = profile_data_dir
+            .join("users")
+            .join(&encoded)
+            .join("workspace")
+            .join(".octos-workspace.toml");
+        assert!(
+            policy_path.exists(),
+            "SessionRuntime::bootstrap must write the workspace policy at {} \
+             without any operator-side hotfix",
+            policy_path.display(),
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_returns_503_when_routed_profile_not_registered() {
+        // M11-F: the legacy `state.agent` fallback was deleted; an
+        // unregistered profile is a configuration bug, not a runtime
+        // fallback. `octos serve` bootstraps every profile in
+        // `ProfileStore::list()` at startup, so a request that lands on
+        // a profile id missing from `state.profiles` must fail closed
+        // with 503 SERVICE UNAVAILABLE (and a body that names the
+        // offending profile so operators can investigate).
+        let state = Arc::new(AppState::empty_for_tests());
+        let req = ChatRequest {
+            message: "ping".to_string(),
+            session_id: Some("legacy".to_string()),
+            topic: None,
+            stream: false,
+            media: Vec::new(),
+            attach_only: false,
+            client_message_id: None,
+        };
+
+        let result = chat_sync(state, HeaderMap::new(), req).await;
+        let (status, msg) = result
+            .err()
+            .expect("expected 503 when profile not registered");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The error must name the missing profile so the operator log
+        // surfaces the misrouted-request shape (not an opaque "no
+        // provider" message that pre-M11-F's legacy path returned).
+        assert!(
+            msg.contains(MAIN_PROFILE_ID),
+            "503 message must name the unregistered profile (got: {msg})",
+        );
+    }
+
+    /// M11-F regression fix REG-6: `chat_sync_via_session_runtime` must
+    /// forward `state.appui_default_session_cwd` as the session's
+    /// workspace hint when no client cwd is supplied. Pre-M11-F serve.rs
+    /// wired this into the server-wide agent via
+    /// `agent.with_workspace_root(default_cwd)` so every `/api/chat`
+    /// inherited it; M11-F's deletion of that helper left this
+    /// dispatcher path falling back to the canonical
+    /// `<data_dir>/users/.../workspace` instead of the operator setting.
+    #[tokio::test]
+    async fn chat_sync_forwards_appui_default_session_cwd_as_workspace_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let operator_cwd = tmp.path().join("operator-coding-workspace");
+        std::fs::create_dir_all(&operator_cwd).unwrap();
+        let profile_runtime = make_m11d_profile(&profile_data_dir, "ack").await;
+
+        let mut profiles = HashMap::new();
+        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
+        let state = Arc::new(AppState {
+            profiles,
+            appui_default_session_cwd: Some(operator_cwd.clone()),
+            ..AppState::empty_for_tests()
+        });
+
+        let req = ChatRequest {
+            message: "anchor here".to_string(),
+            session_id: Some("reg6-trace".to_string()),
+            topic: None,
+            stream: false,
+            media: Vec::new(),
+            attach_only: false,
+            client_message_id: None,
+        };
+
+        let _response = chat_sync(state.clone(), HeaderMap::new(), req)
+            .await
+            .expect("chat_sync should succeed");
+
+        // After the first call, the cached SessionRuntime must be
+        // anchored at the operator-configured cwd (not the canonical
+        // `<profile_data_dir>/users/.../workspace`).
+        let session_key =
+            octos_core::SessionKey::with_profile(MAIN_PROFILE_ID, "api", "reg6-trace");
+        let session_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_key, None)
+            .await
+            .expect("cached SessionRuntime");
+        let expected =
+            std::fs::canonicalize(&operator_cwd).unwrap_or_else(|_| operator_cwd.clone());
+        let actual = std::fs::canonicalize(&session_runtime.workspace_root)
+            .unwrap_or_else(|_| session_runtime.workspace_root.clone());
+        assert_eq!(
+            actual,
+            expected,
+            "SessionRuntime.workspace_root must equal appui.default_session_cwd \
+             when forwarded by chat_sync_via_session_runtime (got {})",
+            session_runtime.workspace_root.display()
+        );
     }
 }

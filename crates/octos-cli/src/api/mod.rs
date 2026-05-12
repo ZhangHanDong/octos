@@ -57,6 +57,7 @@ use crate::login_allowlist::LoginAllowlistStore;
 use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
+use crate::runtime::{ProfileRuntime, SessionRuntimeCache};
 use crate::setup_state_store::SetupStateStore;
 use crate::tenant::TenantStore;
 use crate::user_store::UserStore;
@@ -108,9 +109,32 @@ impl RunIdCache {
 
 /// Shared application state for API handlers.
 pub struct AppState {
-    /// Agent for processing messages (None if no LLM provider configured).
-    pub agent: Option<Arc<octos_agent::Agent>>,
-    /// Session manager for history.
+    /// Per-profile runtime catalog. Built at startup from
+    /// `ProfileStore::list()` — one [`ProfileRuntime`] per enabled
+    /// profile with an active primary LLM. The `/api/chat` handler
+    /// and UI Protocol dispatcher resolve the request's profile here,
+    /// then ask [`Self::session_cache`] to materialize the matching
+    /// `SessionRuntime` on demand.
+    ///
+    /// An unregistered profile is a configuration bug (M11-F deleted
+    /// the legacy server-wide `agent` fallback); handlers fail closed
+    /// with 503 when a request routes to a missing profile.
+    pub profiles: HashMap<String, Arc<ProfileRuntime>>,
+    /// TTL/LRU cache of per-session runtimes keyed by
+    /// `(profile_id, session_key)`. Built once at startup;
+    /// `/api/chat` and other dispatchers call `get_or_init` to
+    /// materialize an `Arc<SessionRuntime>` per turn.
+    pub session_cache: Arc<SessionRuntimeCache>,
+    /// Process-wide [`octos_bus::SessionManager`] backed by
+    /// `<data_dir>/sessions/`. Used by REST endpoints that browse and
+    /// edit on-disk session history (`/api/sessions`, `/api/sessions/:id/messages`,
+    /// `/api/sessions/:id/title`, …) and by the UI Protocol audit
+    /// writer to resolve the canonical data_dir. `/api/chat` and the
+    /// WS turn dispatcher route through the per-session
+    /// `SessionRuntime.sessions` instead — the field stays here so
+    /// the listing / metadata endpoints have a single shared handle.
+    /// `None` in tests / setup-wizard deployments that haven't opened
+    /// a SessionManager yet.
     pub sessions: Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>>,
     /// Process-wide event broadcaster for harness/admin + swarm SSE
     /// surfaces. Chat traffic uses `/api/ui-protocol/ws` exclusively as
@@ -230,7 +254,11 @@ impl AppState {
             std::env::temp_dir().join(format!("octos-test-admin-token-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).ok();
         Self {
-            agent: None,
+            profiles: HashMap::new(),
+            session_cache: Arc::new(SessionRuntimeCache::new(
+                64,
+                std::time::Duration::from_secs(1800),
+            )),
             sessions: None,
             broadcaster: Arc::new(EventBroadcaster::new(16)),
             started_at: chrono::Utc::now(),
