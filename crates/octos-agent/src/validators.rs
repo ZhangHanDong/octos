@@ -35,15 +35,67 @@ use tracing::{debug, warn};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::tools::{ToolRegistry, ToolResult};
-use crate::workspace_policy::{Validator, ValidatorPhaseKind, ValidatorSpec};
+use crate::workspace_policy::{
+    MagicByteKind, Validator, ValidatorFileSource, ValidatorPhaseKind, ValidatorSpec,
+};
 
 /// Current schema version for [`ValidatorOutcome`] persistence.
 pub const VALIDATOR_RESULT_SCHEMA_VERSION: u32 = 1;
 
 const EVIDENCE_SUBDIR: &str = ".octos/validator-evidence";
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
+/// Default timeout for HTTP-probe validators when [`Validator::timeout_ms`]
+/// is absent. Picked so a stale local API surface fails fast rather than
+/// stalling the whole contract gate.
+const DEFAULT_HTTP_PROBE_TIMEOUT_MS: u64 = 5_000;
 const MAX_EVIDENCE_BYTES: usize = 512 * 1024;
 const KILL_GRACE_PERIOD: Duration = Duration::from_millis(300);
+
+/// Default ominix-api URL when the `OMINIX_API_URL` env override is absent.
+const DEFAULT_OMINIX_API_URL: &str = "http://127.0.0.1:8081";
+
+/// Default `required_tier` for legacy ledger records emitted before Wave-3a.
+///
+/// Sentinel value (`""`) — replaced with the tier derived from the legacy
+/// `required` field by [`ValidatorOutcome::normalize_legacy_tier`] after
+/// deserialize. We can't peek at sibling fields during a `serde(default = ...)`
+/// callback, so the normalization happens explicitly on every read path.
+fn default_required_tier() -> String {
+    String::new()
+}
+
+/// Test-only override for the ominix-api base URL.
+///
+/// Production reads the URL from the `OMINIX_API_URL` env var (or falls
+/// back to [`DEFAULT_OMINIX_API_URL`]). Tests cannot safely mutate env vars
+/// in 2024 edition under `deny(unsafe_code)`, so they install the address
+/// of an in-test HTTP server here instead.
+#[cfg(test)]
+static TEST_OMINIX_URL_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn test_ominix_url_override() -> &'static std::sync::Mutex<Option<String>> {
+    TEST_OMINIX_URL_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn ominix_api_base_url() -> String {
+    #[cfg(test)]
+    {
+        if let Ok(guard) = test_ominix_url_override().lock() {
+            if let Some(ref url) = *guard {
+                return url.clone();
+            }
+        }
+    }
+    std::env::var("OMINIX_API_URL").unwrap_or_else(|_| DEFAULT_OMINIX_API_URL.to_string())
+}
+
+/// Sample value, on a normalized -1.0..1.0 audio axis, above which a sample is
+/// considered "non-silent". Matches the existing `mofa-podcast` skill's
+/// non-silent heuristic so the validator and the skill agree on what counts
+/// as silence.
+const NON_SILENT_SAMPLE_FLOOR: f32 = 0.01;
 
 /// Phase in which a validator runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,11 +149,80 @@ impl ValidatorStatus {
 }
 
 /// Invocation context shared by a batch of validators for the same workspace.
+///
+/// `input_args` carries the originating spawn task's input JSON when this
+/// invocation is run as part of a spawn-task contract gate. Domain validators
+/// (`HttpProbe`, `OminixVoiceExists`) reference these args via
+/// `${args.<key>}` template interpolation so they can assert e.g. "the
+/// requested voice name is registered with ominix-api".
+///
+/// `tool_output` carries the spawn task tool's `named_outputs` map (e.g.
+/// `mofa_publish` emits `deploy_url`). Domain validators reference these via
+/// `${output.<key>}` interpolation so they can probe the live URL the tool
+/// just produced. Absent for non-spawn contexts and for tools that emit no
+/// named outputs.
 #[derive(Clone, Debug)]
 pub struct ValidatorInvocation {
     pub phase: ValidatorPhase,
     pub workspace_root: PathBuf,
     pub repo_label: String,
+    /// Optional input args from the originating spawn task. Used by
+    /// `${args.<key>}` interpolation; absent for non-spawn contexts (e.g.
+    /// turn-end validators that don't reference task inputs).
+    pub input_args: Option<serde_json::Value>,
+    /// Optional `named_outputs` map from the spawn task tool's stdout
+    /// envelope. Used by `${output.<key>}` interpolation; absent when the
+    /// tool emitted no named outputs (most legacy plugins).
+    pub tool_output: Option<serde_json::Value>,
+    /// Optional `files_to_send` list from the originating spawn_only tool's
+    /// stdout envelope (the plugin protocol's authoritative list of files
+    /// the skill just produced). Consumed by file-list-driven validators
+    /// (`MagicBytes`, `AudioNonSilent`, `PerFileNonSilent`) when their spec
+    /// declares `source = "spawn_only_files"` — see issue octos #1034.
+    ///
+    /// Absent (defaulted to an empty `Vec`) for non-spawn contexts and for
+    /// spawn_only tools that emit no files. Validators that consult this
+    /// list and find it empty surface a `Fail` outcome so misconfigured
+    /// policies (e.g. opting into `spawn_only_files` from a turn-end
+    /// validator that has no plugin output) are caught early.
+    pub spawn_only_files: Vec<PathBuf>,
+}
+
+impl ValidatorInvocation {
+    /// Build a `ValidatorInvocation` for a context that does not carry spawn
+    /// task input args (e.g. turn-end validators, free-standing test setups).
+    pub fn new(phase: ValidatorPhase, workspace_root: PathBuf, repo_label: String) -> Self {
+        Self {
+            phase,
+            workspace_root,
+            repo_label,
+            input_args: None,
+            tool_output: None,
+            spawn_only_files: Vec::new(),
+        }
+    }
+
+    /// Attach spawn task input args for `${args.<key>}` template
+    /// interpolation by domain validators.
+    pub fn with_input_args(mut self, args: serde_json::Value) -> Self {
+        self.input_args = Some(args);
+        self
+    }
+
+    /// Attach spawn task tool output (the `named_outputs` map) for
+    /// `${output.<key>}` template interpolation by domain validators.
+    pub fn with_tool_output(mut self, output: serde_json::Value) -> Self {
+        self.tool_output = Some(output);
+        self
+    }
+
+    /// Attach the plugin-reported `files_to_send` list so file-list-driven
+    /// validators with `source = "spawn_only_files"` (issue octos #1034)
+    /// can consume the authoritative path set the spawn_only tool emitted.
+    pub fn with_spawn_only_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.spawn_only_files = files;
+        self
+    }
 }
 
 /// Typed durable outcome of a single validator run.
@@ -117,7 +238,15 @@ pub struct ValidatorOutcome {
     pub phase: ValidatorPhase,
     pub kind: String,
     pub repo_label: String,
+    /// True iff a non-`Pass` outcome from this validator demotes the spawn
+    /// task — i.e. the originating [`Required::Hard`] tier. Soft/None map to
+    /// `false` so legacy replay readers see them as warnings, matching the
+    /// pre-Wave-3a `required: false` semantics.
     pub required: bool,
+    /// Explicit gate-strength tier. Defaults to `"hard"` on replay of records
+    /// emitted before Wave-3a so legacy ledgers de-serialize cleanly.
+    #[serde(default = "default_required_tier")]
+    pub required_tier: String,
     pub status: ValidatorStatus,
     pub reason: String,
     pub duration_ms: u64,
@@ -138,6 +267,27 @@ impl ValidatorOutcome {
             return true;
         }
         matches!(self.status, ValidatorStatus::Pass)
+    }
+
+    /// True iff this outcome's gate strength is the soft tier (added in
+    /// Wave-3a so partial-artifact contracts can warn-and-continue without
+    /// demoting the spawn task).
+    pub fn is_soft_warning(&self) -> bool {
+        self.required_tier == "soft" && !matches!(self.status, ValidatorStatus::Pass)
+    }
+
+    /// Backfill `required_tier` on records emitted before Wave-3a.
+    ///
+    /// Pre-Wave-3a ledger rows have no `required_tier` field, so
+    /// `serde(default)` initializes it to the empty-string sentinel.
+    /// Normalize the sentinel back to a tier derived from the legacy
+    /// `required` field — `required: true` → `"hard"`, `required: false` →
+    /// `"none"`. Idempotent: a Wave-3a-emitted record that already carries
+    /// `"hard"`/`"soft"`/`"none"` is left untouched.
+    fn normalize_legacy_tier(&mut self) {
+        if self.required_tier.is_empty() {
+            self.required_tier = if self.required { "hard" } else { "none" }.to_string();
+        }
     }
 }
 
@@ -199,8 +349,9 @@ impl ValidatorLedger {
             if line.trim().is_empty() {
                 continue;
             }
-            let outcome: ValidatorOutcome = serde_json::from_str(&line)
+            let mut outcome: ValidatorOutcome = serde_json::from_str(&line)
                 .wrap_err_with(|| format!("parse ledger line failed: {line}"))?;
+            outcome.normalize_legacy_tier();
             outcomes.push(outcome);
         }
         Ok(outcomes)
@@ -369,6 +520,98 @@ impl ValidatorRunner {
                 }
                 ValidatorSpec::FileExists { path, min_bytes } => self
                     .run_file_exists(invocation, validator, path, *min_bytes, started_at, started),
+                ValidatorSpec::HttpProbe {
+                    url_template,
+                    expected_status,
+                    expected_contains,
+                } => {
+                    self.run_http_probe(
+                        invocation,
+                        validator,
+                        url_template,
+                        *expected_status,
+                        expected_contains.as_deref(),
+                        started_at,
+                        started,
+                    )
+                    .await
+                }
+                ValidatorSpec::OminixVoiceExists { name_arg } => {
+                    self.run_ominix_voice_exists(
+                        invocation, validator, name_arg, started_at, started,
+                    )
+                    .await
+                }
+                ValidatorSpec::AudioNonSilent {
+                    glob,
+                    min_ratio,
+                    source,
+                    extension,
+                } => self.run_audio_non_silent(
+                    invocation,
+                    validator,
+                    glob,
+                    *min_ratio,
+                    *source,
+                    extension.as_deref(),
+                    started_at,
+                    started,
+                ),
+                ValidatorSpec::PerFileNonSilent {
+                    glob,
+                    min_ratio,
+                    require_at_least,
+                    source,
+                    extension,
+                } => self.run_per_file_non_silent(
+                    invocation,
+                    validator,
+                    glob,
+                    *min_ratio,
+                    *require_at_least,
+                    *source,
+                    extension.as_deref(),
+                    started_at,
+                    started,
+                ),
+                ValidatorSpec::MagicBytes {
+                    glob,
+                    format,
+                    source,
+                    extension,
+                } => self.run_magic_bytes(
+                    invocation,
+                    validator,
+                    glob,
+                    *format,
+                    *source,
+                    extension.as_deref(),
+                    started_at,
+                    started,
+                ),
+                ValidatorSpec::HttpProbeUntil {
+                    url_template,
+                    expected_status,
+                    expected_contains,
+                    poll_interval_ms,
+                    deadline_ms,
+                } => {
+                    self.run_http_probe_until(
+                        invocation,
+                        validator,
+                        url_template,
+                        *expected_status,
+                        expected_contains.as_deref(),
+                        *poll_interval_ms,
+                        *deadline_ms,
+                        started_at,
+                        started,
+                    )
+                    .await
+                }
+                ValidatorSpec::Sha256Match { glob, sha256 } => {
+                    self.run_sha256_match(invocation, validator, glob, sha256, started_at, started)
+                }
             };
 
             record_counter(&outcome, kind_label);
@@ -400,8 +643,38 @@ impl ValidatorRunner {
         let timeout_ms = validator.timeout_ms.unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS);
         let timeout_duration = Duration::from_millis(timeout_ms);
 
+        // Interpolate `${args.X}` and `${output.X}` references in both the
+        // executable path and each argv element. argv elements are passed
+        // as separate slots (no shell concatenation), so substitution is
+        // safe — and necessary if a policy wants to reference a tool-
+        // emitted path (e.g. `${output.patch_path}` for a `git apply`
+        // check). A missing key surfaces as an Error outcome.
+        let resolved_cmd = match interpolate_template(
+            cmd,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+        let mut resolved_args = Vec::with_capacity(args.len());
+        for arg in args {
+            match interpolate_template(
+                arg,
+                invocation.input_args.as_ref(),
+                invocation.tool_output.as_ref(),
+            ) {
+                Ok(value) => resolved_args.push(value),
+                Err(reason) => {
+                    return error_outcome(invocation, validator, started_at, started, reason);
+                }
+            }
+        }
+
         // Shell-safety layer: SafePolicy denies the known-dangerous patterns.
-        let command_string = build_command_string(cmd, args);
+        let command_string = build_command_string(&resolved_cmd, &resolved_args);
         let decision = self
             .policy
             .check(&command_string, &invocation.workspace_root);
@@ -418,9 +691,9 @@ impl ValidatorRunner {
             }
         }
 
-        let mut command = Command::new(cmd);
+        let mut command = Command::new(&resolved_cmd);
         command
-            .args(args)
+            .args(&resolved_args)
             .current_dir(&invocation.workspace_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -484,7 +757,8 @@ impl ValidatorRunner {
                     phase: invocation.phase,
                     kind: validator_kind_label(&validator.spec).to_string(),
                     repo_label: invocation.repo_label.clone(),
-                    required: validator.required,
+                    required: validator.tier().is_hard(),
+                    required_tier: validator.tier().as_str().to_string(),
                     status,
                     reason,
                     duration_ms,
@@ -511,7 +785,8 @@ impl ValidatorRunner {
                     phase: invocation.phase,
                     kind: validator_kind_label(&validator.spec).to_string(),
                     repo_label: invocation.repo_label.clone(),
-                    required: validator.required,
+                    required: validator.tier().is_hard(),
+                    required_tier: validator.tier().as_str().to_string(),
                     status: ValidatorStatus::Timeout,
                     reason: format!("command validator timed out after {timeout_ms}ms"),
                     duration_ms,
@@ -562,7 +837,8 @@ impl ValidatorRunner {
                     phase: invocation.phase,
                     kind: validator_kind_label(&validator.spec).to_string(),
                     repo_label: invocation.repo_label.clone(),
-                    required: validator.required,
+                    required: validator.tier().is_hard(),
+                    required_tier: validator.tier().as_str().to_string(),
                     status,
                     reason,
                     duration_ms,
@@ -586,7 +862,8 @@ impl ValidatorRunner {
                     phase: invocation.phase,
                     kind: validator_kind_label(&validator.spec).to_string(),
                     repo_label: invocation.repo_label.clone(),
-                    required: validator.required,
+                    required: validator.tier().is_hard(),
+                    required_tier: validator.tier().as_str().to_string(),
                     status: ValidatorStatus::Timeout,
                     reason: format!("tool validator '{tool}' timed out after {timeout_ms}ms"),
                     duration_ms,
@@ -607,10 +884,31 @@ impl ValidatorRunner {
         started_at: DateTime<Utc>,
         started: Instant,
     ) -> ValidatorOutcome {
-        let target = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
+        // Mirror the `HttpProbe` template story so policies can declare e.g.
+        // `voice_profiles/${args.name}.wav` for `fm_voice_save` and have the
+        // path resolved against the spawn task's input args. A missing key is
+        // a hard error so the validator surfaces an `Error` outcome rather
+        // than silently checking a literal `${args.name}` path. Note the
+        // returned string is percent-encoded path-segment-safe — fine for the
+        // single-filename segment use case the contract specifies.
+        //
+        // `${output.X}` resolves against the spawn task's `named_outputs` map
+        // (verbatim, not percent-encoded) so a tool that emits a structured
+        // path can drive the FileExists check directly.
+        let resolved_path = match interpolate_template(
+            path,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+        let target = if Path::new(&resolved_path).is_absolute() {
+            PathBuf::from(&resolved_path)
         } else {
-            invocation.workspace_root.join(path)
+            invocation.workspace_root.join(&resolved_path)
         };
         let duration_ms = started.elapsed().as_millis() as u64;
         let (status, reason) = match std::fs::metadata(&target) {
@@ -664,10 +962,709 @@ impl ValidatorRunner {
             phase: invocation.phase,
             kind: validator_kind_label(&validator.spec).to_string(),
             repo_label: invocation.repo_label.clone(),
-            required: validator.required,
+            required: validator.tier().is_hard(),
+            required_tier: validator.tier().as_str().to_string(),
             status,
             reason,
             duration_ms,
+            evidence_path: None,
+            stderr: None,
+            started_at,
+        }
+    }
+
+    /// Run an HTTP-probe validator.
+    ///
+    /// Interpolates `${args.<key>}` and `${output.<key>}` against the spawn
+    /// task's input args and `named_outputs` respectively, then performs a
+    /// GET against the resulting URL and asserts the status code (and
+    /// optionally a substring of the body, which is itself interpolated)
+    /// matches the spec.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_http_probe(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        url_template: &str,
+        expected_status: u16,
+        expected_contains: Option<&str>,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        let timeout_ms = validator
+            .timeout_ms
+            .unwrap_or(DEFAULT_HTTP_PROBE_TIMEOUT_MS);
+        let url = match interpolate_template(
+            url_template,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(url) => url,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+
+        // Interpolate the body-substring assertion too so policies can
+        // reference tool-emitted values (e.g. expected_contains carrying
+        // `${output.repo}` to assert the deployment HTML mentions the
+        // emitted repo slug).
+        let resolved_contains = match expected_contains {
+            Some(raw) => match interpolate_template(
+                raw,
+                invocation.input_args.as_ref(),
+                invocation.tool_output.as_ref(),
+            ) {
+                Ok(value) => Some(value),
+                Err(reason) => {
+                    return error_outcome(invocation, validator, started_at, started, reason);
+                }
+            },
+            None => None,
+        };
+        let expected_contains_ref = resolved_contains.as_deref();
+
+        match probe_http(&url, timeout_ms, expected_status, expected_contains_ref).await {
+            Ok(reason) => self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Pass,
+                reason,
+                started_at,
+                started,
+            ),
+            Err(HttpProbeFailure::Timeout) => self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Timeout,
+                format!("http probe timed out after {timeout_ms}ms: {url}"),
+                started_at,
+                started,
+            ),
+            Err(HttpProbeFailure::Fail(reason)) => self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                reason,
+                started_at,
+                started,
+            ),
+            Err(HttpProbeFailure::Error(reason)) => self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Error,
+                reason,
+                started_at,
+                started,
+            ),
+        }
+    }
+
+    /// Run an OminixVoiceExists validator.
+    ///
+    /// Calls `GET ${OMINIX_API_URL:-http://127.0.0.1:8081}/v1/voices` and
+    /// asserts the JSON body's `voices[].name` array contains the voice
+    /// name resolved from the spawn task's input args.
+    async fn run_ominix_voice_exists(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        name_arg: &str,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        let timeout_ms = validator
+            .timeout_ms
+            .unwrap_or(DEFAULT_HTTP_PROBE_TIMEOUT_MS);
+        let base = ominix_api_base_url();
+        let url = format!("{}/v1/voices", base.trim_end_matches('/'));
+        let voice_name = match input_arg(invocation.input_args.as_ref(), name_arg) {
+            Some(value) => value,
+            None => {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Error,
+                    format!("ominix_voice_exists: input args missing key '{name_arg}'"),
+                    started_at,
+                    started,
+                );
+            }
+        };
+        match fetch_ominix_voices(&url, timeout_ms).await {
+            Ok(voices) => {
+                if voices.iter().any(|v| v == &voice_name) {
+                    self.make_outcome(
+                        invocation,
+                        validator,
+                        ValidatorStatus::Pass,
+                        format!(
+                            "ominix voice '{voice_name}' is registered (out of {} total)",
+                            voices.len()
+                        ),
+                        started_at,
+                        started,
+                    )
+                } else {
+                    let preview = if voices.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        voices.join(", ")
+                    };
+                    self.make_outcome(
+                        invocation,
+                        validator,
+                        ValidatorStatus::Fail,
+                        format!(
+                            "ominix voice '{voice_name}' is not registered. Available voices: {preview}"
+                        ),
+                        started_at,
+                        started,
+                    )
+                }
+            }
+            Err(HttpProbeFailure::Timeout) => self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Timeout,
+                format!("ominix /v1/voices timed out after {timeout_ms}ms: {url}"),
+                started_at,
+                started,
+            ),
+            Err(HttpProbeFailure::Fail(reason)) | Err(HttpProbeFailure::Error(reason)) => self
+                .make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Error,
+                    reason,
+                    started_at,
+                    started,
+                ),
+        }
+    }
+
+    /// Run an AudioNonSilent validator.
+    #[allow(clippy::too_many_arguments)]
+    fn run_audio_non_silent(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        pattern: &str,
+        min_ratio: f32,
+        source: ValidatorFileSource,
+        extension: Option<&str>,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        // Resolve the candidate file list. For `source = "glob"` (legacy
+        // default) the validator interpolates the glob and matches it
+        // against the workspace root. For `source = "spawn_only_files"`
+        // (issue octos #1034) the validator consumes the plugin-reported
+        // `files_to_send` list verbatim, optionally narrowed by extension —
+        // see [`resolve_validator_files`] for the shared resolution rules.
+        let (matches, pattern_for_diagnostics) = match resolve_validator_files(
+            invocation,
+            pattern,
+            source,
+            extension,
+            FileResolutionMode::TemplateBoth,
+            "audio_non_silent",
+        ) {
+            Ok(resolution) => resolution,
+            Err(FileResolutionError { status, reason }) => {
+                return self
+                    .make_outcome(invocation, validator, status, reason, started_at, started);
+            }
+        };
+        if matches.is_empty() {
+            return self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("audio_non_silent: no files matched '{pattern_for_diagnostics}'"),
+                started_at,
+                started,
+            );
+        }
+
+        let mut passed_any = false;
+        let mut failures = Vec::new();
+        for path in &matches {
+            match decode_non_silent_ratio(path) {
+                Ok(ratio) if ratio >= min_ratio => {
+                    passed_any = true;
+                    break;
+                }
+                Ok(ratio) => failures.push(format!(
+                    "{}: non_silent_ratio={ratio:.3} < min_ratio={min_ratio:.3}",
+                    path.display()
+                )),
+                Err(reason) => failures.push(format!("{}: {reason}", path.display())),
+            }
+        }
+
+        if passed_any {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Pass,
+                format!("audio_non_silent: at least one file met min_ratio={min_ratio:.3}"),
+                started_at,
+                started,
+            )
+        } else {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("audio_non_silent failed: {}", failures.join("; ")),
+                started_at,
+                started,
+            )
+        }
+    }
+
+    /// Run a [`ValidatorSpec::PerFileNonSilent`] validator: every matched
+    /// file must independently pass the non-silent ratio threshold, and the
+    /// match count must meet `require_at_least`.
+    ///
+    /// Complements [`Self::run_audio_non_silent`], which only requires a
+    /// single match. Reuses the WAV/MP3 decoder via
+    /// [`decode_non_silent_ratio`]. Failure messages include the file's
+    /// basename (NOT the full path) so an LLM logger can reason about which
+    /// segment failed without leaking workspace layout.
+    #[allow(clippy::too_many_arguments)]
+    fn run_per_file_non_silent(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        pattern: &str,
+        min_ratio: f32,
+        require_at_least: usize,
+        source: ValidatorFileSource,
+        extension: Option<&str>,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        // Resolve the candidate file list. Glob mode interpolates `${args.X}`
+        // ONLY (rejects path-traversal segments and absolute-path arg
+        // values). `${output.X}` is intentionally not supported in glob mode
+        // here — callers wanting tool-output-driven globs should use the
+        // whole-file `AudioNonSilent` variant. `spawn_only_files` mode
+        // (octos #1034) bypasses interpolation entirely and consumes the
+        // plugin-reported file list verbatim.
+        let (matches, _resolved_pattern) = match resolve_validator_files(
+            invocation,
+            pattern,
+            source,
+            extension,
+            FileResolutionMode::TemplateArgsOnly,
+            "per_file_non_silent",
+        ) {
+            Ok(resolution) => resolution,
+            Err(FileResolutionError { status, reason }) => {
+                return self
+                    .make_outcome(invocation, validator, status, reason, started_at, started);
+            }
+        };
+
+        // Enforce `require_at_least` as a hard floor on matched count
+        // FIRST — that lets us distinguish "tool emitted zero artifacts"
+        // (a true contract failure when the operator declared a minimum)
+        // from "tool emitted artifacts but one is silent" (the per-file
+        // gate below). The two failure modes warrant different remediation
+        // hints in the ledger.
+        if matches.len() < require_at_least {
+            return self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!(
+                    "per_file_non_silent: expected >={require_at_least} audio files, found {}",
+                    matches.len()
+                ),
+                started_at,
+                started,
+            );
+        }
+
+        let mut failures = Vec::new();
+        for path in &matches {
+            // Per-file basename for diagnostics. We deliberately avoid
+            // emitting the full absolute path so the failure message stays
+            // stable across hosts and doesn't surface a workspace temp
+            // directory (which leaks across CI runs).
+            let label = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unnamed>")
+                .to_string();
+            match decode_non_silent_ratio(path) {
+                Ok(ratio) if ratio >= min_ratio => {}
+                Ok(ratio) => failures.push(format!(
+                    "{label}: non_silent_ratio={ratio:.3} < min_ratio={min_ratio:.3}"
+                )),
+                Err(reason) => failures.push(format!("{label}: {reason}")),
+            }
+        }
+
+        if failures.is_empty() {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Pass,
+                format!(
+                    "per_file_non_silent: all {} match(es) met min_ratio={min_ratio:.3}",
+                    matches.len()
+                ),
+                started_at,
+                started,
+            )
+        } else {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("per_file_non_silent failed: {}", failures.join("; ")),
+                started_at,
+                started,
+            )
+        }
+    }
+
+    /// Run a MagicBytes validator.
+    #[allow(clippy::too_many_arguments)]
+    fn run_magic_bytes(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        pattern: &str,
+        kind: MagicByteKind,
+        source: ValidatorFileSource,
+        extension: Option<&str>,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        // Resolve the candidate file list. Glob mode interpolates
+        // `${args.X}` / `${output.X}` so policies can pin the glob to a
+        // tool-emitted output path. `spawn_only_files` mode (octos #1034)
+        // bypasses interpolation and consumes the plugin-reported file list
+        // verbatim.
+        let (matches, pattern_for_diagnostics) = match resolve_validator_files(
+            invocation,
+            pattern,
+            source,
+            extension,
+            FileResolutionMode::TemplateBoth,
+            "magic_bytes",
+        ) {
+            Ok(resolution) => resolution,
+            Err(FileResolutionError { status, reason }) => {
+                return self
+                    .make_outcome(invocation, validator, status, reason, started_at, started);
+            }
+        };
+        if matches.is_empty() {
+            return self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("magic_bytes: no files matched '{pattern_for_diagnostics}'"),
+                started_at,
+                started,
+            );
+        }
+
+        let mut failures = Vec::new();
+        for path in &matches {
+            match read_magic_prefix(path) {
+                Ok(prefix) => {
+                    if !kind.matches(&prefix) {
+                        failures.push(format!(
+                            "{}: header does not match {} magic bytes",
+                            path.display(),
+                            kind.as_str()
+                        ));
+                    }
+                }
+                Err(reason) => {
+                    failures.push(format!("{}: read failed: {reason}", path.display()));
+                }
+            }
+        }
+        if failures.is_empty() {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Pass,
+                format!(
+                    "magic_bytes: all {} match(es) carry {} signature",
+                    matches.len(),
+                    kind.as_str()
+                ),
+                started_at,
+                started,
+            )
+        } else {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("magic_bytes failed: {}", failures.join("; ")),
+                started_at,
+                started,
+            )
+        }
+    }
+
+    /// Run a polling [`HttpProbeUntil`] validator.
+    ///
+    /// Repeatedly probes the interpolated URL on a fixed cadence until the
+    /// expected status+substring contract holds, or the wall-clock deadline
+    /// expires. Each probe re-uses the [`probe_http`] helper that
+    /// [`HttpProbe`] uses, so SSRF posture and timeout semantics match the
+    /// single-shot variant. Per-probe timeout defaults to the smaller of the
+    /// poll interval and 5s so a stuck probe never starves the loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_http_probe_until(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        url_template: &str,
+        expected_status: u16,
+        expected_contains: Option<&str>,
+        poll_interval_ms: u64,
+        deadline_ms: u64,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        let url = match interpolate_template(
+            url_template,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(url) => url,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+
+        // Per-probe timeout caps how long a single HTTP attempt can stall
+        // before the polling loop reclaims control. Clamp to [1s, 5s] so
+        // (a) the probe always has enough budget to complete the TCP
+        // handshake even when `poll_interval_ms` is sub-second, and (b) a
+        // hung probe never overshoots the wall-clock deadline by more than
+        // 5s. We additionally cap each probe by the *remaining* deadline
+        // inside the loop so the validator never runs past `deadline_ms`.
+        let per_probe_timeout_floor_ms = poll_interval_ms.clamp(1_000, 5_000);
+        let deadline = std::time::Instant::now() + Duration::from_millis(deadline_ms);
+        let interval = Duration::from_millis(poll_interval_ms);
+
+        let mut attempt: u32 = 0;
+        let mut last_summary = "no response yet".to_string();
+        loop {
+            // Top-of-loop deadline guard: surface a Fail with the last
+            // response summary as soon as the wall-clock deadline is hit,
+            // even if `probe_http` would otherwise consume another timeout
+            // budget. Critical for short deadlines (< per-probe floor).
+            let now = std::time::Instant::now();
+            let remaining_ms = deadline.saturating_duration_since(now).as_millis() as u64;
+            if remaining_ms == 0 {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Fail,
+                    format!(
+                        "http_probe_until {url} did not match in {deadline_ms}ms; last response: {last_summary}"
+                    ),
+                    started_at,
+                    started,
+                );
+            }
+            // Bound the per-probe timeout by remaining deadline so a hung
+            // final probe cannot push the validator past `deadline_ms`.
+            let per_probe_timeout_ms = per_probe_timeout_floor_ms.min(remaining_ms.max(1));
+
+            attempt += 1;
+            match probe_http(
+                &url,
+                per_probe_timeout_ms,
+                expected_status,
+                expected_contains,
+            )
+            .await
+            {
+                Ok(reason) => {
+                    return self.make_outcome(
+                        invocation,
+                        validator,
+                        ValidatorStatus::Pass,
+                        format!("http_probe_until matched on attempt {attempt}: {reason}"),
+                        started_at,
+                        started,
+                    );
+                }
+                Err(HttpProbeFailure::Timeout) => {
+                    last_summary = format!("attempt {attempt}: per-probe timeout");
+                }
+                Err(HttpProbeFailure::Fail(reason)) => {
+                    last_summary = format!("attempt {attempt}: {reason}");
+                }
+                Err(HttpProbeFailure::Error(reason)) => {
+                    last_summary = format!("attempt {attempt}: transport error: {reason}");
+                }
+            }
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Fail,
+                    format!(
+                        "http_probe_until {url} did not match in {deadline_ms}ms; last response: {last_summary}"
+                    ),
+                    started_at,
+                    started,
+                );
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::time::sleep(interval.min(remaining)).await;
+        }
+    }
+
+    /// Run a [`Sha256Match`] validator.
+    ///
+    /// Resolves BOTH `glob` and `sha256` against `${args.<key>}` first so a
+    /// tool that passes its expected hash through input args can scope the
+    /// check to a per-invocation artifact path (e.g. the freshly-installed
+    /// skill binary) and wire a manifest-derived checksum into the contract
+    /// in one step. Each file matching the glob must have a digest equal to
+    /// the (lowercased, hex) expected value; a single mismatch is a [`Fail`].
+    /// Empty glob is a [`Fail`] so a contract that expects an artifact under
+    /// a path never silently passes.
+    fn run_sha256_match(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        glob_template: &str,
+        sha256_template: &str,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        let expected_hex = match interpolate_template(
+            sha256_template,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(value) => value.trim().to_ascii_lowercase(),
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+        if expected_hex.len() != 64 || !expected_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return error_outcome(
+                invocation,
+                validator,
+                started_at,
+                started,
+                format!(
+                    "sha256_match: expected hex-encoded 64-char SHA-256 digest, got '{expected_hex}'"
+                ),
+            );
+        }
+        // Interpolate the glob so a per-invocation contract (e.g.
+        // `${args.skill_dir}/main`) can scope the digest check to the
+        // artifact this specific spawn task produced. Uses the path-safe
+        // interpolator so embedded `/` separators survive — operators
+        // pinning a literal glob like `skills/*/main` are unaffected.
+        let pattern = match interpolate_args_path(glob_template, invocation.input_args.as_ref()) {
+            Ok(pattern) => pattern,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+        let matches = match glob_files(&invocation.workspace_root, &pattern) {
+            Ok(matches) => matches,
+            Err(reason) => {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Error,
+                    reason,
+                    started_at,
+                    started,
+                );
+            }
+        };
+        if matches.is_empty() {
+            return self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("sha256_match: no files matched '{pattern}'"),
+                started_at,
+                started,
+            );
+        }
+        let mut failures = Vec::new();
+        for path in &matches {
+            match compute_sha256_hex(path) {
+                Ok(actual) => {
+                    if actual != expected_hex {
+                        failures.push(format!(
+                            "{}: actual={actual} != expected={expected_hex}",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(reason) => failures.push(format!("{}: {reason}", path.display())),
+            }
+        }
+        if failures.is_empty() {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Pass,
+                format!(
+                    "sha256_match: all {} match(es) carry expected digest {expected_hex}",
+                    matches.len()
+                ),
+                started_at,
+                started,
+            )
+        } else {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("sha256_match failed: {}", failures.join("; ")),
+                started_at,
+                started,
+            )
+        }
+    }
+
+    fn make_outcome(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        status: ValidatorStatus,
+        reason: String,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        ValidatorOutcome {
+            schema_version: VALIDATOR_RESULT_SCHEMA_VERSION,
+            validator_id: validator.id.clone(),
+            phase: invocation.phase,
+            kind: validator_kind_label(&validator.spec).to_string(),
+            repo_label: invocation.repo_label.clone(),
+            required: validator.tier().is_hard(),
+            required_tier: validator.tier().as_str().to_string(),
+            status,
+            reason,
+            duration_ms: started.elapsed().as_millis() as u64,
             evidence_path: None,
             stderr: None,
             started_at,
@@ -743,6 +1740,617 @@ impl ValidatorRunner {
     }
 }
 
+/// Internal failure category for HTTP-probe validators.
+///
+/// Threaded back out of [`probe_http`] so the runner can map each category
+/// onto the correct typed [`ValidatorStatus`] (`Timeout`, `Fail`, `Error`).
+enum HttpProbeFailure {
+    Timeout,
+    Fail(String),
+    Error(String),
+}
+
+/// Substitute `${args.<key>}` references in `template` against `input_args`.
+///
+/// This thin wrapper preserves the legacy single-source signature for the
+/// inline test suite; production callers use [`interpolate_template`] which
+/// also resolves `${output.<key>}` against the spawn task's `named_outputs`.
+/// See [`interpolate_template`] for the canonical doc-comment on
+/// percent-encoding semantics and missing-key error policy.
+///
+/// Use [`interpolate_args_path`] for glob/path templates where
+/// percent-encoding would break the segment separator.
+#[cfg(test)]
+fn interpolate_args(
+    template: &str,
+    input_args: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    interpolate_template(template, input_args, None)
+}
+
+/// Substitute `${args.<key>}` and `${output.<key>}` references in `template`.
+///
+/// Two interpolation sources, two trust levels:
+///
+/// - `${args.<key>}` resolves against the originating spawn task's input
+///   args (LLM-controlled). Values are percent-encoded into URL-segment-safe
+///   form so an LLM-supplied value cannot break out of the path/query slot
+///   it lands in.
+/// - `${output.<key>}` resolves against the spawn task tool's `named_outputs`
+///   map (tool-controlled, trust boundary equal to the tool itself). Values
+///   are spliced in verbatim because the canonical use case is a tool that
+///   emits a full URL (e.g. `mofa_publish` emitting `deploy_url`) that the
+///   downstream HTTP probe needs to call exactly as-is. Percent-encoding
+///   would corrupt the URL.
+///
+/// A missing key in either source surfaces as `Error` outcome (matches the
+/// `${args.X}` semantics shipped in #935): the validator runner translates
+/// this `Err` into a typed Error result rather than silently substituting
+/// the empty string.
+///
+/// Mixed templates resolve both sources in a single pass, e.g.
+/// `https://${output.host}/voices/${args.name}` works in one call. Order
+/// inside the template is preserved.
+fn interpolate_template(
+    template: &str,
+    input_args: Option<&serde_json::Value>,
+    tool_output: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    loop {
+        let next_args = rest.find("${args.");
+        let next_output = rest.find("${output.");
+        let (start, prefix_len, source, source_label, encode) = match (next_args, next_output) {
+            (None, None) => break,
+            (Some(a), None) => (a, "${args.".len(), input_args, "input arg", true),
+            (None, Some(o)) => (o, "${output.".len(), tool_output, "output", false),
+            (Some(a), Some(o)) => {
+                if a <= o {
+                    (a, "${args.".len(), input_args, "input arg", true)
+                } else {
+                    (o, "${output.".len(), tool_output, "output", false)
+                }
+            }
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + prefix_len..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unterminated reference in template: {template}"))?;
+        let key = &after[..end];
+        let value = input_arg(source, key).ok_or_else(|| {
+            format!("{source_label} '{key}' not found while interpolating template: {template}")
+        })?;
+        if encode {
+            out.push_str(&percent_encode_url_segment(&value));
+        } else {
+            out.push_str(&value);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Path-safe counterpart to [`interpolate_args`] for glob templates.
+///
+/// Same key lookup semantics, but values are inserted verbatim instead of
+/// percent-encoded so embedded `/` separators (e.g. `${args.skill_dir}` =
+/// `"skills/example"`) survive into the resulting glob. Path traversal
+/// attempts that try to escape the workspace root are rejected explicitly so
+/// an LLM-controlled arg value cannot wire the validator at, say, a
+/// `${args.skill_dir}/main` template that resolves to `/etc/passwd`. The
+/// caller is expected to thread the resulting glob through `glob_files`
+/// (which resolves relative paths against the workspace root, blunting
+/// further traversal).
+fn interpolate_args_path(
+    template: &str,
+    input_args: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("${args.") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "${args.".len()..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unterminated ${{args.}} reference in template: {template}"))?;
+        let key = &after[..end];
+        let value = input_arg(input_args, key).ok_or_else(|| {
+            format!("input arg '{key}' not found while interpolating template: {template}")
+        })?;
+        // Reject path-traversal segments so an LLM-controlled arg value can
+        // never escape the workspace root via `${args.X}/...`. We
+        // intentionally accept `/` as a segment separator (otherwise common
+        // contracts like `${args.skill_dir}/main` can't work) but block
+        // `..` segments and absolute-path leakage.
+        for segment in value.split('/') {
+            if segment == ".." {
+                return Err(format!(
+                    "input arg '{key}' contains '..' segment which is rejected for path templates: {value}"
+                ));
+            }
+        }
+        if value.starts_with('/') {
+            return Err(format!(
+                "input arg '{key}' must be a relative path, got absolute: {value}"
+            ));
+        }
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Percent-encode bytes that have reserved meaning in URL path/query segments
+/// so an LLM-controlled arg value cannot break out of the segment it was
+/// placed into. Conservative: encodes everything outside the unreserved set
+/// defined in RFC 3986 plus the `~` allowed-in-unreserved character.
+fn percent_encode_url_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Fetch a single argument value from a spawn task's input args by dotted key.
+fn input_arg(input_args: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let mut value = input_args?;
+    for part in key.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        value = value.get(part)?;
+    }
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Perform an HTTP GET probe and assert the response shape.
+async fn probe_http(
+    url: &str,
+    timeout_ms: u64,
+    expected_status: u16,
+    expected_contains: Option<&str>,
+) -> Result<String, HttpProbeFailure> {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return Err(HttpProbeFailure::Error(format!(
+                "build http client failed: {err}"
+            )));
+        }
+    };
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(err) if err.is_timeout() => return Err(HttpProbeFailure::Timeout),
+        Err(err) => {
+            return Err(HttpProbeFailure::Error(format!(
+                "http probe request failed for {url}: {err}"
+            )));
+        }
+    };
+    let actual = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    if actual != expected_status {
+        let preview = preview_body(&body);
+        return Err(HttpProbeFailure::Fail(format!(
+            "http probe got status {actual} (expected {expected_status}) at {url}; body preview: {preview}"
+        )));
+    }
+    if let Some(needle) = expected_contains {
+        if !body.contains(needle) {
+            let preview = preview_body(&body);
+            return Err(HttpProbeFailure::Fail(format!(
+                "http probe body at {url} did not contain '{needle}'; body preview: {preview}"
+            )));
+        }
+    }
+    Ok(format!(
+        "http probe {url} returned status {actual}{}",
+        match expected_contains {
+            Some(needle) => format!(" with substring '{needle}'"),
+            None => String::new(),
+        }
+    ))
+}
+
+fn preview_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    if trimmed.len() <= 200 {
+        return trimmed.to_string();
+    }
+    let mut end = 200;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &trimmed[..end])
+}
+
+/// Fetch ominix-api `/v1/voices` and extract the registered voice names.
+async fn fetch_ominix_voices(url: &str, timeout_ms: u64) -> Result<Vec<String>, HttpProbeFailure> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .map_err(|err| HttpProbeFailure::Error(format!("build http client failed: {err}")))?;
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(err) if err.is_timeout() => return Err(HttpProbeFailure::Timeout),
+        Err(err) => {
+            return Err(HttpProbeFailure::Error(format!(
+                "ominix /v1/voices fetch failed at {url}: {err}"
+            )));
+        }
+    };
+    if !response.status().is_success() {
+        return Err(HttpProbeFailure::Error(format!(
+            "ominix /v1/voices returned status {} at {url}",
+            response.status().as_u16()
+        )));
+    }
+    let body = response.text().await.unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|err| HttpProbeFailure::Error(format!("ominix /v1/voices invalid JSON: {err}")))?;
+    let voices = parsed
+        .get("voices")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            HttpProbeFailure::Error(format!(
+                "ominix /v1/voices response missing 'voices' array (body preview: {})",
+                preview_body(&body)
+            ))
+        })?;
+    let names: Vec<String> = voices
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    Ok(names)
+}
+
+/// Template-interpolation flavour used by [`resolve_validator_files`].
+///
+/// Mirrors the per-variant interpolation rules already in place before octos
+/// #1034: `MagicBytes` / `AudioNonSilent` substitute both `${args.X}` and
+/// `${output.X}`, while `PerFileNonSilent` substitutes `${args.X}` only via
+/// the path-traversal-safe [`interpolate_args_path`] helper.
+#[derive(Clone, Copy, Debug)]
+enum FileResolutionMode {
+    /// Interpolate both `${args.X}` and `${output.X}`. Used by `MagicBytes`
+    /// and `AudioNonSilent`.
+    TemplateBoth,
+    /// Interpolate `${args.X}` only via [`interpolate_args_path`]. Used by
+    /// `PerFileNonSilent`.
+    TemplateArgsOnly,
+}
+
+/// Error returned by [`resolve_validator_files`] when the file list cannot be
+/// produced (interpolation failure, invalid glob, etc.). The caller surfaces
+/// `status` + `reason` directly through `make_outcome`.
+#[derive(Clone, Debug)]
+struct FileResolutionError {
+    status: ValidatorStatus,
+    reason: String,
+}
+
+/// Resolve the candidate file list for a file-list-driven validator
+/// (`MagicBytes`, `AudioNonSilent`, `PerFileNonSilent`).
+///
+/// * `ValidatorFileSource::Glob` (legacy default) — interpolates the
+///   `pattern` per `mode` and matches the resolved glob against
+///   `invocation.workspace_root` via [`glob_files`]. Returns the matched
+///   path list and the resolved pattern (for diagnostics).
+/// * `ValidatorFileSource::SpawnOnlyFiles` (octos #1034) — bypasses the glob
+///   entirely and consumes `invocation.spawn_only_files` verbatim. If
+///   `extension` is set, only files whose extension matches (case-
+///   insensitive, no leading dot) are returned. The diagnostic pattern is
+///   synthesized from the optional extension filter so failure messages
+///   remain interpretable. Files that do NOT exist on disk are filtered out
+///   so the contract treats a stale `files_to_send` entry the same way the
+///   glob path treats a missing match.
+fn resolve_validator_files(
+    invocation: &ValidatorInvocation,
+    pattern: &str,
+    source: ValidatorFileSource,
+    extension: Option<&str>,
+    mode: FileResolutionMode,
+    validator_kind: &str,
+) -> Result<(Vec<PathBuf>, String), FileResolutionError> {
+    match source {
+        ValidatorFileSource::Glob => {
+            let resolved_pattern = match mode {
+                FileResolutionMode::TemplateBoth => interpolate_template(
+                    pattern,
+                    invocation.input_args.as_ref(),
+                    invocation.tool_output.as_ref(),
+                ),
+                FileResolutionMode::TemplateArgsOnly => {
+                    interpolate_args_path(pattern, invocation.input_args.as_ref())
+                }
+            }
+            .map_err(|reason| FileResolutionError {
+                status: ValidatorStatus::Error,
+                reason,
+            })?;
+            let matches =
+                glob_files(&invocation.workspace_root, &resolved_pattern).map_err(|reason| {
+                    FileResolutionError {
+                        status: ValidatorStatus::Error,
+                        reason,
+                    }
+                })?;
+            Ok((matches, resolved_pattern))
+        }
+        ValidatorFileSource::SpawnOnlyFiles => {
+            let normalized_ext = extension.map(normalize_extension_suffix);
+            let mut matches = Vec::new();
+            for path in &invocation.spawn_only_files {
+                if let Some(ref required) = normalized_ext {
+                    let actual = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if &actual != required {
+                        continue;
+                    }
+                }
+                if path.is_file() {
+                    matches.push(path.clone());
+                }
+            }
+            let diagnostic_pattern = match normalized_ext.as_deref() {
+                Some(ext) => format!("spawn_only_files (extension={ext})"),
+                None => "spawn_only_files".to_string(),
+            };
+            // Surface a helpful Error outcome if a misconfigured policy
+            // opts into `spawn_only_files` but the validator runs in a
+            // context without any plugin-reported files (e.g. a turn-end
+            // pass). The caller turns the empty list into a domain-specific
+            // Fail message; this branch fires ONLY when the policy itself
+            // is asking for a list the invocation cannot produce.
+            if invocation.spawn_only_files.is_empty() {
+                return Err(FileResolutionError {
+                    status: ValidatorStatus::Fail,
+                    reason: format!(
+                        "{validator_kind}: source = \"spawn_only_files\" requested but the spawn_only \
+                         tool emitted no files_to_send"
+                    ),
+                });
+            }
+            Ok((matches, diagnostic_pattern))
+        }
+    }
+}
+
+/// Normalize an extension filter (`"mp3"`, `".MP3"`, `"Mp3"`) to a lowercase
+/// no-leading-dot form so [`resolve_validator_files`] can compare against
+/// `PathBuf::extension()` output uniformly.
+fn normalize_extension_suffix(ext: &str) -> String {
+    ext.trim_start_matches('.').to_ascii_lowercase()
+}
+
+/// Resolve a glob pattern against `workspace_root` and return matching files
+/// (skipping directories).
+fn glob_files(workspace_root: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> {
+    let absolute_pattern = if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        workspace_root.join(pattern)
+    };
+    let mut matches = Vec::new();
+    for entry in glob::glob(&absolute_pattern.to_string_lossy())
+        .map_err(|err| format!("invalid glob '{pattern}': {err}"))?
+    {
+        let path = entry.map_err(|err| format!("glob '{pattern}' failed: {err}"))?;
+        if path.is_file() {
+            matches.push(path);
+        }
+    }
+    Ok(matches)
+}
+
+/// Read the first 32 bytes of a file for magic-byte sniffing.
+fn read_magic_prefix(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|err| format!("open failed: {err}"))?;
+    let mut buf = [0u8; 32];
+    let n = file
+        .read(&mut buf)
+        .map_err(|err| format!("read failed: {err}"))?;
+    Ok(buf[..n].to_vec())
+}
+
+/// Compute the SHA-256 digest of a file, streaming chunked reads so large
+/// artifacts don't blow the validator process's memory budget. Returns the
+/// lowercase hex encoding so callers can compare against the
+/// canonical-form manifest digest with `==`.
+fn compute_sha256_hex(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|err| format!("open failed: {err}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|err| format!("read failed: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Decode `path` (WAV via [`hound`], or MP3 via the optional `audio_mp3`
+/// feature) and return the ratio of non-silent samples to total samples.
+fn decode_non_silent_ratio(path: &Path) -> Result<f32, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "wav" | "wave" => decode_non_silent_ratio_wav(path),
+        "mp3" => decode_non_silent_ratio_mp3(path),
+        other => Err(format!(
+            "audio_non_silent: unsupported file extension '{other}' (supported: wav, mp3)"
+        )),
+    }
+}
+
+fn decode_non_silent_ratio_wav(path: &Path) -> Result<f32, String> {
+    let mut reader =
+        hound::WavReader::open(path).map_err(|err| format!("wav open failed: {err}"))?;
+    let spec = reader.spec();
+    let mut total: u64 = 0;
+    let mut non_silent: u64 = 0;
+    let denom = match spec.sample_format {
+        hound::SampleFormat::Float => 1.0_f32,
+        // PCM full-scale magnitude per bit depth: (2^(bits-1)) - 1. The
+        // earlier coarse approximation (`i32::MAX` for both 24 and 32 bit)
+        // mis-normalized 24-bit samples by a factor of 256, so a perfectly
+        // loud 24-bit recording fell below the 0.01 non-silent floor.
+        hound::SampleFormat::Int => match spec.bits_per_sample {
+            8 => i8::MAX as f32,
+            16 => i16::MAX as f32,
+            24 => ((1u32 << 23) - 1) as f32,
+            32 => i32::MAX as f32,
+            other => {
+                return Err(format!("unsupported wav bits_per_sample={other}"));
+            }
+        },
+    };
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                let value = sample.map_err(|err| format!("wav decode failed: {err}"))?;
+                total += 1;
+                if value.abs() > NON_SILENT_SAMPLE_FLOOR {
+                    non_silent += 1;
+                }
+            }
+        }
+        hound::SampleFormat::Int => {
+            for sample in reader.samples::<i32>() {
+                let value = sample.map_err(|err| format!("wav decode failed: {err}"))? as f32;
+                total += 1;
+                if (value / denom).abs() > NON_SILENT_SAMPLE_FLOOR {
+                    non_silent += 1;
+                }
+            }
+        }
+    }
+    if total == 0 {
+        return Err("wav file has zero samples".to_string());
+    }
+    Ok(non_silent as f32 / total as f32)
+}
+
+#[cfg(feature = "audio_mp3")]
+fn decode_non_silent_ratio_mp3(path: &Path) -> Result<f32, String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).map_err(|err| format!("mp3 open failed: {err}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|err| format!("mp3 probe failed: {err}"))?;
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| "mp3 file has no default track".to_string())?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|err| format!("mp3 decoder init failed: {err}"))?;
+    let track_id = track.id;
+    let mut total: u64 = 0;
+    let mut non_silent: u64 = 0;
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(symphonia::core::errors::Error::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(err) => return Err(format!("mp3 read failed: {err}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(symphonia::core::errors::Error::IoError(_)) => break,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(err) => return Err(format!("mp3 decode failed: {err}")),
+        };
+        if sample_buf.is_none() {
+            let spec = *decoded.spec();
+            sample_buf = Some(SampleBuffer::new(decoded.capacity() as u64, spec));
+        }
+        if let Some(ref mut buf) = sample_buf {
+            buf.copy_interleaved_ref(decoded);
+            for &sample in buf.samples() {
+                total += 1;
+                if sample.abs() > NON_SILENT_SAMPLE_FLOOR {
+                    non_silent += 1;
+                }
+            }
+        }
+    }
+    if total == 0 {
+        return Err("mp3 file decoded zero samples".to_string());
+    }
+    Ok(non_silent as f32 / total as f32)
+}
+
+#[cfg(not(feature = "audio_mp3"))]
+fn decode_non_silent_ratio_mp3(_path: &Path) -> Result<f32, String> {
+    Err(
+        "audio_non_silent for .mp3 requires the 'audio_mp3' feature; \
+         enable it on octos-agent or use a .wav input"
+            .to_string(),
+    )
+}
+
 /// Build a representation of the command for the safety-policy check. This is
 /// not forwarded to a shell — we only use it to run the denylist matcher.
 fn build_command_string(cmd: &str, args: &[String]) -> String {
@@ -768,7 +2376,8 @@ fn error_outcome(
         phase: invocation.phase,
         kind: validator_kind_label(&validator.spec).to_string(),
         repo_label: invocation.repo_label.clone(),
-        required: validator.required,
+        required: validator.tier().is_hard(),
+        required_tier: validator.tier().as_str().to_string(),
         status: ValidatorStatus::Error,
         reason,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -783,6 +2392,13 @@ fn validator_kind_label(spec: &ValidatorSpec) -> &'static str {
         ValidatorSpec::Command { .. } => "command",
         ValidatorSpec::ToolCall { .. } => "tool_call",
         ValidatorSpec::FileExists { .. } => "file_exists",
+        ValidatorSpec::HttpProbe { .. } => "http_probe",
+        ValidatorSpec::OminixVoiceExists { .. } => "ominix_voice_exists",
+        ValidatorSpec::AudioNonSilent { .. } => "audio_non_silent",
+        ValidatorSpec::PerFileNonSilent { .. } => "per_file_non_silent",
+        ValidatorSpec::MagicBytes { .. } => "magic_bytes",
+        ValidatorSpec::HttpProbeUntil { .. } => "http_probe_until",
+        ValidatorSpec::Sha256Match { .. } => "sha256_match",
     }
 }
 
@@ -834,6 +2450,10 @@ fn record_counter(outcome: &ValidatorOutcome, kind_label: &'static str) {
         "phase" => outcome.phase.as_str().to_string(),
         "kind" => kind_label.to_string(),
         "required" => outcome.required.to_string(),
+        // The Wave-3a explicit tier — "hard" / "soft" / "none". Lets
+        // operators dashboard soft warnings separately from purely optional
+        // ones, even though both share `required = false`.
+        "tier" => outcome.required_tier.clone(),
     )
     .increment(1);
 
@@ -841,6 +2461,9 @@ fn record_counter(outcome: &ValidatorOutcome, kind_label: &'static str) {
         counter!("octos_workspace_validator_required_failed_total").increment(1);
     } else if !outcome.required && outcome.status != ValidatorStatus::Pass {
         counter!("octos_workspace_validator_optional_warning_total").increment(1);
+        if outcome.required_tier == "soft" {
+            counter!("octos_workspace_validator_soft_warning_total").increment(1);
+        }
     }
 }
 
@@ -931,6 +2554,48 @@ mod tests {
             }),
             "file_exists"
         );
+        assert_eq!(
+            validator_kind_label(&ValidatorSpec::HttpProbe {
+                url_template: "http://x".into(),
+                expected_status: 200,
+                expected_contains: None,
+            }),
+            "http_probe"
+        );
+        assert_eq!(
+            validator_kind_label(&ValidatorSpec::OminixVoiceExists {
+                name_arg: "name".into()
+            }),
+            "ominix_voice_exists"
+        );
+        assert_eq!(
+            validator_kind_label(&ValidatorSpec::AudioNonSilent {
+                glob: "*.wav".into(),
+                min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            }),
+            "audio_non_silent"
+        );
+        assert_eq!(
+            validator_kind_label(&ValidatorSpec::PerFileNonSilent {
+                glob: "**/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            }),
+            "per_file_non_silent"
+        );
+        assert_eq!(
+            validator_kind_label(&ValidatorSpec::MagicBytes {
+                glob: "*.mp3".into(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            }),
+            "magic_bytes"
+        );
     }
 
     #[test]
@@ -955,6 +2620,7 @@ mod tests {
             kind: "command".into(),
             repo_label: "slides/x".into(),
             required: true,
+            required_tier: "hard".into(),
             status: ValidatorStatus::Pass,
             reason: String::new(),
             duration_ms: 0,
@@ -971,7 +2637,1985 @@ mod tests {
         assert!(!outcome.required_gate_passed());
 
         outcome.required = false;
+        outcome.required_tier = "none".into();
         outcome.status = ValidatorStatus::Fail;
         assert!(outcome.required_gate_passed());
+    }
+
+    // ---------------------------------------------------------------------
+    // Helpers for the domain-validator tests (HTTP probe, audio, magic bytes)
+    // ---------------------------------------------------------------------
+
+    use std::io::{Read, Write as IoWrite};
+    use std::net::TcpListener;
+
+    fn dummy_invocation(workspace_root: PathBuf) -> ValidatorInvocation {
+        ValidatorInvocation::new(ValidatorPhase::Completion, workspace_root, "test".into())
+    }
+
+    fn validator_with_spec(id: &str, spec: ValidatorSpec) -> Validator {
+        Validator {
+            id: id.into(),
+            required: true,
+            soft_fail: false,
+            timeout_ms: Some(2000),
+            phase: ValidatorPhaseKind::Completion,
+            spec,
+        }
+    }
+
+    /// Tiny synchronous HTTP server scripted via `responses`. Spawns a thread,
+    /// listens on `127.0.0.1:0`, replies to each accepted connection in order,
+    /// and exits once `responses.len()` connections have been served. Returns
+    /// the listener's bound `host:port` for the test to point validators at.
+    fn spawn_test_http_server(responses: Vec<&'static str>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn http_probe_passes_on_expected_status_and_substring() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n{\"ok\":\"yangmi\"}";
+        let addr = spawn_test_http_server(vec![response]);
+        let url = format!("http://{addr}/voices/yangmi");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_ok",
+            ValidatorSpec::HttpProbe {
+                url_template: url.clone(),
+                expected_status: 200,
+                expected_contains: Some("yangmi".into()),
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_fails_on_404_status() {
+        let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        let addr = spawn_test_http_server(vec![response]);
+        let url = format!("http://{addr}/missing");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_404",
+            ValidatorSpec::HttpProbe {
+                url_template: url,
+                expected_status: 200,
+                expected_contains: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        assert!(outcomes[0].reason.contains("got status 404"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_fails_when_body_missing_expected_substring() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nNOPE";
+        let addr = spawn_test_http_server(vec![response]);
+        let url = format!("http://{addr}/x");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_no_substring",
+            ValidatorSpec::HttpProbe {
+                url_template: url,
+                expected_status: 200,
+                expected_contains: Some("yangmi".into()),
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        assert!(outcomes[0].reason.contains("did not contain 'yangmi'"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_interpolates_args_into_url_template() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+        let addr = spawn_test_http_server(vec![response]);
+        let url_template = format!("http://{addr}/voices/${{args.name}}");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_input_args(serde_json::json!({"name": "yangmi"}));
+        let validator = validator_with_spec(
+            "probe_interp",
+            ValidatorSpec::HttpProbe {
+                url_template,
+                expected_status: 200,
+                expected_contains: None,
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        // The successful reason should reference the interpolated URL.
+        assert!(
+            outcomes[0].reason.contains("/voices/yangmi"),
+            "missing interpolated value in: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// RAII guard that installs an ominix-api URL override in
+    /// [`TEST_OMINIX_URL_OVERRIDE`] and clears it on drop.
+    struct OminixUrlGuard;
+
+    impl OminixUrlGuard {
+        fn install(url: String) -> Self {
+            *test_ominix_url_override().lock().unwrap() = Some(url);
+            Self
+        }
+    }
+
+    impl Drop for OminixUrlGuard {
+        fn drop(&mut self) {
+            *test_ominix_url_override().lock().unwrap() = None;
+        }
+    }
+
+    /// Serialize ominix tests on the shared URL override slot. Using an
+    /// async-aware `tokio::sync::Mutex` here so the guard can safely cross
+    /// `.await` points (the test holds it across the in-test HTTP probe).
+    fn ominix_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn ominix_voice_exists_passes_when_name_in_voice_list() {
+        let _serial = ominix_test_lock().lock().await;
+        let body = "{\"voices\":[{\"name\":\"vivian\",\"aliases\":[]},{\"name\":\"serena\"}]}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let leaked: &'static str = Box::leak(response.into_boxed_str());
+        let addr = spawn_test_http_server(vec![leaked]);
+        let _guard = OminixUrlGuard::install(format!("http://{addr}"));
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_input_args(serde_json::json!({"name": "vivian"}));
+        let validator = validator_with_spec(
+            "voice_pass",
+            ValidatorSpec::OminixVoiceExists {
+                name_arg: "name".into(),
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn ominix_voice_exists_fails_with_available_list_on_missing_name() {
+        let _serial = ominix_test_lock().lock().await;
+        let body = "{\"voices\":[{\"name\":\"vivian\"},{\"name\":\"serena\"}]}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let leaked: &'static str = Box::leak(response.into_boxed_str());
+        let addr = spawn_test_http_server(vec![leaked]);
+        let _guard = OminixUrlGuard::install(format!("http://{addr}"));
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_input_args(serde_json::json!({"name": "yangmi"}));
+        let validator = validator_with_spec(
+            "voice_fail",
+            ValidatorSpec::OminixVoiceExists {
+                name_arg: "name".into(),
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        // Failure message must surface the available list so the LLM can
+        // react in one round.
+        assert!(
+            outcomes[0].reason.contains("yangmi"),
+            "missing requested name in reason: {}",
+            outcomes[0].reason
+        );
+        assert!(
+            outcomes[0].reason.contains("vivian") && outcomes[0].reason.contains("serena"),
+            "missing available list in reason: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// Generate a WAV file at `path` filled with silence.
+    fn write_silent_wav(path: &Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        for _ in 0..samples {
+            writer.write_sample(0i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
+    /// Generate a WAV sine wave at `path`. Loud enough that every sample is
+    /// above [`NON_SILENT_SAMPLE_FLOOR`].
+    fn write_sine_wav(path: &Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        let amplitude = i16::MAX / 2;
+        for index in 0..samples {
+            let phase = (index as f32) * std::f32::consts::TAU * 440.0 / 8000.0;
+            let value = (phase.sin() * amplitude as f32) as i16;
+            // Keep value away from zero crossings to ensure non-silent floor.
+            let value = if value.abs() < 4_000 { 4_000 } else { value };
+            writer.write_sample(value).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
+    #[tokio::test]
+    async fn audio_non_silent_fails_for_silent_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio_path = dir.path().join("silent.wav");
+        write_silent_wav(&audio_path, 800);
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "silent_audio",
+            ValidatorSpec::AudioNonSilent {
+                glob: "*.wav".into(),
+                min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("non_silent_ratio"),
+            "reason should expose ratio: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_non_silent_passes_for_sine_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio_path = dir.path().join("sine.wav");
+        write_sine_wav(&audio_path, 800);
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "loud_audio",
+            ValidatorSpec::AudioNonSilent {
+                glob: "*.wav".into(),
+                min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn magic_bytes_passes_for_valid_mp3_id3_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.mp3");
+        let mut bytes = b"ID3".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 128));
+        std::fs::write(&path, &bytes).unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "mp3_ok",
+            ValidatorSpec::MagicBytes {
+                glob: "*.mp3".into(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn magic_bytes_fails_when_file_is_actually_gif() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_mp3.mp3");
+        std::fs::write(&path, b"GIF87a\0\0\0").unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "mp3_bad",
+            ValidatorSpec::MagicBytes {
+                glob: "*.mp3".into(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        assert!(outcomes[0].reason.contains("does not match mp3"));
+    }
+
+    #[test]
+    fn interpolate_args_substitutes_simple_key() {
+        let args = serde_json::json!({"name": "yangmi"});
+        let out = interpolate_args("http://x/${args.name}", Some(&args)).unwrap();
+        assert_eq!(out, "http://x/yangmi");
+    }
+
+    #[test]
+    fn interpolate_args_errors_when_key_missing() {
+        let args = serde_json::json!({});
+        let err = interpolate_args("http://x/${args.name}", Some(&args)).unwrap_err();
+        assert!(err.contains("'name'"));
+    }
+
+    #[tokio::test]
+    async fn file_exists_passes_when_args_interpolation_points_to_real_file() {
+        // Mirrors the `fm_voice_save` post-condition: a templated path like
+        // `voice_profiles/${args.name}.wav` must resolve against the spawn
+        // task's input args. The existing `HttpProbe` validator already
+        // does this; `FileExists` follows the same pattern.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("voice_profiles")).unwrap();
+        let wav = dir.path().join("voice_profiles/yangmi.wav");
+        std::fs::write(&wav, vec![0u8; 64]).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "voice_wav_exists",
+            ValidatorSpec::FileExists {
+                path: "voice_profiles/${args.name}.wav".into(),
+                min_bytes: Some(32),
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"name": "yangmi"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("yangmi.wav"),
+            "reason should reference the interpolated path: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn file_exists_fails_when_interpolated_path_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("voice_profiles")).unwrap();
+        // No file written.
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "voice_wav_exists",
+            ValidatorSpec::FileExists {
+                path: "voice_profiles/${args.name}.wav".into(),
+                min_bytes: None,
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"name": "missing_voice"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("missing_voice.wav"),
+            "reason should reference the interpolated path: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn file_exists_errors_when_required_arg_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "voice_wav_exists",
+            ValidatorSpec::FileExists {
+                path: "voice_profiles/${args.name}.wav".into(),
+                min_bytes: None,
+            },
+        );
+        // input_args missing the `name` key — interpolation should surface a
+        // typed Error outcome rather than silently dropping the reference.
+        let invocation =
+            dummy_invocation(dir.path().to_path_buf()).with_input_args(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'name'"),
+            "reason should name the missing arg: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[test]
+    fn interpolate_args_percent_encodes_reserved_characters() {
+        // An LLM-controlled value MUST NOT be able to break out of the URL
+        // segment it lands in. `?`, `&`, `/`, `#` etc. must be percent-
+        // encoded so the resulting URL has the literal value as a single
+        // path segment, not a structural separator.
+        let args = serde_json::json!({"name": "evil/../?inject=1"});
+        let out = interpolate_args("http://x/${args.name}", Some(&args)).unwrap();
+        // The interpolated segment should not contain raw `/`, `?`, or `=`.
+        let interpolated = out.strip_prefix("http://x/").expect("prefix preserved");
+        assert!(
+            !interpolated.contains('/'),
+            "raw `/` leaked: {interpolated}"
+        );
+        assert!(
+            !interpolated.contains('?'),
+            "raw `?` leaked: {interpolated}"
+        );
+        assert!(
+            !interpolated.contains('='),
+            "raw `=` leaked: {interpolated}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: `${output.X}` template interpolation tests.
+    // -------------------------------------------------------------------
+
+    /// Minimal valid PNG signature + chunk (1x1 transparent) used by the
+    /// MagicBytes test below. Only the leading PNG signature bytes are
+    /// inspected by the validator, but a full chunk-set keeps the file
+    /// recognizable to image tools.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x62, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, b'I',
+        b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn interpolate_template_substitutes_output_key_verbatim() {
+        // Tool-emitted values (`${output.X}`) come from a trusted source
+        // and represent full URLs / paths. Percent-encoding would corrupt
+        // them, so the substitution must be verbatim.
+        let output = serde_json::json!({"deploy_url": "https://example.com/path?ref=main"});
+        let out = interpolate_template("${output.deploy_url}", None, Some(&output)).unwrap();
+        assert_eq!(out, "https://example.com/path?ref=main");
+    }
+
+    #[test]
+    fn interpolate_template_errors_when_output_key_missing() {
+        // Mirror the `${args.X}` semantics: a missing key surfaces as a
+        // hard error so the validator can produce an `Error` outcome
+        // rather than silently degrading the URL.
+        let output = serde_json::json!({});
+        let err = interpolate_template("${output.deploy_url}", None, Some(&output)).unwrap_err();
+        assert!(err.contains("'deploy_url'"), "{err}");
+        assert!(err.contains("output"), "{err}");
+    }
+
+    #[test]
+    fn interpolate_template_errors_when_tool_output_is_none() {
+        let err = interpolate_template("${output.deploy_url}", None, None).unwrap_err();
+        assert!(err.contains("'deploy_url'"), "{err}");
+    }
+
+    #[test]
+    fn interpolate_template_mixes_args_and_output_in_one_template() {
+        // A single template can reference both sources in any order.
+        let args = serde_json::json!({"name": "yangmi"});
+        let output = serde_json::json!({"host": "https://api.example.com"});
+        let out = interpolate_template(
+            "${output.host}/voices/${args.name}/check",
+            Some(&args),
+            Some(&output),
+        )
+        .unwrap();
+        assert_eq!(out, "https://api.example.com/voices/yangmi/check");
+    }
+
+    #[test]
+    fn interpolate_template_keeps_args_percent_encoding_when_output_is_present() {
+        // Mixed template: args path segment is percent-encoded even
+        // though the template also references a tool output. Confirms the
+        // two interpolation sources remain logically distinct.
+        let args = serde_json::json!({"name": "evil/../?inject=1"});
+        let output = serde_json::json!({"host": "https://api.example.com"});
+        let out = interpolate_template("${output.host}/x/${args.name}", Some(&args), Some(&output))
+            .unwrap();
+        let segment = out
+            .strip_prefix("https://api.example.com/x/")
+            .expect("prefix preserved");
+        assert!(
+            !segment.contains('/'),
+            "args `/` leaked into segment: {segment}"
+        );
+        assert!(
+            !segment.contains('?'),
+            "args `?` leaked into segment: {segment}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_exists_resolves_output_template() {
+        // `${output.X}` works inside FileExists for tools that emit a
+        // structured artifact path.
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("publish/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let index = out_dir.join("index.html");
+        std::fs::write(&index, vec![0u8; 64]).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "published_index",
+            ValidatorSpec::FileExists {
+                path: "${output.publish_dir}/index.html".into(),
+                min_bytes: Some(8),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({"publish_dir": "publish/out"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn file_exists_errors_when_required_output_key_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "needs_output",
+            ValidatorSpec::FileExists {
+                path: "${output.publish_dir}/index.html".into(),
+                min_bytes: None,
+            },
+        );
+        // tool_output missing the `publish_dir` key entirely.
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'publish_dir'"),
+            "{}",
+            outcomes[0].reason
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave-3a: HttpProbeUntil — polling HTTP probe
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn http_probe_until_passes_on_first_successful_attempt() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"ok\":\"done\"}";
+        let addr = spawn_test_http_server(vec![response]);
+        let url = format!("http://{addr}/status");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_until_immediate",
+            ValidatorSpec::HttpProbeUntil {
+                url_template: url,
+                expected_status: 200,
+                expected_contains: Some("done".into()),
+                poll_interval_ms: 50,
+                deadline_ms: 2_000,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("attempt 1"),
+            "first-attempt success should be surfaced: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_resolves_output_url_template() {
+        // mofa_publish-style scenario: tool emits a fully-formed deploy_url;
+        // HttpProbe probes that URL verbatim (no percent-encoding).
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n<!DOCTYPE html>";
+        let addr = spawn_test_http_server(vec![response]);
+        let url_template = "${output.deploy_url}".to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_deploy",
+            ValidatorSpec::HttpProbe {
+                url_template,
+                expected_status: 200,
+                expected_contains: Some("<!DOCTYPE".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({
+            "deploy_url": format!("http://{addr}/site"),
+        }));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_errors_when_output_deploy_url_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_deploy_missing",
+            ValidatorSpec::HttpProbe {
+                url_template: "${output.deploy_url}".into(),
+                expected_status: 200,
+                expected_contains: None,
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'deploy_url'"),
+            "{}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_expected_contains_interpolates_args_and_output() {
+        // mofa_publish-style scenario where the deployed page mentions
+        // both an LLM-supplied slug (args.repo_slug) and a tool-emitted
+        // commit sha (output.commit_sha). Both must interpolate in the
+        // expected_contains assertion.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\nrepo=octos-site sha=abc123";
+        let addr = spawn_test_http_server(vec![response]);
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_mixed",
+            ValidatorSpec::HttpProbe {
+                url_template: format!("http://{addr}/"),
+                expected_status: 200,
+                expected_contains: Some("sha=${output.commit_sha}".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_input_args(serde_json::json!({"repo_slug": "octos-site"}))
+        .with_tool_output(serde_json::json!({"commit_sha": "abc123"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn command_args_interpolate_output_key() {
+        // Command's argv can reference output values for tools that emit
+        // a path (e.g. propose_patch emitting `patch_path` → `git apply
+        // --check ${output.patch_path}`). Verbatim substitution so the
+        // path stays usable as a real filesystem argument.
+        let dir = tempfile::tempdir().unwrap();
+        let path_arg = dir.path().join("deploy.txt");
+        std::fs::write(&path_arg, b"x").unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "cmd_with_output",
+            ValidatorSpec::Command {
+                cmd: "test".into(),
+                args: vec!["-f".into(), "${output.target_path}".into()],
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({
+            "target_path": path_arg.to_string_lossy().to_string(),
+        }));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn command_args_error_when_output_key_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "cmd_missing_output",
+            ValidatorSpec::Command {
+                cmd: "true".into(),
+                args: vec!["${output.missing}".into()],
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'missing'"),
+            "{}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_until_passes_after_polling_through_pending_responses() {
+        // First two responses are 503s (so the probe must retry); the third
+        // returns the expected 200 + substring. The polling loop must keep
+        // probing until the success arrives.
+        let pending = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 7\r\n\r\npending";
+        let ready = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ncomplete";
+        let addr = spawn_test_http_server(vec![pending, pending, ready]);
+        let url = format!("http://{addr}/status");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_until_after_retry",
+            ValidatorSpec::HttpProbeUntil {
+                url_template: url,
+                expected_status: 200,
+                expected_contains: Some("complete".into()),
+                poll_interval_ms: 50,
+                deadline_ms: 5_000,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("attempt 3"),
+            "expected retry path before success: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_until_caps_per_probe_timeout_by_remaining_deadline() {
+        // Codex review surface: with a 100ms deadline and a 1s per-probe
+        // floor, the validator must NOT consume the full 1s for the last
+        // probe — it should cap by the remaining deadline so the validator
+        // returns ≈ at the wall-clock deadline. We point the probe at an
+        // unreachable port; without the cap, a single probe would block for
+        // 1s before failing. With the cap, the validator returns Fail in
+        // well under 1s.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        // Bind + immediately drop a listener so the port is closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{addr}/never-reachable");
+        let validator = validator_with_spec(
+            "probe_until_short_deadline",
+            ValidatorSpec::HttpProbeUntil {
+                url_template: url,
+                expected_status: 200,
+                expected_contains: None,
+                poll_interval_ms: 50,
+                deadline_ms: 100,
+            },
+        );
+        let before = std::time::Instant::now();
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        let elapsed = before.elapsed();
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        // Without the remaining-deadline cap, a single probe would block
+        // ≈1s. With the cap, the validator returns within a few hundred ms
+        // of the 100ms deadline. Allow generous headroom for cold CI.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "deadline overrun: elapsed = {elapsed:?} (deadline 100ms, per-probe floor 1000ms)"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_until_fails_with_last_response_when_deadline_expires() {
+        // Always returns a 503; the probe must exhaust the deadline and
+        // surface a Fail outcome with the last response summary in the
+        // message so the LLM/operator can debug in one round.
+        let pending = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 7\r\n\r\npending";
+        let addr = spawn_test_http_server(vec![pending; 64]);
+        let url = format!("http://{addr}/status");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_until_deadline",
+            ValidatorSpec::HttpProbeUntil {
+                url_template: url,
+                expected_status: 200,
+                expected_contains: None,
+                poll_interval_ms: 50,
+                deadline_ms: 200,
+            },
+        );
+        let before = std::time::Instant::now();
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        let elapsed = before.elapsed();
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        // Reason must reference the deadline and the last server reply so
+        // the failure is debuggable from the ledger alone.
+        assert!(
+            outcomes[0].reason.contains("200ms")
+                && outcomes[0].reason.to_lowercase().contains("503"),
+            "deadline + last response should be in reason: {}",
+            outcomes[0].reason
+        );
+        // The validator must not wildly overshoot the deadline; allow ample
+        // headroom for CI scheduling jitter on cold runners.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deadline overrun: elapsed = {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_until_interpolates_args_into_url_template() {
+        // Same interpolation contract as HttpProbe: ${args.<key>} resolves
+        // against the spawn task's input args (URL-encoded path segment).
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+        let addr = spawn_test_http_server(vec![response]);
+        let url_template = format!("http://{addr}/jobs/${{args.task_id}}");
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_input_args(serde_json::json!({"task_id": "abc-123"}));
+        let validator = validator_with_spec(
+            "probe_until_interp",
+            ValidatorSpec::HttpProbeUntil {
+                url_template,
+                expected_status: 200,
+                expected_contains: None,
+                poll_interval_ms: 50,
+                deadline_ms: 2_000,
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("/jobs/abc-123"),
+            "interpolated URL should surface in reason: {}",
+            outcomes[0].reason
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave-3a: Sha256Match
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sha256_match_passes_for_explicit_hex_digest_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let bytes = b"hello, sha256 world".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "sha_ok",
+            ValidatorSpec::Sha256Match {
+                glob: "payload.bin".into(),
+                sha256: expected.clone(),
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains(&expected),
+            "matched digest should surface in reason: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn magic_bytes_glob_interpolates_output_key() {
+        // MagicBytes pinned to a tool-emitted output directory.
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("publish");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("a.png"), PNG_1X1).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_output",
+            ValidatorSpec::MagicBytes {
+                glob: "${output.dir}/*.png".into(),
+                format: crate::workspace_policy::MagicByteKind::Png,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({"dir": "publish"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn audio_non_silent_glob_interpolates_output_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("clips");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        write_sine_wav(&out_dir.join("a.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "audio_output_glob",
+            ValidatorSpec::AudioNonSilent {
+                glob: "${output.audio_dir}/*.wav".into(),
+                min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({"audio_dir": "clips"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn sha256_match_fails_when_digest_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, b"actual contents").unwrap();
+        // A clearly different hash — all-zero is convenient as a sentinel
+        // and ensures the validator surfaces a real mismatch, not a parser
+        // error.
+        let expected = "0".repeat(64);
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "sha_mismatch",
+            ValidatorSpec::Sha256Match {
+                glob: "payload.bin".into(),
+                sha256: expected,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        // Reason must surface BOTH the actual and the expected digest so
+        // operators can diagnose the mismatch from the ledger.
+        assert!(
+            outcomes[0].reason.contains("actual=") && outcomes[0].reason.contains("expected="),
+            "mismatch reason should expose both digests: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_match_interpolates_expected_hex_from_input_args() {
+        // Lifts the inline `manage_skills::download_binary` checksum onto the
+        // canonical validator path: a spawn task passes its manifest's
+        // `sha256` field through input args, and the validator resolves it
+        // via `${args.expected_sha256}` before hashing the artifact.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skill_main");
+        let bytes = b"#!/bin/sh\nexit 0\n";
+        std::fs::write(&path, bytes).unwrap();
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"expected_sha256": expected.clone()}));
+        let validator = validator_with_spec(
+            "sha_manifest_interp",
+            ValidatorSpec::Sha256Match {
+                glob: "skill_main".into(),
+                sha256: "${args.expected_sha256}".into(),
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains(&expected),
+            "interpolated digest should surface in reason: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_match_interpolates_glob_against_input_args_with_path_separators() {
+        // Codex review surface: `Sha256Match.glob` must accept `${args.X}`
+        // where the value contains `/` separators so the contract can scope
+        // the digest check to a per-invocation artifact path
+        // (e.g. `${args.skill_dir}/main`). Verifies the workspace policy
+        // entry for `manage_skills` is functional rather than catastrophically
+        // matching every binary in the workspace.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills/example_v1");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let payload = b"installed skill binary v1\n";
+        std::fs::write(skill_dir.join("main"), payload).unwrap();
+
+        // Drop an unrelated binary at a sibling path; the test must not
+        // cross-contaminate with its digest, proving the glob is scoped.
+        let other_dir = dir.path().join("skills/unrelated");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(other_dir.join("main"), b"different binary").unwrap();
+
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(payload))
+        };
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation =
+            dummy_invocation(dir.path().to_path_buf()).with_input_args(serde_json::json!({
+                "skill_dir": "skills/example_v1",
+                "expected_sha256": expected.clone(),
+            }));
+        let validator = validator_with_spec(
+            "sha_scoped_to_skill_dir",
+            ValidatorSpec::Sha256Match {
+                glob: "${args.skill_dir}/main".into(),
+                sha256: "${args.expected_sha256}".into(),
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn sha256_match_rejects_traversal_segments_in_interpolated_glob() {
+        // Codex review surface: ${args.X} in a glob template must not be
+        // a vector for path-traversal escape from the workspace root.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation =
+            dummy_invocation(dir.path().to_path_buf()).with_input_args(serde_json::json!({
+                "skill_dir": "../../etc",
+                "expected_sha256": "0".repeat(64),
+            }));
+        let validator = validator_with_spec(
+            "sha_traversal",
+            ValidatorSpec::Sha256Match {
+                glob: "${args.skill_dir}/main".into(),
+                sha256: "${args.expected_sha256}".into(),
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains(".."),
+            "traversal rejection should surface the offending segment: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_match_errors_when_expected_hex_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload.bin"), b"contents").unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "sha_malformed",
+            ValidatorSpec::Sha256Match {
+                glob: "payload.bin".into(),
+                // 32 chars, not 64 — must surface a typed Error rather than
+                // silently treating a truncated/typo hash as a hash mismatch.
+                sha256: "deadbeefcafef00d".repeat(2),
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("sha256_match"),
+            "error reason should mention the validator: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_match_fails_when_no_file_matches_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "sha_missing",
+            ValidatorSpec::Sha256Match {
+                glob: "skill_main".into(),
+                sha256: "0".repeat(64),
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        assert!(outcomes[0].reason.contains("no files matched"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave-3a: Required::Soft / soft_fail
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn soft_fail_validator_does_not_block_required_gate_when_failing() {
+        // A failing validator with `soft_fail = true` records the failure to
+        // the ledger BUT does not demote the spawn task. The
+        // `required_gate_passed()` invariant on the persisted outcome must
+        // hold so the workspace contract gate ignores it.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = Validator {
+            id: "sub_artifact_warn".into(),
+            // Hard-required *would* block — but soft_fail flips it to a
+            // warning-only outcome even though `required = true`.
+            required: true,
+            soft_fail: true,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::FileExists {
+                path: "sub-artifact.md".into(),
+                min_bytes: None,
+            },
+        };
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        assert!(
+            !outcomes[0].required,
+            "soft_fail must serialize as required = false so legacy replayers \
+             see it as a warning, not a hard-fail"
+        );
+        assert_eq!(outcomes[0].required_tier, "soft");
+        assert!(
+            outcomes[0].required_gate_passed(),
+            "soft_fail outcomes must not block the required gate"
+        );
+        assert!(outcomes[0].is_soft_warning());
+    }
+
+    #[tokio::test]
+    async fn soft_fail_with_required_false_persists_as_soft_warning() {
+        // Codex review surface: covers the surprising case where the
+        // operator writes `required = false, soft_fail = true`. The truth
+        // table maps this to `Required::Soft` (warning, not pure optional),
+        // and the persisted outcome must carry `required_tier = "soft"` so
+        // dashboards can split it from `required = false, soft_fail = false`
+        // (purely informational) outcomes.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = Validator {
+            id: "soft_optional_warn".into(),
+            required: false,
+            soft_fail: true,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::FileExists {
+                path: "missing-sub-artifact.md".into(),
+                min_bytes: None,
+            },
+        };
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        assert!(
+            !outcomes[0].required,
+            "soft_fail surfaces as required=false"
+        );
+        assert_eq!(
+            outcomes[0].required_tier, "soft",
+            "(required=false, soft_fail=true) must record tier=soft, not none"
+        );
+        assert!(outcomes[0].required_gate_passed());
+        assert!(outcomes[0].is_soft_warning());
+    }
+
+    #[tokio::test]
+    async fn legacy_ledger_record_without_required_tier_normalizes_on_replay() {
+        // Codex review surface: legacy outcomes (pre-Wave-3a) have no
+        // `required_tier` field. `read_all` must normalize the empty
+        // sentinel into a tier derived from the legacy `required` field —
+        // `required = true` → "hard", `required = false` → "none" — so
+        // dashboards never see a misclassified "hard" for an old optional
+        // failure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_ledger.jsonl");
+        // Two legacy records: one was hard-required (`required = true`),
+        // one was purely optional (`required = false`). Neither carries
+        // `required_tier`.
+        let legacy_hard = r#"{"schema_version":1,"validator_id":"old_hard","phase":"completion","kind":"file_exists","repo_label":"slides/x","required":true,"status":"pass","reason":"ok","duration_ms":12,"started_at":"2026-04-01T00:00:00Z"}"#;
+        let legacy_optional = r#"{"schema_version":1,"validator_id":"old_optional","phase":"completion","kind":"file_exists","repo_label":"slides/x","required":false,"status":"fail","reason":"missing","duration_ms":3,"started_at":"2026-04-01T00:00:00Z"}"#;
+        std::fs::write(&path, format!("{legacy_hard}\n{legacy_optional}\n")).unwrap();
+        let ledger = ValidatorLedger::open(&path).unwrap();
+        let outcomes = ledger.read_all().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        let hard = outcomes
+            .iter()
+            .find(|o| o.validator_id == "old_hard")
+            .unwrap();
+        assert_eq!(hard.required_tier, "hard");
+        let optional = outcomes
+            .iter()
+            .find(|o| o.validator_id == "old_optional")
+            .unwrap();
+        assert_eq!(
+            optional.required_tier, "none",
+            "legacy required=false must normalize to tier=none, not the default tier=hard"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_required_validator_still_blocks_gate_when_failing() {
+        // Symmetry probe: with `soft_fail = false` (the default), a failing
+        // required validator demotes the gate as before.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = Validator {
+            id: "primary_required".into(),
+            required: true,
+            soft_fail: false,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::FileExists {
+                path: "primary-artifact.md".into(),
+                min_bytes: None,
+            },
+        };
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        assert!(outcomes[0].required, "hard-required must serialize as true");
+        assert_eq!(outcomes[0].required_tier, "hard");
+        assert!(!outcomes[0].required_gate_passed());
+    }
+
+    // --- PerFileNonSilent --------------------------------------------------
+
+    /// Happy path: three sine-wave segments, all loud. The validator must
+    /// pass and the count of matched files must be surfaced in the reason
+    /// so operators can confirm the glob landed on the expected segments.
+    #[tokio::test]
+    async fn per_file_non_silent_passes_when_all_segments_are_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_sine_wav(&seg_dir.join("seg_000_alice.wav"), 800);
+        write_sine_wav(&seg_dir.join("seg_001_bob.wav"), 800);
+        write_sine_wav(&seg_dir.join("seg_002_alice.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_loud",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("3 match"),
+            "reason should surface match count: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// Adversarial path: one of three segments is silent. The validator
+    /// must fail AND surface the offending filename (basename) so an
+    /// operator/LLM can localize which segment to regenerate.
+    #[tokio::test]
+    async fn per_file_non_silent_fails_when_one_segment_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_sine_wav(&seg_dir.join("seg_000_alice.wav"), 800);
+        // The bad apple — silent samples drag the per-file ratio to 0.0.
+        write_silent_wav(&seg_dir.join("seg_001_bob.wav"), 800);
+        write_sine_wav(&seg_dir.join("seg_002_alice.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_silent_segment",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        // Must name the offending file so the failure is actionable.
+        assert!(
+            outcomes[0].reason.contains("seg_001_bob.wav"),
+            "failure must name the silent segment: {}",
+            outcomes[0].reason
+        );
+        // Must include BOTH the measured ratio and the threshold for
+        // ledger diagnostics — this mirrors the AudioNonSilent contract.
+        assert!(
+            outcomes[0].reason.contains("non_silent_ratio")
+                && outcomes[0].reason.contains("min_ratio"),
+            "failure must include measured and threshold ratios: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// Zero matches with a positive `require_at_least` must fail with a
+    /// message that surfaces both the expected minimum and the actual
+    /// count. Distinguishes "tool emitted zero artifacts" from
+    /// "tool emitted artifacts but one was silent".
+    #[tokio::test]
+    async fn per_file_non_silent_fails_when_match_count_below_require_at_least() {
+        let dir = tempfile::tempdir().unwrap();
+        // No segments dir at all.
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_min_count",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        // Message must surface BOTH the expected minimum and the actual
+        // count so operators see "expected >=1, found 0" verbatim.
+        assert!(
+            outcomes[0].reason.contains(">=1") && outcomes[0].reason.contains("found 0"),
+            "match-count failure must surface expected vs actual: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// `require_at_least = 0` (the serde default) is a deliberate escape
+    /// hatch: a per-file gate that doesn't ALSO demand a minimum count.
+    /// Zero matches must still be a Pass under that policy so a spawn
+    /// task can declare per-file invariants on optional intermediate
+    /// artifacts without forcing every run to produce them.
+    #[tokio::test]
+    async fn per_file_non_silent_passes_when_require_at_least_zero_and_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_optional",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 0,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// `${args.X}` interpolation must resolve against the spawn task's
+    /// input args, with path-traversal segments rejected. The happy path
+    /// here probes that the interpolated glob actually matches.
+    #[tokio::test]
+    async fn per_file_non_silent_glob_interpolates_args_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("episode42/segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_sine_wav(&seg_dir.join("seg_000_host.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_interp",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "${args.episode_dir}/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"episode_dir": "episode42"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// Path-traversal in an arg value (`..`) must be rejected with an
+    /// Error outcome — not silently followed. Mirrors the
+    /// `interpolate_args_path` contract used by Sha256Match.
+    #[tokio::test]
+    async fn per_file_non_silent_rejects_path_traversal_arg_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_traversal",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "${args.episode_dir}/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"episode_dir": "../etc"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains(".."),
+            "error must surface the rejected segment: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// Confirms the placeholder filenames emitted by mofa-podcast
+    /// (`pause_after_*`, `pause_line_*`, `bgm_placeholder_line_*`) do NOT
+    /// fall under the `**/segments/seg_*.wav` glob, even though they
+    /// share the `segments/` directory. Without this exclusion the per-
+    /// file gate would fire on the intentionally-silent pause WAVs and
+    /// the podcast contract would never pass.
+    #[tokio::test]
+    async fn per_file_non_silent_glob_excludes_placeholder_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        // One valid (loud) dialogue segment.
+        write_sine_wav(&seg_dir.join("seg_000_host.wav"), 800);
+        // Inter-speaker pause + line pause + BGM placeholder — all are
+        // legitimately silent because they ARE the pauses.
+        write_silent_wav(&seg_dir.join("pause_after_000.wav"), 800);
+        write_silent_wav(&seg_dir.join("pause_line_001.wav"), 800);
+        write_silent_wav(&seg_dir.join("bgm_placeholder_line_002.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_segment_pattern",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("1 match"),
+            "glob must match exactly 1 dialogue segment, not the 4 files on disk: {}",
+            outcomes[0].reason
+        );
+    }
+
+    // --- octos #1034: source = "spawn_only_files" --------------------------
+    //
+    // The validator family below covers the file-list-driven source that
+    // replaces the legacy glob when a contract opts in via
+    // `source = "spawn_only_files"`. The plugin protocol's `files_to_send`
+    // (already captured by `enforce_spawn_task_contract` and threaded into
+    // `ValidatorInvocation::spawn_only_files`) is the authoritative path
+    // set the skill produced — globbing the workspace can no longer race
+    // the topic-suffixed output directory naming.
+
+    /// MagicBytes + AudioNonSilent must accept a `files_to_send` list and
+    /// run their checks against each file directly, bypassing the glob.
+    /// This is the canonical happy-path for the octos #1034 refactor.
+    #[tokio::test]
+    async fn magic_bytes_uses_spawn_only_files_when_source_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        // Topic-suffixed directory — the exact failure mode from the
+        // mini5 trace (chat topic 《逐玉》 → `mofa-podcast-zhuyu/`). A glob
+        // anchored at `skill-output/mofa-podcast/` would never reach this.
+        let podcast_dir = dir.path().join("skill-output/mofa-podcast-zhuyu");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        let mp3_path = podcast_dir.join("podcast_full_1779067937.mp3");
+        let mut bytes = b"ID3".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 128));
+        std::fs::write(&mp3_path, &bytes).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_spawn_only",
+            ValidatorSpec::MagicBytes {
+                // Glob is intentionally something that would NOT match
+                // anything on disk — proving the validator does not fall
+                // back to the glob path.
+                glob: String::new(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("mp3".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![mp3_path]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn audio_non_silent_uses_spawn_only_files_when_source_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let podcast_dir = dir.path().join("skill-output/mofa-podcast-zhuyu");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        // WAV here so the audio decoder path runs without the optional
+        // `audio_mp3` feature gate.
+        let wav_path = podcast_dir.join("podcast_full_1779067937.wav");
+        write_sine_wav(&wav_path, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "audio_non_silent_spawn_only",
+            ValidatorSpec::AudioNonSilent {
+                glob: String::new(),
+                min_ratio: 0.3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("wav".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![wav_path]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// PerFileNonSilent also accepts the file list verbatim (for callers
+    /// whose intermediate artifacts ARE in `files_to_send`).
+    #[tokio::test]
+    async fn per_file_non_silent_uses_spawn_only_files_when_source_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let podcast_dir = dir.path().join("skill-output/mofa-podcast-zhuyu/segments");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        let a = podcast_dir.join("seg_000.wav");
+        let b = podcast_dir.join("seg_001.wav");
+        write_sine_wav(&a, 800);
+        write_sine_wav(&b, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_spawn_only",
+            ValidatorSpec::PerFileNonSilent {
+                glob: String::new(),
+                min_ratio: 0.3,
+                require_at_least: 2,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("wav".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![a, b]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// The extension filter must distinguish files by suffix so a contract
+    /// can pin "the mp3" without false-matching adjacent WAV intermediates
+    /// that may also live in `files_to_send`.
+    #[tokio::test]
+    async fn spawn_only_files_extension_filter_distinguishes_mp3_from_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let topic_dir = dir.path().join("skill-output/mofa-podcast-zhuyu");
+        std::fs::create_dir_all(&topic_dir).unwrap();
+        // Two files emitted by the plugin: an MP3 (the real deliverable)
+        // and a WAV intermediate the plugin also chose to expose.
+        let mp3 = topic_dir.join("podcast_full.mp3");
+        let mut bytes = b"ID3".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 128));
+        std::fs::write(&mp3, &bytes).unwrap();
+        let wav = topic_dir.join("podcast_full.wav");
+        // Write a NON-mp3 byte pattern (RIFF/WAVE-shaped) so the magic
+        // check on the wav file would fail if it leaked through the
+        // filter — proving the extension filter actually gates the input.
+        std::fs::write(&wav, b"RIFF\0\0\0\0WAVE").unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_mp3_only",
+            ValidatorSpec::MagicBytes {
+                glob: String::new(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("mp3".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        // Both files are reported by the plugin — the filter selects the mp3.
+        .with_spawn_only_files(vec![mp3, wav]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// Regression guard: existing contracts that did NOT opt in keep the
+    /// glob path verbatim. The `spawn_only_files` invocation attached to
+    /// the call must not be consulted when `source = "glob"` (the default).
+    #[tokio::test]
+    async fn glob_source_still_used_when_not_opted_in_even_with_files_to_send_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("a.png");
+        std::fs::write(&real_path, PNG_1X1).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_legacy_glob",
+            ValidatorSpec::MagicBytes {
+                glob: "*.png".into(),
+                format: crate::workspace_policy::MagicByteKind::Png,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        // Attach a `files_to_send` list pointing at a DIFFERENT path that
+        // does not exist on disk. The validator must ignore the list and
+        // still satisfy via the glob match.
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![dir.path().join("nonexistent.png")]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// A contract that opts into `spawn_only_files` from a context where
+    /// the spawn_only tool emitted no files must Fail (not Pass via empty
+    /// match) so a misconfigured policy surfaces early.
+    #[tokio::test]
+    async fn spawn_only_files_source_fails_when_files_to_send_list_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_no_files",
+            ValidatorSpec::MagicBytes {
+                glob: String::new(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("mp3".into()),
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf());
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("spawn_only_files"),
+            "reason should surface the source: {}",
+            outcomes[0].reason
+        );
+    }
+
+    // --- octos #1036: mofa_slides sweep -----------------------------------
+    //
+    // Mirror the octos #1034 podcast happy-path test for the mofa_slides
+    // contract that PR #1035 left on the glob path. Failure mode being
+    // closed: a recursive `**/*.pptx` glob would match unrelated stale
+    // decks from earlier runs in the same session workspace.
+    //
+    // The `voice_synthesize` contract was originally part of this sweep
+    // but was dropped after codex review caught that the voice plugin's
+    // `succeed()` path emits only `{output, success}` (no `files_to_send`)
+    // and its success text `"Generated audio: <path>"` is not one of the
+    // prefixes `PluginTool::detect_output_file` recognises. The marker
+    // was fixed in PR #1039 and the voice_synthesize sweep follows below.
+
+    /// `mofa_slides` MagicBytes(Pptx) must run against the plugin's reported
+    /// PPTX path verbatim, including outputs at arbitrary depth where the
+    /// session workspace may contain unrelated PPTXs from earlier runs.
+    #[tokio::test]
+    async fn mofa_slides_uses_spawn_only_files_at_arbitrary_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deeply-nested project-style path (`<project>/output/deck.pptx`).
+        // Lay down a SECOND stale PPTX elsewhere in the workspace — the
+        // legacy `**/*.pptx` glob would match either, but the
+        // spawn_only_files path must inspect only the reported file.
+        let project_out = dir.path().join("slides/demo/output");
+        std::fs::create_dir_all(&project_out).unwrap();
+        let pptx_path = project_out.join("deck.pptx");
+        let mut pptx_bytes = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_bytes.extend(std::iter::repeat_n(0u8, 256));
+        std::fs::write(&pptx_path, &pptx_bytes).unwrap();
+        // Stale, structurally-broken PPTX from a prior run. If the
+        // validator ever fell back to the glob path it would pick this
+        // up first (alphabetical glob order under `**`) and fail —
+        // satisfying the test only via the spawn_only_files path.
+        let stale = dir.path().join("aaa-stale.pptx");
+        std::fs::write(&stale, b"<!DOCTYPE html>\n<html>old error</html>\n").unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
+        let contract = session_policy
+            .spawn_tasks
+            .get("mofa_slides")
+            .expect("mofa_slides contract must be registered");
+        let validators: Vec<Validator> = contract
+            .on_completion
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                crate::workspace_policy::SpawnTaskValidatorSpec::into_validator(
+                    entry.clone(),
+                    "mofa_slides",
+                    i,
+                )
+            })
+            .collect();
+
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "mofa_slides".into(),
+        )
+        .with_spawn_only_files(vec![pptx_path]);
+        let outcomes = runner.run_all(&invocation, &validators).await;
+        assert!(
+            outcomes.iter().all(|o| o.status == ValidatorStatus::Pass),
+            "mofa_slides contract must satisfy via spawn_only_files even when an \
+             unrelated stale PPTX exists in the workspace; outcomes = {outcomes:?}",
+        );
+    }
+
+    // --- octos #1038: voice_synthesize sweep ------------------------------
+    //
+    // Mirror the octos #1036 mofa_slides happy-path test for the voice
+    // contract that PR #1037's revert (772783e7) left on the glob path.
+    // Failure mode being closed: a recursive
+    // `skill-output/voice/**/*.{mp3,wav}` glob would match unrelated
+    // stale audio from earlier runs in the same session workspace, the
+    // same fragility we already closed for `podcast_generate` (#1034)
+    // and `mofa_slides` (#1036). Predecessor PR #1039 fixed the voice
+    // plugin's success-line marker so `files_to_send` is now populated
+    // and the sweep is finally safe.
+
+    /// `voice_synthesize` AudioNonSilent must run against the plugin's
+    /// reported audio path verbatim. The reported file lives OUTSIDE
+    /// the legacy `skill-output/voice/**/*.{mp3,wav}` glob root, so a
+    /// validator that fell back to the glob would never see it — the
+    /// test would only pass via the spawn_only_files code path.
+    /// (The failure-mode counterpart below plants a non-silent file
+    /// INSIDE the legacy glob root to prove the validator does not
+    /// consult that path at all.)
+    #[tokio::test]
+    async fn voice_synthesize_uses_spawn_only_files_with_audio_outside_legacy_glob_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // Real, non-silent output the plugin would report via the
+        // `Generated: <path>` marker that PR #1039 introduced. The
+        // plugin writes to whatever path the LLM gave it, which is
+        // often OUTSIDE the legacy `skill-output/voice/` root — e.g.
+        // a project-scoped subdirectory or a tempdir-style path. This
+        // test pins down that the validator picks up the reported file
+        // regardless of where it lives in the workspace.
+        let project_dir = dir.path().join("projects/demo/audio");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let fresh = project_dir.join("synthesized_1779067937.wav");
+        write_sine_wav(&fresh, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
+        let contract = session_policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract must be registered");
+        let validators: Vec<Validator> = contract
+            .on_completion
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                crate::workspace_policy::SpawnTaskValidatorSpec::into_validator(
+                    entry.clone(),
+                    "voice_synthesize",
+                    i,
+                )
+            })
+            .collect();
+
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "voice_synthesize".into(),
+        )
+        .with_spawn_only_files(vec![fresh]);
+        let outcomes = runner.run_all(&invocation, &validators).await;
+        assert!(
+            outcomes.iter().all(|o| o.status == ValidatorStatus::Pass),
+            "voice_synthesize contract must satisfy via spawn_only_files for a file \
+             outside the legacy `skill-output/voice/**/*` glob root (a glob fallback \
+             would never have matched this path); outcomes = {outcomes:?}",
+        );
+    }
+
+    /// Belt-and-suspenders: when the plugin reports ONLY a silent .wav
+    /// (the failure mode the contract exists to catch), the validator
+    /// must surface a Fail outcome even when an unrelated non-silent
+    /// .wav lives in the workspace. The legacy glob would have matched
+    /// the unrelated file and silently satisfied the contract.
+    #[tokio::test]
+    async fn voice_synthesize_spawn_only_files_fails_when_reported_audio_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice_dir = dir.path().join("skill-output/voice");
+        std::fs::create_dir_all(&voice_dir).unwrap();
+        // The plugin reported a silent file — this is the failure case.
+        let silent = voice_dir.join("synthesized_1779067937.wav");
+        write_silent_wav(&silent, 800);
+        // A NON-silent file from an earlier run; if the validator ever
+        // fell back to the glob it would pick this up and pass, masking
+        // the failure. The spawn_only_files path must ignore it.
+        let unrelated = voice_dir.join("aaa-fresh.wav");
+        write_sine_wav(&unrelated, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
+        let contract = session_policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract must be registered");
+        let validators: Vec<Validator> = contract
+            .on_completion
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                crate::workspace_policy::SpawnTaskValidatorSpec::into_validator(
+                    entry.clone(),
+                    "voice_synthesize",
+                    i,
+                )
+            })
+            .collect();
+
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "voice_synthesize".into(),
+        )
+        .with_spawn_only_files(vec![silent]);
+        let outcomes = runner.run_all(&invocation, &validators).await;
+        assert!(
+            outcomes.iter().any(|o| o.status == ValidatorStatus::Fail),
+            "voice_synthesize contract must FAIL on a silent reported file even when \
+             an unrelated non-silent file exists in the workspace (proves the validator \
+             does not fall back to the glob path); outcomes = {outcomes:?}",
+        );
     }
 }

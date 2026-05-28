@@ -8,13 +8,84 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use octos_agent::cost_ledger::CostAccountant;
 use octos_agent::{Tool, ToolPolicy, ToolResult};
-use octos_llm::{LlmProvider, ProviderRouter};
+use octos_llm::{EmbeddingProvider, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use serde::Deserialize;
 
 use crate::context::PipelineContext;
 use crate::discovery::PipelineDiscovery;
-use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineStatusBridge};
+use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineResult, PipelineStatusBridge};
+use crate::run_dir::{PipelineRunSummary, RunDir};
+use octos_core::{SessionScope, TokenUsage};
+
+/// #1020 / M17-B — reason string stamped onto every pipeline run's
+/// `summary.json` because pipeline workers do not yet propagate the
+/// parent's `ContextManager`. Evidence validators look for this reason
+/// to confirm the acceptance bullet is satisfied.
+pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
+    "pipeline workers don't yet propagate ContextManager (M17-B)";
+
+/// Phase 2-A of the [`SessionScope`] migration (load-bearing follow-up
+/// to PR #1199 / Phase 1).
+///
+/// Resolves the effective working directory pipeline workers should
+/// spawn into, given the tool-level fallback (`tool_working_dir`) and
+/// the parent session's optional [`SessionScope`].
+///
+/// * When the parent session attached a scope via [`ToolContext::session_scope`]
+///   (snapshotted into [`PipelineHostContext::session_scope`]),
+///   workers spawn into `scope.workspace()` so per-session reads stay
+///   isolated to that session's ephemeral workspace dir. This is the
+///   root cause fix for the mini5 NEW-06 cross-session contamination
+///   bug: today's `RunPipelineTool` pins `working_dir` at construction
+///   time (profile-level `data/`), so pipeline workers `read_file` and
+///   `list_dir` against 200+ stale `.md` files from prior sessions.
+/// * When no scope is present (legacy callers — CLI, unit tests, hosts
+///   that haven't migrated yet), fall back to the tool's
+///   `working_dir`. Behaviour is byte-for-byte identical to pre-Phase-2-A.
+///
+/// Also creates the workspace dir on disk when it doesn't exist, so a
+/// freshly minted session can spawn workers without the caller having
+/// to pre-create directories. Per the Phase 1 spec doc, this is the
+/// caller's responsibility — the scope itself never does I/O. We do it
+/// here (at the `RunPipelineTool` boundary) rather than inside the
+/// executor so any callers of `PipelineExecutor::run(...)` direct stay
+/// on the pre-Phase-2-A path.
+///
+/// `create_dir_all` failures fall back to the tool-level working dir
+/// and emit a WARN — the production pipeline should not regress its
+/// user-visible outcome on a transient filesystem error (e.g. quota
+/// hit on first session creation). Per-session isolation is the
+/// happy-path invariant; the fallback preserves legacy behaviour as a
+/// safety net.
+///
+/// [`ToolContext::session_scope`]: octos_agent::tools::ToolContext::session_scope
+/// [`PipelineHostContext::session_scope`]: crate::host_context::PipelineHostContext::session_scope
+pub(crate) fn resolve_pipeline_working_dir(
+    tool_working_dir: &std::path::Path,
+    session_scope: Option<&SessionScope>,
+) -> PathBuf {
+    let Some(scope) = session_scope else {
+        return tool_working_dir.to_path_buf();
+    };
+    let workspace = scope.workspace().to_path_buf();
+    if let Err(error) = std::fs::create_dir_all(&workspace) {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            error = %error,
+            tool_working_dir = %tool_working_dir.display(),
+            "phase2a: failed to create session workspace; falling back to tool working_dir \
+             (pipeline workers will NOT be session-isolated for this run)"
+        );
+        return tool_working_dir.to_path_buf();
+    }
+    tracing::debug!(
+        workspace = %workspace.display(),
+        tool_working_dir = %tool_working_dir.display(),
+        "phase2a: pipeline workers will spawn in session-scoped workspace"
+    );
+    workspace
+}
 
 /// Tool that runs DOT-based pipelines.
 pub struct RunPipelineTool {
@@ -24,6 +95,12 @@ pub struct RunPipelineTool {
     working_dir: PathBuf,
     provider_policy: Option<ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
+    /// Section B (codex review P1.1): pipeline-level strict-signing
+    /// policy. Defaults to `false` (legacy permissive path). When the
+    /// host has opted into `plugins.require_signed`, this is set via
+    /// [`Self::with_plugin_require_signed`] so per-node plugin loads
+    /// enforce the same gate.
+    plugin_require_signed: bool,
     discovery: PipelineDiscovery,
     /// Per-message status bridge (set via `set_status_bridge` before each call).
     status_bridge: std::sync::Mutex<Option<PipelineStatusBridge>>,
@@ -35,6 +112,17 @@ pub struct RunPipelineTool {
     /// auto-populates from the workspace policy. Defaults to the
     /// graph id + `"pipeline"` fallback when empty.
     contract_id: Option<String>,
+    /// NEW-06 fix: optional embedder for hybrid memory search.
+    ///
+    /// Without this set, worker `Agent` instances spawned per pipeline
+    /// node fall through to the unfiltered cwd-only fallback path in
+    /// `EpisodeStore::find_relevant` — which only does keyword overlap
+    /// plus CWD filtering, NOT the modality-aware similarity gate in
+    /// [`octos_agent::agent::memory::MIN_EPISODE_SIMILARITY`]. The
+    /// gateway / serve runtimes own the embedder; this lets the
+    /// orchestrator propagate it down to pipeline workers so episodic
+    /// memory recall is contamination-safe end-to-end.
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl RunPipelineTool {
@@ -52,11 +140,29 @@ impl RunPipelineTool {
             working_dir,
             provider_policy: None,
             plugin_dirs: Vec::new(),
+            plugin_require_signed: false,
             discovery,
             status_bridge: std::sync::Mutex::new(None),
             cost_accountant: None,
             contract_id: None,
+            embedder: None,
         }
+    }
+
+    /// NEW-06 fix: attach an embedder that the pipeline executor will
+    /// propagate onto every per-node worker [`octos_agent::Agent`].
+    ///
+    /// When set, the worker's "Relevant Past Experiences" memory recall
+    /// runs the modality-aware hybrid path that applies
+    /// [`octos_agent::agent::memory::MIN_EPISODE_SIMILARITY`] BEFORE
+    /// injecting episodes into the worker's prompt. Without it, workers
+    /// fell back to the unfiltered cwd-only path in
+    /// `EpisodeStore::find_relevant` and pulled in cross-domain
+    /// episodes (e.g. a JWST research prompt rendered with an Apple
+    /// CEO / GPT-5.5 podcast episode on mini5).
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// Attach a [`CostAccountant`] (coding-blue FA-7). When set, pipeline
@@ -92,18 +198,25 @@ impl RunPipelineTool {
     fn build_workspace_context_with_host(
         &self,
         host: &crate::host_context::PipelineHostContext,
+        effective_working_dir: &std::path::Path,
     ) -> PipelineContext {
-        let policy = match octos_agent::workspace_policy::read_workspace_policy(&self.working_dir) {
-            Ok(policy) => policy,
-            Err(error) => {
-                tracing::warn!(
-                    working_dir = %self.working_dir.display(),
-                    error = %error,
-                    "run_pipeline: failed to read workspace policy; running legacy path"
-                );
-                None
-            }
-        };
+        // Phase 2-A (codex review of #1203, P2) — when a scoped run
+        // overrides `working_dir` onto a per-session workspace, the
+        // workspace policy (validators + compaction) may live under
+        // that scope dir, NOT the profile-level tool root. AppUI /
+        // runtime sessions provision the policy file inside the
+        // session workspace; reading from `self.working_dir` (the
+        // profile root) would miss it and the session would run
+        // without its declared validators or compaction policy.
+        //
+        // Resolution order: (1) policy under the effective working
+        // dir (scope when present), (2) policy under the tool's
+        // profile root (legacy / shared policy). Falling back to the
+        // profile root preserves pre-Phase-2-A behaviour for
+        // non-scoped callers (where `effective_working_dir == self.working_dir`).
+        let policy = self
+            .read_workspace_policy_for_session(effective_working_dir)
+            .or_else(|| self.read_workspace_policy_for_session(&self.working_dir));
         let mut ctx = PipelineContext::new();
         if let Some(policy) = policy {
             ctx = ctx.with_policy(policy);
@@ -122,6 +235,30 @@ impl RunPipelineTool {
             ctx = ctx.with_contract_id(contract_id);
         }
         ctx
+    }
+
+    /// Read a workspace policy from a candidate root, downgrading
+    /// errors to a WARN + `None` (mirrors the legacy
+    /// `build_workspace_context_with_host` behaviour). Lifted out so
+    /// the scope-aware lookup can try the session workspace first and
+    /// fall back to the profile root without duplicating the
+    /// error-handling shape.
+    fn read_workspace_policy_for_session(
+        &self,
+        candidate: &std::path::Path,
+    ) -> Option<octos_agent::workspace_policy::WorkspacePolicy> {
+        match octos_agent::workspace_policy::read_workspace_policy(candidate) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(
+                    candidate = %candidate.display(),
+                    error = %error,
+                    "run_pipeline: failed to read workspace policy from candidate root; \
+                     trying fallback or running legacy path"
+                );
+                None
+            }
+        }
     }
 
     /// Add the global octos-home skills directory as a search path.
@@ -144,6 +281,14 @@ impl RunPipelineTool {
 
     pub fn with_plugin_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.plugin_dirs = dirs;
+        self
+    }
+
+    /// Section B (codex review P1.1): opt into strict signature
+    /// enforcement for pipeline-spawned plugin loads. Inherited from
+    /// `plugins.require_signed` on the host config.
+    pub fn with_plugin_require_signed(mut self, require_signed: bool) -> Self {
+        self.plugin_require_signed = require_signed;
         self
     }
 
@@ -216,6 +361,16 @@ impl RunPipelineTool {
     pub fn set_status_bridge(&self, bridge: PipelineStatusBridge) {
         *self.status_bridge.lock().unwrap_or_else(|e| e.into_inner()) = Some(bridge);
     }
+
+    /// Doc-hidden test accessor — confirms the embedder propagation
+    /// path is wired (NEW-06 regression guard). The pipeline worker
+    /// memory-recall threshold gate only runs when an embedder is
+    /// present; this lets tests assert the constructor + builder paths
+    /// keep it threaded through.
+    #[doc(hidden)]
+    pub fn embedder_for_test(&self) -> Option<&Arc<dyn EmbeddingProvider>> {
+        self.embedder.as_ref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -224,9 +379,48 @@ struct Input {
     input: String,
     #[serde(default)]
     variables: serde_json::Map<String, serde_json::Value>,
-    /// Pipeline-level timeout in seconds. Default: 1800 (30 min). Max: 1800.
+    /// Pipeline-level timeout in seconds. Default: 1800 (30 min),
+    /// optionally overridden per-pipeline via the DOT graph attribute
+    /// `default_timeout_secs`. Clamped to [60, 3600].
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+/// Hard wall-clock floor on `run_pipeline` (seconds).
+///
+/// Below this value the pipeline cannot complete even the smallest
+/// 2-node graph reliably; we clamp up so a careless caller never disarms
+/// the timeout entirely.
+const PIPELINE_TIMEOUT_MIN_SECS: u64 = 60;
+
+/// Hard wall-clock ceiling on `run_pipeline` (seconds, NEW-15).
+///
+/// Raised from 1800 → 3600 to give honest deep research with crawl +
+/// synthesize on slow production LLM lanes (e.g. wisemodel
+/// kimi/MiniMax) room to finish without synthesize-node starvation.
+/// Anything above this is treated as a runaway and clamped — operators
+/// can still observe the original requested value in the bridge logs,
+/// they just don't get more than an hour per spawn_only invocation.
+const PIPELINE_TIMEOUT_MAX_SECS: u64 = 3600;
+
+/// Hard-coded fallback when neither the LLM nor the DOT graph specify
+/// a timeout. Kept at 1800s for byte-identical backward-compat with
+/// pre-NEW-15 callers.
+const PIPELINE_TIMEOUT_DEFAULT_SECS: u64 = 1800;
+
+/// Resolve the effective wall-clock timeout for a `run_pipeline` run.
+///
+/// Precedence: LLM-supplied > DOT-graph default > hard-coded 1800s.
+/// Always clamped to [`PIPELINE_TIMEOUT_MIN_SECS`,
+/// `PIPELINE_TIMEOUT_MAX_SECS`].
+///
+/// Extracted so the resolution policy can be unit-tested without
+/// constructing a full `RunPipelineTool` + `TOOL_CTX`.
+fn resolve_pipeline_timeout(llm_value: Option<u64>, dot_default: Option<u64>) -> u64 {
+    llm_value
+        .or(dot_default)
+        .unwrap_or(PIPELINE_TIMEOUT_DEFAULT_SECS)
+        .clamp(PIPELINE_TIMEOUT_MIN_SECS, PIPELINE_TIMEOUT_MAX_SECS)
 }
 
 #[async_trait]
@@ -236,10 +430,15 @@ impl Tool for RunPipelineTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a multi-step pipeline defined as an inline DOT graph. Each node runs a \
-         specialized agent with its own prompt, model, and output limits. \
-         ALWAYS write inline DOT graphs — do NOT use pre-built pipeline names. \
-         This lets you pick optimal models per node (cheap for search, high-output for synthesis)."
+        "Run a sanctioned multi-step pipeline by NAME. The only currently \
+         sanctioned pipeline is `deep_research` — use it when the user asks \
+         for in-depth, multi-source, source-citing research that needs \
+         parallel search workers + synthesis. Do NOT compose your own \
+         inline DOT graph for ad-hoc tasks (slides, media, code edits, \
+         partial regenerations, etc.) — those have purpose-built tools \
+         (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
+         tool exists for what the user asked, surface that as a limitation \
+         rather than improvising a custom pipeline."
     }
 
     fn tags(&self) -> &[&str] {
@@ -247,25 +446,25 @@ impl Tool for RunPipelineTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        let adaptive_hints = include_str!("prompts/adaptive_hints.txt");
-        let node_attrs = include_str!("prompts/node_attrs.txt");
-        let example = include_str!("prompts/example_dot.txt");
-
-        let pipeline_desc = format!(
-            "Inline DOT graph. ALWAYS write a custom digraph.\n\n\
-             Do NOT specify model= attributes — the system selects optimal models automatically.\n\
-             Focus on writing good prompts, choosing tools, and structuring the pipeline.\n\n\
-             {node_attrs}\n\n\
-             {adaptive_hints}\n\n\
-             {example}"
-        );
+        let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
+             sanctioned name is `deep_research`. Do NOT pass an inline \
+             DOT graph here — inline DOT was the legacy free-form \
+             contract; the executor still accepts it for operator \
+             debugging but agent-driven runs MUST use the name form. If \
+             you find yourself wanting to compose your own DOT, the \
+             correct response is to use the purpose-built tool for that \
+             domain (`mofa_slides` for slides, `podcast_generate` for \
+             podcasts, `voice_synthesize` for TTS, etc.), or tell the \
+             user no such tool exists for their request."
+            .to_string();
 
         serde_json::json!({
             "type": "object",
             "properties": {
                 "pipeline": {
                     "type": "string",
-                    "description": pipeline_desc
+                    "description": pipeline_desc,
+                    "enum": ["deep_research"]
                 },
                 "input": {
                     "type": "string",
@@ -278,11 +477,51 @@ impl Tool for RunPipelineTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Timeout in seconds. Estimate based on real execution times: simple 2-node pipeline ~3min → 300s; standard 3-node research pipeline ~8min → 600s; 5-7 topic deep research with crawl+synthesize ~15-20min → 1200s; complex multi-source analysis with many nodes ~25min → 1500s. Max: 1800. Default: 1800"
+                    "description": "Timeout in seconds. Estimate from real production execution times (kimi/MiniMax on wisemodel — frontier models may be 2-3x faster):\n- simple 2-node pipeline ~3min → 300s\n- standard 3-node research pipeline ~10min → 800s\n- 5-7 topic deep research with crawl+synthesize ~25-30min → 1800s\n- complex multi-source analysis with many nodes ~40-50min → 3000s\n- exhaustive deep research with broad fan-out ~60min → 3600s\nMax: 3600. Default: 1800 (per-pipeline DOT may override via the `default_timeout_secs` graph attribute). Prefer higher estimates on production LLM lanes — under-estimating causes synthesize-node starvation when plan_and_search consumes >60% of the wall-clock budget."
                 }
             },
             "required": ["pipeline", "input"]
         })
+    }
+
+    /// Synchronously parse and structurally validate the DOT graph before
+    /// the spawn_only intercept dispatches the actual run to the background.
+    ///
+    /// Without this pre-flight, an LLM-generated invalid DOT (e.g. multiple
+    /// dangling roots → `rule 1: ambiguous start`) failed inside the
+    /// background task and surfaced only as a user-visible error bubble —
+    /// the agent's foreground turn already returned "started in background"
+    /// to the LLM, so the model thought it succeeded and never retried.
+    /// Catching the bad shape here turns the failure into a tool_result the
+    /// LLM can react to in its next iteration.
+    ///
+    /// Scope is deliberately limited to `parse_dot` + the same `validate::`
+    /// lint pass the executor runs — model assignment is skipped because
+    /// the topology checks (`ambiguous start`, dangling refs, etc.) are
+    /// what the LLM gets wrong; model fields are auto-filled by the
+    /// executor and never the failure source.
+    async fn pre_flight_validate(&self, args: &serde_json::Value) -> Result<(), String> {
+        let input: Input = serde_json::from_value(args.clone())
+            .map_err(|e| format!("invalid run_pipeline input: {e}"))?;
+        let dot_content = self
+            .resolve_with_fallback(&input.pipeline)
+            .await
+            .map_err(|e| format!("failed to resolve pipeline DOT: {e}"))?;
+        let graph = crate::parser::parse_dot(&dot_content)
+            .map_err(|e| format!("failed to parse pipeline DOT: {e}"))?;
+        let diags = crate::validate::validate(&graph);
+        if crate::validate::has_errors(&diags) {
+            let errors: Vec<_> = diags
+                .iter()
+                .filter(|d| d.severity == crate::validate::Severity::Error)
+                .map(|d| format!("rule {}: {}", d.rule, d.message))
+                .collect();
+            return Err(format!(
+                "pipeline validation failed:\n{}",
+                errors.join("\n")
+            ));
+        }
+        Ok(())
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
@@ -299,6 +538,13 @@ impl Tool for RunPipelineTool {
             },
             "run_pipeline invoked"
         );
+
+        // #1020 / M17-B: capture run start so we can stamp the summary's
+        // `start_time` field with the same instant the pipeline launched.
+        // RFC3339 keeps the audit-trail JSON human-readable.
+        let run_started_at = std::time::SystemTime::now();
+        let run_start_rfc3339 = systemtime_to_rfc3339(run_started_at);
+        let pipeline_started = std::time::Instant::now();
 
         let dot_content = self.resolve_with_fallback(&input.pipeline).await?;
 
@@ -322,13 +568,33 @@ impl Tool for RunPipelineTool {
             .try_with(crate::host_context::PipelineHostContext::from_tool_context)
             .unwrap_or_default();
 
+        // Phase 2-A: resolve the effective working dir for the
+        // executor. When the host context carries a [`SessionScope`]
+        // (Phase 1 wiring), every per-node worker spawns into the
+        // session's ephemeral workspace dir instead of the tool-level
+        // (profile-level) `data/` dir. The helper also ensures the
+        // workspace exists on disk before any worker tries to CWD into
+        // it. When no scope is present we fall back to the tool's
+        // working dir — byte-for-byte identical to pre-Phase-2-A
+        // behaviour.
+        let effective_working_dir =
+            resolve_pipeline_working_dir(&self.working_dir, host_context.session_scope.as_deref());
+
+        // Build the workspace_context BEFORE moving `effective_working_dir`
+        // into the struct literal — the policy lookup reads from the
+        // effective root (scope-aware) so scoped sessions pick up
+        // validators + compaction declared inside their workspace.
+        let workspace_context =
+            self.build_workspace_context_with_host(&host_context, &effective_working_dir);
+
         let config = ExecutorConfig {
             default_provider: self.default_provider.clone(),
             provider_router: self.provider_router.clone(),
             memory: self.memory.clone(),
-            working_dir: self.working_dir.clone(),
+            working_dir: effective_working_dir,
             provider_policy: self.provider_policy.clone(),
             plugin_dirs: self.plugin_dirs.clone(),
+            plugin_require_signed: self.plugin_require_signed,
             status_bridge,
             shutdown: shutdown.clone(),
             max_parallel_workers: 8,
@@ -342,12 +608,41 @@ impl Tool for RunPipelineTool {
             // reservation for free. When no policy is present the
             // context is empty and the executor stays on the legacy
             // path.
-            workspace_context: self.build_workspace_context_with_host(&host_context),
+            workspace_context,
             host_context,
+            // NEW-06 fix: thread the parent embedder onto every pipeline
+            // worker Agent so episodic memory recall stays on the
+            // contamination-safe hybrid scored + filtered path. When
+            // unset (legacy callers or hosts without an embedder
+            // configured), workers stay on the cwd-only fallback path —
+            // identical to pre-fix behaviour.
+            embedder: self.embedder.clone(),
+            // Phase 2-A (codex review of #1203, P2) — keep model
+            // catalog / `pipeline_models.json` reads anchored to the
+            // PROFILE data dir even when `working_dir` was swapped to
+            // the per-session workspace. Without this split, scoped
+            // runs silently lose strong/fast model defaults and cost
+            // projections fall back to the minimum estimate.
+            catalog_dir: Some(self.working_dir.clone()),
         };
 
-        // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].
-        let timeout_secs = input.timeout_secs.unwrap_or(1800).clamp(60, 1800);
+        // Pipeline-level timeout resolution (NEW-15):
+        // 1. LLM-supplied `timeout_secs` always wins (so an operator can
+        //    override a pipeline's baked-in default per-call).
+        // 2. Otherwise, fall back to the DOT graph's `default_timeout_secs`
+        //    attribute (set by skill authors per-pipeline — e.g.
+        //    `deep_research` ships with 2400s because its fan-out shape
+        //    consistently exceeds the historical 1800s default on
+        //    production LLM lanes).
+        // 3. Otherwise, fall back to the hard-coded 1800s.
+        // Final value is clamped to [60, 3600] — the upper bound was
+        // raised from 1800 → 3600 so honest deep research with crawl +
+        // synthesize on slow LLM lanes has room to finish without
+        // synthesize-node starvation.
+        let dot_default_timeout = crate::parser::parse_dot(&dot_content)
+            .ok()
+            .and_then(|g| g.default_timeout_secs);
+        let timeout_secs = resolve_pipeline_timeout(input.timeout_secs, dot_default_timeout);
 
         let executor = PipelineExecutor::new(config);
         let result = tokio::time::timeout(
@@ -359,13 +654,72 @@ impl Tool for RunPipelineTool {
         // Signal shutdown to all workers regardless of how we finished
         shutdown.store(true, std::sync::atomic::Ordering::Release);
 
-        let result = result.map_err(|_| {
-            eyre::eyre!(
-                "pipeline timed out after {}s (timeout_secs={})",
-                timeout_secs,
-                timeout_secs
-            )
-        })??;
+        // #1126 codex P2: compute the run_id + graph_id BEFORE we
+        // branch on success vs timeout. The marker write must happen
+        // on the timeout path too (the prior shape only emitted on
+        // success), otherwise timed-out runs were the one scenario
+        // missing audit-trail evidence — exactly the runs validators
+        // most need to inspect.
+        let graph_id = graph_id_from_dot(&dot_content);
+        let run_id = generate_run_id(&graph_id, run_started_at);
+
+        let result = match result {
+            Ok(inner) => inner?,
+            Err(_) => {
+                let duration_ms =
+                    u64::try_from(pipeline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                emit_external_context_unmanaged_timeout_summary(
+                    &self.working_dir,
+                    &run_id,
+                    &graph_id,
+                    duration_ms,
+                    &run_start_rfc3339,
+                    timeout_secs,
+                );
+                // Cascade-fail every still-active `pipeline:<node>` child
+                // task registered under this `run_pipeline` invocation.
+                // The pipeline's executor calls `supervisor.mark_running`
+                // for each node task but only `mark_completed`/`mark_failed`
+                // *after* the dispatch returns; on timeout the awaiting
+                // future is dropped before either fires and the children
+                // stay as `state: "running"` forever.
+                let host_context = octos_agent::tools::TOOL_CTX
+                    .try_with(crate::host_context::PipelineHostContext::from_tool_context)
+                    .unwrap_or_default();
+                cascade_fail_orphan_node_tasks(&host_context, timeout_secs);
+                // NEW-09: surface the timeout as a `ToolResult { success: false }`
+                // rather than `Err(eyre)`. The Err arm of the spawn_only
+                // background executor in `octos-agent/src/agent/execution.rs`
+                // calls `bg_sender(...)` (so the `message/persisted` /
+                // `turn/spawn_complete` bubble IS emitted), but soak round-8
+                // observed that the harness's `isFinalArrived` heuristic
+                // missed the completion. Returning the failure-with-result
+                // shape routes the timeout through the SAME `Ok(r) if
+                // !r.success` arm that has been live-tested for every other
+                // failing spawn_only tool. The bubble shape becomes
+                // `✗ run_pipeline failed: pipeline timed out after Ns`
+                // (matching the success-path "failed" wording instead of the
+                // Err-path "error" wording), the JSONL row is persisted via
+                // the existing failure path, and downstream `read_task_output`
+                // reads see the same error text.
+                return Ok(build_pipeline_timeout_result(timeout_secs));
+            }
+        };
+
+        // #1020 / M17-B: stamp the run's `summary.json` with the
+        // `external_context_unmanaged` marker so evidence validators can
+        // confirm pipeline workers ran without the parent's ContextManager
+        // propagated. Failures are logged at WARN and never bubble up:
+        // missing audit trail must not regress the user-visible outcome.
+        let duration_ms = u64::try_from(pipeline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        emit_external_context_unmanaged_summary(
+            &self.working_dir,
+            &run_id,
+            &graph_id,
+            &result,
+            duration_ms,
+            &run_start_rfc3339,
+        );
 
         let summary = result
             .node_summaries
@@ -384,9 +738,9 @@ impl Tool for RunPipelineTool {
             .join("\n");
 
         // Find the report file from this pipeline run's actual files_modified.
-        // The session actor auto-delivers .md files via file_modified on ToolResult,
-        // so no LLM instruction needed.
-        // Ensure absolute path so session actor can find and deliver the file.
+        // Delivery is driven by files_to_send on ToolResult, so no LLM instruction
+        // or session-level markdown heuristics are needed.
+        // Ensure absolute path so the execution loop can find and deliver the file.
         let real_report_file = result
             .files_modified
             .iter()
@@ -438,7 +792,7 @@ impl Tool for RunPipelineTool {
             tracing::info!(file = %path.display(), "pipeline produced report file");
         }
 
-        // Also set files_to_send so the execution loop auto-delivers
+        // Explicitly set files_to_send so the execution loop auto-delivers.
         let files_to_send = report_file.iter().filter(|p| p.exists()).cloned().collect();
 
         // Surface per-node cost attribution in the structured side-channel so
@@ -457,8 +811,336 @@ impl Tool for RunPipelineTool {
             file_modified: report_file,
             files_to_send,
             structured_metadata,
+            named_outputs: None,
         })
     }
+}
+
+/// #1020 / M17-B — Build a [`PipelineRunSummary`] stamped with the
+/// `external_context_unmanaged` marker for a completed pipeline run.
+///
+/// `RunPipelineTool` constructs this for every run because pipeline
+/// workers don't yet propagate the parent's `ContextManager` — workers
+/// run with per-node prompt context instead. Evidence validators look
+/// for `context_mode = "external_context_unmanaged"` plus the reason
+/// string to confirm M17-B's acceptance bullet is satisfied.
+///
+/// `start_time_rfc3339` should be a caller-supplied RFC3339 timestamp
+/// (the pipeline-run start) so the summary on disk is comparable across
+/// runs and matches the `RunDir` audit trail. We accept it as a string
+/// to keep this helper dependency-free of `chrono`.
+pub(crate) fn build_pipeline_run_summary(
+    graph_id: impl Into<String>,
+    result: &PipelineResult,
+    duration_ms: u64,
+    start_time_rfc3339: impl Into<String>,
+) -> PipelineRunSummary {
+    PipelineRunSummary {
+        graph_id: graph_id.into(),
+        success: result.success,
+        duration_ms,
+        total_tokens: result.token_usage.clone(),
+        nodes_executed: result.node_summaries.len(),
+        start_time: start_time_rfc3339.into(),
+        context_mode: None,
+        context_reason: None,
+    }
+    .with_external_context_unmanaged(PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON)
+}
+
+/// #1126 codex P2 follow-up to #1020 / M17-B — write a `summary.json`
+/// for the timeout failure path. Without this, runs that hit the
+/// pipeline-level timeout had no audit-trail marker at all, even
+/// though pipeline workers had been launched and consumed budget.
+/// Records `success: false`, a `duration_ms` equal to the elapsed
+/// wall-clock at the timeout boundary, zero node summaries, and the
+/// same `external_context_unmanaged` marker so validators see a
+/// consistent shape for both success and failure paths.
+fn emit_external_context_unmanaged_timeout_summary(
+    working_dir: &std::path::Path,
+    run_id: &str,
+    graph_id: &str,
+    duration_ms: u64,
+    start_time_rfc3339: &str,
+    timeout_secs: u64,
+) {
+    let run_dir = match RunDir::new(working_dir, run_id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "failed to open run dir for M17-B timeout summary; skipping"
+            );
+            return;
+        }
+    };
+    let reason = format!(
+        "{PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON}; pipeline timed out after {timeout_secs}s"
+    );
+    let summary = PipelineRunSummary {
+        graph_id: graph_id.to_string(),
+        success: false,
+        duration_ms,
+        total_tokens: TokenUsage::default(),
+        nodes_executed: 0,
+        start_time: start_time_rfc3339.to_string(),
+        context_mode: None,
+        context_reason: None,
+    }
+    .with_external_context_unmanaged(reason);
+    if let Err(error) = run_dir.write_summary(&summary) {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "failed to write M17-B timeout summary; downstream evidence validators may flag this run"
+        );
+    }
+}
+
+/// Cascade-fail every still-active `pipeline:<node>` child task
+/// registered in the supervisor under the `run_pipeline` parent's
+/// `tool_call_id`. Invoked from the `RunPipelineTool::execute` timeout
+/// arm so dropped child futures don't leave orphan `state: "running"`
+/// entries in the supervisor (the bug that surfaced as
+/// `pipeline:analyze running` indefinitely on the dashboard).
+///
+/// No-op when the host context didn't snapshot a supervisor (legacy
+/// callers / unit tests) or didn't carry a parent_tool_call_id. The
+/// underlying [`TaskSupervisor::mark_descendants_failed`] filters to
+/// the `pipeline:` `tool_name` prefix so the parent `run_pipeline`
+/// task (which shares the same `tool_call_id` as its node children)
+/// is never touched by the cascade — its own `mark_failed` path in
+/// the timeout arm handles parent-level transition. The supervisor
+/// method is also idempotent on already-terminal tasks, so
+/// re-invocation is safe.
+fn cascade_fail_orphan_node_tasks(
+    host_context: &crate::host_context::PipelineHostContext,
+    timeout_secs: u64,
+) -> usize {
+    let Some(supervisor) = host_context.task_supervisor.as_ref() else {
+        return 0;
+    };
+    let Some(parent_tcid) = host_context.parent_tool_call_id.as_deref() else {
+        return 0;
+    };
+    let reason = format!("pipeline timed out after {timeout_secs}s");
+    let cascaded = supervisor.mark_descendants_failed(parent_tcid, &reason);
+    if cascaded > 0 {
+        tracing::warn!(
+            parent_tool_call_id = %parent_tcid,
+            cascaded,
+            timeout_secs,
+            "run_pipeline timeout cascade-failed orphan child node tasks",
+        );
+    }
+    cascaded
+}
+
+/// NEW-09 — build the canonical [`ToolResult`] returned from
+/// `RunPipelineTool::execute` when the pipeline-level timeout fires.
+///
+/// Returning `Ok(ToolResult { success: false, .. })` (rather than
+/// `Err(eyre)`) routes the timeout through the same `Ok(r) if !r.success`
+/// arm of the spawn_only background executor in
+/// `octos-agent/src/agent/execution.rs` that handles every other failing
+/// background tool. That arm:
+///
+/// 1. Marks the supervisor task `Failed` with the timeout reason.
+/// 2. Calls the registered `BackgroundResultSender` which persists the
+///    completion row to the session JSONL via
+///    `persist_assistant_with_media` and emits both `message/persisted`
+///    (legacy clients) and `turn/spawn_complete` (M10 clients).
+/// 3. The bubble surface text becomes
+///    `✗ run_pipeline failed: pipeline timed out after Ns` — matching
+///    the wording every other failing spawn_only tool produces.
+///
+/// Pre-fix, the timeout returned `Err(eyre)` which DID also call the
+/// sender via the `Err(e)` arm, but the harness's `isFinalArrived`
+/// heuristic in soak round-8 observed the timeout completion never
+/// reached the WS client; consolidating onto a single failure path
+/// eliminates the Err/Ok divergence and pins the contract test surface
+/// to one shape.
+///
+/// `files_to_send` is intentionally empty: a timed-out run produced no
+/// deliverable artifact. `structured_metadata` and `named_outputs` are
+/// `None` since no nodes executed to completion. `tokens_used` is `None`
+/// because per-node token accounting was not collected when the parent
+/// future was dropped; downstream cost-ledger callers must handle the
+/// `None` case (they already do for legacy `Err` returns).
+pub(crate) fn build_pipeline_timeout_result(timeout_secs: u64) -> ToolResult {
+    ToolResult {
+        output: format!("pipeline timed out after {timeout_secs}s"),
+        success: false,
+        tokens_used: None,
+        file_modified: None,
+        files_to_send: Vec::new(),
+        structured_metadata: None,
+        named_outputs: None,
+    }
+}
+
+/// #1020 / M17-B — write a `summary.json` carrying the
+/// `external_context_unmanaged` marker to the run's `.octos/runs/<run_id>/`
+/// directory. Failures are logged at WARN and never propagated so the
+/// pipeline's user-visible outcome is unchanged when the audit-trail
+/// write fails (e.g. read-only filesystem during tests).
+fn emit_external_context_unmanaged_summary(
+    working_dir: &std::path::Path,
+    run_id: &str,
+    graph_id: &str,
+    result: &PipelineResult,
+    duration_ms: u64,
+    start_time_rfc3339: &str,
+) {
+    let run_dir = match RunDir::new(working_dir, run_id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "failed to open run dir for M17-B context-mode summary; skipping"
+            );
+            return;
+        }
+    };
+    let summary = build_pipeline_run_summary(graph_id, result, duration_ms, start_time_rfc3339);
+    if let Err(error) = run_dir.write_summary(&summary) {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "failed to write M17-B context-mode summary; downstream evidence validators may flag this run"
+        );
+    }
+}
+
+/// Extract the graph identifier from the resolved DOT body. Falls back
+/// to `"pipeline"` when the header lacks an explicit name (matches the
+/// sanitiser's `digraph { ... }` -> `digraph pipeline { ... }` rewrite).
+fn graph_id_from_dot(dot_content: &str) -> String {
+    let header = dot_content
+        .trim_start()
+        .strip_prefix("digraph")
+        .map(|rest| rest.trim_start())
+        .unwrap_or("");
+    let candidate: String = header
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if candidate.is_empty() {
+        "pipeline".to_string()
+    } else {
+        candidate
+    }
+}
+
+/// Build a filesystem-safe run id of the form
+/// `<graph_id>-<unix_secs>-<nanos>-<pid>-<counter>`.
+/// Matches the `validate_pipeline_id` constraint (no `/`, `\`, `..`, control
+/// chars, <= 128 bytes) and stays unique across simultaneous runs of the
+/// same pipeline so two writers do not race on `summary.json`.
+///
+/// #1126 codex P2: the prior shape `{graph}-{secs}-{pid}` collided when
+/// two `run_pipeline` calls for the same graph started in the same
+/// second within the same process. Nanosecond resolution + a
+/// per-process monotonic counter make collision practically impossible
+/// even for back-to-back synchronous fan-out.
+fn generate_run_id(graph_id: &str, started_at: std::time::SystemTime) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let (secs, nanos) = started_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let pid = std::process::id();
+    let counter = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Sanitize graph_id defensively — `graph_id_from_dot` already strips
+    // unsafe chars but a caller-provided value could be anything.
+    let safe_graph: String = graph_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    let candidate = format!("{safe_graph}-{secs}-{nanos:09}-{pid}-{counter}");
+    if candidate.is_empty() || candidate.len() > 128 {
+        format!("pipeline-{secs}-{nanos:09}-{pid}-{counter}")
+    } else {
+        candidate
+    }
+}
+
+/// Format a `SystemTime` as a coarse RFC3339 timestamp without pulling
+/// in `chrono`. Falls back to the unix epoch on clock skew.
+fn systemtime_to_rfc3339(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Inline a minimal date renderer: we only need year/month/day/hour/min/sec
+    // for the audit trail. `chrono` is intentionally not pulled in here —
+    // keeping octos-pipeline's deps unchanged is a hard rule for #1020.
+    let (year, month, day, hour, min, sec) = unix_secs_to_ymdhms(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Convert unix seconds (UTC) into (year, month, day, hour, minute, second).
+/// Handles dates from 1970-01-01 through 9999-12-31. Returns the epoch on
+/// negative values (clock skew).
+fn unix_secs_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    if secs < 0 {
+        return (1970, 1, 1, 0, 0, 0);
+    }
+    let total_secs = secs as u64;
+    let sec = (total_secs % 60) as u32;
+    let total_mins = total_secs / 60;
+    let min = (total_mins % 60) as u32;
+    let total_hours = total_mins / 60;
+    let hour = (total_hours % 24) as u32;
+    let mut days = (total_hours / 24) as i64;
+
+    // Compute year/month/day from days-since-epoch (1970-01-01).
+    let mut year: i32 = 1970;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let year_days = if leap { 366 } else { 365 };
+        if days < year_days as i64 {
+            break;
+        }
+        days -= year_days as i64;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_lens: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month: u32 = 1;
+    for &m_len in &month_lens {
+        if days < m_len as i64 {
+            break;
+        }
+        days -= m_len as i64;
+        month += 1;
+    }
+    let day = (days as u32) + 1;
+    (year, month, day, hour, min, sec)
 }
 
 /// Project a non-empty slice of [`NodeCost`] rows into the
@@ -583,5 +1265,637 @@ mod tests {
     #[test]
     fn node_costs_metadata_returns_none_for_empty_rows() {
         assert!(node_costs_metadata(&[]).is_none());
+    }
+
+    /// NEW-15 (1): the 30-min historical default is preserved when
+    /// neither the LLM nor the DOT supply a timeout — backward-compat
+    /// guard.
+    #[test]
+    fn resolve_pipeline_timeout_defaults_to_1800_when_unspecified() {
+        assert_eq!(resolve_pipeline_timeout(None, None), 1800);
+    }
+
+    /// NEW-15 (2): an LLM-supplied value within [60, 3600] passes
+    /// through unmodified — the new ceiling no longer truncates honest
+    /// deep-research estimates at 1800s.
+    #[test]
+    fn resolve_pipeline_timeout_passes_llm_value_in_range() {
+        assert_eq!(resolve_pipeline_timeout(Some(3000), None), 3000);
+    }
+
+    /// NEW-15 (3): an LLM value above the new 3600s ceiling clamps
+    /// down — a runaway pipeline still cannot lock the session past
+    /// an hour per spawn_only invocation.
+    #[test]
+    fn resolve_pipeline_timeout_clamps_llm_value_above_ceiling() {
+        assert_eq!(resolve_pipeline_timeout(Some(5000), None), 3600);
+    }
+
+    /// NEW-15 (4): an LLM value below the 60s floor clamps up — a
+    /// careless caller cannot disarm the timeout entirely.
+    #[test]
+    fn resolve_pipeline_timeout_clamps_llm_value_below_floor() {
+        assert_eq!(resolve_pipeline_timeout(Some(10), None), 60);
+    }
+
+    /// NEW-15 (5): when the LLM does NOT supply `timeout_secs`, the
+    /// DOT graph's `default_timeout_secs` attribute wins over the
+    /// hard-coded 1800s default. This is the path that lets skill
+    /// authors ship per-pipeline realistic caps.
+    #[test]
+    fn resolve_pipeline_timeout_uses_dot_default_when_llm_omits() {
+        assert_eq!(resolve_pipeline_timeout(None, Some(2400)), 2400);
+    }
+
+    /// NEW-15 (6): the LLM's explicit `timeout_secs` always wins over
+    /// the DOT default — operators can override per-call without
+    /// editing the shipped pipeline.
+    #[test]
+    fn resolve_pipeline_timeout_llm_overrides_dot_default() {
+        assert_eq!(resolve_pipeline_timeout(Some(1500), Some(2400)), 1500);
+    }
+
+    /// NEW-15 (7): clamping applies to the DOT default too — a skill
+    /// author cannot ship a pipeline whose baked-in fallback exceeds
+    /// the new 3600s ceiling.
+    #[test]
+    fn resolve_pipeline_timeout_clamps_dot_default_above_ceiling() {
+        assert_eq!(resolve_pipeline_timeout(None, Some(7200)), 3600);
+    }
+
+    /// #1020 / M17-B — `build_pipeline_run_summary` MUST stamp the
+    /// summary with `context_mode = "external_context_unmanaged"` plus
+    /// the canonical M17-B reason string. Evidence validators grep
+    /// these fields off `summary.json`, so any drift here silently
+    /// breaks the M17-B acceptance bullet for `run_pipeline`.
+    #[test]
+    fn build_pipeline_run_summary_stamps_external_context_unmanaged_marker() {
+        use octos_core::TokenUsage;
+        let result = PipelineResult {
+            output: "ok".into(),
+            success: true,
+            token_usage: TokenUsage::default(),
+            node_summaries: Vec::new(),
+            files_modified: Vec::new(),
+            node_costs: Vec::new(),
+        };
+        let summary =
+            build_pipeline_run_summary("test_pipeline", &result, 1234, "2026-05-20T17:00:00Z");
+        assert_eq!(summary.graph_id, "test_pipeline");
+        assert_eq!(
+            summary.context_mode.as_deref(),
+            Some("external_context_unmanaged"),
+            "every run_pipeline summary must carry the M17-B marker"
+        );
+        assert_eq!(
+            summary.context_reason.as_deref(),
+            Some(PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON),
+            "the marker reason must match the canonical M17-B constant"
+        );
+        // The serialized JSON form is what evidence validators actually
+        // see on disk — assert the wire shape directly.
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("M17-B"),
+            "context_reason should reference M17-B for grep-ability"
+        );
+    }
+
+    /// #1020 / M17-B — `emit_external_context_unmanaged_summary` writes
+    /// the marker-stamped summary to disk under
+    /// `<working_dir>/.octos/runs/<run_id>/summary.json` so the audit
+    /// trail satisfies the M17-B evidence requirement at runtime.
+    #[test]
+    fn emit_external_context_unmanaged_summary_writes_marker_to_disk() {
+        use octos_core::TokenUsage;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let result = PipelineResult {
+            output: "ok".into(),
+            success: true,
+            token_usage: TokenUsage::default(),
+            node_summaries: Vec::new(),
+            files_modified: Vec::new(),
+            node_costs: Vec::new(),
+        };
+        emit_external_context_unmanaged_summary(
+            dir.path(),
+            "deep_research-1747800000-12345",
+            "deep_research",
+            &result,
+            5000,
+            "2026-05-20T17:00:00Z",
+        );
+        let summary_path = dir
+            .path()
+            .join(".octos/runs/deep_research-1747800000-12345/summary.json");
+        assert!(
+            summary_path.exists(),
+            "RunPipelineTool must persist summary.json with the M17-B marker"
+        );
+        let contents = std::fs::read_to_string(&summary_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert_eq!(json["graph_id"], "deep_research");
+        assert_eq!(
+            json["context_reason"], PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON,
+            "summary.json must carry the canonical M17-B reason"
+        );
+    }
+
+    /// Run-id generator must produce a `validate_pipeline_id`-safe id
+    /// even when the graph_id contains unsafe characters (slash, dot,
+    /// control bytes). Without this defensive sanitization a maliciously
+    /// named pipeline would fail to write `summary.json` and the M17-B
+    /// marker would be silently dropped.
+    #[test]
+    fn generate_run_id_is_pipeline_id_safe() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let id = generate_run_id("ev/il..\\name", t);
+        assert!(crate::graph::validate_pipeline_id(&id).is_ok());
+        // The unix secs anchor + the original name's safe chars should
+        // be preserved so operators can correlate the run with its logs.
+        assert!(id.contains("1700000000"));
+    }
+
+    /// `graph_id_from_dot` extracts the digraph name when present and
+    /// falls back to `"pipeline"` for anonymous graphs. The fallback
+    /// path is what inline-DOT LLM calls use, so missing it would mean
+    /// inline runs write `summary.json` under an empty-string run id —
+    /// which `validate_pipeline_id` rejects.
+    #[test]
+    fn graph_id_from_dot_uses_pipeline_fallback_for_anonymous_graphs() {
+        assert_eq!(
+            graph_id_from_dot("digraph deep_research { a -> b }"),
+            "deep_research"
+        );
+        assert_eq!(graph_id_from_dot("digraph { a -> b }"), "pipeline");
+        assert_eq!(graph_id_from_dot("  digraph  research_42 {"), "research_42");
+    }
+
+    /// #1126 codex P2 acceptance: two run_pipeline calls for the same
+    /// graph that start within the same second in the same process
+    /// must produce DISTINCT run ids so their `summary.json` files do
+    /// NOT race / overwrite. Before this fix the id was
+    /// `{graph}-{secs}-{pid}`, which collided. After: nanos + counter
+    /// make collision practically impossible.
+    #[test]
+    fn generate_run_id_distinguishes_concurrent_runs_in_same_second() {
+        let t = std::time::SystemTime::now();
+        let id1 = generate_run_id("deep_research", t);
+        let id2 = generate_run_id("deep_research", t);
+        assert_ne!(
+            id1, id2,
+            "two run ids minted in the same second for the same graph must differ"
+        );
+    }
+
+    /// #1126 codex P2 acceptance: when a pipeline run times out, a
+    /// `summary.json` with the `external_context_unmanaged` marker
+    /// must still be written so evidence validators can confirm the
+    /// run launched workers. The reason string must include the
+    /// timeout duration.
+    #[test]
+    fn emit_external_context_unmanaged_timeout_summary_writes_marker_to_disk() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        emit_external_context_unmanaged_timeout_summary(
+            dir.path(),
+            "deep_research-1747800000-000000001-12345-0",
+            "deep_research",
+            1_800_000,
+            "2026-05-20T17:00:00Z",
+            1800,
+        );
+        let summary_path = dir
+            .path()
+            .join(".octos/runs/deep_research-1747800000-000000001-12345-0/summary.json");
+        assert!(
+            summary_path.exists(),
+            "timeout path must persist summary.json with M17-B marker"
+        );
+        let contents = std::fs::read_to_string(&summary_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(json["success"], false, "timeout summary records failure");
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out"),
+            "context_reason must explicitly mention the timeout for audit",
+        );
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("1800"),
+            "context_reason must include the timeout in seconds",
+        );
+    }
+
+    /// Regression pin for the `run_pipeline` timeout orphan bug:
+    /// when a pipeline times out, every still-active
+    /// `pipeline:<node>` child task registered under the parent's
+    /// `tool_call_id` must be cascade-failed in the supervisor with
+    /// the timeout reason. Previously the future was dropped before
+    /// `mark_completed`/`mark_failed` could fire, so children stayed
+    /// in `state: "running"` forever. The ledger evidence from mini3
+    /// showed parent task hitting `task_updated:failed` while
+    /// `pipeline:analyze` had exactly ONE `state:running` event and
+    /// never a terminal mark.
+    ///
+    /// Codex MAJOR follow-up on #1180: the cascade MUST NOT touch the
+    /// parent `run_pipeline` task even though it shares the same
+    /// `tool_call_id` as its node children — the parent's own
+    /// `mark_failed` path handles parent-level transition.
+    #[test]
+    fn cascade_fail_orphan_node_tasks_marks_all_active_children_failed() {
+        use octos_agent::task_supervisor::TaskSupervisor;
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let parent_tcid = "tool-call-run_pipeline-timeout";
+
+        // The parent run_pipeline task is registered with the SAME
+        // tool_call_id its node children reuse (see
+        // execution.rs::register_task_with_input_and_cmid +
+        // executor.rs::register_node_task). The cascade must filter
+        // by `pipeline:` prefix and skip this parent.
+        let parent_task =
+            supervisor.register("run_pipeline", parent_tcid, Some("session-timeout-test"));
+        supervisor.mark_running(&parent_task);
+
+        // Two pipeline-node child tasks registered under the parent
+        // tool_call_id, both moved to running (matching what the
+        // executor does at node dispatch time).
+        let child_analyze = supervisor.register(
+            "pipeline:analyze",
+            parent_tcid,
+            Some("session-timeout-test"),
+        );
+        let child_plan_and_search = supervisor.register(
+            "pipeline:plan_and_search",
+            parent_tcid,
+            Some("session-timeout-test"),
+        );
+        supervisor.mark_running(&child_analyze);
+        supervisor.mark_running(&child_plan_and_search);
+
+        // Build the host context the way TOOL_CTX would expose it
+        // when run_pipeline dispatches inside a real session.
+        let host = crate::host_context::PipelineHostContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_tool_call_id: Some(parent_tcid.to_string()),
+            parent_session_key: Some("session-timeout-test".to_string()),
+            ..Default::default()
+        };
+
+        // Drive the timeout cascade with timeout_secs = 1200 to match
+        // the ledger evidence.
+        let cascaded = cascade_fail_orphan_node_tasks(&host, 1200);
+        assert_eq!(
+            cascaded, 2,
+            "both active pipeline:<node> children must cascade-fail"
+        );
+
+        for cid in [&child_analyze, &child_plan_and_search] {
+            let task = supervisor.get_task(cid).expect("child task survives");
+            assert_eq!(
+                task.status.as_str(),
+                "failed",
+                "child task {} must be Failed after pipeline timeout cascade",
+                task.tool_name
+            );
+            let err = task.error.clone().unwrap_or_default();
+            assert!(
+                err.contains("pipeline timed out after 1200s"),
+                "error must carry the canonical timeout reason, got: {err}",
+            );
+        }
+
+        // Parent task must remain Running — the cascade filters by
+        // `pipeline:` prefix so the parent run_pipeline task is
+        // never touched even though it shares the same tool_call_id.
+        let parent_after = supervisor
+            .get_task(&parent_task)
+            .expect("parent run_pipeline task survives");
+        assert_eq!(
+            parent_after.status.as_str(),
+            "running",
+            "parent run_pipeline task must NOT be touched by the cascade — \
+             its own mark_failed path in the timeout arm handles parent-level transition"
+        );
+        assert!(
+            parent_after.error.is_none(),
+            "cascade must not write an error to the parent task"
+        );
+    }
+
+    /// `cascade_fail_orphan_node_tasks` is a no-op when the host
+    /// context didn't snapshot a supervisor — preserves the legacy
+    /// pre-M8 path (pipelines invoked from CLI / unit tests where
+    /// TOOL_CTX is empty).
+    #[test]
+    fn cascade_fail_orphan_node_tasks_noop_without_supervisor() {
+        let host = crate::host_context::PipelineHostContext::default();
+        let cascaded = cascade_fail_orphan_node_tasks(&host, 1200);
+        assert_eq!(cascaded, 0);
+    }
+
+    /// `cascade_fail_orphan_node_tasks` is a no-op when the host
+    /// context didn't capture a parent_tool_call_id. Defensive guard
+    /// so we never mass-fail unrelated tasks.
+    #[test]
+    fn cascade_fail_orphan_node_tasks_noop_without_parent_tcid() {
+        use octos_agent::task_supervisor::TaskSupervisor;
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let host = crate::host_context::PipelineHostContext {
+            task_supervisor: Some(supervisor),
+            parent_tool_call_id: None,
+            ..Default::default()
+        };
+        let cascaded = cascade_fail_orphan_node_tasks(&host, 1200);
+        assert_eq!(cascaded, 0);
+    }
+
+    /// NEW-09 regression pin: the pipeline-level timeout MUST return
+    /// `Ok(ToolResult { success: false, output: "pipeline timed out
+    /// after Ns" })` rather than `Err(eyre)`. The spawn_only background
+    /// executor in `octos-agent/src/agent/execution.rs` then routes the
+    /// timeout through the `Ok(r) if !r.success` arm, which has been
+    /// live-tested to call `bg_sender(BackgroundResultPayload { ... })`
+    /// — persisting a `message/persisted` (legacy) and
+    /// `turn/spawn_complete` (M10) event so the WS client renders the
+    /// completion bubble and the harness's `isFinalArrived` heuristic
+    /// fires.
+    ///
+    /// Pre-fix, the timeout returned `Err(eyre)` which routed through
+    /// the `Err(e)` arm. Both arms emit a `BackgroundResultPayload`,
+    /// but soak round-8 observed the WS client never saw the
+    /// completion event for the Err path. Consolidating onto the
+    /// `Ok(r) if !r.success` arm eliminates the divergence.
+    #[test]
+    fn pipeline_timeout_returns_ok_failure_result_not_err() {
+        let result = build_pipeline_timeout_result(1200);
+        assert!(
+            !result.success,
+            "timeout result must carry success=false so the spawn_only \
+             execution branch routes through the `Ok(r) if !r.success` arm"
+        );
+        assert_eq!(
+            result.output, "pipeline timed out after 1200s",
+            "output text must carry the canonical timeout reason — the \
+             spawn_only failure arm composes the chat bubble as \
+             `✗ run_pipeline failed: <output>`"
+        );
+        assert!(
+            result.files_to_send.is_empty(),
+            "timed-out runs produce no deliverable artifact"
+        );
+        assert!(
+            result.file_modified.is_none(),
+            "no report file when no nodes completed"
+        );
+        assert!(
+            result.tokens_used.is_none(),
+            "per-node token accounting was not collected when the parent \
+             future was dropped"
+        );
+        assert!(
+            result.structured_metadata.is_none(),
+            "no per-node cost rows on the timeout path"
+        );
+        assert!(
+            result.named_outputs.is_none(),
+            "no named outputs without completed nodes"
+        );
+    }
+
+    /// NEW-09: the timeout-result output text must match what
+    /// `cascade_fail_orphan_node_tasks` writes onto the child task
+    /// `error` field. Without this invariant, a downstream
+    /// `read_task_output` against the parent task surfaces different
+    /// timeout-reason wording than the cascade-failed child rows, and
+    /// dashboards / debugging tooling lose correlation.
+    #[test]
+    fn pipeline_timeout_output_matches_cascade_failed_child_error_text() {
+        use octos_agent::task_supervisor::TaskSupervisor;
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let parent_tcid = "tool-call-run_pipeline-timeout-correlation";
+        let parent_task =
+            supervisor.register("run_pipeline", parent_tcid, Some("session-correlation"));
+        supervisor.mark_running(&parent_task);
+        let child =
+            supervisor.register("pipeline:analyze", parent_tcid, Some("session-correlation"));
+        supervisor.mark_running(&child);
+
+        let host = crate::host_context::PipelineHostContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_tool_call_id: Some(parent_tcid.to_string()),
+            parent_session_key: Some("session-correlation".to_string()),
+            ..Default::default()
+        };
+        let cascaded = cascade_fail_orphan_node_tasks(&host, 1200);
+        assert_eq!(cascaded, 1);
+
+        let child_error = supervisor
+            .get_task(&child)
+            .expect("child task survives")
+            .error
+            .unwrap_or_default();
+
+        let timeout_result = build_pipeline_timeout_result(1200);
+        assert!(
+            child_error.contains(&timeout_result.output),
+            "child cascade-failure error ({child_error}) must contain the \
+             parent timeout result output ({}) so dashboards correlate \
+             parent + child rows on a shared reason string",
+            timeout_result.output,
+        );
+    }
+
+    // ───── Phase 2-A: SessionScope-aware working dir resolution ─────
+    //
+    // The mini5 NEW-06 contamination bug had the same root cause every
+    // round: `RunPipelineTool` pins `working_dir` at construction time
+    // to the profile-level `data/` dir, so per-node workers spawn with
+    // CWD == profile data and `read_file`-loop on 200+ stale `.md`
+    // files from prior sessions. Phase 1 (#1199) plumbed `SessionScope`
+    // through host contexts but did not consume it; Phase 2-A flips
+    // `RunPipelineTool::execute` over to the scope's `workspace()` when
+    // present. These tests pin the resolver semantics so the wiring
+    // doesn't silently regress as more callers (Phase 2-B, 2-C, 2-D)
+    // come online.
+
+    /// Phase 2-A acceptance — when the parent host context attaches a
+    /// `SessionScope`, the pipeline executor's `working_dir` MUST be
+    /// the scope's `workspace()`, not the tool's pinned `working_dir`.
+    /// This is the load-bearing fix for mini5 NEW-06: workers no
+    /// longer see other sessions' `read_file` surface.
+    #[test]
+    fn pipeline_worker_uses_session_scope_workspace_when_present() {
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let session_root = tempfile::tempdir().expect("temp dir");
+        let scope =
+            SessionScope::solo(session_root.path().to_path_buf(), vec![]).expect("solo scope");
+
+        let resolved = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        assert_eq!(
+            resolved,
+            scope.workspace(),
+            "scope present must override tool-level working_dir"
+        );
+        assert_ne!(
+            resolved, tool_wd,
+            "session-scoped path must NOT equal tool's profile-level working_dir"
+        );
+    }
+
+    /// Backward-compat — legacy callers (CLI, unit tests, hosts not
+    /// yet migrated to attach a `SessionScope`) keep their pre-Phase-2-A
+    /// behaviour byte-for-byte. The tool's `working_dir` is returned
+    /// verbatim and NO directory is created.
+    #[test]
+    fn pipeline_worker_falls_back_to_self_working_dir_when_no_scope() {
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let resolved = resolve_pipeline_working_dir(&tool_wd, None);
+        assert_eq!(
+            resolved, tool_wd,
+            "no scope must fall back to tool-level working_dir (pre-Phase-2-A behaviour)"
+        );
+    }
+
+    /// Phase 2-A acceptance — the scope's `workspace()` may not exist
+    /// on disk yet at run-pipeline time (the Phase 1 scope wiring is
+    /// types-only; it never does I/O). The resolver MUST create the
+    /// dir so workers can spawn without `current_dir(...)` ENOENT
+    /// errors. Per the Phase 1 spec doc, this is the caller's
+    /// responsibility — `SessionScope` itself stays I/O-free.
+    #[test]
+    fn pipeline_creates_session_workspace_dir_on_demand() {
+        let tenant_root = tempfile::tempdir().expect("temp dir");
+        // Manually craft a scope whose workspace() points into a
+        // not-yet-existing subdirectory so we can assert the helper
+        // creates it.
+        let scope = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-phase2a".into(),
+            "session-fresh".into(),
+            vec![],
+        )
+        .expect("multi-tenant scope");
+        let workspace = scope.workspace().to_path_buf();
+        assert!(
+            !workspace.exists(),
+            "precondition: workspace should not exist before resolver runs"
+        );
+
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let resolved = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        assert_eq!(resolved, workspace, "resolver returns the scoped workspace");
+        assert!(
+            workspace.exists(),
+            "resolver must create the workspace dir on disk so worker spawn does not ENOENT"
+        );
+        assert!(
+            workspace.is_dir(),
+            "resolver must create a directory, not a file"
+        );
+    }
+
+    /// Multiple workers spawned in the same session (same scope) MUST
+    /// share the same workspace CWD. This is what gives in-session
+    /// continuity: writes from one node are visible to the next.
+    #[test]
+    fn pipeline_workers_in_same_session_share_workspace() {
+        let tenant_root = tempfile::tempdir().expect("temp dir");
+        let scope = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-share".into(),
+            "session-share".into(),
+            vec![],
+        )
+        .expect("multi-tenant scope");
+
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let first = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        let second = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        assert_eq!(
+            first, second,
+            "two resolver calls with the same scope must return the same workspace CWD"
+        );
+        assert_eq!(first, scope.workspace());
+    }
+
+    /// The contamination-fixing assertion — two distinct sessions
+    /// (same tenant root, same tool-level working_dir) MUST resolve to
+    /// DIFFERENT workspaces. This is exactly the mini5 NEW-06 path:
+    /// without this, the second session's pipeline workers would
+    /// `read_file` 200+ `.md` files from the first session's runs and
+    /// hallucinate cross-domain content (the JWST query producing an
+    /// Intel/Tim Cook report).
+    #[test]
+    fn pipeline_workers_in_different_sessions_have_isolated_workspaces() {
+        let tenant_root = tempfile::tempdir().expect("temp dir");
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+
+        let scope_a = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-iso".into(),
+            "session-a".into(),
+            vec![],
+        )
+        .expect("scope a");
+        let scope_b = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-iso".into(),
+            "session-b".into(),
+            vec![],
+        )
+        .expect("scope b");
+
+        let cwd_a = resolve_pipeline_working_dir(&tool_wd, Some(&scope_a));
+        let cwd_b = resolve_pipeline_working_dir(&tool_wd, Some(&scope_b));
+        assert_ne!(
+            cwd_a, cwd_b,
+            "two sessions on the same tenant MUST have isolated workspace CWDs — \
+             this is the load-bearing assertion for the mini5 NEW-06 fix"
+        );
+        // Both must be under the tenant root so per-tenant audit trails
+        // still work; only the per-session segment differs.
+        assert!(cwd_a.starts_with(tenant_root.path()));
+        assert!(cwd_b.starts_with(tenant_root.path()));
     }
 }

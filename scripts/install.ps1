@@ -1345,6 +1345,10 @@ if ($Domain -and (Test-Command "caddy")) {
     Section "Configuring Caddy for $Domain"
     $caddyfile = Join-Path $DataDir "Caddyfile"
     $caddyUpstream = "localhost:$Port"
+    # Regex-escape the configured domain so dots match literally
+    # (each '.' becomes '\\.' in the emitted Caddyfile, which CEL parses
+    # to '\.' and RE2 then treats as a literal dot). Closes #1124.
+    $DomainRe = $Domain.Replace('.', '\\.')
     @"
 {
     on_demand_tls {
@@ -1353,7 +1357,23 @@ if ($Domain -and (Test-Command "caddy")) {
 }
 
 :9999 {
-    respond /check 200
+    # On-demand TLS gate. Only the configured apex or exactly one
+    # label before it (matching the *.$Domain route below) may
+    # trigger ACME issuance — any other SNI returns 403 so Caddy
+    # refuses to ask Let's Encrypt for a cert. Deeper names like
+    # a.b.$Domain are NOT routed and must not consume the
+    # configured domain's ACME rate limit. This is the security
+    # boundary that prevents arbitrary DNS pointed at this server
+    # from burning ACME rate limits. See codex P1 follow-up to
+    # #380 / #1070, and #1124 for the apex+single-label tightening.
+    @octos_tls expression ``{query.domain}.matches("^([^.]+\\.)?$DomainRe`$")``
+    respond @octos_tls 200
+    respond /check 403
+}
+
+http:// {
+    @octos host $Domain *.$Domain
+    redir @octos https://{host}{uri} 308
 }
 
 $Domain {
@@ -1374,32 +1394,36 @@ $Domain {
     }
 }
 
-*.$Domain {
+https:// {
+    # Site address is intentionally catch-all so Caddy issues per-host
+    # on-demand certs via HTTP/TLS-ALPN challenges (a wildcard site
+    # address would force Caddy to manage a literal *.$Domain subject,
+    # which Let's Encrypt only issues via DNS challenge). The security
+    # boundary is the /check ask endpoint above, which only green-lights
+    # ACME for $Domain and its subdomains.
     tls {
         on_demand
     }
 
-    @api path /api/*
-    @admin path /admin*
-    @auth path /auth/*
+    @sub host *.$Domain
 
-    handle @api {
-        reverse_proxy $caddyUpstream {
-            header_up X-Profile-Id {labels.2}
+    handle @sub {
+        @api path /api/*
+        @admin path /admin*
+        @auth path /auth/*
+
+        handle @api {
+            reverse_proxy $caddyUpstream
         }
-    }
-    handle @admin {
-        reverse_proxy $caddyUpstream {
-            header_up X-Profile-Id {labels.2}
+        handle @admin {
+            reverse_proxy $caddyUpstream
         }
-    }
-    handle @auth {
-        reverse_proxy $caddyUpstream {
-            header_up X-Profile-Id {labels.2}
+        handle @auth {
+            reverse_proxy $caddyUpstream
         }
-    }
-    handle {
-        reverse_proxy $caddyUpstream
+        handle {
+            reverse_proxy $caddyUpstream
+        }
     }
 }
 "@ | Set-Content -Path $caddyfile -Encoding UTF8
@@ -1463,8 +1487,10 @@ if ($Tunnel) {
         Write-Host "    Check logs: Get-Content '$FrpcLog' -Tail 20"
     }
 
+    # `/api/status` was retired in M12 Phase D-5 — probe the public `/health`
+    # endpoint as a daemon liveness check instead.
     try {
-        $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/api/status" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/health" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
         Ok "octos serve is running on port ${Port}"
     } catch {
         Warn "octos serve is not responding on port ${Port} (tunnel will retry once it starts)"

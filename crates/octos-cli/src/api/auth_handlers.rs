@@ -375,6 +375,14 @@ pub struct MeResponse {
     pub user: User,
     pub profile: Option<ProfileResponse>,
     pub portal: PortalState,
+    /// If the request was made on a tenant subdomain (i.e.
+    /// `host_scoped_profile_id` resolves), this is the tenant's profile
+    /// summary. The dashboard uses this to hide admin-global navigation
+    /// when an admin is operating in a tenant scope (Option Y, #315).
+    /// `None` when no tenant subdomain is in scope (root domain, direct
+    /// IP, or localhost).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_profile: Option<ScopedAuthTarget>,
 }
 
 #[derive(Serialize)]
@@ -396,6 +404,25 @@ pub async fn send_code(
         .auth_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    // Server-state precheck: if SMTP isn't configured the OTP code path will
+    // silently log to the console (otp.rs::send_otp falls through to a debug
+    // log when smtp_config is None). Surface that to the caller as a clear,
+    // non-enumerating error — this branches on server state, not on whether
+    // any specific email is registered, so it can't be used for account
+    // enumeration. Operator fix is to configure SMTP via the wizard or
+    // directly via POST /api/admin/smtp.
+    if !auth_mgr.smtp_configured().await {
+        tracing::warn!(
+            email = %req.email,
+            "send_code rejected — dashboard_auth.smtp is not configured on this server",
+        );
+        return Ok(Json(SendCodeResponse {
+            ok: false,
+            message: Some(
+                "Email login is not available on this server because SMTP is not configured. Contact the administrator.".into(),
+            ),
+        }));
+    }
     let requested_email = req.email.trim().to_lowercase();
     let scoped_profile_id = trusted_auth_scope_profile_id(&state, &headers);
     let scoped_login_target = scoped_profile_id
@@ -404,7 +431,7 @@ pub async fn send_code(
     let root_login_target = if scoped_profile_id.is_none() {
         match resolve_root_login_target(&state, &requested_email) {
             Some(target) => Some(target),
-            None if auth_mgr.allow_self_registration => Some(RootLoginTarget::Allowlisted),
+            None if auth_mgr.allow_self_registration() => Some(RootLoginTarget::Allowlisted),
             None => None,
         }
     } else {
@@ -424,7 +451,7 @@ pub async fn send_code(
             }));
         }
     } else if root_login_target.is_none() {
-        if !auth_mgr.allow_self_registration {
+        if !auth_mgr.allow_self_registration() {
             tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
             return Ok(Json(SendCodeResponse {
                 ok: false,
@@ -521,10 +548,21 @@ pub async fn auth_status(
             })
         })
         .unwrap_or(false);
-    let email_login_enabled = scoped_profile
+    let user_based_enabled = scoped_profile
         .as_ref()
         .map(|profile| profile.email_login_enabled)
         .unwrap_or(global_email_login_enabled);
+    // Email login is only "enabled" if the server can actually deliver mail.
+    // Without SMTP, send_otp silently logs the code to the server console and
+    // returns success — leaving the dashboard happy to show the email form
+    // but the user never receiving anything. Surfacing the SMTP state here
+    // lets the dashboard hide the email form / display a clear notice.
+    // Server-state, not user-state, so no enumeration risk.
+    let smtp_ready = match state.auth_manager.as_ref() {
+        Some(mgr) => mgr.smtp_configured().await,
+        None => false,
+    };
+    let email_login_enabled = user_based_enabled && smtp_ready;
 
     Ok(Json(AuthStatusResponse {
         bootstrap_mode: is_bootstrap_mode(&state),
@@ -533,7 +571,7 @@ pub async fn auth_status(
         allow_self_registration: state
             .auth_manager
             .as_ref()
-            .map(|m| m.allow_self_registration)
+            .map(|m| m.allow_self_registration())
             .unwrap_or(false),
         scoped_profile,
     }))
@@ -569,7 +607,7 @@ pub async fn verify(
                 message: Some("Invalid or expired code".into()),
             }));
         }
-    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration {
+    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration() {
         return Ok(Json(VerifyResponse {
             ok: false,
             token: None,
@@ -594,7 +632,7 @@ pub async fn verify(
                     .verify_otp_with_registration(&requested_email, &req.code, true)
                     .await
             }
-            None if auth_mgr.allow_self_registration => {
+            None if auth_mgr.allow_self_registration() => {
                 auth_mgr
                     .verify_otp_with_registration(&requested_email, &req.code, true)
                     .await
@@ -700,8 +738,15 @@ pub async fn logout(
 /// GET /api/auth/me
 pub async fn me(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<MeResponse>, StatusCode> {
+    // Determine the active tenant scope (if any). The dashboard reads
+    // this to gate admin-global UI when an admin is operating on a
+    // tenant subdomain (Option Y, #315).
+    let scoped_profile = host_scoped_profile_id(&state, &headers)
+        .and_then(|profile_id| scoped_auth_target(&state, &profile_id));
+
     // Handle admin token first — bootstrap admin still needs a real persisted principal.
     if matches!(&identity, AuthIdentity::Admin) {
         let user = if let Some(ref user_store) = state.user_store {
@@ -746,6 +791,7 @@ pub async fn me(
             user,
             profile,
             portal,
+            scoped_profile,
         }));
     }
 
@@ -783,6 +829,7 @@ pub async fn me(
                     can_manage_sub_accounts: true,
                 }],
             },
+            scoped_profile,
         }));
     }
 
@@ -825,6 +872,7 @@ pub async fn me(
         user,
         profile,
         portal,
+        scoped_profile,
     }))
 }
 
@@ -833,6 +881,7 @@ pub async fn me(
 /// GET /api/my/profile
 pub async fn my_profile(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ProfileResponse>, StatusCode> {
     let ps = state
@@ -840,7 +889,7 @@ pub async fn my_profile(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let profile = resolve_my_profile(&identity, ps)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
 
     let status = if let Some(ref pm) = state.process_manager {
         pm.status(&profile.id).await
@@ -863,14 +912,15 @@ pub async fn my_profile(
 /// GET /api/my/profile/skills
 pub async fn my_profile_skills(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state.profile_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let profile_id =
-        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let profile_id = resolve_my_profile_id(&identity, store, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
     let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     let skills = crate::commands::skills::list_skills(&skills_dir)
@@ -888,6 +938,7 @@ pub struct MySkillRegistryQuery {
 /// GET /api/my/profile/skills/registry
 pub async fn my_profile_skill_registry(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Query(query): Query<MySkillRegistryQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -895,8 +946,8 @@ pub async fn my_profile_skill_registry(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let profile_id =
-        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let profile_id = resolve_my_profile_id(&identity, store, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
     // Validate this profile has a resolvable skills scope.
     crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
@@ -915,6 +966,7 @@ pub async fn my_profile_skill_registry(
 /// POST /api/my/profile/skills
 pub async fn install_my_profile_skill(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(req): Json<super::admin::InstallSkillRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -922,8 +974,8 @@ pub async fn install_my_profile_skill(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let profile_id =
-        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let profile_id = resolve_my_profile_id(&identity, store, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
     let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
@@ -945,6 +997,7 @@ pub async fn install_my_profile_skill(
 /// DELETE /api/my/profile/skills/:name
 pub async fn remove_my_profile_skill(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(name): Path<String>,
 ) -> Result<Json<super::admin::ActionResponse>, (StatusCode, String)> {
@@ -952,8 +1005,8 @@ pub async fn remove_my_profile_skill(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let profile_id =
-        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let profile_id = resolve_my_profile_id(&identity, store, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
     let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
@@ -969,6 +1022,7 @@ pub async fn remove_my_profile_skill(
 /// PUT /api/my/profile
 pub async fn update_my_profile(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     body: String,
 ) -> Result<Json<ProfileResponse>, (StatusCode, String)> {
@@ -984,8 +1038,8 @@ pub async fn update_my_profile(
         "admin not configured".into(),
     ))?;
 
-    let mut profile =
-        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+    let mut profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
 
     // Apply updates (same logic as admin::update_profile but scoped)
     if let Some(name) = req.name {
@@ -1050,13 +1104,14 @@ pub struct SoulResponse {
 /// GET /api/my/soul
 pub async fn my_soul(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<SoulResponse>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile = resolve_my_profile(&identity, ps)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
     let data_dir = ps.resolve_data_dir(&profile);
     let content = crate::soul_service::read_soul(&data_dir);
     Ok(Json(SoulResponse {
@@ -1074,6 +1129,7 @@ pub struct UpdateSoulRequest {
 /// PUT /api/my/soul
 pub async fn update_my_soul(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(req): Json<UpdateSoulRequest>,
 ) -> Result<Json<SoulResponse>, (StatusCode, String)> {
@@ -1084,7 +1140,8 @@ pub async fn update_my_soul(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let profile = resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
     let data_dir = ps.resolve_data_dir(&profile);
     crate::soul_service::write_soul(&data_dir, &req.content)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1099,13 +1156,14 @@ pub async fn update_my_soul(
 /// DELETE /api/my/soul
 pub async fn delete_my_soul(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<SoulResponse>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile = resolve_my_profile(&identity, ps)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
     let data_dir = ps.resolve_data_dir(&profile);
     crate::soul_service::remove_soul(&data_dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     tracing::info!(profile = %profile.id, "soul reset via API");
@@ -1118,8 +1176,14 @@ pub async fn delete_my_soul(
 
 // ── Content catalog endpoints ────────────────────────────────────────
 
-/// GET /api/my/content
-pub async fn my_content(
+// Helper for `ui_protocol::handle_content_list` (M12 Phase D-5).
+// The REST route `GET /api/my/content` was retired in this milestone; the
+// function survives as a private helper that the WS dispatcher calls
+// directly to back the `content/list` RPC method. Downgraded to
+// `pub(super)` so the public API surface no longer exposes a fn whose
+// route was removed.
+/// Helper backing the WS `content/list` RPC method (formerly `GET /api/my/content`).
+pub(super) async fn my_content(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
@@ -1133,8 +1197,25 @@ pub async fn my_content(
         StatusCode::SERVICE_UNAVAILABLE,
         "content catalog not configured".into(),
     ))?;
-    // Use X-Profile-Id header (from Caddy proxy) if available, otherwise resolve from identity
+    // Use X-Profile-Id header (from Caddy proxy) if available, otherwise resolve from identity.
+    //
+    // Codex P1 fix (PR #958 review): authorize the X-Profile-Id branch the
+    // same way the host-scoped path does. Without `is_authorized_for_profile`
+    // a bearer-authenticated user could pass any tenant id and read its
+    // catalog, since the bearer auth completes before the middleware's
+    // loopback-only X-Profile-Id check runs. The new check matches the
+    // semantics enforced by `resolve_my_profile_id`'s host-scoped branch:
+    // admin can target any tenant, users can target their own profile or
+    // sub-accounts they own. Cross-tenant access returns 403.
     let profile = if let Some(pid) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
+        if !is_authorized_for_profile(&state, &identity, pid) {
+            tracing::warn!(
+                identity = ?identity,
+                requested_profile = %pid,
+                "GET /api/my/content X-Profile-Id denied — identity not authorized for the profile"
+            );
+            return Err((StatusCode::FORBIDDEN, "forbidden".into()));
+        }
         ps.get(pid)
             .map_err(|_| {
                 (
@@ -1144,7 +1225,8 @@ pub async fn my_content(
             })?
             .ok_or((StatusCode::NOT_FOUND, format!("profile '{pid}' not found")))?
     } else {
-        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?
+        resolve_my_profile(&identity, ps, &state, &headers)
+            .map_err(|s| (s, "profile not found".into()))?
     };
     let data_dir = ps.resolve_data_dir(&profile);
 
@@ -1177,6 +1259,7 @@ pub async fn my_content(
 /// GET /api/my/content/:id/thumbnail
 pub async fn my_content_thumbnail(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, StatusCode> {
@@ -1192,7 +1275,7 @@ pub async fn my_content_thumbnail(
         .content_catalog_mgr
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile = resolve_my_profile(&identity, ps)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
 
     let catalog = mgr
         .get_catalog(&profile.id)
@@ -1212,6 +1295,7 @@ pub async fn my_content_thumbnail(
 /// GET /api/my/content/:id/body
 pub async fn my_content_body(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, StatusCode> {
@@ -1227,7 +1311,7 @@ pub async fn my_content_body(
         .content_catalog_mgr
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile = resolve_my_profile(&identity, ps)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
 
     let catalog = mgr
         .get_catalog(&profile.id)
@@ -1259,9 +1343,14 @@ pub async fn my_content_body(
     Ok(([(header::CONTENT_TYPE, content_type)], Body::from(data)).into_response())
 }
 
-/// DELETE /api/my/content/:id
-pub async fn delete_my_content(
+// Helper for `ui_protocol::handle_content_delete` (M12 Phase D-5).
+// The REST route `DELETE /api/my/content/{id}` was retired in this
+// milestone; the function survives as a private helper backing the
+// `content/delete` WS RPC method.
+/// Helper backing the WS `content/delete` RPC method (formerly `DELETE /api/my/content/{id}`).
+pub(super) async fn delete_my_content(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
@@ -1273,7 +1362,8 @@ pub async fn delete_my_content(
         StatusCode::SERVICE_UNAVAILABLE,
         "content catalog not configured".into(),
     ))?;
-    let profile = resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
 
     let catalog = mgr
         .get_catalog(&profile.id)
@@ -1295,13 +1385,18 @@ pub async fn delete_my_content(
 }
 
 #[derive(Deserialize)]
-pub struct BulkDeleteRequest {
+pub(super) struct BulkDeleteRequest {
     pub ids: Vec<String>,
 }
 
-/// POST /api/my/content/bulk-delete
-pub async fn bulk_delete_my_content(
+// Helper for `ui_protocol::handle_content_bulk_delete` (M12 Phase D-5).
+// The REST route `POST /api/my/content/bulk-delete` was retired in this
+// milestone; the function survives as a private helper backing the
+// `content/bulk_delete` WS RPC method.
+/// Helper backing the WS `content/bulk_delete` RPC method (formerly `POST /api/my/content/bulk-delete`).
+pub(super) async fn bulk_delete_my_content(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(req): Json<BulkDeleteRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
@@ -1313,7 +1408,8 @@ pub async fn bulk_delete_my_content(
         StatusCode::SERVICE_UNAVAILABLE,
         "content catalog not configured".into(),
     ))?;
-    let profile = resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|s| (s, "profile not found".into()))?;
 
     let catalog = mgr
         .get_catalog(&profile.id)
@@ -1333,6 +1429,7 @@ pub async fn bulk_delete_my_content(
 /// POST /api/my/profile/start
 pub async fn start_my_gateway(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
     let ps = state
@@ -1344,7 +1441,7 @@ pub async fn start_my_gateway(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let profile = resolve_my_profile(&identity, ps)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
 
     // Validate LLM provider is configured
     if profile.config.primary_provider().is_none() && profile.config.primary_model().is_none() {
@@ -1375,13 +1472,14 @@ pub async fn start_my_gateway(
 /// POST /api/my/profile/stop
 pub async fn stop_my_gateway(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_my_profile_id(&identity, ps)?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
     let pm = state
         .process_manager
         .as_ref()
@@ -1406,6 +1504,7 @@ pub async fn stop_my_gateway(
 /// POST /api/my/profile/restart
 pub async fn restart_my_gateway(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
     let ps = state
@@ -1417,7 +1516,7 @@ pub async fn restart_my_gateway(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let profile = resolve_my_profile(&identity, ps)?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
 
     match pm.restart(&profile).await {
         Ok(()) => {
@@ -1440,13 +1539,14 @@ pub async fn restart_my_gateway(
 /// GET /api/my/profile/status
 pub async fn my_gateway_status(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<crate::process_manager::ProcessStatus>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_my_profile_id(&identity, ps)?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
     let pm = state
         .process_manager
         .as_ref()
@@ -1457,13 +1557,14 @@ pub async fn my_gateway_status(
 /// GET /api/my/profile/logs
 pub async fn my_gateway_logs(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_my_profile_id(&identity, ps)?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
     let pm = state
         .process_manager
         .as_ref()
@@ -1501,13 +1602,14 @@ pub async fn my_gateway_logs(
 /// GET /api/my/profile/whatsapp/qr
 pub async fn my_whatsapp_qr(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<crate::process_manager::BridgeQrInfo>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_my_profile_id(&identity, ps)?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
     let pm = state
         .process_manager
         .as_ref()
@@ -1522,13 +1624,14 @@ pub async fn my_whatsapp_qr(
 /// GET /api/my/profile/metrics
 pub async fn my_provider_metrics(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_my_profile_id(&identity, ps)?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
     let pm = state
         .process_manager
         .as_ref()
@@ -1543,13 +1646,14 @@ pub async fn my_provider_metrics(
 /// GET /api/my/profile/accounts — List sub-accounts for the current user's profile.
 pub async fn my_sub_accounts(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<Vec<crate::api::admin::ProfileResponse>>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_my_profile_id(&identity, ps)?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
     let pm = state
         .process_manager
         .as_ref()
@@ -1574,8 +1678,10 @@ pub async fn my_sub_accounts(
 fn resolve_my_managed_parent_profile(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
+    state: &AppState,
+    headers: &HeaderMap,
 ) -> Result<crate::profiles::UserProfile, StatusCode> {
-    let profile = resolve_my_profile(identity, ps)?;
+    let profile = resolve_my_profile(identity, ps, state, headers)?;
     if profile.parent_id.is_some() {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -1585,6 +1691,7 @@ fn resolve_my_managed_parent_profile(
 /// GET /api/my/profile/accounts/:id — Return a sub-account managed by the current user.
 pub async fn my_sub_account(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(sub_id): Path<String>,
 ) -> Result<Json<crate::api::admin::ProfileResponse>, StatusCode> {
@@ -1597,7 +1704,7 @@ pub async fn my_sub_account(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let sub = resolve_my_sub_account(&identity, ps, &sub_id)?;
+    let sub = resolve_my_sub_account(&identity, ps, &state, &headers, &sub_id)?;
     let status = pm.status(&sub.id).await;
     Ok(Json(crate::api::admin::ProfileResponse {
         email: None,
@@ -1609,6 +1716,7 @@ pub async fn my_sub_account(
 /// POST /api/my/profile/accounts — Create a sub-account owned by the current user.
 pub async fn create_my_sub_account(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(req): Json<crate::api::admin::CreateSubAccountRequest>,
 ) -> Result<(StatusCode, Json<crate::api::admin::ProfileResponse>), (StatusCode, String)> {
@@ -1621,7 +1729,7 @@ pub async fn create_my_sub_account(
         "admin not configured".into(),
     ))?;
 
-    let parent = resolve_my_managed_parent_profile(&identity, ps)
+    let parent = resolve_my_managed_parent_profile(&identity, ps, &state, &headers)
         .map_err(|status| (status, "sub-accounts cannot create sub-accounts".into()))?;
 
     if !req.channels.is_empty() {
@@ -1687,6 +1795,7 @@ pub async fn create_my_sub_account(
 /// PUT /api/my/profile/accounts/:id — Update a managed sub-account.
 pub async fn update_my_sub_account(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(sub_id): Path<String>,
     body: String,
@@ -1707,9 +1816,9 @@ pub async fn update_my_sub_account(
         "admin not configured".into(),
     ))?;
 
-    let _parent = resolve_my_managed_parent_profile(&identity, ps)
+    let _parent = resolve_my_managed_parent_profile(&identity, ps, &state, &headers)
         .map_err(|status| (status, "sub-accounts cannot manage sub-accounts".into()))?;
-    let mut sub = resolve_my_sub_account(&identity, ps, &sub_id)
+    let mut sub = resolve_my_sub_account(&identity, ps, &state, &headers, &sub_id)
         .map_err(|status| (status, "sub-account not found".into()))?;
 
     if let Some(name) = req.name {
@@ -1788,9 +1897,11 @@ pub async fn update_my_sub_account(
 fn resolve_my_sub_account(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
+    state: &AppState,
+    headers: &HeaderMap,
     sub_id: &str,
 ) -> Result<crate::profiles::UserProfile, StatusCode> {
-    let parent_id = resolve_my_profile_id(identity, ps)?;
+    let parent_id = resolve_my_profile_id(identity, ps, state, headers)?;
     let sub = ps
         .get(sub_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -1805,6 +1916,7 @@ fn resolve_my_sub_account(
 /// POST /api/my/profile/accounts/:id/start — Start a sub-account gateway.
 pub async fn start_my_sub_gateway(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(sub_id): Path<String>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
@@ -1817,7 +1929,7 @@ pub async fn start_my_sub_gateway(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let sub = resolve_my_sub_account(&identity, ps, &sub_id)?;
+    let sub = resolve_my_sub_account(&identity, ps, &state, &headers, &sub_id)?;
 
     match pm.start(&sub).await {
         Ok(()) => Ok(Json(ActionResponse {
@@ -1834,6 +1946,7 @@ pub async fn start_my_sub_gateway(
 /// POST /api/my/profile/accounts/:id/stop — Stop a sub-account gateway.
 pub async fn stop_my_sub_gateway(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(sub_id): Path<String>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
@@ -1846,7 +1959,7 @@ pub async fn stop_my_sub_gateway(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let _ = resolve_my_sub_account(&identity, ps, &sub_id)?;
+    let _ = resolve_my_sub_account(&identity, ps, &state, &headers, &sub_id)?;
 
     match pm.stop(&sub_id).await {
         Ok(_) => Ok(Json(ActionResponse {
@@ -1862,13 +1975,79 @@ pub async fn stop_my_sub_gateway(
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
+/// Return `true` iff the authenticated identity is allowed to act as the
+/// given profile id for `/api/my/*` endpoints.
+///
+/// Authorization rules:
+/// - Admin token can act as any profile.
+/// - A user session with `UserRole::Admin` can act as any profile
+///   (matches the rest of the router which treats admin email sessions
+///   as full admins for `/api/admin/*`). Without this carve-out, an
+///   admin who logs in via OTP would 403 on tenant subdomains while
+///   the bootstrap admin token would not — codex P2 (PR #958 review).
+/// - A user can act as their own profile.
+/// - A user (top-level account) can also act as any sub-account they own.
+/// - Everyone else is denied (returns `false`).
+pub(crate) fn is_authorized_for_profile(
+    state: &AppState,
+    identity: &AuthIdentity,
+    profile_id: &str,
+) -> bool {
+    match identity {
+        AuthIdentity::Admin => true,
+        AuthIdentity::User {
+            role: UserRole::Admin,
+            ..
+        } => true,
+        AuthIdentity::User { id, .. } => {
+            if id == profile_id {
+                return true;
+            }
+            // Allow a top-level user to act as any of their sub-accounts.
+            let Some(store) = state.profile_store.as_ref() else {
+                return false;
+            };
+            match store.get(profile_id) {
+                Ok(Some(profile)) => profile.parent_id.as_deref() == Some(id.as_str()),
+                _ => false,
+            }
+        }
+    }
+}
+
 /// Resolve the profile ID for "my" endpoints.
+///
+/// Server-side host-authoritative scoping (Option Y, closes #315):
+/// 1. If the request `Host` / `X-Forwarded-Host` header resolves to a
+///    tenant profile via `host_scoped_profile_id`, return that profile id
+///    — but only after verifying the authenticated identity is allowed
+///    to view it. If the identity is NOT authorized, return 403 rather
+///    than silently falling through to the identity's default profile,
+///    which would be both confusing and a cross-tenant data leak.
+/// 2. Otherwise (no tenant subdomain, unknown host, or local request),
+///    fall back to the identity-based default: admin token returns the
+///    fixed admin profile id, user sessions return the user's own id.
+///
 /// For regular users, returns their user ID. For admin token, returns the admin's own profile ID
 /// (auto-creating the admin profile if it doesn't exist yet).
 fn resolve_my_profile_id(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
+    state: &AppState,
+    headers: &HeaderMap,
 ) -> Result<String, StatusCode> {
+    if let Some(scoped) = host_scoped_profile_id(state, headers) {
+        if !is_authorized_for_profile(state, identity, &scoped) {
+            tracing::warn!(
+                identity = ?identity,
+                scoped_profile = %scoped,
+                "/api/my/* host-scope denied — identity not authorized for the tenant subdomain"
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+        return Ok(scoped);
+    }
+
     match identity {
         AuthIdentity::Admin => {
             ensure_admin_profile(ps)?;
@@ -1882,8 +2061,10 @@ fn resolve_my_profile_id(
 fn resolve_my_profile(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
+    state: &AppState,
+    headers: &HeaderMap,
 ) -> Result<crate::profiles::UserProfile, StatusCode> {
-    let id = resolve_my_profile_id(identity, ps)?;
+    let id = resolve_my_profile_id(identity, ps, state, headers)?;
     ps.get(&id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)
@@ -2174,6 +2355,26 @@ mod tests {
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
         let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
         let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
+        // Tests that exercise per-email send_code/verify branches expect the
+        // SMTP precheck to pass; populate a synthetic config so the common
+        // fixture stays past the early "SMTP not configured" return. Tests
+        // that specifically check the no-SMTP behavior can clear this with
+        // set_smtp_config(None).
+        let auth_manager = Arc::new(AuthManager::new(
+            Some(crate::otp::DashboardAuthConfig {
+                smtp: Some(crate::otp::SmtpConfig {
+                    host: "smtp.test.invalid".into(),
+                    port: 465,
+                    username: "test@test.invalid".into(),
+                    password_env: "SMTP_PASSWORD".into(),
+                    from_address: "test@test.invalid".into(),
+                }),
+                session_expiry_hours: 24,
+                allow_self_registration: false,
+                static_tokens: Vec::new(),
+            }),
+            user_store.clone(),
+        ));
         let state = AppState {
             auth_token: Some("bootstrap-token".into()),
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
@@ -2182,7 +2383,7 @@ mod tests {
             profile_store: Some(profile_store.clone()),
             user_store: Some(user_store.clone()),
             allowlist_store: Some(allowlist_store),
-            auth_manager: Some(Arc::new(AuthManager::new(None, user_store.clone()))),
+            auth_manager: Some(auth_manager),
             ..AppState::empty_for_tests()
         };
         (dir, state, user_store, profile_store)
@@ -2203,12 +2404,15 @@ mod tests {
 
     #[test]
     fn should_return_admin_id_when_admin_identity() {
-        let (_dir, ps) = temp_profile_store();
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
         // Create a user profile that would have been returned by the old "first" logic
-        ps.save(&make_user_profile("guofoo", "Guo Foo")).unwrap();
+        profile_store
+            .save(&make_user_profile("guofoo", "Guo Foo"))
+            .unwrap();
 
         let identity = AuthIdentity::Admin;
-        let result = resolve_my_profile_id(&identity, &ps).unwrap();
+        let result =
+            resolve_my_profile_id(&identity, &profile_store, &state, &HeaderMap::new()).unwrap();
         assert_eq!(
             result, ADMIN_PROFILE_ID,
             "admin should get its own profile ID, not the first user's"
@@ -2217,14 +2421,17 @@ mod tests {
 
     #[test]
     fn should_return_user_id_when_user_identity() {
-        let (_dir, ps) = temp_profile_store();
-        ps.save(&make_user_profile("user123", "Test User")).unwrap();
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("user123", "Test User"))
+            .unwrap();
 
         let identity = AuthIdentity::User {
             id: "user123".into(),
             role: UserRole::User,
         };
-        let result = resolve_my_profile_id(&identity, &ps).unwrap();
+        let result =
+            resolve_my_profile_id(&identity, &profile_store, &state, &HeaderMap::new()).unwrap();
         assert_eq!(result, "user123");
     }
 
@@ -2262,16 +2469,249 @@ mod tests {
 
     #[test]
     fn should_resolve_admin_profile_not_first_user() {
-        let (_dir, ps) = temp_profile_store();
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
         // Create user profile first — old code would return this
-        ps.save(&make_user_profile("alice", "Alice")).unwrap();
+        profile_store
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
         // Ensure admin profile exists
-        ensure_admin_profile(&ps).unwrap();
+        ensure_admin_profile(&profile_store).unwrap();
 
         let identity = AuthIdentity::Admin;
-        let profile = resolve_my_profile(&identity, &ps).unwrap();
+        let profile =
+            resolve_my_profile(&identity, &profile_store, &state, &HeaderMap::new()).unwrap();
         assert_eq!(profile.id, ADMIN_PROFILE_ID);
         assert_eq!(profile.name, "Admin");
+    }
+
+    // ── Option Y host-authoritative scoping (issue #315) ──────────────
+
+    #[test]
+    fn host_scope_admin_falls_through_when_host_unknown() {
+        // Admin viewing /api/my/* via an unmapped host (e.g. direct IP or
+        // root domain) MUST still get the admin profile back. Without this
+        // admin loses access to their own profile entirely.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        // No profiles besides what `ensure_admin_profile` will auto-create.
+        let identity = AuthIdentity::Admin;
+        // "localhost" is the canonical "no tenant subdomain" host.
+        let result = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("localhost"),
+        )
+        .unwrap();
+        assert_eq!(
+            result, ADMIN_PROFILE_ID,
+            "admin must keep its own profile when no tenant subdomain is in scope"
+        );
+    }
+
+    #[test]
+    fn host_scope_admin_resolves_to_tenant_when_host_matches() {
+        // Admin visiting a tenant subdomain MUST be re-scoped to that
+        // tenant's profile. Closes the original #315 bug where admin
+        // unconditionally saw the global admin profile from any host.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+
+        let identity = AuthIdentity::Admin;
+        let result = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("tenant.example.test"),
+        )
+        .unwrap();
+        assert_eq!(result, "tenant");
+    }
+
+    #[test]
+    fn host_scope_sub_account_on_own_tenant_subdomain() {
+        // A user (logged in as their tenant profile via scoped OTP) visits
+        // their own tenant subdomain. Host check should resolve to that
+        // tenant id — which IS the user's id, so authorization passes.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut tenant = make_user_profile("dspfac", "DSPFac");
+        tenant.public_subdomain = Some("dspfac".into());
+        profile_store.save(&tenant).unwrap();
+
+        let identity = AuthIdentity::User {
+            id: "dspfac".into(),
+            role: UserRole::User,
+        };
+        let result = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("dspfac.example.test"),
+        )
+        .unwrap();
+        assert_eq!(result, "dspfac");
+    }
+
+    #[test]
+    fn host_scope_cross_tenant_user_access_denied() {
+        // A user logged in under tenant A visits tenant B's subdomain.
+        // Server MUST refuse with 403 rather than silently falling
+        // through to tenant A's profile (which would be confusing) or,
+        // worse, granting access to tenant B's data.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant-a", "Tenant A"))
+            .unwrap();
+        let mut tenant_b = make_user_profile("tenant-b", "Tenant B");
+        tenant_b.public_subdomain = Some("tenantb".into());
+        profile_store.save(&tenant_b).unwrap();
+
+        let identity = AuthIdentity::User {
+            id: "tenant-a".into(),
+            role: UserRole::User,
+        };
+        let err = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("tenantb.example.test"),
+        )
+        .expect_err("cross-tenant access must be rejected");
+        assert_eq!(err, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn host_scope_admin_can_access_any_tenant() {
+        // The cross-tenant rule applies to user identities only.
+        // Admin must still be allowed to view any tenant's profile via
+        // host-scoped routing.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut tenant_b = make_user_profile("tenant-b", "Tenant B");
+        tenant_b.public_subdomain = Some("tenantb".into());
+        profile_store.save(&tenant_b).unwrap();
+
+        let identity = AuthIdentity::Admin;
+        let result = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("tenantb.example.test"),
+        )
+        .unwrap();
+        assert_eq!(result, "tenant-b");
+    }
+
+    #[test]
+    fn host_scope_admin_role_user_can_access_any_tenant() {
+        // Codex P2 (PR #958 review): an admin email-session
+        // (UserRole::Admin) must have the same cross-tenant scope as a
+        // bootstrap admin token. Otherwise an admin who logs in via OTP
+        // would 403 on tenant subdomains while the bootstrap token
+        // would not — inconsistent and breaks the day-to-day admin
+        // workflow.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut tenant_b = make_user_profile("tenant-b", "Tenant B");
+        tenant_b.public_subdomain = Some("tenantb".into());
+        profile_store.save(&tenant_b).unwrap();
+
+        let identity = AuthIdentity::User {
+            id: "admin-user".into(),
+            role: UserRole::Admin,
+        };
+        let result = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("tenantb.example.test"),
+        )
+        .unwrap();
+        assert_eq!(result, "tenant-b");
+    }
+
+    #[test]
+    fn is_authorized_for_profile_table() {
+        // The shared auth helper is consumed by both the host-scoped
+        // path AND the X-Profile-Id branch in `my_content` (codex P1
+        // fix). Lock the truth-table down with a focused unit test.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--child", "Child");
+        child.parent_id = Some("tenant".into());
+        profile_store.save(&child).unwrap();
+        profile_store
+            .save(&make_user_profile("other", "Other"))
+            .unwrap();
+
+        // Admin token: yes to everything.
+        assert!(is_authorized_for_profile(
+            &state,
+            &AuthIdentity::Admin,
+            "tenant"
+        ));
+        assert!(is_authorized_for_profile(
+            &state,
+            &AuthIdentity::Admin,
+            "other"
+        ));
+
+        // Admin role (OTP-authenticated admin user): yes to everything.
+        let admin_user = AuthIdentity::User {
+            id: "any-admin".into(),
+            role: UserRole::Admin,
+        };
+        assert!(is_authorized_for_profile(&state, &admin_user, "tenant"));
+        assert!(is_authorized_for_profile(&state, &admin_user, "other"));
+
+        // Regular user: own profile yes.
+        let tenant_user = AuthIdentity::User {
+            id: "tenant".into(),
+            role: UserRole::User,
+        };
+        assert!(is_authorized_for_profile(&state, &tenant_user, "tenant"));
+        // Sub-account they own: yes.
+        assert!(is_authorized_for_profile(
+            &state,
+            &tenant_user,
+            "tenant--child"
+        ));
+        // A different tenant: no.
+        assert!(!is_authorized_for_profile(&state, &tenant_user, "other"));
+        // A non-existent profile: no.
+        assert!(!is_authorized_for_profile(&state, &tenant_user, "ghost"));
+    }
+
+    #[test]
+    fn host_scope_parent_user_authorized_for_own_sub_account() {
+        // A top-level user owns a sub-account; that sub-account has a
+        // public subdomain. Parent visits the sub-account's subdomain
+        // (e.g. via "Switch profile" / sub-account UI) → host check
+        // resolves to the sub-account id; the parent IS authorized
+        // because they own the sub. Verifies `is_authorized_for_profile`
+        // walks the parent_id relationship.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        profile_store.save(&child).unwrap();
+
+        let identity = AuthIdentity::User {
+            id: "tenant".into(),
+            role: UserRole::User,
+        };
+        let result = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("assistant.example.test"),
+        )
+        .unwrap();
+        assert_eq!(result, "tenant--assistant");
     }
 
     #[test]
@@ -2328,6 +2768,7 @@ mod tests {
 
         let Json(resp) = update_my_profile(
             State(Arc::new(state)),
+            HeaderMap::new(),
             axum::Extension(AuthIdentity::User {
                 id: "tenant".into(),
                 role: UserRole::User,
@@ -2359,6 +2800,7 @@ mod tests {
 
         let err = update_my_profile(
             State(Arc::new(state)),
+            HeaderMap::new(),
             axum::Extension(AuthIdentity::User {
                 id: "tenant--assistant".into(),
                 role: UserRole::User,
@@ -2397,6 +2839,7 @@ mod tests {
 
         let Json(resp) = my_profile_skills(
             State(Arc::new(state)),
+            HeaderMap::new(),
             axum::Extension(AuthIdentity::User {
                 id: "alice".into(),
                 role: UserRole::User,
@@ -2429,6 +2872,7 @@ mod tests {
 
         let Json(resp) = install_my_profile_skill(
             State(Arc::new(state)),
+            HeaderMap::new(),
             axum::Extension(AuthIdentity::User {
                 id: "alice".into(),
                 role: UserRole::User,
@@ -2638,6 +3082,112 @@ mod tests {
         assert_eq!(user.id, "tenant--assistant");
     }
 
+    #[tokio::test]
+    async fn send_code_returns_clear_error_when_smtp_unconfigured() {
+        // Without SMTP, otp.rs::send_otp silently logs the OTP to the
+        // server console and returns Ok(true). The handler used to forward
+        // that as "Verification code sent to your email", leaving the user
+        // staring at an empty inbox with no error indication. The precheck
+        // now surfaces a clear server-state message — this is the
+        // regression test that locks it in.
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        // Clear the synthetic SMTP that temp_app_state installs so the
+        // precheck fires.
+        state
+            .auth_manager
+            .as_ref()
+            .unwrap()
+            .set_smtp_config(None)
+            .await;
+
+        let resp = send_code(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "anyone@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !resp.0.ok,
+            "send_code must surface failure when SMTP is unconfigured (was masked by anti-enumeration always-success)"
+        );
+        let msg = resp.0.message.expect("message should be set");
+        assert!(
+            msg.contains("SMTP is not configured"),
+            "message should explain the server-state issue, not a per-email issue: {msg}"
+        );
+        assert!(
+            msg.contains("administrator"),
+            "message should direct the user to contact admin: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_status_email_login_disabled_when_smtp_unconfigured() {
+        // /api/auth/status drives the dashboard's login-form rendering.
+        // Reporting email_login_enabled=true while SMTP is missing leaves
+        // the dashboard happy to show the email form for a login attempt
+        // that can never succeed. With this change the flag honestly
+        // reflects whether mail can actually be delivered.
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        // Add a top-level user so the user-based half of the AND would
+        // otherwise be true.
+        user_store
+            .save(&User {
+                id: "alice".into(),
+                email: "alice@example.com".into(),
+                name: "Alice".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+        profile_store
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+
+        // First: SMTP configured (the temp_app_state default) → enabled.
+        let Json(status_with_smtp) = auth_status(State(Arc::new(state)), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(
+            status_with_smtp.email_login_enabled,
+            "with SMTP configured + a login-ready user, email login should be enabled"
+        );
+
+        // Second: clear SMTP → disabled even though the user still exists.
+        let (_dir2, state2, user_store2, profile_store2) = temp_app_state();
+        state2
+            .auth_manager
+            .as_ref()
+            .unwrap()
+            .set_smtp_config(None)
+            .await;
+        user_store2
+            .save(&User {
+                id: "alice".into(),
+                email: "alice@example.com".into(),
+                name: "Alice".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+        profile_store2
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+        let Json(status_without_smtp) = auth_status(State(Arc::new(state2)), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(
+            !status_without_smtp.email_login_enabled,
+            "without SMTP, email login must be disabled regardless of user state"
+        );
+    }
+
     #[test]
     fn send_code_request_deserialize() {
         let json = r#"{"email": "test@example.com"}"#;
@@ -2771,6 +3321,7 @@ mod tests {
 /// GET /api/my/profile/wechat/qr-start
 pub async fn my_wechat_qr_start(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Check if ProcessManager has a bridge with QR info
@@ -2779,8 +3330,9 @@ pub async fn my_wechat_qr_start(
             .profile_store
             .as_ref()
             .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
-        let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps)
-            .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
+        let profile_id =
+            super::auth_handlers::resolve_my_profile_id(&identity, ps, &state, &headers)
+                .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
         let key = format!("{}-wechat", profile_id);
         if let Some(info) = pm.bridge_qr(&key).await {
             if let Some(ref qr_url) = info.qr {
@@ -2821,6 +3373,7 @@ pub async fn my_wechat_qr_start(
 /// POST /api/my/profile/wechat/qr-poll
 pub async fn my_wechat_qr_poll(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -2828,7 +3381,7 @@ pub async fn my_wechat_qr_poll(
         .profile_store
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
-    let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps)
+    let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps, &state, &headers)
         .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
 
     let session_key = req["session_key"].as_str().unwrap_or_default();

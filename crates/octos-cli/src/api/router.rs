@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -94,16 +94,44 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Chat + status API (existing)
     //
-    // M9-α-5/α-6 (ADR PR #830 / audit issue #845): the chat SSE
-    // transport (`POST /api/chat?stream=true`, `GET /api/chat/stream`,
-    // `GET /api/sessions/:id/events/stream`) has been deleted. The
-    // sole chat transport is `/api/ui-protocol/ws`. The legacy text-
-    // frame `/api/ws` and the harness/admin `/api/events/harness` SSE
-    // endpoint are unrelated to chat and remain.
+    // Transport history:
+    // - M9-α-5/α-6 (ADR PR #830 / audit issue #845): the chat SSE
+    //   transport (`POST /api/chat?stream=true`, `GET /api/chat/stream`,
+    //   `GET /api/sessions/:id/events/stream`) was deleted.
+    // - Cleanup PR #908: the legacy text-frame `/api/ws` was retired
+    //   (no live clients and it never carried the UI Protocol v1 wire
+    //   format).
+    // - Cleanup follow-up to #908: the surviving sync REST endpoint
+    //   `POST /api/chat` was retired once the last callers
+    //   (coding_multi_session integration test, three e2e specs,
+    //   validate-m4-1a-live.sh) migrated to the canonical WS path.
+    //
+    // The sole chat transport is `/api/ui-protocol/ws`. The
+    // harness/admin `/api/events/harness` SSE endpoint is unrelated to
+    // chat and remains.
+    //
+    // M12 Phase D-5 (ADR PR #910 / audit PR #911): the auxiliary
+    // session/status REST surface has been retired and replaced by the
+    // WS UI Protocol v1 RPC methods on `/api/ui-protocol/ws`:
+    //
+    //   GET    /api/sessions                          → session/list
+    //   GET    /api/sessions/{id}/messages            → session/messages_page
+    //   GET    /api/sessions/{id}/status              → session/status.get
+    //   GET    /api/sessions/{id}/files               → session/files.list
+    //   GET    /api/sessions/{id}/tasks               → session/tasks.list
+    //   GET    /api/sessions/{id}/workspace-contract  → session/workspace.get
+    //   PATCH  /api/sessions/{id}/title               → session/title.set
+    //   DELETE /api/sessions/{id}                     → session/delete
+    //   GET    /api/status                            → system/status.get
+    //
+    // The handler functions are retained as private helpers because the
+    // WS dispatcher in `ui_protocol.rs` still reuses them to back the
+    // RPC methods above; only the REST route registrations are dropped.
+    // Auth (`/api/auth/*`), blob (`/api/files/*`), task-control
+    // (`/api/tasks/*`), chat ingress (`/api/ui-protocol/ws`), uploads,
+    // and site-preview remain REST per the ADR.
     let chat_api = Router::new()
-        .route("/api/chat", post(handlers::chat))
         .route("/api/events/harness", get(events_harness::events_harness))
-        .route("/api/ws", get(handlers::ws_handler))
         .route("/api/ui-protocol/ws", get(ui_protocol::ws_handler))
         .route(
             "/api/upload",
@@ -125,36 +153,35 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/site-preview/{session_id}/{site_slug}/{*path}",
             get(handlers::serve_site_preview_path),
         )
+        // Issue #994 (P0 sev2 cross-tenant data read): these routes
+        // used to live on the unauthenticated `public` branch below
+        // and resolved profile + session purely from the URL tuple.
+        // They now require user auth and the handler asserts that
+        // the authenticated identity owns the route's `profile_id`
+        // AND the route's `session_id` resolves to a workspace under
+        // that profile's data directory — see
+        // [`handlers::serve_owned_site_preview_root`].
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}",
+            get(handlers::serve_owned_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/",
+            get(handlers::serve_owned_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}",
+            get(handlers::serve_owned_site_preview_path),
+        )
         .route("/api/files/list", get(handlers::list_content_files))
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
-        .route("/api/sessions", get(handlers::list_sessions))
-        .route(
-            "/api/sessions/{id}/messages",
-            get(handlers::session_messages),
-        )
-        // `/api/sessions/{id}/events/stream` (SSE) was deleted in
-        // M9-α-5/α-6 — every session-event subscriber now consumes the
-        // `session/event.v1` notification on `/api/ui-protocol/ws`.
-        .route("/api/sessions/{id}/status", get(handlers::session_status))
-        .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
-        .route("/api/sessions/{id}/files", get(handlers::session_files))
-        .route(
-            "/api/sessions/{id}/workspace-contract",
-            get(handlers::session_workspace_contract),
-        )
-        .route("/api/sessions/{id}", delete(handlers::delete_session))
-        .route(
-            "/api/sessions/{id}/title",
-            patch(handlers::update_session_title),
-        )
-        // M7.9 / W2 — task supervisor exposure
+        // M7.9 / W2 — task supervisor exposure (kept REST)
         .route("/api/tasks/{task_id}/cancel", post(handlers::cancel_task))
         .route(
             "/api/tasks/{task_id}/restart-from-node",
             post(handlers::restart_task_from_node),
-        )
-        .route("/api/status", get(handlers::status));
+        );
 
     // User self-service endpoints (user or admin auth)
     let my_api = Router::new()
@@ -163,7 +190,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
-        .route("/api/my/content", get(auth_handlers::my_content))
+        // M12 Phase D-5: `/api/my/content` (list), `/api/my/content/{id}`
+        // (delete), and `/api/my/content/bulk-delete` retired in favor of
+        // WS RPC methods `content/list`, `content/delete`, and
+        // `content/bulk_delete` on `/api/ui-protocol/ws`. The blob read
+        // endpoints (`/{id}/thumbnail`, `/{id}/body`) remain REST per ADR.
         .route(
             "/api/my/content/{id}/thumbnail",
             get(auth_handlers::my_content_thumbnail),
@@ -171,14 +202,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/my/content/{id}/body",
             get(auth_handlers::my_content_body),
-        )
-        .route(
-            "/api/my/content/{id}",
-            delete(auth_handlers::delete_my_content),
-        )
-        .route(
-            "/api/my/content/bulk-delete",
-            post(auth_handlers::bulk_delete_my_content),
         )
         .route(
             "/api/my/profile/start",
@@ -260,7 +283,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/register/setup-script",
             get(admin::register_setup_script),
-        );
+        )
+        // Issue #1001 follow-up: signed-preview minting. Sits on the
+        // authenticated `my_api` branch — the SPA dashboard already
+        // has the user's bearer when it renders the iframe, so we
+        // require auth at the mint step. The actual preview content
+        // is served via the PUBLIC `/api/preview-signed/{token}/...`
+        // route registered below (no auth middleware — the token IS
+        // the credential). See
+        // [`handlers::sign_preview`] for the auth/authorisation flow.
+        .route("/api/my/preview/sign", post(handlers::sign_preview));
 
     // Admin API routes (admin auth only, 1MB body limit)
     let admin_api = Router::new()
@@ -529,6 +561,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(webhook_proxy::feishu_webhook_proxy),
         )
         .route(
+            "/webhook/line/{profile_id}",
+            post(webhook_proxy::line_webhook_proxy),
+        )
+        .route(
             "/webhook/twilio/{profile_id}",
             post(webhook_proxy::twilio_webhook_proxy),
         );
@@ -554,35 +590,225 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         Router::new().route("/api/internal/frps-auth", post(frps_plugin::frps_auth));
 
     // Unauthenticated routes (static files + auth endpoints + webhook proxy + internal)
+    //
+    // Issue #994 (P0 sev2 cross-tenant data read): `/api/preview/...`
+    // used to live here. It now sits on the authenticated `chat_api`
+    // group above — the handler asserts identity-owns-profile +
+    // session-belongs-to-profile, so the URL tuple is no longer
+    // sufficient to read another tenant's built site.
+    //
+    // Issue #1001 follow-up: the signed-URL preview route
+    // `/api/preview-signed/{token}/{*path}` lives here so the SPA
+    // iframe can GET it without `Authorization: Bearer ...`. The
+    // token itself is the credential — `handlers::serve_signed_preview`
+    // looks the token up in `AppState.preview_tokens`, re-validates the
+    // issuer bearer, and re-checks identity ↔ profile authorisation
+    // before serving content. Daemon restart drops the token cache and
+    // every outstanding preview link invalidates with it.
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
         .route(
-            "/api/preview/{profile_id}/{session_id}/{site_slug}",
-            get(handlers::serve_public_site_preview_root),
-        )
-        .route(
-            "/api/preview/{profile_id}/{session_id}/{site_slug}/",
-            get(handlers::serve_public_site_preview_root),
-        )
-        .route(
-            "/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}",
-            get(handlers::serve_public_site_preview_path),
-        )
-        .route(
             "/api/register/setup-script/{id}/{auth_token}",
             get(admin::register_setup_script_public),
+        )
+        .route(
+            "/api/preview-signed/{token}",
+            get(handlers::serve_signed_preview_root),
+        )
+        .route(
+            "/api/preview-signed/{token}/",
+            get(handlers::serve_signed_preview_root),
+        )
+        .route(
+            "/api/preview-signed/{token}/{*path}",
+            get(handlers::serve_signed_preview),
         )
         .merge(webhook_routes)
         .merge(version_routes)
         .merge(internal_routes);
 
+    // Layer 1 defence for issue #995 — the strip middleware runs OUTSIDE
+    // every other route layer so an unauthenticated request can never
+    // see an attacker-supplied `X-Profile-Id` on its way to a handler
+    // (handler-level Layer 2 in `handlers::decide_resolved_profile_id`
+    // is the second line of defence). Loopback / private connections are
+    // considered trusted; everything else has the header stripped before
+    // any handler / auth middleware runs.
     public
         .merge(protected)
         .fallback(static_files::static_handler)
+        .layer(middleware::from_fn(strip_untrusted_profile_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+/// Cached parsed list of trusted-proxy CIDRs from `OCTOS_TRUSTED_PROXY_CIDRS`.
+///
+/// Initialised once on first call. Empty if the env var is unset or no
+/// entries parse. Each entry is `(network address as 16-byte big-endian, prefix bits)`,
+/// with IPv4 mapped into the IPv4-in-IPv6 prefix (`::ffff:0:0/96`) so the
+/// matcher can run a single big-endian bit comparison regardless of family.
+fn trusted_proxy_cidrs() -> &'static [TrustedProxyCidr] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<TrustedProxyCidr>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::env::var("OCTOS_TRUSTED_PROXY_CIDRS").unwrap_or_default();
+            let mut out = Vec::new();
+            for entry in raw.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                match parse_cidr(entry) {
+                    Some(cidr) => out.push(cidr),
+                    None => tracing::warn!(
+                        target: "octos::api::auth",
+                        cidr = %entry,
+                        "OCTOS_TRUSTED_PROXY_CIDRS entry could not be parsed; ignoring"
+                    ),
+                }
+            }
+            out
+        })
+        .as_slice()
+}
+
+/// Parsed trusted-proxy CIDR — IPv4 entries are normalised into the
+/// IPv4-mapped-IPv6 space so a single 128-bit big-endian comparison
+/// handles both families.
+#[derive(Clone, Copy, Debug)]
+struct TrustedProxyCidr {
+    network: [u8; 16],
+    prefix_bits: u8,
+}
+
+fn parse_cidr(entry: &str) -> Option<TrustedProxyCidr> {
+    let (addr, prefix) = entry.split_once('/')?;
+    let addr: std::net::IpAddr = addr.trim().parse().ok()?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+
+    let (octets, max_prefix) = match addr {
+        std::net::IpAddr::V4(v4) => {
+            // Map IPv4 into ::ffff:V4 (16 bytes, big-endian).
+            let mut buf = [0u8; 16];
+            buf[10] = 0xff;
+            buf[11] = 0xff;
+            buf[12..16].copy_from_slice(&v4.octets());
+            (buf, 32u8)
+        }
+        std::net::IpAddr::V6(v6) => (v6.octets(), 128u8),
+    };
+
+    if prefix > max_prefix {
+        return None;
+    }
+
+    // For IPv4 entries the prefix is on the last 32 bits, so add the
+    // 96-bit IPv4-mapped prefix.
+    let effective_prefix = match addr {
+        std::net::IpAddr::V4(_) => 96 + prefix,
+        std::net::IpAddr::V6(_) => prefix,
+    };
+
+    Some(TrustedProxyCidr {
+        network: mask_to_prefix(octets, effective_prefix),
+        prefix_bits: effective_prefix,
+    })
+}
+
+fn mask_to_prefix(octets: [u8; 16], prefix_bits: u8) -> [u8; 16] {
+    let mut out = octets;
+    let full_bytes = (prefix_bits / 8) as usize;
+    let remaining_bits = prefix_bits % 8;
+    for byte in out.iter_mut().skip(full_bytes) {
+        *byte = 0;
+    }
+    if full_bytes < 16 && remaining_bits > 0 {
+        let mask = 0xffu8 << (8 - remaining_bits);
+        out[full_bytes] = octets[full_bytes] & mask;
+    }
+    out
+}
+
+fn ip_matches_cidr(ip: std::net::IpAddr, cidr: &TrustedProxyCidr) -> bool {
+    let octets = match ip {
+        std::net::IpAddr::V4(v4) => {
+            let mut buf = [0u8; 16];
+            buf[10] = 0xff;
+            buf[11] = 0xff;
+            buf[12..16].copy_from_slice(&v4.octets());
+            buf
+        }
+        std::net::IpAddr::V6(v6) => v6.octets(),
+    };
+    mask_to_prefix(octets, cidr.prefix_bits) == cidr.network
+}
+
+/// Decide whether a remote address is a trusted reverse-proxy.
+///
+/// The wildcard Caddy ingress in `scripts/install.sh` runs on the same
+/// host as the daemon and `reverse_proxy localhost:NN`, so the
+/// `X-Profile-Id` it sets always arrives over loopback. The fleet's
+/// trust model is therefore: loopback ⇒ trusted, anything else ⇒ untrusted
+/// unless the operator explicitly opts in via `OCTOS_TRUSTED_PROXY_CIDRS`
+/// (a comma-separated list of CIDRs).
+///
+/// `None` for the remote addr means we couldn't read `ConnectInfo` —
+/// e.g. axum tests built with `into_make_service()` rather than
+/// `into_make_service_with_connect_info()`. In production this never
+/// happens (`commands::serve` always uses the connect-info variant); in
+/// tests we treat missing connect-info as untrusted so the strip path
+/// is exercised. Tests that want to simulate a loopback hop must use
+/// `into_make_service_with_connect_info::<SocketAddr>()`.
+pub(crate) fn is_trusted_proxy_addr(addr: Option<std::net::IpAddr>) -> bool {
+    let Some(addr) = addr else {
+        return false;
+    };
+    if addr.is_loopback() {
+        return true;
+    }
+    let cidrs = trusted_proxy_cidrs();
+    cidrs.iter().any(|cidr| ip_matches_cidr(addr, cidr))
+}
+
+/// Middleware: strip `X-Profile-Id` from requests that did not originate
+/// from a trusted proxy.
+///
+/// This is the Layer 1 defence for issue #995. The header is meant to be
+/// set by the operator's Caddy ingress, which talks to the daemon over
+/// loopback — so anything not from loopback / a configured trusted
+/// proxy is treated as forged and the header is removed before any
+/// handler or downstream middleware can see it.
+async fn strip_untrusted_profile_id_middleware(
+    mut req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let remote_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    if !is_trusted_proxy_addr(remote_ip) && req.headers().contains_key("x-profile-id") {
+        let raw = req
+            .headers()
+            .get("x-profile-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        req.headers_mut().remove("x-profile-id");
+        tracing::warn!(
+            target: "octos::api::auth",
+            remote_addr = ?remote_ip,
+            stripped_value = %raw,
+            uri = %req.uri(),
+            "X-Profile-Id stripped: request not from a trusted proxy (#995 hardening)"
+        );
+    }
+
+    next.run(req).await
 }
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens (no length leak).
@@ -598,6 +824,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Extract bearer token from request headers or query params.
+///
+/// Header path: `Authorization: Bearer <token>` — taken byte-for-byte
+/// (HTTP header values are NOT percent-encoded).
+///
+/// Query path: `?token=<value>` or `?_token=<value>` — used by SSE,
+/// `EventSource`, `<img src>`, and WebSocket clients that cannot set
+/// custom headers. Per [issue #1010](https://github.com/octos-org/octos/issues/1010),
+/// the raw query value is **percent-decoded** before comparison. The
+/// raw URI fragment may contain `%21` for `!`, `%2B` for `+`, `%2F`
+/// for `/`, etc. — without decoding, a token like
+/// `Octos-E2E-Strong-Token-2026-XYZ-123!` arrives as
+/// `…123%21`, never matches the stored token, and the auth middleware
+/// silently 401s the upgrade while REST callers (header path) work.
+///
+/// Decode semantics are RFC 3986 percent-decode-only — `+` stays
+/// literal `+`, only `%XX` triples are decoded — so the two auth paths
+/// accept the same token format. `application/x-www-form-urlencoded`
+/// (`+` → space) would break tokens containing `+`.
 fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
     // Try Authorization header first
     let header_token = req
@@ -622,8 +866,28 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
     if !header_token.is_empty() {
         header_token.to_string()
     } else {
-        query_token.to_string()
+        // RFC 3986 percent-decode (NOT form-decode — `+` stays literal).
+        // `decode_utf8_lossy` substitutes U+FFFD for invalid UTF-8
+        // sequences, which keeps the function infallible; downstream
+        // constant-time comparison against stored ASCII tokens still
+        // fails on garbage input.
+        percent_encoding::percent_decode_str(query_token)
+            .decode_utf8_lossy()
+            .into_owned()
     }
+}
+
+/// Crate-public wrapper around [`resolve_identity`].
+///
+/// Exposed for the signed-preview re-validation in
+/// [`crate::api::handlers::serve_signed_preview`]: the public
+/// `/api/preview-signed/{token}/...` route lives OUTSIDE
+/// `user_auth_middleware`, so it must re-resolve the issuer bearer
+/// stored in the `PreviewTokens` grant on every request. A revoked
+/// session ⇒ `None` ⇒ 403, which is how logout / session-delete
+/// invalidates outstanding previews "for free".
+pub(crate) async fn resolve_identity_public(state: &AppState, token: &str) -> Option<AuthIdentity> {
+    resolve_identity(state, token).await
 }
 
 /// Resolve token to an AuthIdentity.
@@ -704,15 +968,20 @@ async fn user_auth_middleware(
     // 2. Accept X-Profile-Id header for chat API routes (proxy auth).
     // The reverse proxy (Caddy) sets this header to identify the profile,
     // so requests through the proxy are implicitly authenticated.
-    // SECURITY: Only accept this header from loopback addresses to prevent
-    // profile impersonation via misconfigured reverse proxy or SSRF.
-    let is_loopback = req
+    // SECURITY: Only accept this header from a TRUSTED proxy address —
+    // loopback by default, plus any CIDR listed in
+    // `OCTOS_TRUSTED_PROXY_CIDRS`. The Layer-1 strip middleware uses
+    // the SAME helper (`is_trusted_proxy_addr`), so operators who run
+    // an off-host reverse proxy can opt the auth path in via the same
+    // env var that controls the strip path — keeping the two layers
+    // consistent (#995 follow-up).
+    let remote_ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(false);
+        .map(|ci| ci.0.ip());
+    let is_trusted_hop = is_trusted_proxy_addr(remote_ip);
 
-    if !profile_id.is_empty() && is_loopback {
+    if !profile_id.is_empty() && is_trusted_hop {
         // Validate that the profile actually exists to prevent spoofing.
         if let Some(ref store) = state.profile_store {
             if store.get(&profile_id).ok().flatten().is_none() {
@@ -724,14 +993,14 @@ async fn user_auth_middleware(
         let uri_str = uri.path();
         // Allow proxy auth for chat- and session-scoped endpoints, not admin.
         // Task-control verbs (`/api/tasks/{id}/cancel`, `/restart-from-node`)
-        // are session-scoped — same trust posture as `/api/sessions`.
-        if uri_str.starts_with("/api/chat")
-            || uri_str.starts_with("/api/ws")
-            || uri_str.starts_with("/api/ui-protocol")
+        // are session-scoped — same trust posture as files/uploads. The
+        // legacy `/api/sessions`, `/api/status`, and `/api/chat` prefixes
+        // used to live here too; they were dropped together with the
+        // routes (M12 Phase D-5 retired sessions/status; the #908
+        // follow-up retired chat).
+        if uri_str.starts_with("/api/ui-protocol")
             || uri_str.starts_with("/api/upload")
-            || uri_str.starts_with("/api/sessions")
             || uri_str.starts_with("/api/files")
-            || uri_str.starts_with("/api/status")
             || uri_str.starts_with("/api/tasks")
         {
             req.extensions_mut().insert(AuthIdentity::User {
@@ -742,10 +1011,10 @@ async fn user_auth_middleware(
         }
     }
 
-    if !profile_id.is_empty() && !is_loopback {
+    if !profile_id.is_empty() && !is_trusted_hop {
         tracing::warn!(
             profile_id = %profile_id,
-            "X-Profile-Id header rejected: request not from loopback address"
+            "X-Profile-Id header rejected: request not from a trusted proxy address (#995 follow-up)"
         );
     }
 
@@ -862,8 +1131,11 @@ mod tests {
 
     #[test]
     fn extract_token_no_auth_returns_empty() {
+        // Any URI works — `extract_token` only consults headers and the
+        // query string. `/api/version` is a stable surviving REST surface
+        // after the M12 Phase D-5 retirement of `/api/status`.
         let req = Request::builder()
-            .uri("/api/status")
+            .uri("/api/version")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_token(&req), "");
@@ -894,6 +1166,60 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_token(&req), "");
+    }
+
+    /// Issue [#1010](https://github.com/octos-org/octos/issues/1010):
+    /// browsers and curl percent-encode special characters in query
+    /// string values. The raw query string contains `%21` for `!`, so
+    /// the extractor must percent-decode the value before handing it to
+    /// `resolve_identity` — otherwise the comparison never matches the
+    /// stored token and WS auth silently 401s while REST (which carries
+    /// the token in the `Authorization` header) works.
+    #[test]
+    fn extract_token_query_param_is_percent_decoded_exclamation() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=test-token-%21")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "test-token-!");
+    }
+
+    /// Percent-decode-only semantics (RFC 3986), not `application/x-www-form-urlencoded`:
+    /// `+` stays literal `+` (matching the `Authorization: Bearer …`
+    /// header path, which never form-decodes), and `%2B` decodes to `+`.
+    #[test]
+    fn extract_token_query_param_keeps_plus_literal_and_decodes_pct2b() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=test+token%2Bfoo")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "test+token+foo");
+    }
+
+    /// Regression: tokens without any percent-encodable characters
+    /// continue to round-trip unchanged. Guards against an over-eager
+    /// decoder that mangles plain ASCII alphanumerics.
+    #[test]
+    fn extract_token_query_param_alphanumeric_unchanged() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=simpleToken123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "simpleToken123");
+    }
+
+    /// A few extra characters that show up in real-world admin tokens
+    /// (`/`, `=`, `:`) and the percent-encoded equivalents should
+    /// round-trip cleanly. We pick the percent-encoded forms because
+    /// raw `:`/`/`/`=` in a query value are technically legal per RFC
+    /// 3986 but browsers/curl often encode them anyway.
+    #[test]
+    fn extract_token_query_param_decodes_common_special_chars() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=A%2FB%3DC%3AD")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "A/B=C:D");
     }
 
     #[tokio::test]
@@ -1149,5 +1475,103 @@ mod tests {
         let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
         assert!(!list.iter().any(|s| s.contains("evil.example.com")));
         assert!(!list.iter().any(|s| s.contains("ocean.ominix.io")));
+    }
+
+    // ── #995 — `is_trusted_proxy_addr` + CIDR parser ───────────────────
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn is_trusted_proxy_addr_accepts_ipv4_loopback() {
+        assert!(is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_accepts_ipv6_loopback() {
+        assert!(is_trusted_proxy_addr(Some(IpAddr::V6(Ipv6Addr::LOCALHOST))));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_rejects_public_ipv4() {
+        // 1.1.1.1 (Cloudflare DNS) is not in any default-trusted block,
+        // so without `OCTOS_TRUSTED_PROXY_CIDRS` it must be rejected.
+        assert!(!is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        )))));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_rejects_missing_connect_info() {
+        // Tests using `into_make_service()` (no ConnectInfo) end up here.
+        // We treat missing ConnectInfo as untrusted so the strip path
+        // actually fires under unit tests. Production wires
+        // `into_make_service_with_connect_info::<SocketAddr>()`.
+        assert!(!is_trusted_proxy_addr(None));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_rejects_rfc1918_when_env_unset() {
+        // Defence-in-depth: by default we only trust loopback. RFC1918
+        // private blocks are NOT auto-trusted because a corp VPN may
+        // assign them to attacker workstations. Operators with a real
+        // upstream proxy on the LAN can opt in via
+        // `OCTOS_TRUSTED_PROXY_CIDRS`.
+        assert!(!is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 1
+        )))));
+        assert!(!is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 1
+        )))));
+    }
+
+    #[test]
+    fn parse_cidr_accepts_ipv4_block() {
+        let cidr = parse_cidr("10.0.0.0/8").expect("valid CIDR");
+        assert!(ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7)),
+            &cidr
+        ));
+        assert!(!ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1)),
+            &cidr
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_accepts_single_ipv4_with_32_bit_prefix() {
+        let cidr = parse_cidr("192.168.42.7/32").expect("valid CIDR");
+        assert!(ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 42, 7)),
+            &cidr
+        ));
+        assert!(!ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 42, 8)),
+            &cidr
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_rejects_oversize_prefix() {
+        // /33 is illegal for IPv4 — parse_cidr must return None rather
+        // than constructing a CIDR that vacuously matches everything.
+        assert!(parse_cidr("10.0.0.0/33").is_none());
+    }
+
+    #[test]
+    fn parse_cidr_accepts_ipv6_block() {
+        let cidr = parse_cidr("fd00::/8").expect("valid CIDR");
+        assert!(ip_matches_cidr("fd12::1".parse::<IpAddr>().unwrap(), &cidr));
+        assert!(!ip_matches_cidr(
+            "2001:db8::1".parse::<IpAddr>().unwrap(),
+            &cidr
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_rejects_malformed_entry() {
+        assert!(parse_cidr("not-an-ip").is_none());
+        assert!(parse_cidr("10.0.0.0").is_none()); // missing prefix
+        assert!(parse_cidr("10.0.0.0/abc").is_none()); // non-numeric prefix
+        assert!(parse_cidr("").is_none());
     }
 }

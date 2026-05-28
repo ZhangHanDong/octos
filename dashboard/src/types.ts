@@ -16,7 +16,9 @@ export interface GatewaySettings {
 
 export interface ChannelCredentials {
   type: string
-  [key: string]: string | number
+  allowed_senders?: string
+  bot_user_id?: string
+  [key: string]: string | number | boolean | undefined
 }
 
 export interface FallbackModel {
@@ -187,9 +189,9 @@ export interface BulkActionResponse {
   count: number
 }
 
-export type ChannelType = 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'feishu' | 'email'
+export type ChannelType = 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'feishu' | 'line' | 'email'
 
-export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'email']
+export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'line', 'email']
 
 export const CHANNEL_COLORS: Record<ChannelType, string> = {
   telegram: 'bg-blue-500',
@@ -197,6 +199,7 @@ export const CHANNEL_COLORS: Record<ChannelType, string> = {
   slack: 'bg-purple-500',
   whatsapp: 'bg-green-500',
   feishu: 'bg-cyan-500',
+  line: 'bg-green-600',
   email: 'bg-orange-500',
 }
 
@@ -206,6 +209,7 @@ export const CHANNEL_LABELS: Record<ChannelType, string> = {
   slack: 'SL',
   whatsapp: 'WA',
   feishu: 'FS',
+  line: 'LN',
   email: 'EM',
 }
 
@@ -246,9 +250,23 @@ export interface AllowlistEntry {
   last_login_at?: string | null
 }
 
+/// The active tenant scope derived from the request `Host` /
+/// `X-Forwarded-Host` header. Populated by the server's
+/// `host_scoped_profile_id` resolver. `null` when no tenant subdomain
+/// is in scope (root domain, direct IP, or localhost). The dashboard
+/// reads this from `/api/auth/me` to hide admin-global navigation
+/// while an admin is operating inside a tenant scope (Option Y,
+/// issue #315).
+export interface ScopedAuthTarget {
+  id: string
+  name: string
+  email_login_enabled: boolean
+}
+
 export interface MeResponse {
   user: User
   profile: ProfileResponse | null
+  scoped_profile?: ScopedAuthTarget | null
 }
 
 export interface BridgeQrInfo {

@@ -166,7 +166,7 @@ impl GatewayRuntime {
             cmd.profile.as_deref().map(|p| p.display().to_string())
         );
         let mut admin_mode = false;
-        let config = if let Some(ref profile_path) = cmd.profile {
+        let mut config = if let Some(ref profile_path) = cmd.profile {
             // Load config from profile JSON (single source of truth)
             let content = std::fs::read_to_string(profile_path)
                 .wrap_err_with(|| format!("failed to read profile: {}", profile_path.display()))?;
@@ -216,6 +216,12 @@ impl GatewayRuntime {
         } else {
             Config::load(&cwd, &data_dir)?
         };
+        // Section B (codex review round-5 P1.2): the `--profile` path
+        // bypasses `Config::from_file`, so call the same env-var OR-merge
+        // helper here. A host-level `plugins.require_signed = true`
+        // propagates to spawned gateways via
+        // `OCTOS_PLUGINS_REQUIRE_SIGNED=1` (set by `ProcessManager`).
+        crate::config::merge_env_plugin_policy_pub(&mut config);
 
         // Track whether any CLI override (`--model`, `--provider`,
         // `--base-url`) was supplied; `ProfileRuntime::bootstrap` is
@@ -289,11 +295,26 @@ impl GatewayRuntime {
         let profile_runtime: Option<Arc<ProfileRuntime>> = if let Some(profile) =
             resolved_profile.as_ref().filter(|_| !cli_llm_override)
         {
-            match ProfileRuntime::bootstrap(
+            // Section B (codex review round-3 + round-5 P1.2): thread the
+            // host's `plugins.require_signed` into the per-profile
+            // bootstrap so strict signing applies even when the profile
+            // JSON omits the flag.
+            //
+            // In the `--profile` managed path `config` is derived from the
+            // profile JSON, so `config.plugins.require_signed` mirrors
+            // whatever the profile declared. The host-level policy
+            // reaches this branch via `OCTOS_PLUGINS_REQUIRE_SIGNED`
+            // (set by `ProcessManager` in `octos serve`), which
+            // `Config::from_file` already OR-merges onto `config.plugins`
+            // for the `--config` path. We forward `config.plugins` here
+            // and `bootstrap_with_host_plugins` then OR-merges it onto
+            // the profile-derived config, closing the loop.
+            match ProfileRuntime::bootstrap_with_host_plugins(
                 profile,
                 &data_dir,
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
+                Some(&config.plugins),
             )
             .await
             {
@@ -697,6 +718,12 @@ impl GatewayRuntime {
                         octos_agent::PluginLoadOptions {
                             work_dir: Some(&plugin_work_dir),
                             synthesis_config,
+                            // Section B: opt-in strict signature enforcement.
+                            // Honours top-level `plugins.require_signed`; default
+                            // is `false` (backward compatible — unsigned plugins
+                            // still load with a warning).
+                            require_signed: config.plugins.require_signed,
+                            verified_cache_dir: None,
                         },
                     ) {
                         Ok(result) => plugin_result = result,
@@ -897,6 +924,10 @@ impl GatewayRuntime {
                 let plugins_c = plugin_dirs_for_spawn.clone();
                 let router_c = provider_router.clone();
                 let octos_home_c = cmd.octos_home.clone();
+                // Section B (codex review follow-up): capture the host's
+                // strict-signing flag so per-session `RunPipelineTool`
+                // instances honour the same `plugins.require_signed` gate.
+                let plugin_require_signed_c = config.plugins.require_signed;
 
                 struct DefaultPipelineToolFactory {
                     llm: Arc<dyn LlmProvider>,
@@ -907,6 +938,13 @@ impl GatewayRuntime {
                     plugin_dirs: Vec<PathBuf>,
                     router: Option<Arc<ProviderRouter>>,
                     octos_home: Option<PathBuf>,
+                    plugin_require_signed: bool,
+                    /// NEW-06 fix: forwarded to every worker `Agent`
+                    /// via `RunPipelineTool::with_embedder` so
+                    /// pipeline-spawned agents inherit hybrid scored +
+                    /// filtered memory recall instead of the cwd-only
+                    /// unfiltered fallback.
+                    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
@@ -918,16 +956,28 @@ impl GatewayRuntime {
                             self.data_dir.clone(),
                         )
                         .with_provider_policy(self.policy.clone())
-                        .with_plugin_dirs(self.plugin_dirs.clone());
+                        .with_plugin_dirs(self.plugin_dirs.clone())
+                        .with_plugin_require_signed(self.plugin_require_signed);
                         if let Some(ref router) = self.router {
                             pt = pt.with_provider_router(router.clone());
                         }
                         if let Some(ref octos_home) = self.octos_home {
                             pt = pt.with_octos_home(octos_home.clone());
                         }
+                        if let Some(ref embedder) = self.embedder {
+                            pt = pt.with_embedder(embedder.clone());
+                        }
                         Arc::new(pt)
                     }
                 }
+
+                // NEW-06 fix: capture the gateway's embedder so pipeline
+                // workers inherit the same contamination-safe memory
+                // recall the gateway's own session agent gets via
+                // `ActorFactory::embedder` -> `with_embedder` (see
+                // session_actor.rs).
+                let embedder_c =
+                    create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
 
                 pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
                     llm: llm_c,
@@ -938,6 +988,8 @@ impl GatewayRuntime {
                     plugin_dirs: plugins_c,
                     router: router_c,
                     octos_home: octos_home_c,
+                    plugin_require_signed: plugin_require_signed_c,
+                    embedder: embedder_c,
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }
@@ -1037,7 +1089,7 @@ impl GatewayRuntime {
         // Mark base tools that should never be auto-evicted by LRU.
         tools.set_base_tools([
             "run_pipeline",
-            "deep_search",
+            "search",
             "deep_crawl",
             "web_search",
             "web_fetch",
@@ -1167,9 +1219,30 @@ impl GatewayRuntime {
             pending_messages: pending_messages.clone(),
             queue_mode: gw_config.queue_mode,
             adaptive_router: adaptive_router_ref,
+            // RFC-3 (#1292): no UserProfile in scope here (CLI-only
+            // `octos gateway` entry point — see the inline-assembly
+            // branch above for the "no profile" path); use built-in
+            // defaults. The per-profile path through
+            // `ProfileFactory::create_actor_factory_for_profile`
+            // threads the profile's `lane_routing` field.
+            lane_routing: None,
             memory_store: Some(memory_store.clone()),
+            // Codex round-2 MAJOR 3 (PR #1327 review): the top-level
+            // gateway actor factory is the "admin" path that dispatches
+            // by detected profile through `profile_factory.rs`. It
+            // doesn't own a single profile_id of its own; per-profile
+            // sessions go through `ProfileFactory::build` which sets
+            // this field. Leaving it `None` here means the admin
+            // fallback path (no recognised profile, or main profile)
+            // continues without scope wiring — the legacy resolver
+            // still applies inside `tools/mod.rs`.
+            profile_id: None,
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
+            // Section B (codex review P1.1): propagate the host
+            // strict-signing policy so SpawnTool subagents enforce the
+            // same gate.
+            plugin_require_signed: config.plugins.require_signed,
             llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
                 .unwrap_or_else(|_| llm_for_compaction.clone()),
             task_query_store: task_query_store.clone(),
@@ -1206,6 +1279,10 @@ impl GatewayRuntime {
                     sandbox_config: sandbox_config.clone(),
                     task_query_store: task_query_store.clone(),
                     subagent_output_router: subagent_output_router.clone(),
+                    // Section B (codex review round-4): clone the host's
+                    // plugin policy so child profiles inherit the
+                    // strict-signing gate even when their JSON omits it.
+                    host_plugins: config.plugins.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1496,8 +1573,18 @@ impl GatewayRuntime {
 
         // Main loop: dispatch inbound messages to concurrent tasks
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let shutdown_notified = shutdown_notify.notified();
+            tokio::pin!(shutdown_notified);
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
             let mut inbound = tokio::select! {
-                _ = shutdown_notify.notified() => {
+                biased;
+                _ = &mut shutdown_notified => {
                     if self.shutdown.load(Ordering::Acquire) {
                         break;
                     }

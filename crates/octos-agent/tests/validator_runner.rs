@@ -22,6 +22,7 @@ fn command_validator(id: &str, cmd: &str, args: &[&str]) -> Validator {
     Validator {
         id: id.to_string(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(5000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -35,6 +36,7 @@ fn file_exists_validator(id: &str, path: &str, min_bytes: Option<u64>) -> Valida
     Validator {
         id: id.to_string(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -48,6 +50,7 @@ fn tool_call_validator(id: &str, tool: &str, args: Value) -> Validator {
     Validator {
         id: id.to_string(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(5000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::ToolCall {
@@ -125,6 +128,7 @@ async fn should_block_ready_when_required_command_validator_fails() {
     let validators = vec![Validator {
         id: "cmd_fail".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -137,6 +141,9 @@ async fn should_block_ready_when_required_command_validator_fails() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -158,6 +165,7 @@ async fn should_warn_but_not_block_when_optional_validator_fails() {
     let validators = vec![Validator {
         id: "optional_fail".into(),
         required: false,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -170,6 +178,9 @@ async fn should_warn_but_not_block_when_optional_validator_fails() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -188,6 +199,7 @@ async fn should_record_duration_and_evidence_path_for_command_validator() {
     let validators = vec![Validator {
         id: "echo_cmd".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -200,6 +212,9 @@ async fn should_record_duration_and_evidence_path_for_command_validator() {
         phase: ValidatorPhase::TurnEnd,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -225,6 +240,7 @@ async fn should_expose_stderr_in_outcome_for_operator_visibility() {
     let validators = vec![Validator {
         id: "stderr_cmd".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -237,6 +253,9 @@ async fn should_expose_stderr_in_outcome_for_operator_visibility() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -265,6 +284,7 @@ async fn should_kill_child_process_on_validator_timeout() {
     let validators = vec![Validator {
         id: "timeout_cmd".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(300),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -284,6 +304,9 @@ async fn should_kill_child_process_on_validator_timeout() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
 
     let before = std::time::Instant::now();
@@ -333,6 +356,9 @@ async fn should_pass_file_exists_validator_when_file_meets_size_floor() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -355,6 +381,9 @@ async fn should_fail_file_exists_validator_when_size_under_floor() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -372,6 +401,9 @@ async fn should_pass_tool_call_validator_when_tool_succeeds() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -388,6 +420,9 @@ async fn should_fail_tool_call_validator_when_tool_reports_unsuccessful() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -414,6 +449,9 @@ async fn should_persist_outcomes_and_replay_them_byte_for_byte() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let original = runner.run_all(&invocation, &validators).await;
     assert_eq!(original.len(), 2);
@@ -448,6 +486,7 @@ async fn should_strip_blocked_env_vars_from_command_validator_child() {
     let validators = vec![Validator {
         id: "env_probe".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(5000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -465,6 +504,9 @@ async fn should_strip_blocked_env_vars_from_command_validator_child() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     // Invoke via a helper that pre-seeds LD_PRELOAD on the spawned command.
     runner
@@ -500,6 +542,7 @@ async fn should_block_spawn_task_contract_when_required_validator_fails() {
     policy.validation.validators = vec![Validator {
         id: "min_bytes_gate".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -516,6 +559,7 @@ async fn should_block_spawn_task_contract_when_required_validator_fails() {
             on_complete: Vec::new(),
             on_deliver: Vec::new(),
             on_failure: vec!["notify_user:validator gate failed".into()],
+            on_completion: Vec::new(),
         },
     );
     write_workspace_policy(dir.path(), &policy).unwrap();
@@ -577,6 +621,7 @@ async fn should_not_block_spawn_task_contract_when_optional_validator_fails() {
     policy.validation.validators = vec![Validator {
         id: "optional_warn".into(),
         required: false,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -593,6 +638,7 @@ async fn should_not_block_spawn_task_contract_when_optional_validator_fails() {
             on_complete: Vec::new(),
             on_deliver: Vec::new(),
             on_failure: Vec::new(),
+            on_completion: Vec::new(),
         },
     );
     write_workspace_policy(dir.path(), &policy).unwrap();
@@ -641,6 +687,7 @@ async fn should_reflect_required_validator_fail_in_inspect_ready_flag() {
     policy.validation.validators = vec![Validator {
         id: "gate".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -678,6 +725,7 @@ async fn should_reflect_required_validator_fail_in_inspect_ready_flag() {
         kind: "file_exists".into(),
         repo_label: "slides/demo".into(),
         required: true,
+        required_tier: "hard".into(),
         status: ValidatorStatus::Pass,
         reason: "manual seed".into(),
         duration_ms: 0,
@@ -707,6 +755,7 @@ async fn should_block_command_validator_with_dangerous_pattern() {
     let validators = vec![Validator {
         id: "dangerous".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -718,6 +767,9 @@ async fn should_block_command_validator_with_dangerous_pattern() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -727,4 +779,74 @@ async fn should_block_command_validator_with_dangerous_pattern() {
         outcome.reason.to_lowercase().contains("denied")
             || outcome.reason.to_lowercase().contains("policy")
     );
+}
+
+#[tokio::test]
+async fn should_bind_files_to_send_to_artifact_for_mofa_slides_contract() {
+    // Issue #998 (P0 functional): `mofa_slides_contract` declared no artifact
+    // source in `for_session()`, so when the plugin reports `files_to_send`
+    // (auto-detected by `PluginTool::detect_output_file` for "Generated PPTX:
+    // <path>" stdout lines — see `plugins/tool.rs:2064-2103`), the contract
+    // layer entered `bind_explicit_files_to_artifacts` with an empty
+    // `artifact_sources()` list and returned "workspace contract has no
+    // artifact source" (`workspace_contract.rs:333-336`), failing every
+    // successful slides run at the post-tool gate.
+    //
+    // The contract must now bind the reported PPTX into a named artifact so
+    // `resolve_artifacts` produces a populated `ActionContext` and the typed
+    // MagicBytes(Pptx) validator runs against real artifact paths.
+    use octos_agent::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
+    use octos_agent::workspace_policy::WorkspacePolicy;
+    use std::time::UNIX_EPOCH;
+
+    let dir = tempdir().unwrap();
+    // Write the default session policy unmodified — this is the policy the
+    // bundled mofa_slides spawn task runs against today.
+    let policy = WorkspacePolicy::for_session();
+    octos_agent::workspace_policy::write_workspace_policy(dir.path(), &policy).unwrap();
+
+    // Lay down a real PPTX-shaped file under the slides plugin's typical
+    // output path so the MagicBytes(Pptx) validator declared on the
+    // `on_completion` list of `mofa_slides_contract` passes. The first two
+    // bytes of a real PPTX (a ZIP container) are `PK`, matching `0x50 0x4B`.
+    let out_dir = dir.path().join("output");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let pptx_path = out_dir.join("deck.pptx");
+    let mut pptx = vec![0u8; 64];
+    pptx[0] = 0x50; // 'P'
+    pptx[1] = 0x4B; // 'K'
+    pptx[2] = 0x03;
+    pptx[3] = 0x04;
+    std::fs::write(&pptx_path, &pptx).unwrap();
+
+    let registry = ToolRegistry::with_builtins(dir.path());
+    // Pass the PPTX through `files_to_send` exactly as `PluginTool` does at
+    // `plugins/tool.rs:1321-1329` after parsing the plugin envelope.
+    let files_to_send = vec![pptx_path.clone()];
+    let result = enforce_spawn_task_contract(
+        &registry,
+        "mofa_slides",
+        "tool-call-slides-1",
+        &files_to_send,
+        UNIX_EPOCH,
+        None,
+    )
+    .await;
+
+    match result {
+        SpawnTaskContractResult::Satisfied { output_files } => {
+            assert!(
+                output_files
+                    .iter()
+                    .any(|p| p.ends_with("deck.pptx") || p.ends_with("output/deck.pptx")),
+                "satisfied result must surface the reported PPTX, got {output_files:?}"
+            );
+        }
+        SpawnTaskContractResult::Failed { error, .. } => panic!(
+            "mofa_slides contract must accept a valid PPTX via files_to_send, got Failed: {error}"
+        ),
+        SpawnTaskContractResult::NotConfigured { reason, .. } => panic!(
+            "mofa_slides contract must be configured in for_session policy, got NotConfigured: {reason:?}"
+        ),
+    }
 }

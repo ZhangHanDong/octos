@@ -30,7 +30,18 @@ struct SynthesizeInput {
     output_path: Option<String>,
     #[serde(default)]
     language: Option<String>,
-    #[serde(default)]
+    /// LLMs (especially deepseek-chat) naturally call this with `voice`
+    /// as the parameter name — it matches user phrasing like
+    /// "用 vivian 的声音说…" and the `fm_tts` tool's `voice` field.
+    /// Without the alias the call silently drops the LLM's `voice`
+    /// argument and `speaker` defaults to `vivian`, silently
+    /// substituting any non-preset voice (e.g. `yangmi`) without error.
+    /// Observed live on mini1 2026-05-10: users repeatedly asked for
+    /// `yangmi`, got `vivian` back with no warning. The Qwen3-TTS
+    /// rejection path (which emits the "use fm_tts" hint) only fires
+    /// when the non-preset name actually reaches ominix-api, which the
+    /// silent default prevented.
+    #[serde(default, alias = "voice")]
     speaker: Option<String>,
     /// Style/emotion prompt (e.g. "用兴奋激动的语气说话，充满热情和活力")
     #[serde(default)]
@@ -619,8 +630,16 @@ fn handle_synthesize(input_json: &str) {
                         let duration_secs = size.saturating_sub(44) as f64 / 48000.0;
                         eprintln!("Converting to MP3...");
                         let final_path = try_convert_to_mp3(&output_path);
+                        // `Generated: <path>` on its own line is the marker
+                        // `PluginTool::detect_output_file` parses to populate
+                        // `files_to_send` (it splits on lines and treats the
+                        // entire rest-of-line as the path). The user-readable
+                        // summary stays on the next line so the LLM still
+                        // sees the duration/size/follow-up hint.
+                        // octos #1038: replaced legacy `Generated audio: …`
+                        // single-line text which the detector did not match.
                         succeed(&format!(
-                            "Generated audio: {final_path} ({duration_secs:.1}s, {size} bytes). Use send_file to deliver it to the user."
+                            "Generated: {final_path}\nSynthesized audio ({duration_secs:.1}s, {size} bytes). Use send_file to deliver it to the user."
                         ));
                     }
                     Err(e) => {
@@ -664,8 +683,12 @@ fn handle_synthesize(input_json: &str) {
                 let duration_secs = size.saturating_sub(44) as f64 / 48000.0;
                 eprintln!("Converting to MP3...");
                 let final_path = try_convert_to_mp3(&output_path);
+                // octos #1038: `Generated: <path>` on its own line is the
+                // marker `PluginTool::detect_output_file` parses to populate
+                // `files_to_send`. See the Qwen3 site above for the rationale.
                 succeed(&format!(
-                    "Generated audio (macOS Say): {final_path} ({duration_secs:.1}s, {size} bytes). \
+                    "Generated: {final_path}\n\
+                     Synthesized audio with macOS Say ({duration_secs:.1}s, {size} bytes). \
                      Note: using built-in macOS voice — install ominix-api for higher-quality Qwen3-TTS. \
                      Use send_file to deliver it to the user."
                 ));

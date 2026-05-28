@@ -15,7 +15,6 @@ members = [
     "crates/app-skills/time",
     "crates/app-skills/weather",
     "crates/app-skills/wechat-bridge",
-    "crates/app-skills/pipeline-guard",
     "crates/app-skills/skill-evolve",
     "crates/app-skills/harness-starter-generic",
     "crates/app-skills/harness-starter-report",
@@ -121,6 +120,18 @@ zip = "2"
 quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
+# PDF text extraction (pure Rust; read_file auto-detects %PDF- magic)
+pdf-extract = "0.9"
+
+# Audio decoding (pure Rust)
+# WAV: always-on (small dep, used by AudioNonSilent validator on .wav files).
+# MP3: gated behind the `audio_mp3` feature on octos-agent so non-audio
+# workspaces don't pay the symphonia dep cost. Without the feature, MP3
+# AudioNonSilent validators return an explicit "feature not enabled" error
+# rather than silently passing.
+hound = "3"
+symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
+
 # Unix-specific (O_NOFOLLOW for symlink-safe file I/O)
 libc = "0.2"
 
@@ -129,6 +140,7 @@ lru = "0.16"
 
 # File search
 glob = "0.3"
+globset = "0.4"
 regex = "1"
 ignore = "0.4"
 
@@ -183,6 +195,7 @@ tower = { version = "0.5", features = ["util"] }
 # Testing
 tokio-test = "0.4"
 tempfile = "3"
+proptest = "1.11"
 
 # -- Release configuration --------------------------------------------------
 [workspace.metadata.release]

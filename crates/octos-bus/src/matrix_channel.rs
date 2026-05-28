@@ -1334,13 +1334,13 @@ fn extract_prompt_flag(args: &str) -> (String, Option<String>) {
     let before = args[..idx].trim().to_string();
     let after = args[idx + prompt_marker.len()..].trim();
 
-    let prompt = if after.starts_with('"') {
+    let prompt = if let Some(stripped) = after.strip_prefix('"') {
         // Find closing quote
-        if let Some(end) = after[1..].find('"') {
-            Some(after[1..1 + end].to_string())
+        if let Some(end) = stripped.find('"') {
+            Some(stripped[..end].to_string())
         } else {
             // No closing quote — take everything after the opening quote
-            Some(after[1..].to_string())
+            Some(stripped.to_string())
         }
     } else {
         // No quotes — take everything as prompt

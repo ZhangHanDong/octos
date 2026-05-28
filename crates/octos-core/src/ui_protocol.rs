@@ -7,7 +7,7 @@
 //! task-control requests so clients can target a stable AppUI contract while
 //! backend support lands behind capabilities.
 
-use crate::{SessionKey, TaskId};
+use crate::{SessionKey, TaskId, ThreadId};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,72 @@ pub const JSON_RPC_VERSION: &str = "2.0";
 
 /// Maximum accepted JSON-RPC text frame size for UI transports.
 pub const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Per-turn ownership context for UI/SSE emission.
+///
+/// Construct this once at ingress, before any live event is emitted, and pass
+/// it to emitters instead of re-deriving routing identity from ambient session
+/// state. The `thread_id` is required; callers that do not have one must fail
+/// before producing a live event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnContext {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub thread_id: ThreadId,
+}
+
+impl TurnContext {
+    pub fn new(session_id: impl Into<String>, topic: Option<String>, thread_id: ThreadId) -> Self {
+        Self {
+            session_id: session_id.into(),
+            topic,
+            thread_id,
+        }
+    }
+
+    pub fn thread_id_str(&self) -> &str {
+        self.thread_id.as_str()
+    }
+}
+
+/// Required server-stamped ownership envelope for web/SSE events.
+///
+/// This is intentionally generic over payload so individual event families can
+/// keep their existing typed payloads while sharing one ownership/routing
+/// contract at the emission boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventEnvelope<P> {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub thread_id: ThreadId,
+    pub event_seq: u64,
+    pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    pub payload: P,
+}
+
+impl<P> EventEnvelope<P> {
+    pub fn new(
+        ctx: &TurnContext,
+        event_seq: u64,
+        event_type: impl Into<String>,
+        tool_call_id: Option<String>,
+        payload: P,
+    ) -> Self {
+        Self {
+            session_id: ctx.session_id.clone(),
+            topic: ctx.topic.clone(),
+            thread_id: ctx.thread_id.clone(),
+            event_seq,
+            event_type: event_type.into(),
+            tool_call_id,
+            payload,
+        }
+    }
+}
 
 /// Feature flag for UPCR-2026-001 typed approval payloads.
 pub const UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1: &str = "approval.typed.v1";
@@ -70,6 +136,37 @@ pub const UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1: &str = "event.message_persis
 /// the message — only the wire event the connected client observes flips.
 pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1";
 
+/// Feature flag for the explicit `file/attached` envelope (UPCR-2026-014
+/// M9-α-9).
+///
+/// Surfaces a dedicated, dedicated-shape notification per artefact path
+/// when a `spawn_only` background tool (`mofa_slides`, `podcast_generate`,
+/// `fm_tts`, `deep_search`) — or any code path that drains a
+/// `BackgroundResultPayload` with non-empty `media` / `envelope_media` —
+/// commits to the canonical session ledger. Mirrors the per-file media
+/// already carried on `message/persisted` and `turn/spawn_complete`, but
+/// as an isolated wire signal so SPA reducers (and admin / debug
+/// clients) can subscribe to file deliveries without parsing the
+/// content-bearing envelopes.
+///
+/// The fan-out is best-effort and additive: when no client has
+/// negotiated this capability the helper still appends the envelope to
+/// the ledger (subscribers + replay buffers continue to observe), but
+/// the dedicated per-connection wire filter drops the frame so legacy
+/// clients see no behaviour change. Clients that advertise this
+/// capability receive a `file/attached` per artefact in addition to the
+/// existing `message/persisted` / `turn/spawn_complete` envelopes.
+///
+/// Wired by the AppUI WS path's `BackgroundResultSender` closure (see
+/// `ui_protocol.rs::install_message_commit_observer` adjacent helpers)
+/// after each background result row commits. The notification's
+/// `(turn_id, path)` pair gives the SPA an authoritative placement
+/// signal even when `turn/spawn_complete`'s richer envelope is delayed
+/// or lost to a wire-level filter mismatch — the exact failure mode
+/// captured by the slides soak (2026-05-24, 5/8 successful generations
+/// produced PPTX bytes but 0/8 surfaced a clickable button on the SPA).
+pub const UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1: &str = "event.file_attached.v1";
+
 /// Feature flag for UPCR-2026-014 M9-γ canonical projection envelope.
 ///
 /// Capability-gated — servers advertise it only when they emit the
@@ -78,6 +175,57 @@ pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1
 /// notifications continue to flow on connections that do not negotiate
 /// this feature, until M9-γ-3 deletes them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1: &str = "projection.envelope.v1";
+
+/// Feature flag for M12 Phase D-1 auxiliary REST→WS migration.
+///
+/// Negotiated by clients that route auxiliary panel traffic (sidebar
+/// session list, right-rail snapshot/files/tasks, status pill, messages
+/// history scroll, workspace contract panel, title rename, session
+/// delete, content gallery) onto the existing
+/// `/api/ui-protocol/ws` JSON-RPC connection instead of the legacy REST
+/// endpoints on `/api/sessions/*`, `/api/status`, and `/api/my/content`.
+/// See `docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`.
+///
+/// REST endpoints stay live for clients that do not negotiate this
+/// feature; D-1 is additive only. Phase D-5 retires the REST routes
+/// once `octos-web` has migrated (tracked separately).
+pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to_ws.v1";
+
+/// Required feature flag for UPCR-2026-021 M15 autonomy inspection/control.
+pub const UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1: &str = "coding.autonomy.v1";
+
+/// Optional M15 feature flag for backend-owned agent lifecycle controls.
+pub const UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1: &str = "coding.agent_control.v1";
+
+/// Optional M15 feature flag for persisted goal runtime controls.
+pub const UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1: &str = "coding.goal_runtime.v1";
+
+/// Optional M15 feature flag for recurring loop runtime controls.
+pub const UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
+
+/// Optional M15 feature flag for backend-owned product review workflows.
+pub const UI_PROTOCOL_FEATURE_REVIEW_START_V1: &str = "review.start.v1";
+
+/// Feature flag for backend-owned context generation, checkpoint, and
+/// compaction lifecycle inspection.
+pub const UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
+
+/// #965 / UPCR-2026-019 — spec-canonical feature name for the
+/// supervised-task inspection surface (`task/list`, `task/updated`,
+/// `task/output/read`, `agent/list`, `agent/status/read`, `agent/output/read`,
+/// `agent/interrupt`, `agent/close`). The methods themselves stay gated on
+/// [`UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1`] so older clients keep
+/// working; this constant is advertised in parallel so the protocol
+/// vocabulary matches the M13-A spec strings.
+pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1: &str =
+    "harness.task_supervision_inspection.v1";
+
+/// #965 / UPCR-2026-019 — spec-canonical feature name for the
+/// supervised-task artifact surface (`task/artifact/list`, `task/artifact/read`,
+/// `agent/artifact/list`, `agent/artifact/read`, `agent/artifact/updated`).
+/// The canonical `task/artifact/*` methods are gated on this flag; legacy
+/// `agent/artifact/*` aliases remain gated on agent control.
+pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_artifacts.v1";
 
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
@@ -94,7 +242,17 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
     UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -112,9 +270,42 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::TASK_LIST | methods::TASK_CANCEL | methods::TASK_RESTART_FROM_NODE => {
             Some(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1)
         }
+        methods::TASK_ARTIFACT_LIST | methods::TASK_ARTIFACT_READ => {
+            Some(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1)
+        }
         methods::SESSION_HYDRATE => Some(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
         methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
+        methods::SESSION_LIST
+        | methods::SESSION_SNAPSHOT
+        | methods::SESSION_MESSAGES_PAGE
+        | methods::SESSION_STATUS_GET
+        | methods::SESSION_FILES_LIST
+        | methods::SESSION_TASKS_LIST
+        | methods::SESSION_WORKSPACE_GET
+        | methods::SESSION_TITLE_SET
+        | methods::SESSION_DELETE
+        | methods::SYSTEM_STATUS_GET
+        | methods::CONTENT_LIST
+        | methods::CONTENT_DELETE
+        | methods::CONTENT_BULK_DELETE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
+        methods::AGENT_LIST
+        | methods::AGENT_STATUS_READ
+        | methods::AGENT_OUTPUT_READ
+        | methods::AGENT_ARTIFACT_LIST
+        | methods::AGENT_ARTIFACT_READ
+        | methods::AGENT_INTERRUPT
+        | methods::AGENT_CLOSE => Some(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
+        methods::SESSION_GOAL_GET | methods::SESSION_GOAL_SET | methods::SESSION_GOAL_CLEAR => {
+            Some(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1)
+        }
+        methods::LOOP_CREATE
+        | methods::LOOP_LIST
+        | methods::LOOP_DELETE
+        | methods::LOOP_PAUSE
+        | methods::LOOP_RESUME
+        | methods::LOOP_FIRE_NOW => Some(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
+        methods::REVIEW_START => Some(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
         _ => None,
     }
 }
@@ -257,6 +448,35 @@ pub mod rpc_error_codes {
 
     /// Spec §10 / M9-FIX-04 backpressure signal; carries `retry_after_ms` in `data`.
     pub const RATE_LIMITED: i64 = -32160;
+
+    /// Generic not-found error for non-session-scoped resources (content
+    /// catalog rows, profile records, ...) returned by REST 404. Distinct
+    /// from `UNKNOWN_SESSION` (-32100) which is reserved for session-scoped
+    /// 404s. M12 Phase D-1 introduced this slot when the REST→WS bridge
+    /// began surfacing content/profile 404s as typed errors; before, every
+    /// REST 404 was force-mapped to `UNKNOWN_SESSION` regardless of
+    /// resource kind.
+    pub const RESOURCE_NOT_FOUND: i64 = -32170;
+}
+
+/// UPCR-2026-021 autonomy runtime error kind registry.
+pub mod autonomy_error_kinds {
+    pub const AGENT_NOT_FOUND: &str = "agent_not_found";
+    pub const AGENT_CONTROL_FORBIDDEN: &str = "agent_control_forbidden";
+    pub const AGENT_CONTROL_UNAVAILABLE: &str = "agent_control_unavailable";
+    pub const AGENT_ARTIFACT_DENIED: &str = "agent_artifact_denied";
+    pub const GOAL_RUNTIME_UNAVAILABLE: &str = "goal_runtime_unavailable";
+    pub const GOAL_UNAVAILABLE: &str = "goal_unavailable";
+    pub const GOAL_INVALID_STATE: &str = "goal_invalid_state";
+    pub const GOAL_RATE_LIMITED: &str = "goal_rate_limited";
+    pub const LOOP_RUNTIME_UNAVAILABLE: &str = "loop_runtime_unavailable";
+    pub const LOOP_NOT_FOUND: &str = "loop_not_found";
+    pub const LOOP_INVALID_INTERVAL: &str = "loop_invalid_interval";
+    pub const LOOP_PROMPT_EMPTY: &str = "loop_prompt_empty";
+    pub const LOOP_BUSY: &str = "loop_busy";
+    pub const LOOP_SLASH_DENIED: &str = "loop_slash_denied";
+    pub const LOOP_POLICY_DENIED: &str = "loop_policy_denied";
+    pub const AUTONOMY_QUOTA_EXCEEDED: &str = "autonomy_quota_exceeded";
 }
 
 /// Logical event-ledger cursor used for resumable UI notification consumption.
@@ -566,6 +786,31 @@ impl RpcError {
         Self::new(rpc_error_codes::RUNTIME_NOT_READY, message)
     }
 
+    /// Generic REST 404 for non-session-scoped resources (content catalog
+    /// rows, profile records, ...). Distinct from
+    /// [`Self::unknown_session`] which carries `session_id` in `data` for
+    /// session-scoped misses. M12 Phase D-1 added this so the REST→WS
+    /// bridge can surface content/profile 404s without misclassifying
+    /// them as session misses.
+    ///
+    /// `resource_type` is a short tag identifying the resource ("content",
+    /// "profile", ...); `identifier` is the resource id the client sent.
+    /// Both are echoed in `data` so clients can reconcile without parsing
+    /// the message string.
+    pub fn not_found(resource_type: impl Into<String>, identifier: impl Into<String>) -> Self {
+        let resource_type = resource_type.into();
+        let identifier = identifier.into();
+        Self::new(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            format!("{resource_type} not found: {identifier}"),
+        )
+        .with_data(serde_json::json!({
+            "kind": "not_found",
+            "resource_type": resource_type,
+            "identifier": identifier,
+        }))
+    }
+
     /// Result-side counterpart to `INVALID_PARAMS`. See
     /// [`rpc_error_codes::MALFORMED_RESULT`] for rationale.
     pub fn malformed_result(message: impl Into<String>) -> Self {
@@ -639,6 +884,9 @@ where
 }
 
 pub mod methods {
+    pub const CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
+    pub const SESSION_STATUS_READ: &str = "session/status/read";
+    pub const PROFILE_LOCAL_CREATE: &str = "profile/local/create";
     pub const SESSION_OPEN: &str = "session/open";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
@@ -658,6 +906,40 @@ pub mod methods {
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
     pub const TURN_STATE_GET: &str = "turn/state/get";
+
+    /// UPCR-2026-021 M15 agent inspection/control surface.
+    pub const AGENT_LIST: &str = "agent/list";
+    pub const AGENT_STATUS_READ: &str = "agent/status/read";
+    pub const AGENT_OUTPUT_READ: &str = "agent/output/read";
+    pub const AGENT_ARTIFACT_LIST: &str = "agent/artifact/list";
+    pub const AGENT_ARTIFACT_READ: &str = "agent/artifact/read";
+    /// #965 / UPCR-2026-019 — spec-canonical names for the same payloads
+    /// served by `agent/artifact/*`. Servers dispatch both into the same
+    /// handlers; clients can use either name (the `task/*` form is the
+    /// long-term direction per the M13 contract).
+    pub const TASK_ARTIFACT_LIST: &str = "task/artifact/list";
+    pub const TASK_ARTIFACT_READ: &str = "task/artifact/read";
+    pub const AGENT_INTERRUPT: &str = "agent/interrupt";
+    pub const AGENT_CLOSE: &str = "agent/close";
+
+    /// UPCR-2026-021 M15 persisted goal runtime surface.
+    pub const SESSION_GOAL_GET: &str = "session/goal/get";
+    pub const SESSION_GOAL_SET: &str = "session/goal/set";
+    pub const SESSION_GOAL_CLEAR: &str = "session/goal/clear";
+
+    /// UPCR-2026-021 M15 recurring loop runtime surface.
+    pub const LOOP_CREATE: &str = "loop/create";
+    pub const LOOP_LIST: &str = "loop/list";
+    pub const LOOP_DELETE: &str = "loop/delete";
+    pub const LOOP_PAUSE: &str = "loop/pause";
+    pub const LOOP_RESUME: &str = "loop/resume";
+    pub const LOOP_FIRE_NOW: &str = "loop/fire_now";
+
+    /// Product-level automated code review workflow.
+    ///
+    /// This is not a generic child-agent control API. The backend owns the
+    /// review template and decides which specialist agents to launch.
+    pub const REVIEW_START: &str = "review/start";
 
     pub const TURN_STARTED: &str = "turn/started";
     pub const TURN_COMPLETED: &str = "turn/completed";
@@ -694,10 +976,93 @@ pub mod methods {
     /// event mirroring the SSE `file:` frame from `files_to_send` tool
     /// surfaces.
     pub const FILE_ATTACHED: &str = "file/attached";
+    /// UPCR-2026-014 (M9-γ) `projection/envelope` — canonical projection
+    /// envelope notification (spec § 14). γ-1 reserves the method name
+    /// in the notification methods list as part of capability negotiation
+    /// wire-up; γ-2 (follow-up) will gate emission on the
+    /// `projection.envelope.v1` feature and delete the legacy
+    /// `message/delta`, `message/persisted`, `tool/*`, and
+    /// `turn/completed` notifications it supersedes.
+    pub const PROJECTION_ENVELOPE: &str = "projection/envelope";
     /// UPCR-2026-014 (M9-α-9) `session/event` — wrapper envelope for
     /// legacy `/api/sessions/:id/events/stream` SSE frames bridged onto
     /// the unified v1 surface.
     pub const SESSION_EVENT: &str = "session/event";
+
+    // ---- M12 Phase D-1 auxiliary REST → WS surface ----
+    // Each method below replaces a REST endpoint listed in the ADR's
+    // inventory table (docs/adr/m12-phase-d-auxiliary-rest-to-ws.md).
+    // All thirteen are capability-gated on
+    // `UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1`
+    // (`content/delete` and `content/bulk_delete` are distinct methods
+    // sharing the `content/*` namespace).
+
+    /// Replaces `GET /api/sessions` — sidebar session list.
+    pub const SESSION_LIST: &str = "session/list";
+    /// Replaces combined `GET /api/sessions/{id}/status` + `/files` +
+    /// `/tasks` — single right-rail bootstrap fetch.
+    pub const SESSION_SNAPSHOT: &str = "session/snapshot";
+    /// Replaces `GET /api/sessions/{id}/messages` — paginated history.
+    pub const SESSION_MESSAGES_PAGE: &str = "session/messages_page";
+    /// Replaces `GET /api/sessions/{id}/status` — status-pill poller.
+    pub const SESSION_STATUS_GET: &str = "session/status.get";
+    /// Replaces `GET /api/sessions/{id}/files` — files panel listing.
+    pub const SESSION_FILES_LIST: &str = "session/files.list";
+    /// Replaces `GET /api/sessions/{id}/tasks` — background tasks panel.
+    pub const SESSION_TASKS_LIST: &str = "session/tasks.list";
+    /// Replaces `GET /api/sessions/{id}/workspace-contract` — workspace
+    /// contract panel.
+    pub const SESSION_WORKSPACE_GET: &str = "session/workspace.get";
+    /// Replaces `PATCH /api/sessions/{id}/title` — manual title setter.
+    pub const SESSION_TITLE_SET: &str = "session/title.set";
+    /// Replaces `DELETE /api/sessions/{id}` — session deletion.
+    pub const SESSION_DELETE: &str = "session/delete";
+    /// Replaces `GET /api/status` — agent/server status (distinct from
+    /// `/api/auth/status` which stays REST).
+    pub const SYSTEM_STATUS_GET: &str = "system/status.get";
+    /// Replaces `GET /api/my/content` — content gallery listing.
+    pub const CONTENT_LIST: &str = "content/list";
+    /// Replaces `DELETE /api/my/content/{id}` — single-content deletion.
+    pub const CONTENT_DELETE: &str = "content/delete";
+    /// Replaces `POST /api/my/content/bulk-delete` — bulk-content deletion.
+    pub const CONTENT_BULK_DELETE: &str = "content/bulk_delete";
+
+    // ---- Wave4-A: adaptive routing + queue state ----
+
+    /// Wave4-A `router/status` — adaptive routing snapshot notification.
+    /// Emitted by the server adjacent to `turn/started` and `turn/completed`
+    /// so the client always has a fresh status without polling.
+    pub const ROUTER_STATUS: &str = "router/status";
+    /// Wave4-A `router/failover` — adaptive router crossed lanes.
+    pub const ROUTER_FAILOVER: &str = "router/failover";
+    /// Wave4-A `router/set_mode` — runtime mode toggle command. Mode
+    /// change is session-scoped, not process-global.
+    pub const ROUTER_SET_MODE: &str = "router/set_mode";
+    /// Wave4-A `router/get_metrics` — on-demand snapshot of the
+    /// `AdaptiveStatus` plus full lane scores / breaker map. Returns
+    /// the same payload shape as the `router/status` notification but
+    /// as an RPC result.
+    pub const ROUTER_GET_METRICS: &str = "router/get_metrics";
+    /// Wave4-A `queue/state` — pending-queue snapshot. Client-emitted
+    /// today; the constant is defined so type-checked code paths across
+    /// the workspace can reference one source of truth.
+    pub const QUEUE_STATE: &str = "queue/state";
+
+    /// UPCR-2026-021 M15 agent lifecycle/output notifications.
+    pub const AGENT_UPDATED: &str = "agent/updated";
+    pub const AGENT_OUTPUT_DELTA: &str = "agent/output/delta";
+    pub const AGENT_ARTIFACT_UPDATED: &str = "agent/artifact/updated";
+    /// UPCR-2026-021 M15 goal runtime notifications.
+    pub const SESSION_GOAL_UPDATED: &str = "session/goal/updated";
+    pub const SESSION_GOAL_CLEARED: &str = "session/goal/cleared";
+    /// UPCR-2026-021 M15 loop runtime notifications.
+    pub const LOOP_UPDATED: &str = "loop/updated";
+    pub const LOOP_FIRED: &str = "loop/fired";
+    pub const LOOP_COMPLETED: &str = "loop/completed";
+    /// M16 `context.lifecycle.v1`: compact-context lifecycle notification.
+    pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
+    /// M16 `context.lifecycle.v1`: prompt normalization report notification.
+    pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -709,6 +1074,7 @@ pub mod approval_cancelled_reasons {
 
 /// All command methods defined by the v1alpha1 protocol model.
 pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
+    methods::PROFILE_LOCAL_CREATE,
     methods::SESSION_OPEN,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
@@ -724,6 +1090,40 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_HYDRATE,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
+    methods::AGENT_LIST,
+    methods::AGENT_STATUS_READ,
+    methods::AGENT_OUTPUT_READ,
+    methods::AGENT_ARTIFACT_LIST,
+    methods::AGENT_ARTIFACT_READ,
+    methods::TASK_ARTIFACT_LIST,
+    methods::TASK_ARTIFACT_READ,
+    methods::AGENT_INTERRUPT,
+    methods::AGENT_CLOSE,
+    methods::SESSION_GOAL_GET,
+    methods::SESSION_GOAL_SET,
+    methods::SESSION_GOAL_CLEAR,
+    methods::LOOP_CREATE,
+    methods::LOOP_LIST,
+    methods::LOOP_DELETE,
+    methods::LOOP_PAUSE,
+    methods::LOOP_RESUME,
+    methods::LOOP_FIRE_NOW,
+    methods::REVIEW_START,
+    methods::SESSION_LIST,
+    methods::SESSION_SNAPSHOT,
+    methods::SESSION_MESSAGES_PAGE,
+    methods::SESSION_STATUS_GET,
+    methods::SESSION_FILES_LIST,
+    methods::SESSION_TASKS_LIST,
+    methods::SESSION_WORKSPACE_GET,
+    methods::SESSION_TITLE_SET,
+    methods::SESSION_DELETE,
+    methods::SYSTEM_STATUS_GET,
+    methods::CONTENT_LIST,
+    methods::CONTENT_DELETE,
+    methods::CONTENT_BULK_DELETE,
+    methods::ROUTER_SET_MODE,
+    methods::ROUTER_GET_METRICS,
 ];
 
 /// Notification methods defined by the v1alpha1 protocol model.
@@ -748,7 +1148,21 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::MESSAGE_PERSISTED,
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
+    methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
+    methods::ROUTER_STATUS,
+    methods::ROUTER_FAILOVER,
+    methods::QUEUE_STATE,
+    methods::AGENT_UPDATED,
+    methods::AGENT_OUTPUT_DELTA,
+    methods::AGENT_ARTIFACT_UPDATED,
+    methods::SESSION_GOAL_UPDATED,
+    methods::SESSION_GOAL_CLEARED,
+    methods::LOOP_UPDATED,
+    methods::LOOP_FIRED,
+    methods::LOOP_COMPLETED,
+    methods::CONTEXT_COMPACTION_COMPLETED,
+    methods::CONTEXT_NORMALIZATION_REPORTED,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -768,6 +1182,40 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_HYDRATE,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
+    methods::AGENT_LIST,
+    methods::AGENT_STATUS_READ,
+    methods::AGENT_OUTPUT_READ,
+    methods::AGENT_ARTIFACT_LIST,
+    methods::AGENT_ARTIFACT_READ,
+    methods::TASK_ARTIFACT_LIST,
+    methods::TASK_ARTIFACT_READ,
+    methods::AGENT_INTERRUPT,
+    methods::AGENT_CLOSE,
+    methods::SESSION_GOAL_GET,
+    methods::SESSION_GOAL_SET,
+    methods::SESSION_GOAL_CLEAR,
+    methods::LOOP_CREATE,
+    methods::LOOP_LIST,
+    methods::LOOP_DELETE,
+    methods::LOOP_PAUSE,
+    methods::LOOP_RESUME,
+    methods::LOOP_FIRE_NOW,
+    methods::REVIEW_START,
+    methods::SESSION_LIST,
+    methods::SESSION_SNAPSHOT,
+    methods::SESSION_MESSAGES_PAGE,
+    methods::SESSION_STATUS_GET,
+    methods::SESSION_FILES_LIST,
+    methods::SESSION_TASKS_LIST,
+    methods::SESSION_WORKSPACE_GET,
+    methods::SESSION_TITLE_SET,
+    methods::SESSION_DELETE,
+    methods::SYSTEM_STATUS_GET,
+    methods::CONTENT_LIST,
+    methods::CONTENT_DELETE,
+    methods::CONTENT_BULK_DELETE,
+    methods::ROUTER_SET_MODE,
+    methods::ROUTER_GET_METRICS,
 ];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
@@ -832,11 +1280,19 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
             UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
             UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+            UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+            UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+            UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
         ])
     }
 
@@ -884,9 +1340,15 @@ impl UiProtocolCapabilities {
             .into_iter()
             .map(|feature| feature.as_ref().to_owned())
             .collect();
+        let autonomy_base_requested = requested
+            .iter()
+            .any(|feature| feature == UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1);
         let supported_features: Vec<String> = UI_PROTOCOL_KNOWN_FEATURES
             .iter()
-            .filter(|feature| requested.iter().any(|requested| requested == **feature))
+            .filter(|feature| {
+                requested.iter().any(|requested| requested == **feature)
+                    && (autonomy_base_requested || !is_autonomy_optional_feature(feature))
+            })
             .map(|feature| (*feature).to_owned())
             .collect();
         let supported_methods: Vec<String> = UI_PROTOCOL_FIRST_SERVER_METHODS
@@ -951,6 +1413,15 @@ impl UiProtocolCapabilities {
     }
 }
 
+fn is_autonomy_optional_feature(feature: &str) -> bool {
+    matches!(
+        feature,
+        UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1
+            | UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1
+            | UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1
+    )
+}
+
 fn string_list(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -1010,6 +1481,7 @@ impl RpcError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiResultKind {
+    ProfileLocalCreate,
     SessionOpen,
     TurnStart,
     TurnInterrupt,
@@ -1022,6 +1494,8 @@ pub enum UiResultKind {
     TaskCancel,
     TaskRestartFromNode,
     TaskOutputRead,
+    TaskArtifactList,
+    TaskArtifactRead,
     SessionHydrate,
     ThreadGraphGet,
     TurnStateGet,
@@ -1030,6 +1504,7 @@ pub enum UiResultKind {
 
 pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind> {
     match method {
+        methods::PROFILE_LOCAL_CREATE => Some(UiResultKind::ProfileLocalCreate),
         methods::SESSION_OPEN => Some(UiResultKind::SessionOpen),
         methods::TURN_START => Some(UiResultKind::TurnStart),
         methods::TURN_INTERRUPT => Some(UiResultKind::TurnInterrupt),
@@ -1042,6 +1517,8 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_CANCEL => Some(UiResultKind::TaskCancel),
         methods::TASK_RESTART_FROM_NODE => Some(UiResultKind::TaskRestartFromNode),
         methods::TASK_OUTPUT_READ => Some(UiResultKind::TaskOutputRead),
+        methods::TASK_ARTIFACT_LIST => Some(UiResultKind::TaskArtifactList),
+        methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
@@ -1067,6 +1544,10 @@ pub enum InputItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenParams {
     pub session_id: SessionKey,
+    /// Optional sub-topic suffix to open. When present, the server scopes
+    /// replay and live fan-out to the matching topic bucket for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1259,10 +1740,12 @@ pub struct ApprovalScopeEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum PermissionProfileMode {
+    #[serde(rename = "read_only", alias = "read-only")]
     ReadOnly,
+    #[serde(rename = "workspace_write", alias = "workspace-write")]
     WorkspaceWrite,
+    #[serde(rename = "danger_full_access", alias = "danger-full-access")]
     DangerFullAccess,
 }
 
@@ -1317,12 +1800,17 @@ impl PermissionProfileSelection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PermissionProfileUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<PermissionProfileMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<PermissionNetworkPolicy>,
+    /// Optional approval behavior override. Accepted values are currently
+    /// `on-request`/`on_request`/`ask` and `never`. Unknown values are rejected
+    /// by the server-side policy resolver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
 }
 
 impl PermissionProfileUpdate {
@@ -1344,6 +1832,12 @@ pub struct PermissionProfileListParams {
 pub struct PermissionProfileSetParams {
     pub session_id: SessionKey,
     pub update: PermissionProfileUpdate,
+    /// Optional runtime-mode override the client asserts for gating
+    /// (`"tenant"`, `"cloud"`, `"local"`, `"solo"`). When provided and
+    /// stricter than the server's deployment mode, the gate uses the
+    /// requested mode. The override can only TIGHTEN gating, never relax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1361,6 +1855,24 @@ pub struct PermissionProfileSetResult {
     pub applied: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLocalCreateParams {
+    pub name: String,
+    pub username: String,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLocalCreateResult {
+    pub profile_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub username: String,
+    pub email: String,
+    pub created: bool,
+    pub runtime_mode: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffPreviewGetParams {
     pub session_id: SessionKey,
@@ -1375,6 +1887,34 @@ pub struct TaskOutputReadParams {
     pub cursor: Option<OutputCursor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactListParams {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactReadParams {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<OutputCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1414,6 +1954,47 @@ pub struct TaskListResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactRecord {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactListResult {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<TaskArtifactRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactReadResult {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub artifact: TaskArtifactRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<OutputCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<OutputCursor>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskListEntry {
     pub id: TaskId,
     pub tool_name: String,
@@ -1422,6 +2003,37 @@ pub struct TaskListEntry {
     pub status: String,
     pub lifecycle_state: String,
     pub runtime_state: String,
+    /// #966 / M13-B — origin of this child task. One of `"model"` (the
+    /// LLM scheduled it via spawn_agent / spawn / delegate), `"supervisor"`
+    /// (a backend supervisor created it, e.g. review/start), or `"user"`
+    /// (explicit user-driven schedule, rare). Lets clients tell apart
+    /// LLM-owned children from user-initiated tasks without parsing
+    /// free-form fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// #966 / M13-B — role label assigned at spawn (e.g.
+    /// `"reviewer"`, `"implementer"`, `"test_worker"`, `"explorer"`).
+    /// Pairs with the M14-C role templates and lets the UX render
+    /// "Reviewer running" instead of "task-xxx running".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// #966 / M13-B — bounded summary capsule for the task (mirrors
+    /// `ChildResultSummary.summary` for terminal children). Short text
+    /// that clients can render inline without fetching the full
+    /// artifact list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// #966 / M13-B — number of artifacts the child has emitted so
+    /// far. Lets the UX badge tasks with their artifact count without
+    /// resolving `task/artifact/list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_count: Option<u32>,
+    /// #966 / M13-B — runtime policy stamp captured at spawn time
+    /// (model, sandbox, approval policy, …). Lets reconnect hydration
+    /// surface the same effective state the original task/updated
+    /// notifications announced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_key: Option<SessionKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1749,6 +2361,10 @@ pub struct SessionHydrateResult {
     pub session_id: SessionKey,
     pub cursor: UiCursor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<HydratedMessage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<Vec<ThreadGraphEntry>>,
@@ -1858,6 +2474,10 @@ pub struct TurnStateGetResult {
     pub turn_id: TurnId,
     pub state: TurnLifecycleState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
@@ -1867,6 +2487,291 @@ pub struct TurnStateGetResult {
     /// turns that have started but not yet committed a row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub committed_seqs: Vec<u64>,
+}
+
+// ----- M12 Phase D-1 auxiliary REST → WS frames -----
+//
+// Each pair below mirrors a REST endpoint listed in the ADR's inventory
+// table (`docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`). Result payloads
+// are typed as opaque [`Value`] containers so the WS dispatchers can
+// forward the existing REST handler's JSON body byte-for-byte without
+// duplicating the REST DTO shapes (`SessionInfo`, `MessageInfo`,
+// `SessionFileInfo`, `BackgroundTaskInfo`, `WorkspaceContractStatus`,
+// `StatusResponse`, `ContentEntry`) into the protocol crate. The shapes
+// are unchanged from the REST contract — only the transport flips.
+
+/// Params for `session/list` — empty request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListParams {}
+
+/// Result for `session/list`. `sessions` is the JSON array the existing
+/// `GET /api/sessions` handler emits (one `SessionInfo` per entry, per
+/// `crates/octos-cli/src/api/handlers.rs:508`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionListResult {
+    pub sessions: Value,
+}
+
+/// Params for `session/snapshot` — combined bootstrap fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshotParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Result for `session/snapshot`. Each field is the JSON body the
+/// corresponding REST endpoint returns today (status / files / tasks).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshotResult {
+    pub status: Value,
+    pub files: Value,
+    pub tasks: Value,
+}
+
+/// Params for `session/messages_page` — paginated history fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessagesPageParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Default page size when `SessionMessagesPageParams::limit` is omitted.
+pub const SESSION_MESSAGES_PAGE_DEFAULT_LIMIT: usize = 100;
+/// Server-side clamp on `SessionMessagesPageParams::limit`. Matches the
+/// existing REST handler's `.min(500)` clamp at
+/// `crates/octos-cli/src/api/handlers.rs:685`.
+pub const SESSION_MESSAGES_PAGE_MAX_LIMIT: usize = 500;
+/// Server-side clamp on `SessionMessagesPageParams::offset`. Matches the
+/// existing REST handler's `.min(10_000)` clamp.
+pub const SESSION_MESSAGES_PAGE_MAX_OFFSET: usize = 10_000;
+
+/// Result for `session/messages_page`. `messages` mirrors the REST shape
+/// (`Vec<MessageInfo>`). `has_more` / `next_offset` are set by the
+/// dispatcher based on `messages.len() == limit`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessagesPageResult {
+    pub messages: Value,
+    pub has_more: bool,
+    pub next_offset: usize,
+}
+
+/// Params for `session/status.get` — status-pill poller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusGetParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Result for `session/status.get`. Mirrors the JSON body of
+/// `GET /api/sessions/{id}/status` (`{ active, has_deferred_files,
+/// has_bg_tasks }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStatusGetResult {
+    pub status: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
+}
+
+/// Params for `session/files.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesListParams {
+    pub session_id: String,
+}
+
+/// Result for `session/files.list`. `files` matches
+/// `Vec<SessionFileInfo>` as emitted by `GET /api/sessions/{id}/files`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionFilesListResult {
+    pub files: Value,
+}
+
+/// Params for `session/tasks.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTasksListParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Result for `session/tasks.list`. `tasks` matches the JSON body of
+/// `GET /api/sessions/{id}/tasks` (a `BackgroundTaskInfo` array proxied
+/// from the gateway; empty in standalone mode).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTasksListResult {
+    pub tasks: Value,
+}
+
+/// Params for `session/workspace.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkspaceGetParams {
+    pub session_id: String,
+}
+
+/// Result for `session/workspace.get`. `contracts` matches
+/// `Vec<WorkspaceContractStatus>` as emitted by
+/// `GET /api/sessions/{id}/workspace-contract`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionWorkspaceGetResult {
+    pub contracts: Value,
+}
+
+/// Params for `session/title.set`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTitleSetParams {
+    pub session_id: String,
+    pub title: String,
+}
+
+/// Result for `session/title.set`. Echoes the resolved `session_id` and
+/// title so the SPA can roundtrip the rename in a single response (the
+/// REST `PATCH /api/sessions/{id}/title` returned `204 No Content`; the
+/// WS shape lifts the title into the response body for echo-correctness).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTitleSetResult {
+    pub session_id: String,
+    pub title: String,
+}
+
+/// Server-side clamp on `SessionTitleSetParams::title` character count.
+/// Matches the existing REST handler's character cap at
+/// `crates/octos-cli/src/api/handlers.rs:1162`.
+pub const SESSION_TITLE_SET_MAX_CHARS: usize = 200;
+
+/// Params for `session/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDeleteParams {
+    pub session_id: String,
+}
+
+/// Result for `session/delete`. Empty (the REST `DELETE` returns
+/// `204 No Content`; on WS we send an empty object for consistency with
+/// other void RPCs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDeleteResult {}
+
+/// Params for `system/status.get`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemStatusGetParams {}
+
+/// Result for `system/status.get`. `status` is the JSON body of the
+/// existing `GET /api/status` handler (`StatusResponse` —
+/// `crates/octos-cli/src/api/handlers.rs:2592`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SystemStatusGetResult {
+    pub status: Value,
+}
+
+/// Params for `content/list`. `filters` is a free-form JSON object that
+/// mirrors the REST `ContentQuery` shape (category, search, from, to,
+/// sort, limit, offset, session_id) — see
+/// `crates/octos-cli/src/content_catalog.rs:96` and the dirs/session_id
+/// fields consumed by `GET /api/my/content`. Forwarded verbatim to the
+/// existing REST handler.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContentListParams {
+    #[serde(default)]
+    pub filters: Value,
+}
+
+/// Result for `content/list`. Mirrors the JSON body of
+/// `GET /api/my/content` (`{ entries: ContentEntry[], total: number }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentListResult {
+    pub entries: Value,
+    pub total: usize,
+}
+
+/// Params for `content/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentDeleteParams {
+    pub id: String,
+}
+
+/// Result for `content/delete`. `deleted` is `true` when the row was
+/// removed, `false` when the id was not in the catalog (the REST handler
+/// returns the same boolean inside its `ActionResponse.ok`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentDeleteResult {
+    pub deleted: bool,
+}
+
+/// Params for `content/bulk_delete`. The `ids` vector is capped at
+/// [`CONTENT_BULK_DELETE_MAX_IDS`] entries; the WS dispatcher rejects
+/// over-cap requests with `INVALID_PARAMS` before any catalog write
+/// lock is taken, so a single oversized request cannot block other
+/// catalog readers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentBulkDeleteParams {
+    pub ids: Vec<String>,
+}
+
+/// Server-side cap on `ContentBulkDeleteParams::ids` length. Mirrored
+/// in `crates/octos-cli/src/api/ui_protocol.rs` as the dispatcher's
+/// early-reject threshold. Chosen so a single bulk-delete cannot
+/// monopolize the catalog write-lock for more than a small bounded
+/// window even if every id is valid; the 1 MiB WS frame limit is a
+/// coarser secondary check.
+pub const CONTENT_BULK_DELETE_MAX_IDS: usize = 256;
+
+/// Result for `content/bulk_delete`. `deleted` is the number of catalog
+/// rows successfully removed — mirrors the count surfaced by the REST
+/// handler's `ActionResponse.message` ("N item(s) deleted.").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentBulkDeleteResult {
+    pub deleted: usize,
+}
+
+// ----- Wave4-A `router/*` + `queue/state` -----
+
+/// Wave4-A `router/set_mode` params. `mode` is the lowercase string
+/// rendering of `octos_llm::AdaptiveMode` — `"off"`, `"hedge"`, or
+/// `"lane"`. The string is intentional (a) so the wire stays decoupled
+/// from `octos-llm`'s enum variant numeric layout and (b) so client
+/// implementations don't have to negotiate over numeric values.
+///
+/// Mode change is session-scoped — it persists for the lifetime of the
+/// `AdaptiveRouter` (process lifetime today), not across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterSetModeParams {
+    pub session_id: SessionKey,
+    pub mode: String,
+}
+
+/// Wave4-A `router/set_mode` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterSetModeResult {
+    /// New mode actually committed by the router (echo of `params.mode`
+    /// when the call succeeded). Returned so clients can confirm the
+    /// transition before swapping their pill state.
+    pub mode: String,
+}
+
+/// Wave4-A `router/get_metrics` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterGetMetricsParams {
+    pub session_id: SessionKey,
+}
+
+/// Wave4-A `router/get_metrics` result. Identical wire shape to
+/// [`RouterStatusEvent`] (excluding the redundant `session_id` echo)
+/// so a client can use the same code path for both — the notification
+/// is a push variant of the same snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterGetMetricsResult {
+    pub provider_name: String,
+    pub mode: String,
+    pub qos_ranking: bool,
+    pub lane_scores: BTreeMap<String, f64>,
+    pub circuit_breakers: BTreeMap<String, String>,
 }
 
 // ----- UPCR-2026-012 `message/persisted` -----
@@ -1930,6 +2835,8 @@ impl MessagePersistedSource {
 pub struct MessagePersistedEvent {
     pub session_id: SessionKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
@@ -1953,6 +2860,20 @@ pub struct MessagePersistedEvent {
     /// running older protocol versions see the same wire shape they used to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
+    /// Optional text content of the persisted row.
+    ///
+    /// Pre-fix this field was omitted from the wire: `message/persisted`
+    /// carried only metadata alongside `media`, and the SPA hardcoded
+    /// `content: ""` when rebuilding the message. That dropped the
+    /// assistant's caption or summary text whenever a row carried BOTH
+    /// text and a file (e.g. `send_file` with a caption, mofa_slides
+    /// delivery with a summary). Carrying the content here when non-empty
+    /// lets clients render the bubble with text + file together.
+    ///
+    /// Wire compatibility: serialized as omitted when empty, so legacy
+    /// clients that don't read the field continue to behave as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 // ----- M10 Phase 1 `turn/spawn_complete` -----
@@ -1976,14 +2897,18 @@ pub struct MessagePersistedEvent {
 ///   anchor; the splice-merge logic in legacy clients was the bug surface
 ///   the new envelope replaces).
 ///
-/// Unlike `message/persisted` (which is metadata-only and works alongside
-/// streaming `message/delta` deltas to reconstruct content), this event
-/// carries the full `content` and `media` for the late completion in one
-/// frame — by design, the client never needs to splice-merge or wait for
-/// further deltas. `media` mirrors the convention in `MessagePersistedEvent`.
+/// Unlike `message/persisted` (which carries optional `content` alongside
+/// streamed `message/delta` deltas — see [`MessagePersistedEvent::content`]
+/// — and is primarily a durable commit confirmation), this event carries
+/// the full `content` and `media` for the late completion in one frame as
+/// a REQUIRED field — by design, the client never needs to splice-merge or
+/// wait for further deltas. `media` mirrors the convention in
+/// `MessagePersistedEvent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnSpawnCompleteEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1992,6 +2917,15 @@ pub struct TurnSpawnCompleteEvent {
     /// populated — a `turn/spawn_complete` without a task_id is a server
     /// bug.
     pub task_id: String,
+    /// Originating tool call id (the spawn_only tool invocation that
+    /// produced this background task). Carrying it on the wire eliminates
+    /// the client-side race where a stale `task_id → tool_call_id` map
+    /// (built from `task/updated` watchers) would fail to flip the
+    /// in-flight chip from spinner to checkmark on completion. Optional
+    /// so legacy daemons and synthetic / fallback emission paths that
+    /// cannot resolve the originating call still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// The originating user message's `client_message_id`, i.e. the
     /// user-prompt anchor under which the new assistant bubble should be
     /// rendered. `None` only for legacy callers that did not propagate
@@ -2007,8 +2941,8 @@ pub struct TurnSpawnCompleteEvent {
     pub cursor: UiCursor,
     pub persisted_at: DateTime<Utc>,
     /// REQUIRED. The full assistant text for the completion bubble. Unlike
-    /// [`MessagePersistedEvent`] (where `content` lives only in the
-    /// session ledger), this event carries the text inline so the client
+    /// [`MessagePersistedEvent::content`] (optional and omitted when
+    /// empty), this event ALWAYS carries the text inline so the client
     /// can render the new bubble atomically without a follow-up fetch.
     pub content: String,
     /// File attachments for this completion (e.g. `_report.md`,
@@ -2232,10 +3166,58 @@ pub struct Envelope {
     pub payload: Payload,
 }
 
+/// Ledger / wire wrapper around [`Envelope`] for the
+/// `projection/envelope` notification (UPCR-2026-014 M9-γ).
+///
+/// The wire JSON-RPC `params` field MUST match the spec § 14.1 wire
+/// shape exactly — `{ thread_id, seq, client_message_id?, payload }` —
+/// with **no `session_id`** key. But the in-memory ledger needs the
+/// `SessionKey` to route the event to the right per-session ring and
+/// broadcast channel, and it needs the optional `topic` so the
+/// topic-scope live filter (`ledger_event_matches_topic_scope`) keeps
+/// envelopes flowing to the right subscriber pane.
+///
+/// This wrapper carries those routing fields **outside** of the
+/// `envelope` body so the durable ledger can persist them and recovery
+/// can rebuild the routing context after restart.
+///
+/// **Serialization split (codex #1336 round-2 BLOCKER 4):** the global
+/// `Serialize` / `Deserialize` derive includes ALL fields (envelope +
+/// session_id + topic) so the DURABLE LEDGER round-trips routing
+/// state across daemon restart. The wire shape — bare `Envelope` per
+/// spec § 14.1 — is opted into only at the JSON-RPC boundary in
+/// [`UiNotification::into_rpc_notification`] /
+/// [`UiNotification::from_method_and_params`], where the bare
+/// envelope is extracted/re-wrapped. This is the "structurally honest"
+/// answer: a single global Serialize that strips routing fields means
+/// the ledger's disk records also strip them, and recovery walks the
+/// disk back into an `EnvelopeNotification` with empty `session_id` /
+/// `None` topic — topic-scoped envelope replay after restart silently
+/// loses routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeNotification {
+    /// Session this envelope belongs to. Used for ledger routing and
+    /// broadcast fan-out. Stripped from the wire (spec § 14.1) at the
+    /// `into_rpc_notification` boundary; preserved on disk so recovery
+    /// can rebuild routing.
+    pub session_id: SessionKey,
+    /// Optional topic for topic-scoped live forwarders (#1329 P0-A class
+    /// fix). Captured at the emit site BEFORE any `base_key()` strip so
+    /// the topic-scope filter routes correctly even when `session_id`
+    /// is the bare base key. Stripped from the wire at the
+    /// `into_rpc_notification` boundary; preserved on disk so recovery
+    /// can re-route topic-scoped envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// The canonical wire envelope — serializes verbatim per spec § 14.1.
+    pub envelope: Envelope,
+}
+
 /// Draft command payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiCommand {
+    ProfileLocalCreate(ProfileLocalCreateParams),
     SessionOpen(SessionOpenParams),
     TurnStart(TurnStartParams),
     TurnInterrupt(TurnInterruptParams),
@@ -2248,14 +3230,34 @@ pub enum UiCommand {
     TaskCancel(TaskCancelParams),
     TaskRestartFromNode(TaskRestartFromNodeParams),
     TaskOutputRead(TaskOutputReadParams),
+    TaskArtifactList(TaskArtifactListParams),
+    TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
+    // ---- M12 Phase D-1 auxiliary REST → WS frames ----
+    SessionList(SessionListParams),
+    SessionSnapshot(SessionSnapshotParams),
+    SessionMessagesPage(SessionMessagesPageParams),
+    SessionStatusGet(SessionStatusGetParams),
+    SessionFilesList(SessionFilesListParams),
+    SessionTasksList(SessionTasksListParams),
+    SessionWorkspaceGet(SessionWorkspaceGetParams),
+    SessionTitleSet(SessionTitleSetParams),
+    SessionDelete(SessionDeleteParams),
+    SystemStatusGet(SystemStatusGetParams),
+    ContentList(ContentListParams),
+    ContentDelete(ContentDeleteParams),
+    ContentBulkDelete(ContentBulkDeleteParams),
+    // ---- Wave4-A: adaptive router controls ----
+    RouterSetMode(RouterSetModeParams),
+    RouterGetMetrics(RouterGetMetricsParams),
 }
 
 impl UiCommand {
     pub fn method(&self) -> &'static str {
         match self {
+            Self::ProfileLocalCreate(_) => methods::PROFILE_LOCAL_CREATE,
             Self::SessionOpen(_) => methods::SESSION_OPEN,
             Self::TurnStart(_) => methods::TURN_START,
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
@@ -2268,9 +3270,26 @@ impl UiCommand {
             Self::TaskCancel(_) => methods::TASK_CANCEL,
             Self::TaskRestartFromNode(_) => methods::TASK_RESTART_FROM_NODE,
             Self::TaskOutputRead(_) => methods::TASK_OUTPUT_READ,
+            Self::TaskArtifactList(_) => methods::TASK_ARTIFACT_LIST,
+            Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
+            Self::SessionList(_) => methods::SESSION_LIST,
+            Self::SessionSnapshot(_) => methods::SESSION_SNAPSHOT,
+            Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
+            Self::SessionStatusGet(_) => methods::SESSION_STATUS_GET,
+            Self::SessionFilesList(_) => methods::SESSION_FILES_LIST,
+            Self::SessionTasksList(_) => methods::SESSION_TASKS_LIST,
+            Self::SessionWorkspaceGet(_) => methods::SESSION_WORKSPACE_GET,
+            Self::SessionTitleSet(_) => methods::SESSION_TITLE_SET,
+            Self::SessionDelete(_) => methods::SESSION_DELETE,
+            Self::SystemStatusGet(_) => methods::SYSTEM_STATUS_GET,
+            Self::ContentList(_) => methods::CONTENT_LIST,
+            Self::ContentDelete(_) => methods::CONTENT_DELETE,
+            Self::ContentBulkDelete(_) => methods::CONTENT_BULK_DELETE,
+            Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
+            Self::RouterGetMetrics(_) => methods::ROUTER_GET_METRICS,
         }
     }
 
@@ -2280,6 +3299,7 @@ impl UiCommand {
     ) -> Result<RpcRequest<Value>, serde_json::Error> {
         let method = self.method();
         let params = match self {
+            Self::ProfileLocalCreate(params) => serde_json::to_value(params),
             Self::SessionOpen(params) => serde_json::to_value(params),
             Self::TurnStart(params) => serde_json::to_value(params),
             Self::TurnInterrupt(params) => serde_json::to_value(params),
@@ -2292,9 +3312,26 @@ impl UiCommand {
             Self::TaskCancel(params) => serde_json::to_value(params),
             Self::TaskRestartFromNode(params) => serde_json::to_value(params),
             Self::TaskOutputRead(params) => serde_json::to_value(params),
+            Self::TaskArtifactList(params) => serde_json::to_value(params),
+            Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
+            Self::SessionList(params) => serde_json::to_value(params),
+            Self::SessionSnapshot(params) => serde_json::to_value(params),
+            Self::SessionMessagesPage(params) => serde_json::to_value(params),
+            Self::SessionStatusGet(params) => serde_json::to_value(params),
+            Self::SessionFilesList(params) => serde_json::to_value(params),
+            Self::SessionTasksList(params) => serde_json::to_value(params),
+            Self::SessionWorkspaceGet(params) => serde_json::to_value(params),
+            Self::SessionTitleSet(params) => serde_json::to_value(params),
+            Self::SessionDelete(params) => serde_json::to_value(params),
+            Self::SystemStatusGet(params) => serde_json::to_value(params),
+            Self::ContentList(params) => serde_json::to_value(params),
+            Self::ContentDelete(params) => serde_json::to_value(params),
+            Self::ContentBulkDelete(params) => serde_json::to_value(params),
+            Self::RouterSetMode(params) => serde_json::to_value(params),
+            Self::RouterGetMetrics(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcRequest::new(id, method, params))
@@ -2314,6 +3351,9 @@ impl UiCommand {
 
     pub fn from_method_and_params(method: &str, params: Value) -> Result<Self, RpcError> {
         match method {
+            methods::PROFILE_LOCAL_CREATE => {
+                Ok(Self::ProfileLocalCreate(decode_params(method, params)?))
+            }
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_params(method, params)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_params(method, params)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_params(method, params)?)),
@@ -2334,12 +3374,63 @@ impl UiCommand {
                 Ok(Self::TaskRestartFromNode(decode_params(method, params)?))
             }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_params(method, params)?)),
+            methods::TASK_ARTIFACT_LIST => {
+                Ok(Self::TaskArtifactList(decode_params(method, params)?))
+            }
+            methods::TASK_ARTIFACT_READ => {
+                Ok(Self::TaskArtifactRead(decode_params(method, params)?))
+            }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
+            methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
+            methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
+            methods::SESSION_MESSAGES_PAGE => {
+                Ok(Self::SessionMessagesPage(decode_params(method, params)?))
+            }
+            methods::SESSION_STATUS_GET => {
+                Ok(Self::SessionStatusGet(decode_params(method, params)?))
+            }
+            methods::SESSION_FILES_LIST => {
+                Ok(Self::SessionFilesList(decode_params(method, params)?))
+            }
+            methods::SESSION_TASKS_LIST => {
+                Ok(Self::SessionTasksList(decode_params(method, params)?))
+            }
+            methods::SESSION_WORKSPACE_GET => {
+                Ok(Self::SessionWorkspaceGet(decode_params(method, params)?))
+            }
+            methods::SESSION_TITLE_SET => Ok(Self::SessionTitleSet(decode_params(method, params)?)),
+            methods::SESSION_DELETE => Ok(Self::SessionDelete(decode_params(method, params)?)),
+            methods::SYSTEM_STATUS_GET => Ok(Self::SystemStatusGet(decode_optional_params(
+                method, params,
+            )?)),
+            methods::CONTENT_LIST => Ok(Self::ContentList(decode_optional_params(method, params)?)),
+            methods::CONTENT_DELETE => Ok(Self::ContentDelete(decode_params(method, params)?)),
+            methods::CONTENT_BULK_DELETE => {
+                Ok(Self::ContentBulkDelete(decode_params(method, params)?))
+            }
+            methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
+            methods::ROUTER_GET_METRICS => {
+                Ok(Self::RouterGetMetrics(decode_params(method, params)?))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
+}
+
+/// Decode params that may be omitted entirely on the wire (i.e. the
+/// param object is `{}` or absent). Used for empty-request methods like
+/// `session/list` and `system/status.get` where the params struct has no
+/// required fields.
+fn decode_optional_params<T: DeserializeOwned + Default>(
+    method: &str,
+    params: Value,
+) -> Result<T, RpcError> {
+    if params.is_null() {
+        return Ok(T::default());
+    }
+    decode_params(method, params)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2454,6 +3545,10 @@ pub struct SessionOpened {
     pub active_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<UiCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2599,6 +3694,7 @@ impl TurnInterruptResult {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum UiRpcResult {
+    ProfileLocalCreate(ProfileLocalCreateResult),
     SessionOpen(SessionOpenResult),
     TurnStart(TurnStartResult),
     TurnInterrupt(TurnInterruptResult),
@@ -2611,6 +3707,8 @@ pub enum UiRpcResult {
     TaskCancel(TaskCancelResult),
     TaskRestartFromNode(TaskRestartFromNodeResult),
     TaskOutputRead(TaskOutputReadResult),
+    TaskArtifactList(TaskArtifactListResult),
+    TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
@@ -2620,6 +3718,7 @@ pub enum UiRpcResult {
 impl UiRpcResult {
     pub fn kind(&self) -> UiResultKind {
         match self {
+            Self::ProfileLocalCreate(_) => UiResultKind::ProfileLocalCreate,
             Self::SessionOpen(_) => UiResultKind::SessionOpen,
             Self::TurnStart(_) => UiResultKind::TurnStart,
             Self::TurnInterrupt(_) => UiResultKind::TurnInterrupt,
@@ -2632,6 +3731,8 @@ impl UiRpcResult {
             Self::TaskCancel(_) => UiResultKind::TaskCancel,
             Self::TaskRestartFromNode(_) => UiResultKind::TaskRestartFromNode,
             Self::TaskOutputRead(_) => UiResultKind::TaskOutputRead,
+            Self::TaskArtifactList(_) => UiResultKind::TaskArtifactList,
+            Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
@@ -2641,6 +3742,7 @@ impl UiRpcResult {
 
     pub fn method(&self) -> Option<&str> {
         match self {
+            Self::ProfileLocalCreate(_) => Some(methods::PROFILE_LOCAL_CREATE),
             Self::SessionOpen(_) => Some(methods::SESSION_OPEN),
             Self::TurnStart(_) => Some(methods::TURN_START),
             Self::TurnInterrupt(_) => Some(methods::TURN_INTERRUPT),
@@ -2653,6 +3755,8 @@ impl UiRpcResult {
             Self::TaskCancel(_) => Some(methods::TASK_CANCEL),
             Self::TaskRestartFromNode(_) => Some(methods::TASK_RESTART_FROM_NODE),
             Self::TaskOutputRead(_) => Some(methods::TASK_OUTPUT_READ),
+            Self::TaskArtifactList(_) => Some(methods::TASK_ARTIFACT_LIST),
+            Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
@@ -2662,6 +3766,7 @@ impl UiRpcResult {
 
     pub fn into_result_value(self) -> Result<Value, serde_json::Error> {
         match self {
+            Self::ProfileLocalCreate(result) => serde_json::to_value(result),
             Self::SessionOpen(result) => serde_json::to_value(result),
             Self::TurnStart(result) => serde_json::to_value(result),
             Self::TurnInterrupt(result) => serde_json::to_value(result),
@@ -2674,6 +3779,8 @@ impl UiRpcResult {
             Self::TaskCancel(result) => serde_json::to_value(result),
             Self::TaskRestartFromNode(result) => serde_json::to_value(result),
             Self::TaskOutputRead(result) => serde_json::to_value(result),
+            Self::TaskArtifactList(result) => serde_json::to_value(result),
+            Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
@@ -2700,6 +3807,9 @@ impl UiRpcResult {
             return Ok(Self::UnsupportedCapability(parsed));
         }
         match method {
+            methods::PROFILE_LOCAL_CREATE => {
+                Ok(Self::ProfileLocalCreate(decode_result(method, result)?))
+            }
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_result(method, result)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_result(method, result)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_result(method, result)?)),
@@ -2720,6 +3830,12 @@ impl UiRpcResult {
                 Ok(Self::TaskRestartFromNode(decode_result(method, result)?))
             }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_result(method, result)?)),
+            methods::TASK_ARTIFACT_LIST => {
+                Ok(Self::TaskArtifactList(decode_result(method, result)?))
+            }
+            methods::TASK_ARTIFACT_READ => {
+                Ok(Self::TaskArtifactRead(decode_result(method, result)?))
+            }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
@@ -2753,6 +3869,16 @@ pub mod progress_kinds {
     pub const TOKEN_COST_UPDATE: &str = "token_cost_update";
     pub const TOOL_PROGRESS: &str = "tool_progress";
     pub const TOOL_COMPLETED: &str = "tool_completed";
+    /// Creative status-word rotation matching the gateway's
+    /// `StatusIndicator` (`✦ Pondering...`, `✦ Brewing...`, etc.) for
+    /// the web ThinkingIndicator surface. The server emits
+    /// `progress/updated{kind:"status_word", label:"<word>"}` every
+    /// ~8s during an in-flight agent turn; the SPA bridge
+    /// (`ui-protocol-event-router.ts`) lifts these onto a
+    /// `crew:status_word` DOM event the `ThinkingIndicator` listens
+    /// for. CJK-aware: the rotator picks Chinese words for Chinese
+    /// input, English for English.
+    pub const STATUS_WORD: &str = "status_word";
     pub const UNKNOWN: &str = "unknown";
 }
 
@@ -2854,6 +3980,12 @@ pub struct UiTokenCostUpdate {
     pub session_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
+    /// Model identifier that produced this cost update. Populated by the
+    /// agent emit layer from `LlmProvider::model_id()` so chat clients can
+    /// render `model · tokens_in / tokens_out · duration` footers without
+    /// scraping the legacy `metadata.label` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl UiTokenCostUpdate {
@@ -2868,6 +4000,7 @@ impl UiTokenCostUpdate {
             response_cost: None,
             session_cost: None,
             currency: None,
+            model: None,
         }
     }
 }
@@ -3023,6 +4156,8 @@ pub struct TurnStartedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageDeltaEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub text: String,
 }
@@ -3030,6 +4165,14 @@ pub struct MessageDeltaEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolStartedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key — populated from the originating
+    /// `SessionKey.topic()` BEFORE any `base_key()` strip. Carried on
+    /// the wire so a topic-scoped subscriber routes the event correctly
+    /// even when the emit-side `session_id` was reconstructed from
+    /// `base_key()`. Closes the P0-A class routing drop (#1329); see
+    /// `UiNotification::topic()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -3040,6 +4183,9 @@ pub struct ToolStartedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolProgressEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3051,6 +4197,9 @@ pub struct ToolProgressEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCompletedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -3199,6 +4348,8 @@ pub struct ApprovalRenderHints {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequestedEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub tool_name: String,
@@ -3225,6 +4376,7 @@ impl ApprovalRequestedEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             tool_name: tool_name.into(),
@@ -3244,6 +4396,9 @@ impl ApprovalRequestedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalAutoResolvedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub tool_name: String,
@@ -3262,6 +4417,9 @@ pub struct ApprovalAutoResolvedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecidedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub decision: ApprovalDecision,
@@ -3288,6 +4446,7 @@ impl ApprovalDecidedEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             decision,
@@ -3307,6 +4466,9 @@ impl ApprovalDecidedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalCancelledEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub reason: String,
@@ -3320,6 +4482,7 @@ impl ApprovalCancelledEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
@@ -3346,19 +4509,359 @@ pub enum TaskRuntimeState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskUpdatedEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub task_id: TaskId,
+    /// Originating tool call id. Carrying it on the wire alongside
+    /// `task_id` lets the client flip the in-flight chip from spinner
+    /// to checkmark without a race against a `task/updated` -> watcher
+    /// -> TaskStore lookup chain (the chain that previously stayed cold
+    /// because the client bridge rejected `task/updated` envelopes that
+    /// lacked `turn_id`). Optional so legacy daemons and synthetic /
+    /// fallback emission paths that cannot resolve the originating call
+    /// still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub title: String,
     pub state: TaskRuntimeState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_detail: Option<String>,
+    // ── #1123 / M13-B projection fields ─────────────────────────────
+    // #1113 wired these fields onto the `BackgroundTask` snapshot and
+    // `task/list` projection, but the live `task/updated` notification
+    // dropped them — clients subscribed to events saw a stale shape
+    // while clients calling `task/list` saw the new shape. Mirroring
+    // them here closes the gap. All five use
+    // `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+    // legacy daemons and synthetic emitters that cannot resolve the
+    // values still round-trip.
+    /// Origin of the underlying task: `"model"`, `"supervisor"`, or
+    /// `"user"`. Mirrors `BackgroundTask::source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Role label assigned at spawn (`"reviewer"`, `"implementer"`,
+    /// `"test_worker"`, `"explorer"`). Mirrors `BackgroundTask::role`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Bounded summary capsule mirroring `ChildResultSummary.summary`
+    /// for terminal children. Mirrors `BackgroundTask::summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Number of artifacts emitted so far so UX can badge tasks without
+    /// resolving `task/artifact/list`. Mirrors
+    /// `BackgroundTask::artifact_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_count: Option<u32>,
+    /// Effective runtime policy stamp captured at spawn. Stored as raw
+    /// JSON so the wire shape does not depend on the AppUI
+    /// `UiAutonomyRuntimePolicyStamp` schema. Mirrors
+    /// `BackgroundTask::runtime_policy_stamp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskOutputDeltaEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub task_id: TaskId,
     pub cursor: OutputCursor,
     pub text: String,
+}
+
+/// Runtime policy details attached to M15 agent records. The policy stamp is
+/// backend-owned and intentionally open so future autonomy policy fields round
+/// trip without forcing clients back to raw JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiAutonomyRuntimePolicyStamp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy_id: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Artifact metadata shared by `agent/artifact/list`,
+/// `agent/artifact/updated`, and the nested artifact list on agent snapshots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiAgentArtifact {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// M15 agent lifecycle snapshot. This mirrors the existing raw fixture and
+/// orchestrator payload while keeping optional display aliases (`title`,
+/// `summary`, `output_tail`) compatible with the production AppUI projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiAgentRecord {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub path: String,
+    pub role: String,
+    pub nickname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub backend_kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<UiAutonomyRuntimePolicyStamp>,
+    #[serde(default)]
+    pub artifact_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<UiAgentArtifact>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentUpdatedEvent {
+    pub session_id: SessionKey,
+    pub agent: UiAgentRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentOutputDeltaEvent {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    pub cursor: OutputCursor,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentArtifactUpdatedEvent {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<UiAgentArtifact>,
+}
+
+/// M15 persisted goal snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiGoalRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub goal_id: String,
+    pub objective: String,
+    pub status: String,
+    pub token_budget: u64,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionGoalUpdatedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub goal: UiGoalRecord,
+    pub transition_actor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionGoalClearedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub cleared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<UiGoalRecord>,
+    pub transition_actor: String,
+}
+
+/// M15 recurring loop snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiLoopRecord {
+    pub loop_id: String,
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub prompt: String,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u64>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at_ms: Option<i64>,
+    pub expires_at_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopUpdatedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_id: Option<String>,
+    #[serde(rename = "loop")]
+    pub loop_state: UiLoopRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiLoopFire {
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopFiredEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub loop_id: String,
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_state: Option<UiLoopRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire: Option<UiLoopFire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopCompletedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub loop_id: String,
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_state: Option<UiLoopRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// M16 active model-visible context state exposed through AppUI lifecycle
+/// notifications. This intentionally carries hashes and counts, not raw
+/// transcript content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextState {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub generation: u64,
+    pub transcript_hash: String,
+    pub item_count: usize,
+    pub token_estimate: usize,
+    pub recovery_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_compaction_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextCompactionRecord {
+    pub compaction_id: String,
+    pub checkpoint_id: String,
+    pub status: String,
+    pub policy_id: String,
+    pub trigger: String,
+    pub input_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_generation: Option<u64>,
+    pub input_transcript_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_transcript_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_transcript_hash: Option<String>,
+    pub input_item_count: usize,
+    pub retained_count: usize,
+    pub dropped_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_item_id: Option<String>,
+    pub token_estimate_before: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_estimate_after: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionCompletedEvent {
+    pub session_id: SessionKey,
+    pub context_state: UiContextState,
+    pub compaction: UiContextCompactionRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextNormalizationReport {
+    pub generation: u64,
+    pub input_transcript_hash: String,
+    pub output_prompt_hash: String,
+    pub model_capability_id: String,
+    pub prompt_message_count: usize,
+    pub token_estimate: usize,
+    pub repaired_count: usize,
+    pub dropped_count: usize,
+    pub synthetic_count: usize,
+    pub truncated_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextNormalizationReportedEvent {
+    pub session_id: SessionKey,
+    pub context_state: UiContextState,
+    pub normalization: UiContextNormalizationReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3373,6 +4876,8 @@ pub struct WarningEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnCompletedEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<UiCursor>,
@@ -3405,6 +4910,8 @@ pub struct TurnSessionResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnErrorEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub code: String,
     pub message: String,
@@ -3427,6 +4934,13 @@ pub struct ReplayLossyEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileAttachedEvent {
     pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    /// Closes the P0-A regression that motivated the prior
+    /// `ledger_event_matches_topic_scope` exemption — now that the
+    /// field exists, the classifier consults the explicit topic and
+    /// the exemption is no longer needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     /// Filesystem path or URL the tool produced.
     pub path: String,
@@ -3450,6 +4964,70 @@ pub struct SessionEventBridgedEvent {
     /// Echo of any `topic` field carried on the legacy frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+}
+
+/// Wave4-A — adaptive router status snapshot pushed alongside `turn/started`
+/// and `turn/completed`. Mirrors `octos_llm::AdaptiveStatus` plus the
+/// information needed by clients to render the routing pill / lane debug
+/// view.
+///
+/// `lane_scores` carries one entry per active lane keyed by
+/// `"<provider_name>/<model_id>"` (the same key used in
+/// `model_catalog.json`). `circuit_breakers` carries the same keys mapped
+/// to a string-rendered breaker state (`"closed"`, `"open"`, `"half_open"`)
+/// so the wire shape stays stable when the underlying enum gains variants.
+///
+/// `BTreeMap` is intentional — deterministic wire order keeps the
+/// web-client diff path stable across re-renders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterStatusEvent {
+    pub session_id: SessionKey,
+    /// Currently selected provider, in `"<provider_name>/<model_id>"` form.
+    pub provider_name: String,
+    /// Active adaptive mode (`off` | `hedge` | `lane`).
+    pub mode: String,
+    /// QoS quality-ranking toggle (orthogonal to mode).
+    pub qos_ranking: bool,
+    /// Per-lane scores, sorted by lane key for deterministic wire output.
+    pub lane_scores: BTreeMap<String, f64>,
+    /// Per-lane circuit-breaker state — `"closed"`, `"open"`, or
+    /// `"half_open"`. Lanes absent from this map have no breaker
+    /// observed yet (cold start).
+    pub circuit_breakers: BTreeMap<String, String>,
+}
+
+/// Wave4-A — emitted when the adaptive router fails over from one lane
+/// to another. `from_provider` / `to_provider` use the same
+/// `"<provider_name>/<model_id>"` key shape as
+/// [`RouterStatusEvent::lane_scores`]. `reason` is free-text from the
+/// router (e.g. "circuit_breaker_open", "score_drop"). `elapsed_ms` is
+/// the wall time from initial provider attempt to failover decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterFailoverEvent {
+    pub session_id: SessionKey,
+    pub from_provider: String,
+    pub to_provider: String,
+    pub reason: String,
+    pub elapsed_ms: u64,
+}
+
+/// Wave4-A — current send-queue depth observed by the client/server
+/// FIFO. `head_client_message_id` identifies the in-flight turn whose
+/// completion will release the next queued frame. `None` when the queue
+/// is empty (after the in-flight turn lands).
+///
+/// **Server emission status:** the queue itself is client-side today
+/// (`octos-web/src/runtime/ui-protocol-send.ts` per-session FIFO). The
+/// server never emits this variant — the web bridge manufactures it
+/// locally using the existing DOM event pattern so other clients can
+/// observe queue state uniformly. The variant is defined here so the
+/// type shape is identical across client implementations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueStateEvent {
+    pub session_id: SessionKey,
+    pub pending_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_client_message_id: Option<String>,
 }
 
 /// Draft notification payloads for UI protocol v1.
@@ -3487,6 +5065,57 @@ pub enum UiNotification {
     /// `/api/sessions/:id/events/stream` SSE frames bridged onto the
     /// unified v1 ledger.
     SessionEventBridged(SessionEventBridgedEvent),
+    /// Wave4-A: adaptive routing snapshot emitted on `turn/started` and
+    /// `turn/completed` so clients can render the routing pill / lane
+    /// debug view without polling.
+    RouterStatus(RouterStatusEvent),
+    /// Wave4-A: adaptive router crossed a lane (failover). The status
+    /// emitted at the next turn boundary will reflect the new lane, but
+    /// clients that want to surface the transition itself (toast, status
+    /// pill flash) subscribe to this notification.
+    RouterFailover(RouterFailoverEvent),
+    /// Wave4-A: queue-state snapshot. Client-manufactured today — server
+    /// never emits this. See [`QueueStateEvent`] docs.
+    QueueState(QueueStateEvent),
+    /// UPCR-2026-021 M15: backend-owned agent lifecycle snapshot.
+    AgentUpdated(AgentUpdatedEvent),
+    /// UPCR-2026-021 M15: best-effort agent output tail delta.
+    AgentOutputDelta(AgentOutputDeltaEvent),
+    /// UPCR-2026-021 M15: agent artifact metadata changed.
+    AgentArtifactUpdated(AgentArtifactUpdatedEvent),
+    /// UPCR-2026-021 M15: persisted session goal changed.
+    SessionGoalUpdated(SessionGoalUpdatedEvent),
+    /// UPCR-2026-021 M15: persisted session goal cleared.
+    SessionGoalCleared(SessionGoalClearedEvent),
+    /// UPCR-2026-021 M15: recurring loop metadata changed.
+    LoopUpdated(LoopUpdatedEvent),
+    /// UPCR-2026-021 M15: loop fired and queued/attempted a continuation.
+    LoopFired(LoopFiredEvent),
+    /// UPCR-2026-021 M15: loop iteration reached a terminal result.
+    LoopCompleted(LoopCompletedEvent),
+    /// M16: compact-context lifecycle event.
+    ContextCompactionCompleted(ContextCompactionCompletedEvent),
+    /// M16: prompt normalization lifecycle event.
+    ContextNormalizationReported(ContextNormalizationReportedEvent),
+    /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
+    /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
+    /// per-connection live filter keeps legacy and envelope deliveries
+    /// mutually exclusive (legacy clients never see this variant,
+    /// negotiated clients see ONLY this variant for the events it
+    /// supersedes — `message/delta`, `message/persisted`, `tool/*`,
+    /// `turn/completed`, `file/attached`).
+    Envelope(EnvelopeNotification),
+}
+
+fn set_topic_if_absent(slot: &mut Option<String>, topic: &str) {
+    if slot
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        *slot = Some(topic.to_owned());
+    }
 }
 
 impl UiNotification {
@@ -3513,10 +5142,142 @@ impl UiNotification {
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
             Self::FileAttached(_) => methods::FILE_ATTACHED,
             Self::SessionEventBridged(_) => methods::SESSION_EVENT,
+            Self::RouterStatus(_) => methods::ROUTER_STATUS,
+            Self::RouterFailover(_) => methods::ROUTER_FAILOVER,
+            Self::QueueState(_) => methods::QUEUE_STATE,
+            Self::AgentUpdated(_) => methods::AGENT_UPDATED,
+            Self::AgentOutputDelta(_) => methods::AGENT_OUTPUT_DELTA,
+            Self::AgentArtifactUpdated(_) => methods::AGENT_ARTIFACT_UPDATED,
+            Self::SessionGoalUpdated(_) => methods::SESSION_GOAL_UPDATED,
+            Self::SessionGoalCleared(_) => methods::SESSION_GOAL_CLEARED,
+            Self::LoopUpdated(_) => methods::LOOP_UPDATED,
+            Self::LoopFired(_) => methods::LOOP_FIRED,
+            Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
+            Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
+            Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
+            Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
         }
     }
 
-    pub fn into_rpc_notification(self) -> Result<RpcNotification<Value>, serde_json::Error> {
+    pub fn session_id(&self) -> &SessionKey {
+        match self {
+            Self::SessionOpened(event) => &event.session_id,
+            Self::TurnStarted(event) => &event.session_id,
+            Self::MessageDelta(event) => &event.session_id,
+            Self::ToolStarted(event) => &event.session_id,
+            Self::ToolProgress(event) => &event.session_id,
+            Self::ToolCompleted(event) => &event.session_id,
+            Self::ApprovalRequested(event) => &event.session_id,
+            Self::ApprovalAutoResolved(event) => &event.session_id,
+            Self::ApprovalDecided(event) => &event.session_id,
+            Self::ApprovalCancelled(event) => &event.session_id,
+            Self::TaskUpdated(event) => &event.session_id,
+            Self::TaskOutputDelta(event) => &event.session_id,
+            Self::ProgressUpdated(event) => &event.session_id,
+            Self::Warning(event) => &event.session_id,
+            Self::TurnCompleted(event) => &event.session_id,
+            Self::TurnError(event) => &event.session_id,
+            Self::ReplayLossy(event) => &event.session_id,
+            Self::MessagePersisted(event) => &event.session_id,
+            Self::TurnSpawnComplete(event) => &event.session_id,
+            Self::FileAttached(event) => &event.session_id,
+            Self::SessionEventBridged(event) => &event.session_id,
+            Self::RouterStatus(event) => &event.session_id,
+            Self::RouterFailover(event) => &event.session_id,
+            Self::QueueState(event) => &event.session_id,
+            Self::AgentUpdated(event) => &event.session_id,
+            Self::AgentOutputDelta(event) => &event.session_id,
+            Self::AgentArtifactUpdated(event) => &event.session_id,
+            Self::SessionGoalUpdated(event) => &event.session_id,
+            Self::SessionGoalCleared(event) => &event.session_id,
+            Self::LoopUpdated(event) => &event.session_id,
+            Self::LoopFired(event) => &event.session_id,
+            Self::LoopCompleted(event) => &event.session_id,
+            Self::ContextCompactionCompleted(event) => &event.session_id,
+            Self::ContextNormalizationReported(event) => &event.session_id,
+            Self::Envelope(event) => &event.session_id,
+        }
+    }
+
+    pub fn topic(&self) -> Option<&str> {
+        match self {
+            Self::TurnStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::MessageDelta(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ToolStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::ToolProgress(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ToolCompleted(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalRequested(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalAutoResolved(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalDecided(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalCancelled(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::TaskOutputDelta(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TurnCompleted(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TurnError(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::MessagePersisted(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TurnSpawnComplete(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::FileAttached(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::SessionEventBridged(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::Envelope(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            _ => self.session_id().topic(),
+        }
+    }
+
+    pub fn stamp_topic_from_session(&mut self) {
+        let Some(topic) = self.session_id().topic().map(ToOwned::to_owned) else {
+            return;
+        };
+        match self {
+            Self::TurnStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::MessageDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolProgress(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ToolCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::MessagePersisted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::Envelope(event) => set_topic_if_absent(&mut event.topic, &topic),
+            _ => {}
+        }
+    }
+
+    pub fn into_rpc_notification(mut self) -> Result<RpcNotification<Value>, serde_json::Error> {
+        self.stamp_topic_from_session();
         let method = self.method();
         let params = match self {
             Self::SessionOpened(params) => serde_json::to_value(params),
@@ -3540,6 +5301,27 @@ impl UiNotification {
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
             Self::FileAttached(params) => serde_json::to_value(params),
             Self::SessionEventBridged(params) => serde_json::to_value(params),
+            Self::RouterStatus(params) => serde_json::to_value(params),
+            Self::RouterFailover(params) => serde_json::to_value(params),
+            Self::QueueState(params) => serde_json::to_value(params),
+            Self::AgentUpdated(params) => serde_json::to_value(params),
+            Self::AgentOutputDelta(params) => serde_json::to_value(params),
+            Self::AgentArtifactUpdated(params) => serde_json::to_value(params),
+            Self::SessionGoalUpdated(params) => serde_json::to_value(params),
+            Self::SessionGoalCleared(params) => serde_json::to_value(params),
+            Self::LoopUpdated(params) => serde_json::to_value(params),
+            Self::LoopFired(params) => serde_json::to_value(params),
+            Self::LoopCompleted(params) => serde_json::to_value(params),
+            Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
+            Self::ContextNormalizationReported(params) => serde_json::to_value(params),
+            // UPCR-2026-014 (M9-γ): the wire shape per spec § 14.1 is the
+            // bare `Envelope` — `session_id` and `topic` are server-internal
+            // routing fields stripped here at the JSON-RPC boundary. The
+            // `EnvelopeNotification` struct itself uses a derive-based
+            // `Serialize` so the durable ledger persists routing fields
+            // on disk; recovery rebuilds them before rebroadcasting (codex
+            // #1336 round-2 BLOCKER 4).
+            Self::Envelope(params) => serde_json::to_value(&params.envelope),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -3589,6 +5371,51 @@ impl UiNotification {
             }
             methods::FILE_ATTACHED => Ok(Self::FileAttached(decode_params(method, params)?)),
             methods::SESSION_EVENT => Ok(Self::SessionEventBridged(decode_params(method, params)?)),
+            methods::ROUTER_STATUS => Ok(Self::RouterStatus(decode_params(method, params)?)),
+            methods::ROUTER_FAILOVER => Ok(Self::RouterFailover(decode_params(method, params)?)),
+            methods::QUEUE_STATE => Ok(Self::QueueState(decode_params(method, params)?)),
+            methods::AGENT_UPDATED => Ok(Self::AgentUpdated(decode_params(method, params)?)),
+            methods::AGENT_OUTPUT_DELTA => {
+                Ok(Self::AgentOutputDelta(decode_params(method, params)?))
+            }
+            methods::AGENT_ARTIFACT_UPDATED => {
+                Ok(Self::AgentArtifactUpdated(decode_params(method, params)?))
+            }
+            methods::SESSION_GOAL_UPDATED => {
+                Ok(Self::SessionGoalUpdated(decode_params(method, params)?))
+            }
+            methods::SESSION_GOAL_CLEARED => {
+                Ok(Self::SessionGoalCleared(decode_params(method, params)?))
+            }
+            methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
+            methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
+            methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
+            methods::CONTEXT_COMPACTION_COMPLETED => Ok(Self::ContextCompactionCompleted(
+                decode_params(method, params)?,
+            )),
+            methods::CONTEXT_NORMALIZATION_REPORTED => Ok(Self::ContextNormalizationReported(
+                decode_params(method, params)?,
+            )),
+            // UPCR-2026-014 (M9-γ): decode the bare wire envelope into the
+            // wrapper; `session_id` and `topic` default to empty/None and
+            // are reconstituted from the ambient ledger context by the
+            // server-side decode path (the ledger never round-trips a
+            // wire-only envelope back into routing).
+            //
+            // Codex #1336 round-2 BLOCKER 4: the JSON-RPC params carry
+            // ONLY the bare `Envelope` (the wire shape per spec § 14.1) —
+            // decode it into `Envelope` directly and wrap with empty
+            // routing fields. The full-struct `EnvelopeNotification`
+            // serialization is used by the ledger ONLY on disk, never
+            // on the wire.
+            methods::PROJECTION_ENVELOPE => {
+                let envelope: Envelope = decode_params(method, params)?;
+                Ok(Self::Envelope(EnvelopeNotification {
+                    session_id: SessionKey(String::new()),
+                    topic: None,
+                    envelope,
+                }))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -3628,9 +5455,12 @@ mod tests {
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         assert!(capabilities.supports_method(methods::TASK_LIST));
         assert!(capabilities.supports_method(methods::TASK_CANCEL));
         assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
         assert!(capabilities.unsupported.is_empty());
 
         let json = serde_json::to_string(&capabilities).expect("serialize capabilities");
@@ -3662,6 +5492,7 @@ mod tests {
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
     }
 
     #[test]
@@ -3673,19 +5504,24 @@ mod tests {
         assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
         assert!(capabilities.supports_method(methods::TASK_OUTPUT_READ));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         assert!(capabilities.unsupported.is_empty());
     }
 
     #[test]
-    fn session_open_params_cwd_is_additive_and_round_trips() {
+    fn session_open_params_topic_and_cwd_are_additive_and_round_trip() {
         let params = SessionOpenParams {
             session_id: SessionKey("local:demo".into()),
+            topic: Some("research".into()),
             profile_id: Some("coding".into()),
             cwd: Some("/repo".into()),
             after: None,
         };
 
         let wire = serde_json::to_value(&params).expect("serialize session/open params");
+        assert_eq!(wire["topic"], json!("research"));
         assert_eq!(wire["cwd"], json!("/repo"));
 
         let decoded: SessionOpenParams =
@@ -3698,6 +5534,7 @@ mod tests {
         });
         let decoded_legacy: SessionOpenParams =
             serde_json::from_value(legacy).expect("legacy session/open params");
+        assert!(decoded_legacy.topic.is_none());
         assert!(decoded_legacy.cwd.is_none());
     }
 
@@ -3708,6 +5545,8 @@ mod tests {
             session_id: session_id.clone(),
             active_profile_id: Some("coding".into()),
             workspace_root: Some("/repo".into()),
+            context: None,
+            context_state: None,
             cursor: None,
             panes: Some(UiPaneSnapshot {
                 session_id: session_id.clone(),
@@ -3788,6 +5627,8 @@ mod tests {
             session_id: SessionKey("local:demo".into()),
             active_profile_id: None,
             workspace_root: None,
+            context: None,
+            context_state: None,
             cursor: None,
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
@@ -3853,6 +5694,8 @@ mod tests {
         assert!(!capabilities.supports_method(methods::TASK_LIST));
         assert!(!capabilities.supports_method(methods::TASK_CANCEL));
         assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
     }
 
     #[test]
@@ -3871,12 +5714,15 @@ mod tests {
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         // Task-control methods are gated by harness.task_control.v1 — they
         // must not appear in the advertised method set when the gating
         // feature is not negotiated.
         assert!(!capabilities.supports_method(methods::TASK_LIST));
         assert!(!capabilities.supports_method(methods::TASK_CANCEL));
         assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
         // Unconditional methods stay present.
         assert!(capabilities.supports_method(methods::SESSION_OPEN));
         assert!(capabilities.supports_method(methods::TURN_START));
@@ -3900,6 +5746,44 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_capabilities_hide_task_and_agent_artifact_methods_without_feature() {
+        // #965/#1084 — task artifact methods have their own harness feature
+        // gate, while legacy agent artifact aliases stay under agent control.
+        let capabilities = UiProtocolCapabilities::for_negotiated_features(Vec::<String>::new());
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_READ));
+    }
+
+    #[test]
+    fn negotiated_capabilities_advertise_task_artifact_methods_when_feature_requested() {
+        let capabilities = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+        ]);
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_READ));
+    }
+
+    #[test]
+    fn negotiated_capabilities_advertise_agent_artifact_methods_when_agent_control_requested() {
+        let capabilities = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+            UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+        ]);
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
+        assert!(capabilities.supports_method(methods::AGENT_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::AGENT_ARTIFACT_READ));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+    }
+
+    #[test]
     fn ui_protocol_v1_wire_contract_is_golden() {
         assert_eq!(UI_PROTOCOL_V1, "octos-ui/v1alpha1");
         assert_eq!(UI_PROTOCOL_SCHEMA_VERSION, 1);
@@ -3914,6 +5798,10 @@ mod tests {
         assert_eq!(
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
             "harness.task_control.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            "harness.task_artifacts.v1"
         );
         assert_eq!(
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
@@ -3932,10 +5820,41 @@ mod tests {
             UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
             "projection.envelope.v1"
         );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            "auxiliary.rest_to_ws.v1"
+        );
+        assert_eq!(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, "coding.autonomy.v1");
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+            "coding.agent_control.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+            "coding.goal_runtime.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+            "coding.loop_runtime.v1"
+        );
+        assert_eq!(UI_PROTOCOL_FEATURE_REVIEW_START_V1, "review.start.v1");
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            "context.lifecycle.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
+            "harness.task_supervision_inspection.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            "harness.task_artifacts.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
             &[
+                "profile/local/create",
                 "session/open",
                 "turn/start",
                 "turn/interrupt",
@@ -3951,6 +5870,40 @@ mod tests {
                 "session/hydrate",
                 "thread/graph/get",
                 "turn/state/get",
+                "agent/list",
+                "agent/status/read",
+                "agent/output/read",
+                "agent/artifact/list",
+                "agent/artifact/read",
+                "task/artifact/list",
+                "task/artifact/read",
+                "agent/interrupt",
+                "agent/close",
+                "session/goal/get",
+                "session/goal/set",
+                "session/goal/clear",
+                "loop/create",
+                "loop/list",
+                "loop/delete",
+                "loop/pause",
+                "loop/resume",
+                "loop/fire_now",
+                "review/start",
+                "session/list",
+                "session/snapshot",
+                "session/messages_page",
+                "session/status.get",
+                "session/files.list",
+                "session/tasks.list",
+                "session/workspace.get",
+                "session/title.set",
+                "session/delete",
+                "system/status.get",
+                "content/list",
+                "content/delete",
+                "content/bulk_delete",
+                "router/set_mode",
+                "router/get_metrics",
             ]
         );
         assert_eq!(
@@ -3976,7 +5929,21 @@ mod tests {
                 "message/persisted",
                 "turn/spawn_complete",
                 "file/attached",
+                "projection/envelope",
                 "session/event",
+                "router/status",
+                "router/failover",
+                "queue/state",
+                "agent/updated",
+                "agent/output/delta",
+                "agent/artifact/updated",
+                "session/goal/updated",
+                "session/goal/cleared",
+                "loop/updated",
+                "loop/fired",
+                "loop/completed",
+                "context/compaction_completed",
+                "context/normalization_reported",
             ]
         );
         assert_eq!(
@@ -3997,6 +5964,40 @@ mod tests {
                 "session/hydrate",
                 "thread/graph/get",
                 "turn/state/get",
+                "agent/list",
+                "agent/status/read",
+                "agent/output/read",
+                "agent/artifact/list",
+                "agent/artifact/read",
+                "task/artifact/list",
+                "task/artifact/read",
+                "agent/interrupt",
+                "agent/close",
+                "session/goal/get",
+                "session/goal/set",
+                "session/goal/clear",
+                "loop/create",
+                "loop/list",
+                "loop/delete",
+                "loop/pause",
+                "loop/resume",
+                "loop/fire_now",
+                "review/start",
+                "session/list",
+                "session/snapshot",
+                "session/messages_page",
+                "session/status.get",
+                "session/files.list",
+                "session/tasks.list",
+                "session/workspace.get",
+                "session/title.set",
+                "session/delete",
+                "system/status.get",
+                "content/list",
+                "content/delete",
+                "content/bulk_delete",
+                "router/set_mode",
+                "router/get_metrics",
             ]
         );
         assert!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.is_empty());
@@ -4034,7 +6035,41 @@ mod tests {
                     "task/output/read",
                     "session/hydrate",
                     "thread/graph/get",
-                    "turn/state/get"
+                    "turn/state/get",
+                    "agent/list",
+                    "agent/status/read",
+                    "agent/output/read",
+                    "agent/artifact/list",
+                    "agent/artifact/read",
+                    "task/artifact/list",
+                    "task/artifact/read",
+                    "agent/interrupt",
+                    "agent/close",
+                    "session/goal/get",
+                    "session/goal/set",
+                    "session/goal/clear",
+                    "loop/create",
+                    "loop/list",
+                    "loop/delete",
+                    "loop/pause",
+                    "loop/resume",
+                    "loop/fire_now",
+                    "review/start",
+                    "session/list",
+                    "session/snapshot",
+                    "session/messages_page",
+                    "session/status.get",
+                    "session/files.list",
+                    "session/tasks.list",
+                    "session/workspace.get",
+                    "session/title.set",
+                    "session/delete",
+                    "system/status.get",
+                    "content/list",
+                    "content/delete",
+                    "content/bulk_delete",
+                    "router/set_mode",
+                    "router/get_metrics"
                 ],
                 "supported_notifications": [
                     "session/open",
@@ -4057,7 +6092,21 @@ mod tests {
                     "message/persisted",
                     "turn/spawn_complete",
                     "file/attached",
-                    "session/event"
+                    "projection/envelope",
+                    "session/event",
+                    "router/status",
+                    "router/failover",
+                    "queue/state",
+                    "agent/updated",
+                    "agent/output/delta",
+                    "agent/artifact/updated",
+                    "session/goal/updated",
+                    "session/goal/cleared",
+                    "loop/updated",
+                    "loop/fired",
+                    "loop/completed",
+                    "context/compaction_completed",
+                    "context/normalization_reported"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
@@ -4069,7 +6118,17 @@ mod tests {
                     "state.turn_state_get.v1",
                     "event.message_persisted.v1",
                     "event.spawn_complete.v1",
-                    "projection.envelope.v1"
+                    "event.file_attached.v1",
+                    "projection.envelope.v1",
+                    "auxiliary.rest_to_ws.v1",
+                    "coding.autonomy.v1",
+                    "coding.agent_control.v1",
+                    "coding.goal_runtime.v1",
+                    "coding.loop_runtime.v1",
+                    "review.start.v1",
+                    "context.lifecycle.v1",
+                    "harness.task_supervision_inspection.v1",
+                    "harness.task_artifacts.v1"
                 ]
             })
         );
@@ -4264,10 +6323,17 @@ mod tests {
         // of this module.
         let task_cancelled = UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: task_id.clone(),
+            tool_call_id: None,
             title: "spawn_only_runner".into(),
             state: TaskRuntimeState::Cancelled,
             runtime_detail: Some("user cancelled".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         })
         .into_rpc_notification()
         .expect("serialize task/updated cancelled");
@@ -4813,6 +6879,45 @@ mod tests {
             UiCommand::from_rpc_request(restart_wire).expect("decode task/restart_from_node"),
             restart
         );
+
+        let artifact_list = UiCommand::TaskArtifactList(TaskArtifactListParams {
+            session_id: SessionKey("local:demo".into()),
+            task_id: task_id.clone(),
+            profile_id: Some("coding".into()),
+            agent_id: None,
+        });
+        assert_eq!(artifact_list.method(), methods::TASK_ARTIFACT_LIST);
+        let artifact_list_wire = artifact_list
+            .clone()
+            .into_rpc_request("task-artifact-list")
+            .expect("serialize task/artifact/list");
+        assert_eq!(artifact_list_wire.params["task_id"], json!(task_id));
+        assert_eq!(
+            UiCommand::from_rpc_request(artifact_list_wire).expect("decode task/artifact/list"),
+            artifact_list
+        );
+
+        let artifact_read = UiCommand::TaskArtifactRead(TaskArtifactReadParams {
+            session_id: SessionKey("local:demo".into()),
+            task_id: TaskId(Uuid::from_u128(45)),
+            artifact_id: Some("summary".into()),
+            path: None,
+            cursor: None,
+            limit_bytes: Some(1024),
+            profile_id: None,
+            agent_id: Some("agent-1".into()),
+        });
+        assert_eq!(artifact_read.method(), methods::TASK_ARTIFACT_READ);
+        let artifact_read_wire = artifact_read
+            .clone()
+            .into_rpc_request("task-artifact-read")
+            .expect("serialize task/artifact/read");
+        assert_eq!(artifact_read_wire.params["artifact_id"], json!("summary"));
+        assert_eq!(artifact_read_wire.params["agent_id"], json!("agent-1"));
+        assert_eq!(
+            UiCommand::from_rpc_request(artifact_read_wire).expect("decode task/artifact/read"),
+            artifact_read
+        );
     }
 
     #[test]
@@ -4821,6 +6926,8 @@ mod tests {
             session_id: SessionKey("local:demo".into()),
             active_profile_id: Some("coding".into()),
             workspace_root: None,
+            context: None,
+            context_state: None,
             cursor: Some(UiCursor {
                 stream: "events".into(),
                 seq: 42,
@@ -4923,6 +7030,14 @@ mod tests {
             first_server_result_kind_for_method(methods::TASK_RESTART_FROM_NODE),
             Some(UiResultKind::TaskRestartFromNode)
         );
+        assert_eq!(
+            first_server_result_kind_for_method(methods::TASK_ARTIFACT_LIST),
+            Some(UiResultKind::TaskArtifactList)
+        );
+        assert_eq!(
+            first_server_result_kind_for_method(methods::TASK_ARTIFACT_READ),
+            Some(UiResultKind::TaskArtifactRead)
+        );
 
         let preview_id = PreviewId::new();
         let diff_result = UiRpcResult::DiffPreviewGet(DiffPreviewGetResult {
@@ -4978,6 +7093,11 @@ mod tests {
                 status: "running".into(),
                 lifecycle_state: "running".into(),
                 runtime_state: "executing_tool".into(),
+                source: None,
+                role: None,
+                summary: None,
+                artifact_count: None,
+                runtime_policy_stamp: None,
                 parent_session_key: Some(SessionKey("local:demo".into())),
                 child_session_key: Some(SessionKey("local:demo#child-1".into())),
                 child_terminal_state: None,
@@ -5007,6 +7127,70 @@ mod tests {
             UiRpcResult::from_method_and_result(methods::TASK_LIST, value)
                 .expect("decode task/list result"),
             task_list
+        );
+
+        let task_artifact_list = UiRpcResult::TaskArtifactList(TaskArtifactListResult {
+            session_id: SessionKey("local:demo".into()),
+            task_id: list_task_id.clone(),
+            agent_id: Some("agent-1".into()),
+            artifacts: vec![TaskArtifactRecord {
+                id: "summary".into(),
+                title: "Summary".into(),
+                kind: "markdown".into(),
+                status: "ready".into(),
+                path: None,
+                content: None,
+                extra: BTreeMap::new(),
+            }],
+        });
+        assert_eq!(task_artifact_list.kind(), UiResultKind::TaskArtifactList);
+        assert_eq!(
+            task_artifact_list.method(),
+            Some(methods::TASK_ARTIFACT_LIST)
+        );
+        let value = task_artifact_list
+            .clone()
+            .into_result_value()
+            .expect("serialize task/artifact/list result");
+        assert_eq!(value["artifacts"][0]["id"], json!("summary"));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TASK_ARTIFACT_LIST, value)
+                .expect("decode task/artifact/list result"),
+            task_artifact_list
+        );
+
+        let task_artifact_read = UiRpcResult::TaskArtifactRead(TaskArtifactReadResult {
+            session_id: SessionKey("local:demo".into()),
+            task_id: list_task_id.clone(),
+            agent_id: Some("agent-1".into()),
+            artifact: TaskArtifactRecord {
+                id: "summary".into(),
+                title: "Summary".into(),
+                kind: "markdown".into(),
+                status: "ready".into(),
+                path: None,
+                content: None,
+                extra: BTreeMap::new(),
+            },
+            content: Some("done".into()),
+            cursor: Some(OutputCursor { offset: 0 }),
+            next_cursor: Some(OutputCursor { offset: 4 }),
+            has_more: false,
+        });
+        assert_eq!(task_artifact_read.kind(), UiResultKind::TaskArtifactRead);
+        assert_eq!(
+            task_artifact_read.method(),
+            Some(methods::TASK_ARTIFACT_READ)
+        );
+        let value = task_artifact_read
+            .clone()
+            .into_result_value()
+            .expect("serialize task/artifact/read result");
+        assert_eq!(value["content"], json!("done"));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TASK_ARTIFACT_READ, value)
+                .expect("decode task/artifact/read result"),
+            task_artifact_read
         );
 
         let cancel_result = UiRpcResult::TaskCancel(TaskCancelResult {
@@ -5320,6 +7504,7 @@ mod tests {
     fn ui_notification_builds_and_parses_json_rpc_notification() {
         let event = UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             turn_id: TurnId(Uuid::from_u128(2)),
             text: "partial".into(),
         });
@@ -5344,6 +7529,237 @@ mod tests {
         assert_eq!(decoded, event);
     }
 
+    fn m15_agent_record(session_id: SessionKey) -> UiAgentRecord {
+        UiAgentRecord {
+            agent_id: "reviewer-api".into(),
+            parent_agent_id: Some("master".into()),
+            session_id,
+            task_id: Some("task_01".into()),
+            path: "master/reviewer-api".into(),
+            role: "reviewer".into(),
+            nickname: "Ada Lovelace".into(),
+            title: Some("Ada Lovelace".into()),
+            backend_kind: "cli_process".into(),
+            status: "running".into(),
+            last_task: Some("Running live code review check".into()),
+            summary: Some("Running live code review check".into()),
+            output_tail: Some("reviewer-api: checking API surface\n".into()),
+            cwd: Some("/repo".into()),
+            profile_id: "coding".into(),
+            runtime_policy_stamp: Some(UiAutonomyRuntimePolicyStamp {
+                profile_id: Some("coding".into()),
+                sandbox: Some("workspace-write".into()),
+                approval_policy: Some("on-request".into()),
+                tool_policy_id: Some("coding-v1".into()),
+                extra: BTreeMap::new(),
+            }),
+            artifact_count: 1,
+            artifacts: vec![m15_agent_artifact()],
+            created_at_ms: 1_778_870_000_000,
+            updated_at_ms: 1_778_870_030_000,
+        }
+    }
+
+    fn m15_agent_artifact() -> UiAgentArtifact {
+        UiAgentArtifact {
+            id: "api-report".into(),
+            title: "API report".into(),
+            kind: "markdown".into(),
+            status: "ready".into(),
+            path: None,
+            content: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn m15_goal_record() -> UiGoalRecord {
+        UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "finish the review and tests".into(),
+            status: "active".into(),
+            token_budget: 50_000,
+            tokens_used: 3_200,
+            time_used_seconds: 180,
+            created_at_ms: 1_778_870_000_000,
+            updated_at_ms: 1_778_870_030_000,
+        }
+    }
+
+    fn m15_loop_record(session_id: SessionKey) -> UiLoopRecord {
+        UiLoopRecord {
+            loop_id: "loop_01".into(),
+            session_id,
+            profile_id: Some("coding".into()),
+            prompt: "check deploy".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: Some(1_778_870_600_000),
+            last_run_at_ms: Some(1_778_870_000_000),
+            expires_at_ms: 1_779_474_800_000,
+            created_at_ms: 1_778_870_000_000,
+            updated_at_ms: 1_778_870_030_000,
+        }
+    }
+
+    #[test]
+    fn m15_autonomy_notifications_register_methods_and_round_trip() {
+        let session_id = SessionKey("coding:local:tui#coding".into());
+        let loop_state = m15_loop_record(session_id.clone());
+        let cases = vec![
+            (
+                UiNotification::AgentUpdated(AgentUpdatedEvent {
+                    session_id: session_id.clone(),
+                    agent: m15_agent_record(session_id.clone()),
+                }),
+                methods::AGENT_UPDATED,
+            ),
+            (
+                UiNotification::AgentOutputDelta(AgentOutputDeltaEvent {
+                    session_id: session_id.clone(),
+                    agent_id: "reviewer-api".into(),
+                    cursor: OutputCursor { offset: 42 },
+                    text: "partial output\n".into(),
+                }),
+                methods::AGENT_OUTPUT_DELTA,
+            ),
+            (
+                UiNotification::AgentArtifactUpdated(AgentArtifactUpdatedEvent {
+                    session_id: session_id.clone(),
+                    agent_id: "reviewer-api".into(),
+                    artifacts: vec![m15_agent_artifact()],
+                }),
+                methods::AGENT_ARTIFACT_UPDATED,
+            ),
+            (
+                UiNotification::SessionGoalUpdated(SessionGoalUpdatedEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    goal: m15_goal_record(),
+                    transition_actor: "user".into(),
+                }),
+                methods::SESSION_GOAL_UPDATED,
+            ),
+            (
+                UiNotification::SessionGoalCleared(SessionGoalClearedEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    cleared: true,
+                    goal: None,
+                    transition_actor: "user".into(),
+                }),
+                methods::SESSION_GOAL_CLEARED,
+            ),
+            (
+                UiNotification::LoopUpdated(LoopUpdatedEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    loop_id: Some("loop_01".into()),
+                    loop_state: loop_state.clone(),
+                    ok: Some(true),
+                    status: Some("active".into()),
+                    deleted: None,
+                }),
+                methods::LOOP_UPDATED,
+            ),
+            (
+                UiNotification::LoopFired(LoopFiredEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    loop_id: "loop_01".into(),
+                    loop_state: Some(loop_state.clone()),
+                    fire: Some(UiLoopFire {
+                        queued: true,
+                        duplicate: Some(false),
+                        continuation_id: Some(7),
+                        dedupe_key: Some("loop:loop_01".into()),
+                        reason: Some("LoopFire".into()),
+                        priority: Some(20),
+                        message: None,
+                        extra: BTreeMap::new(),
+                    }),
+                    ok: Some(true),
+                    status: Some("queued".into()),
+                }),
+                methods::LOOP_FIRED,
+            ),
+            (
+                UiNotification::LoopCompleted(LoopCompletedEvent {
+                    session_id,
+                    profile_id: Some("coding".into()),
+                    loop_id: "loop_01".into(),
+                    loop_state: Some(loop_state),
+                    status: Some("completed".into()),
+                    completed_at_ms: Some(1_778_870_090_000),
+                    result: Some(json!({ "message": "iteration completed" })),
+                    error: None,
+                }),
+                methods::LOOP_COMPLETED,
+            ),
+        ];
+
+        for (event, method) in cases {
+            assert_eq!(event.method(), method);
+            assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&method));
+
+            let rpc = event
+                .clone()
+                .into_rpc_notification()
+                .expect("serialize M15 notification");
+            assert_eq!(rpc.method, method);
+            let decoded =
+                UiNotification::from_rpc_notification(rpc).expect("decode M15 notification");
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn m15_agent_fixture_notifications_decode_to_typed_variants() {
+        let session_id = SessionKey("coding:local:tui#coding".into());
+        let agent = m15_agent_record(session_id.clone());
+        let agent_wire = RpcNotification::new(
+            methods::AGENT_UPDATED,
+            json!({
+                "session_id": session_id,
+                "agent": agent,
+            }),
+        );
+        let decoded =
+            UiNotification::from_rpc_notification(agent_wire).expect("decode agent/updated");
+        assert!(matches!(decoded, UiNotification::AgentUpdated(_)));
+
+        let output_wire = RpcNotification::new(
+            methods::AGENT_OUTPUT_DELTA,
+            json!({
+                "session_id": session_id,
+                "agent_id": "reviewer-api",
+                "cursor": { "offset": 23 },
+                "text": "reviewer-api: finding\n"
+            }),
+        );
+        let decoded =
+            UiNotification::from_rpc_notification(output_wire).expect("decode agent/output/delta");
+        assert!(matches!(decoded, UiNotification::AgentOutputDelta(_)));
+
+        let artifact_wire = RpcNotification::new(
+            methods::AGENT_ARTIFACT_UPDATED,
+            json!({
+                "session_id": session_id,
+                "agent_id": "reviewer-api",
+                "artifacts": [{
+                    "id": "api-report",
+                    "title": "API report",
+                    "kind": "markdown",
+                    "status": "ready"
+                }]
+            }),
+        );
+        let decoded = UiNotification::from_rpc_notification(artifact_wire)
+            .expect("decode agent/artifact/updated");
+        assert!(matches!(decoded, UiNotification::AgentArtifactUpdated(_)));
+    }
+
     #[test]
     fn resumable_notifications_carry_event_ledger_cursors() {
         let session_id = SessionKey("local:demo".into());
@@ -5355,6 +7771,8 @@ mod tests {
             session_id: session_id.clone(),
             active_profile_id: None,
             workspace_root: None,
+            context: None,
+            context_state: None,
             cursor: Some(opened_cursor.clone()),
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
@@ -5378,6 +7796,7 @@ mod tests {
         };
         let completed = UiNotification::TurnCompleted(TurnCompletedEvent {
             session_id,
+            topic: None,
             turn_id: TurnId(Uuid::from_u128(9)),
             cursor: Some(completed_cursor),
             tokens_in: None,
@@ -5525,6 +7944,44 @@ mod tests {
                     }
                 }
             })
+        );
+
+        let decoded_notification: RpcNotification<Value> =
+            serde_json::from_value(wire).expect("deserialize wire");
+        let decoded = UiNotification::from_rpc_notification(decoded_notification)
+            .expect("decode progress/updated");
+        assert_eq!(decoded, event);
+    }
+
+    /// The chat bubble footer renders `model · tokens_in / tokens_out · duration`
+    /// by reading `metadata.token_cost.model`. The wire shape must survive a
+    /// round trip so the WebSocket bridge can faithfully relay the model id
+    /// the agent emit layer attached.
+    #[test]
+    fn progress_updated_token_cost_round_trip_preserves_model() {
+        let mut token_cost = UiTokenCostUpdate::new();
+        token_cost.input_tokens = Some(80);
+        token_cost.output_tokens = Some(20);
+        token_cost.model = Some("deepseek-v4-pro".into());
+
+        let metadata = UiProgressMetadata::token_cost(token_cost);
+        let turn_id = TurnId(Uuid::from_u128(11));
+        let event = UiNotification::ProgressUpdated(ProgressUpdatedEvent::new(
+            SessionKey("local:demo".into()),
+            Some(turn_id.clone()),
+            metadata,
+        ));
+
+        let wire = serde_json::to_value(
+            event
+                .clone()
+                .into_rpc_notification()
+                .expect("serialize progress/updated"),
+        )
+        .expect("serialize wire");
+        assert_eq!(
+            wire["params"]["metadata"]["token_cost"]["model"],
+            json!("deepseek-v4-pro"),
         );
 
         let decoded_notification: RpcNotification<Value> =
@@ -5845,6 +8302,7 @@ mod tests {
             .with_timezone(&Utc);
         let event = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
             session_id: session_id.clone(),
+            topic: None,
             approval_id: approval_id.clone(),
             turn_id: turn_id.clone(),
             decision: ApprovalDecision::Approve,
@@ -5908,10 +8366,17 @@ mod tests {
     fn task_updated_event_round_trips_with_cancelled_state() {
         let event = UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: TaskId(Uuid::from_u128(7)),
+            tool_call_id: None,
             title: "spawn_only_runner".into(),
             state: TaskRuntimeState::Cancelled,
             runtime_detail: Some("user cancelled".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         });
         let rpc = event
             .clone()
@@ -5920,6 +8385,87 @@ mod tests {
         let decoded =
             UiNotification::from_rpc_notification(rpc).expect("deserialize task/updated cancelled");
         assert_eq!(decoded, event);
+    }
+
+    /// #1123 codex P2 follow-up to #1113: pin that the new M13-B
+    /// projection fields (source / role / summary / artifact_count /
+    /// runtime_policy_stamp) round-trip through serde on
+    /// `TaskUpdatedEvent` AND that absent fields stay absent on the
+    /// wire (no `null` leakage that would clobber a prior value cached
+    /// by a stale subscriber).
+    #[test]
+    fn task_updated_event_round_trips_m13b_projection_fields() {
+        // Populated path: every projection field set, all five must
+        // appear on the wire and decode back unchanged.
+        let event = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            topic: None,
+            task_id: TaskId(Uuid::from_u128(0xBEEF)),
+            tool_call_id: Some("call-r".into()),
+            title: "review".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            source: Some("model".into()),
+            role: Some("reviewer".into()),
+            summary: Some("found 1 issue".into()),
+            artifact_count: Some(2),
+            runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+        };
+        let value = serde_json::to_value(&event).expect("serialize task/updated");
+        assert_eq!(value.get("source"), Some(&json!("model")));
+        assert_eq!(value.get("role"), Some(&json!("reviewer")));
+        assert_eq!(value.get("summary"), Some(&json!("found 1 issue")));
+        assert_eq!(value.get("artifact_count"), Some(&json!(2)));
+        assert_eq!(
+            value.get("runtime_policy_stamp"),
+            Some(&json!({ "approval_policy": "on-request" })),
+        );
+        let parsed: TaskUpdatedEvent =
+            serde_json::from_value(value).expect("deserialize task/updated");
+        assert_eq!(parsed, event);
+
+        // Absent path: no field set, no field on the wire. A legacy
+        // payload that pre-dates the fields still parses thanks to
+        // `#[serde(default)]`.
+        let bare = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            topic: None,
+            task_id: TaskId(Uuid::from_u128(0xBEE0)),
+            tool_call_id: None,
+            title: "review".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let bare_value = serde_json::to_value(&bare).expect("serialize bare task/updated");
+        assert!(bare_value.get("source").is_none(), "absent source omits");
+        assert!(bare_value.get("role").is_none(), "absent role omits");
+        assert!(bare_value.get("summary").is_none(), "absent summary omits");
+        assert!(
+            bare_value.get("artifact_count").is_none(),
+            "absent artifact_count omits",
+        );
+        assert!(
+            bare_value.get("runtime_policy_stamp").is_none(),
+            "absent runtime_policy_stamp omits",
+        );
+        let legacy_json = json!({
+            "session_id": "local:demo",
+            "task_id": TaskId(Uuid::from_u128(0xBEE0)),
+            "title": "review",
+            "state": "running",
+        });
+        let parsed_legacy: TaskUpdatedEvent =
+            serde_json::from_value(legacy_json).expect("deserialize legacy bare");
+        assert_eq!(parsed_legacy.source, None);
+        assert_eq!(parsed_legacy.role, None);
+        assert_eq!(parsed_legacy.summary, None);
+        assert_eq!(parsed_legacy.artifact_count, None);
+        assert_eq!(parsed_legacy.runtime_policy_stamp, None);
     }
 
     // ===== UPCR-2026-009 / -010 / -011 / -012 golden tests (PR G) =====
@@ -5974,6 +8520,8 @@ mod tests {
         let result = SessionHydrateResult {
             session_id: sample_session_id(),
             cursor: sample_cursor(),
+            context: None,
+            context_state: None,
             messages: Some(vec![HydratedMessage {
                 seq: 17,
                 role: "user".into(),
@@ -6013,6 +8561,8 @@ mod tests {
         let messages_only = SessionHydrateResult {
             session_id: sample_session_id(),
             cursor: sample_cursor(),
+            context: None,
+            context_state: None,
             messages: Some(vec![]),
             threads: None,
             turns: None,
@@ -6084,6 +8634,8 @@ mod tests {
             session_id: sample_session_id(),
             turn_id: sample_turn_id(),
             state: TurnLifecycleState::Active,
+            context: None,
+            context_state: None,
             started_at: Some(sample_persisted_at()),
             completed_at: None,
             thread_id: Some("thread-1".into()),
@@ -6108,6 +8660,8 @@ mod tests {
                 session_id: sample_session_id(),
                 turn_id: sample_turn_id(),
                 state,
+                context: None,
+                context_state: None,
                 started_at: None,
                 completed_at: None,
                 thread_id: None,
@@ -6123,6 +8677,7 @@ mod tests {
     fn golden_message_persisted_event_serde() {
         let event = MessagePersistedEvent {
             session_id: sample_session_id(),
+            topic: None,
             turn_id: Some(sample_turn_id()),
             thread_id: Some("thread-1".into()),
             seq: 18,
@@ -6136,11 +8691,29 @@ mod tests {
             },
             persisted_at: sample_persisted_at(),
             media: vec!["report.md".into()],
+            content: Some("Here is the report.".into()),
         };
         let value = serde_json::to_value(&event).expect("serialize");
         assert_eq!(value.get("source"), Some(&json!("assistant")));
+        assert_eq!(value.get("content"), Some(&json!("Here is the report.")));
         let parsed: MessagePersistedEvent = serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed, event);
+
+        // content=None must be omitted from the wire (legacy compat
+        // for clients that don't read the field).
+        let event_no_content = MessagePersistedEvent {
+            content: None,
+            ..event.clone()
+        };
+        let value_no_content = serde_json::to_value(&event_no_content).expect("serialize");
+        assert_eq!(
+            value_no_content.get("content"),
+            None,
+            "content=None must be omitted from the wire"
+        );
+        let parsed_no_content: MessagePersistedEvent =
+            serde_json::from_value(value_no_content).expect("deserialize none");
+        assert_eq!(parsed_no_content, event_no_content);
 
         // All five source variants round-trip.
         for source in [
@@ -6152,6 +8725,7 @@ mod tests {
         ] {
             let e = MessagePersistedEvent {
                 session_id: sample_session_id(),
+                topic: None,
                 turn_id: None,
                 thread_id: None,
                 seq: 1,
@@ -6165,6 +8739,7 @@ mod tests {
                 },
                 persisted_at: sample_persisted_at(),
                 media: vec![],
+                content: None,
             };
             let v = serde_json::to_value(&e).expect("serialize source");
             let p: MessagePersistedEvent = serde_json::from_value(v).expect("deserialize source");
@@ -6186,9 +8761,11 @@ mod tests {
     fn golden_turn_spawn_complete_event_serde() {
         let event = TurnSpawnCompleteEvent {
             session_id: sample_session_id(),
+            topic: None,
             turn_id: Some(sample_turn_id()),
             thread_id: Some("thread-1".into()),
             task_id: "task_abc123".into(),
+            tool_call_id: Some("call_abc123".into()),
             response_to_client_message_id: Some("cmid-user-1".into()),
             seq: 42,
             message_id: "msg-spawn-1".into(),
@@ -6206,6 +8783,7 @@ mod tests {
         // top-level object with snake_case keys; absent optional fields
         // omit cleanly.
         assert_eq!(value.get("task_id"), Some(&json!("task_abc123")));
+        assert_eq!(value.get("tool_call_id"), Some(&json!("call_abc123")));
         assert_eq!(
             value.get("response_to_client_message_id"),
             Some(&json!("cmid-user-1")),
@@ -6223,9 +8801,11 @@ mod tests {
         // optional-fields convention).
         let bare = TurnSpawnCompleteEvent {
             session_id: sample_session_id(),
+            topic: None,
             turn_id: None,
             thread_id: None,
             task_id: "task_zzz".into(),
+            tool_call_id: None,
             response_to_client_message_id: None,
             seq: 1,
             message_id: "msg-bare".into(),
@@ -6241,6 +8821,10 @@ mod tests {
         let bare_v = serde_json::to_value(&bare).expect("serialize bare");
         assert!(bare_v.get("turn_id").is_none(), "absent turn_id omits");
         assert!(bare_v.get("thread_id").is_none(), "absent thread_id omits");
+        assert!(
+            bare_v.get("tool_call_id").is_none(),
+            "absent tool_call_id omits",
+        );
         assert!(
             bare_v.get("response_to_client_message_id").is_none(),
             "absent response_to_client_message_id omits",
@@ -6259,6 +8843,119 @@ mod tests {
         assert_eq!(rpc.method, methods::TURN_SPAWN_COMPLETE);
         let decoded = UiNotification::from_rpc_notification(rpc).expect("notification deserialize");
         assert_eq!(decoded, notif);
+    }
+
+    /// Asserts the new `tool_call_id` field round-trips through serde on
+    /// both `task/updated` and `turn/spawn_complete`. The chip-flip
+    /// race in the client browser hinged on having this field on the
+    /// wire, so a regression here would silently re-introduce the bug
+    /// even if the constructors still type-check.
+    #[test]
+    fn task_updated_and_spawn_complete_events_round_trip_tool_call_id() {
+        // `TaskUpdatedEvent` with `tool_call_id` set.
+        let task_event = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            topic: None,
+            task_id: TaskId(Uuid::from_u128(0xDEADBEEF)),
+            tool_call_id: Some("call_podcast_generate_42".into()),
+            title: "podcast_generate".into(),
+            state: TaskRuntimeState::Completed,
+            runtime_detail: Some("rendered output.mp3".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let task_value = serde_json::to_value(&task_event).expect("serialize task_updated");
+        assert_eq!(
+            task_value.get("tool_call_id"),
+            Some(&json!("call_podcast_generate_42")),
+            "tool_call_id must appear on the wire",
+        );
+        let parsed_task: TaskUpdatedEvent =
+            serde_json::from_value(task_value).expect("deserialize task_updated");
+        assert_eq!(parsed_task, task_event);
+
+        // `TaskUpdatedEvent` with `tool_call_id == None` omits on the wire
+        // (legacy daemons / synthetic paths).
+        let task_legacy = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            topic: None,
+            task_id: TaskId(Uuid::from_u128(1)),
+            tool_call_id: None,
+            title: "legacy".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let legacy_value = serde_json::to_value(&task_legacy).expect("serialize legacy");
+        assert!(
+            legacy_value.get("tool_call_id").is_none(),
+            "absent tool_call_id must omit so legacy daemons parse",
+        );
+        // Defensive: a JSON payload from an even-older daemon that lacks
+        // the field entirely still parses via `#[serde(default)]`.
+        let bare_legacy_json = json!({
+            "session_id": "local:demo",
+            "task_id": TaskId(Uuid::from_u128(1)),
+            "title": "legacy",
+            "state": "running",
+        });
+        let parsed_legacy: TaskUpdatedEvent =
+            serde_json::from_value(bare_legacy_json).expect("deserialize legacy bare");
+        assert_eq!(parsed_legacy.tool_call_id, None);
+
+        // `TurnSpawnCompleteEvent` with `tool_call_id` set.
+        let spawn_event = TurnSpawnCompleteEvent {
+            session_id: SessionKey("local:demo".into()),
+            topic: None,
+            turn_id: None,
+            thread_id: None,
+            task_id: "task_podcast_42".into(),
+            tool_call_id: Some("call_podcast_generate_42".into()),
+            response_to_client_message_id: None,
+            seq: 7,
+            message_id: "msg-spawn-7".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: "local:demo".into(),
+                seq: 7,
+            },
+            persisted_at: sample_persisted_at(),
+            content: "🎙 podcast delivered".into(),
+            media: vec!["output.mp3".into()],
+        };
+        let spawn_value = serde_json::to_value(&spawn_event).expect("serialize spawn_complete");
+        assert_eq!(
+            spawn_value.get("tool_call_id"),
+            Some(&json!("call_podcast_generate_42")),
+            "tool_call_id must appear on the wire",
+        );
+        let parsed_spawn: TurnSpawnCompleteEvent =
+            serde_json::from_value(spawn_value).expect("deserialize spawn_complete");
+        assert_eq!(parsed_spawn, spawn_event);
+
+        // Defensive: a `turn/spawn_complete` payload from an older daemon
+        // that lacks the field entirely still parses via
+        // `#[serde(default)]`.
+        let bare_spawn_json = json!({
+            "session_id": "local:demo",
+            "task_id": "task_legacy",
+            "seq": 1,
+            "message_id": "msg-legacy",
+            "source": "background",
+            "cursor": { "stream": "local:demo", "seq": 1 },
+            "persisted_at": "2026-01-01T00:00:00Z",
+            "content": "done",
+        });
+        let parsed_legacy_spawn: TurnSpawnCompleteEvent =
+            serde_json::from_value(bare_spawn_json).expect("deserialize legacy spawn bare");
+        assert_eq!(parsed_legacy_spawn.tool_call_id, None);
     }
 
     #[test]
@@ -6375,6 +9072,599 @@ mod tests {
         assert_eq!(rpc.method, methods::TURN_STATE_GET);
         let decoded = UiCommand::from_rpc_request(rpc).expect("decode state");
         assert_eq!(decoded, state);
+    }
+
+    // ===== M12 Phase D-1 auxiliary REST → WS frames =====
+
+    #[test]
+    fn aux_rest_to_ws_v1_feature_string_is_stable() {
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            "auxiliary.rest_to_ws.v1"
+        );
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
+        // Each command is built, serialized via `into_rpc_request`,
+        // re-decoded via `from_rpc_request`, and asserted equal. The
+        // method string is checked against the `methods::` constant so
+        // a typo there shows up here, not at deploy.
+        let cases: Vec<(UiCommand, &str)> = vec![
+            (
+                UiCommand::SessionList(SessionListParams::default()),
+                methods::SESSION_LIST,
+            ),
+            (
+                UiCommand::SessionSnapshot(SessionSnapshotParams {
+                    session_id: "sess-1".into(),
+                    topic: Some("default".into()),
+                }),
+                methods::SESSION_SNAPSHOT,
+            ),
+            (
+                UiCommand::SessionMessagesPage(SessionMessagesPageParams {
+                    session_id: "sess-1".into(),
+                    limit: Some(50),
+                    offset: Some(0),
+                    since_seq: None,
+                    topic: None,
+                }),
+                methods::SESSION_MESSAGES_PAGE,
+            ),
+            (
+                UiCommand::SessionStatusGet(SessionStatusGetParams {
+                    session_id: "sess-1".into(),
+                    topic: None,
+                }),
+                methods::SESSION_STATUS_GET,
+            ),
+            (
+                UiCommand::SessionFilesList(SessionFilesListParams {
+                    session_id: "sess-1".into(),
+                }),
+                methods::SESSION_FILES_LIST,
+            ),
+            (
+                UiCommand::SessionTasksList(SessionTasksListParams {
+                    session_id: "sess-1".into(),
+                    topic: None,
+                }),
+                methods::SESSION_TASKS_LIST,
+            ),
+            (
+                UiCommand::SessionWorkspaceGet(SessionWorkspaceGetParams {
+                    session_id: "sess-1".into(),
+                }),
+                methods::SESSION_WORKSPACE_GET,
+            ),
+            (
+                UiCommand::SessionTitleSet(SessionTitleSetParams {
+                    session_id: "sess-1".into(),
+                    title: "Renamed".into(),
+                }),
+                methods::SESSION_TITLE_SET,
+            ),
+            (
+                UiCommand::SessionDelete(SessionDeleteParams {
+                    session_id: "sess-1".into(),
+                }),
+                methods::SESSION_DELETE,
+            ),
+            (
+                UiCommand::SystemStatusGet(SystemStatusGetParams::default()),
+                methods::SYSTEM_STATUS_GET,
+            ),
+            (
+                UiCommand::ContentList(ContentListParams {
+                    filters: serde_json::json!({ "limit": 10 }),
+                }),
+                methods::CONTENT_LIST,
+            ),
+            (
+                UiCommand::ContentDelete(ContentDeleteParams { id: "c-1".into() }),
+                methods::CONTENT_DELETE,
+            ),
+            (
+                UiCommand::ContentBulkDelete(ContentBulkDeleteParams {
+                    ids: vec!["c-1".into(), "c-2".into()],
+                }),
+                methods::CONTENT_BULK_DELETE,
+            ),
+        ];
+        assert_eq!(
+            cases.len(),
+            13,
+            "13 UiCommand arms cover the 13 auxiliary methods \
+             (`session/list`, `session/snapshot`, `session/messages_page`, \
+             `session/status.get`, `session/files.list`, `session/tasks.list`, \
+             `session/workspace.get`, `session/title.set`, `session/delete`, \
+             `system/status.get`, `content/list`, `content/delete`, \
+             `content/bulk_delete`) — `content/delete` and `content/bulk_delete` \
+             are distinct methods"
+        );
+        for (command, expected_method) in cases {
+            let rpc = command
+                .clone()
+                .into_rpc_request("req")
+                .expect("serialize command");
+            assert_eq!(rpc.method, expected_method);
+            let decoded = UiCommand::from_rpc_request(rpc).expect("decode command");
+            assert_eq!(decoded, command);
+        }
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_empty_param_methods_accept_null_params() {
+        // Wire shape per JSON-RPC 2.0 allows omitting params on
+        // no-arg methods. `session/list` and `system/status.get`
+        // accept either `{}` or absent params.
+        let session_list_null =
+            UiCommand::from_method_and_params(methods::SESSION_LIST, Value::Null)
+                .expect("session/list with null params");
+        assert!(matches!(session_list_null, UiCommand::SessionList(_)));
+
+        let system_status_null =
+            UiCommand::from_method_and_params(methods::SYSTEM_STATUS_GET, Value::Null)
+                .expect("system/status.get with null params");
+        assert!(matches!(system_status_null, UiCommand::SystemStatusGet(_)));
+
+        let content_list_null =
+            UiCommand::from_method_and_params(methods::CONTENT_LIST, Value::Null)
+                .expect("content/list with null params");
+        assert!(matches!(content_list_null, UiCommand::ContentList(_)));
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
+        // Each result struct serializes to a stable shape and decodes
+        // back. Opaque `Value` fields are forwarded byte-for-byte from
+        // the REST handler bodies so they may carry whatever shape the
+        // existing REST contract emits.
+        let listing = SessionListResult {
+            sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
+        };
+        let value = serde_json::to_value(&listing).expect("serialize");
+        let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.sessions, listing.sessions);
+
+        let snapshot = SessionSnapshotResult {
+            status: serde_json::json!({ "active": false }),
+            files: serde_json::json!([]),
+            tasks: serde_json::json!([]),
+        };
+        let value = serde_json::to_value(&snapshot).expect("serialize");
+        let decoded: SessionSnapshotResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.status, snapshot.status);
+        assert_eq!(decoded.files, snapshot.files);
+        assert_eq!(decoded.tasks, snapshot.tasks);
+
+        let page = SessionMessagesPageResult {
+            messages: serde_json::json!([]),
+            has_more: false,
+            next_offset: 0,
+        };
+        let value = serde_json::to_value(&page).expect("serialize");
+        let decoded: SessionMessagesPageResult =
+            serde_json::from_value(value).expect("deserialize");
+        assert!(!decoded.has_more);
+        assert_eq!(decoded.next_offset, 0);
+
+        let title = SessionTitleSetResult {
+            session_id: "s-1".into(),
+            title: "Renamed".into(),
+        };
+        let value = serde_json::to_value(&title).expect("serialize");
+        let decoded: SessionTitleSetResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, title);
+
+        let delete = SessionDeleteResult::default();
+        let value = serde_json::to_value(&delete).expect("serialize");
+        let decoded: SessionDeleteResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, delete);
+
+        let content = ContentListResult {
+            entries: serde_json::json!([{ "id": "c-1" }]),
+            total: 1,
+        };
+        let value = serde_json::to_value(&content).expect("serialize");
+        let decoded: ContentListResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.entries, content.entries);
+        assert_eq!(decoded.total, content.total);
+
+        let bulk = ContentBulkDeleteResult { deleted: 5 };
+        let value = serde_json::to_value(&bulk).expect("serialize");
+        let decoded: ContentBulkDeleteResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, bulk);
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_methods_are_capability_gated() {
+        // The 12 new methods must gate on
+        // `auxiliary.rest_to_ws.v1`. A connection that does not
+        // negotiate the feature must NOT see them in the advertised
+        // `supported_methods`.
+        let none = UiProtocolCapabilities::for_negotiated_features(Vec::<String>::new());
+        for method in [
+            methods::SESSION_LIST,
+            methods::SESSION_SNAPSHOT,
+            methods::SESSION_MESSAGES_PAGE,
+            methods::SESSION_STATUS_GET,
+            methods::SESSION_FILES_LIST,
+            methods::SESSION_TASKS_LIST,
+            methods::SESSION_WORKSPACE_GET,
+            methods::SESSION_TITLE_SET,
+            methods::SESSION_DELETE,
+            methods::SYSTEM_STATUS_GET,
+            methods::CONTENT_LIST,
+            methods::CONTENT_DELETE,
+            methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                !none.supports_method(method),
+                "method {method} must NOT be advertised without aux_rest_to_ws_v1"
+            );
+        }
+
+        let with_feature = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+        ]);
+        for method in [
+            methods::SESSION_LIST,
+            methods::SESSION_SNAPSHOT,
+            methods::SESSION_MESSAGES_PAGE,
+            methods::SESSION_STATUS_GET,
+            methods::SESSION_FILES_LIST,
+            methods::SESSION_TASKS_LIST,
+            methods::SESSION_WORKSPACE_GET,
+            methods::SESSION_TITLE_SET,
+            methods::SESSION_DELETE,
+            methods::SYSTEM_STATUS_GET,
+            methods::CONTENT_LIST,
+            methods::CONTENT_DELETE,
+            methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                with_feature.supports_method(method),
+                "method {method} must be advertised when aux_rest_to_ws_v1 is negotiated"
+            );
+        }
+        assert!(with_feature.supports_feature(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
+    }
+
+    #[test]
+    fn autonomy_methods_require_base_and_group_features() {
+        let without_base = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+        ]);
+        assert!(!without_base.supports_feature(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1));
+        assert!(!without_base.supports_method(methods::SESSION_GOAL_SET));
+
+        let base_only = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+        ]);
+        assert!(base_only.supports_feature(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
+        assert!(!base_only.supports_method(methods::SESSION_GOAL_SET));
+
+        let with_group = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+        ]);
+        assert!(with_group.supports_method(methods::SESSION_GOAL_SET));
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 2): every M12 Phase D-1
+    /// request/result DTO must be pinned to a JSON-shape golden, not
+    /// just to a serde round-trip. A round-trip catches "can encode
+    /// and decode", but it does NOT catch "the field was renamed but
+    /// both ends agree on the rename" — exactly the failure mode we
+    /// care about when the WS bridge has to mirror REST DTOs that
+    /// live in a different crate. The literal-JSON asserts below
+    /// force a field rename (or a missing-field default flip) in any
+    /// REST DTO to fail this test before it lands.
+    #[test]
+    fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
+        // session/list — empty params
+        assert_eq!(
+            serde_json::to_value(SessionListParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+        let parsed: SessionListParams =
+            serde_json::from_value(serde_json::json!({})).expect("decode");
+        assert_eq!(parsed, SessionListParams::default());
+
+        // session/snapshot
+        let p = SessionSnapshotParams {
+            session_id: "sess-1".into(),
+            topic: Some("topic-x".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-1", "topic": "topic-x" }),
+        );
+        // Topic is optional — when absent, it must NOT serialize as
+        // `"topic": null`. Drift in the `skip_serializing_if`
+        // directive would flip the wire shape silently.
+        let p_no_topic = SessionSnapshotParams {
+            session_id: "sess-1".into(),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p_no_topic).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-1" }),
+        );
+
+        // session/messages_page
+        let p = SessionMessagesPageParams {
+            session_id: "sess-2".into(),
+            limit: Some(50),
+            offset: Some(10),
+            since_seq: Some(100),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({
+                "session_id": "sess-2",
+                "limit": 50,
+                "offset": 10,
+                "since_seq": 100,
+            }),
+        );
+
+        // session/status.get
+        let p = SessionStatusGetParams {
+            session_id: "sess-3".into(),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-3" }),
+        );
+
+        // session/files.list
+        assert_eq!(
+            serde_json::to_value(SessionFilesListParams {
+                session_id: "sess-4".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-4" }),
+        );
+
+        // session/tasks.list
+        assert_eq!(
+            serde_json::to_value(SessionTasksListParams {
+                session_id: "sess-5".into(),
+                topic: Some("t".into()),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-5", "topic": "t" }),
+        );
+
+        // session/workspace.get
+        assert_eq!(
+            serde_json::to_value(SessionWorkspaceGetParams {
+                session_id: "sess-6".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-6" }),
+        );
+
+        // session/title.set
+        assert_eq!(
+            serde_json::to_value(SessionTitleSetParams {
+                session_id: "sess-7".into(),
+                title: "New title".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-7", "title": "New title" }),
+        );
+
+        // session/delete
+        assert_eq!(
+            serde_json::to_value(SessionDeleteParams {
+                session_id: "sess-8".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-8" }),
+        );
+
+        // system/status.get — empty
+        assert_eq!(
+            serde_json::to_value(SystemStatusGetParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // content/list — free-form filters; default object is empty
+        assert_eq!(
+            serde_json::to_value(ContentListParams::default()).expect("serialize"),
+            serde_json::json!({ "filters": null }),
+        );
+        assert_eq!(
+            serde_json::to_value(ContentListParams {
+                filters: serde_json::json!({ "category": "image", "limit": 50 }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "filters": { "category": "image", "limit": 50 } }),
+        );
+
+        // content/delete
+        assert_eq!(
+            serde_json::to_value(ContentDeleteParams { id: "c-1".into() }).expect("serialize"),
+            serde_json::json!({ "id": "c-1" }),
+        );
+
+        // content/bulk_delete
+        assert_eq!(
+            serde_json::to_value(ContentBulkDeleteParams {
+                ids: vec!["c-1".into(), "c-2".into()],
+            })
+            .expect("serialize"),
+            serde_json::json!({ "ids": ["c-1", "c-2"] }),
+        );
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for
+    /// every aux result DTO. Pinned wire shapes — a rename of any
+    /// field below must show up in this test before it reaches a
+    /// downstream client. Each `assert_eq!` is the contract.
+    #[test]
+    fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
+        // session/list — `{ sessions: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionListResult {
+                sessions: serde_json::json!([{ "id": "s-1" }]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
+        );
+
+        // session/snapshot — `{ status, files, tasks }`
+        assert_eq!(
+            serde_json::to_value(SessionSnapshotResult {
+                status: serde_json::json!({ "active": true }),
+                files: serde_json::json!([{ "path": "f.txt" }]),
+                tasks: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "status": { "active": true },
+                "files": [{ "path": "f.txt" }],
+                "tasks": [],
+            }),
+        );
+
+        // session/messages_page — `{ messages, has_more, next_offset }`
+        assert_eq!(
+            serde_json::to_value(SessionMessagesPageResult {
+                messages: serde_json::json!([]),
+                has_more: true,
+                next_offset: 200,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "messages": [],
+                "has_more": true,
+                "next_offset": 200,
+            }),
+        );
+
+        // session/status.get — `{ status: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionStatusGetResult {
+                status: serde_json::json!({ "active": false }),
+                context_state: None,
+            })
+            .expect("serialize"),
+            serde_json::json!({ "status": { "active": false } }),
+        );
+
+        // session/files.list — `{ files: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionFilesListResult {
+                files: serde_json::json!([{ "path": "a.txt" }]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "files": [{ "path": "a.txt" }] }),
+        );
+
+        // session/tasks.list — `{ tasks: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionTasksListResult {
+                tasks: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "tasks": [] }),
+        );
+
+        // session/workspace.get — `{ contracts: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionWorkspaceGetResult {
+                contracts: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "contracts": [] }),
+        );
+
+        // session/title.set — `{ session_id, title }`
+        assert_eq!(
+            serde_json::to_value(SessionTitleSetResult {
+                session_id: "s-1".into(),
+                title: "Hello".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "s-1", "title": "Hello" }),
+        );
+
+        // session/delete — empty object
+        assert_eq!(
+            serde_json::to_value(SessionDeleteResult::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // system/status.get — `{ status: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SystemStatusGetResult {
+                status: serde_json::json!({ "version": "0.1.1" }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "status": { "version": "0.1.1" } }),
+        );
+
+        // content/list — `{ entries, total }`
+        assert_eq!(
+            serde_json::to_value(ContentListResult {
+                entries: serde_json::json!([{ "id": "c-1" }]),
+                total: 7,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "entries": [{ "id": "c-1" }],
+                "total": 7,
+            }),
+        );
+
+        // content/delete — `{ deleted: bool }`
+        assert_eq!(
+            serde_json::to_value(ContentDeleteResult { deleted: true }).expect("serialize"),
+            serde_json::json!({ "deleted": true }),
+        );
+
+        // content/bulk_delete — `{ deleted: usize }`
+        assert_eq!(
+            serde_json::to_value(ContentBulkDeleteResult { deleted: 12 }).expect("serialize"),
+            serde_json::json!({ "deleted": 12 }),
+        );
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 1): the new
+    /// `RpcError::not_found(resource_type, identifier)` constructor
+    /// must carry the resource tag + identifier in `data` so clients
+    /// can distinguish a content-row miss from a session miss without
+    /// parsing message strings. Pinned via JSON golden.
+    #[test]
+    fn rpc_error_not_found_carries_typed_resource_data() {
+        let err = RpcError::not_found("content", "c-99");
+        assert_eq!(err.code, rpc_error_codes::RESOURCE_NOT_FOUND);
+        let value = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(value.get("code"), Some(&json!(-32170)));
+        let data = value.get("data").expect("data present");
+        assert_eq!(data.get("kind"), Some(&json!("not_found")));
+        assert_eq!(data.get("resource_type"), Some(&json!("content")));
+        assert_eq!(data.get("identifier"), Some(&json!("c-99")));
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 3): the bulk-delete cap is
+    /// part of the wire contract and must not drift silently. Pin
+    /// the constant value to 256 so a future bump shows up as a
+    /// test diff.
+    #[test]
+    fn content_bulk_delete_max_ids_constant_is_pinned() {
+        assert_eq!(
+            CONTENT_BULK_DELETE_MAX_IDS, 256,
+            "wire-contract cap; bump server dispatcher AND any client adapters together",
+        );
     }
 
     // ===== UPCR-2026-014 M9-γ projection envelope golden tests =====
@@ -6704,6 +9994,804 @@ mod tests {
         assert!(
             UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             "projection.envelope.v1 must be registered for capability negotiation"
+        );
+    }
+
+    #[test]
+    fn envelope_notification_method_is_projection_envelope() {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo".into()),
+            topic: None,
+            envelope: Envelope {
+                thread_id: "thread-1".into(),
+                seq: 1,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "hi".into() },
+            },
+        });
+        assert_eq!(notif.method(), "projection/envelope");
+        assert_eq!(notif.session_id(), &SessionKey("local:demo".into()));
+    }
+
+    #[test]
+    fn envelope_notification_round_trips_through_rpc_envelope_with_bare_wire_shape() {
+        // The wire shape MUST be the bare `Envelope` per spec § 14.1 —
+        // `session_id` and `topic` are server-internal routing fields
+        // and MUST NOT leak onto the JSON-RPC `params`.
+        let envelope = Envelope {
+            thread_id: "thread-7".into(),
+            seq: 42,
+            client_message_id: Some("cmid-x".into()),
+            payload: Payload::UserMessage {
+                text: "hi".into(),
+                files: vec![FileRef {
+                    path: "/tmp/a.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 12,
+                }],
+            },
+        };
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:demo".into()),
+            topic: Some("planning".into()),
+            envelope: envelope.clone(),
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        assert_eq!(rpc.method, "projection/envelope");
+        // Wire shape: bare Envelope JSON, no session_id/topic keys.
+        let params = &rpc.params;
+        assert!(
+            params.get("session_id").is_none(),
+            "session_id must not leak onto the wire"
+        );
+        assert!(
+            params.get("topic").is_none(),
+            "topic must not leak onto the wire"
+        );
+        assert_eq!(params.get("thread_id"), Some(&json!("thread-7")));
+        assert_eq!(params.get("seq"), Some(&json!(42)));
+        assert_eq!(params.get("client_message_id"), Some(&json!("cmid-x")));
+
+        // Round-trip decode: session_id defaults to empty (the AppUI
+        // decode path rebuilds it from ambient context); envelope must
+        // be byte-equal.
+        let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
+        match parsed {
+            UiNotification::Envelope(ev) => {
+                assert_eq!(ev.envelope, envelope);
+                // Routing fields default on the decode path; consumer
+                // reconstructs them from ambient context.
+                assert_eq!(ev.session_id, SessionKey(String::new()));
+                assert_eq!(ev.topic, None);
+            }
+            other => panic!("expected Envelope variant, got {other:?}"),
+        }
+    }
+
+    /// Codex #1336 round-2 BLOCKER 4: the durable ledger writes records
+    /// via `serde_json::to_string(&LedgerDiskRecord)`, which chains
+    /// through the global `Serialize` impl on `EnvelopeNotification`.
+    /// Before the fix, that global impl stripped `session_id` + `topic`
+    /// to mirror the wire shape — so disk records lost their routing
+    /// context and recovery deserialized them with empty/None routing.
+    /// Topic-scoped envelope replay after restart silently mis-routed.
+    ///
+    /// Post-fix: the global Serialize/Deserialize is derive-based and
+    /// preserves ALL fields. The wire shape is opted into only at the
+    /// JSON-RPC boundary inside `into_rpc_notification`.
+    #[test]
+    fn envelope_notification_serde_preserves_routing_fields_for_disk_persistence() {
+        // Persistent shape: routing fields survive a JSON round-trip.
+        // This is the path the durable ledger uses for its on-disk
+        // records, NOT the wire path.
+        let original = EnvelopeNotification {
+            session_id: SessionKey("local:disk-routing".into()),
+            topic: Some("planning".into()),
+            envelope: Envelope {
+                thread_id: "thread-disk".into(),
+                seq: 7,
+                client_message_id: None,
+                payload: Payload::AssistantDelta {
+                    text: "persisted delta".into(),
+                },
+            },
+        };
+
+        // Serialize the EnvelopeNotification directly (NOT via
+        // into_rpc_notification) — this mirrors how the ledger writes
+        // it inside a LedgerDiskRecord. The output MUST contain the
+        // routing fields.
+        let serialized =
+            serde_json::to_value(&original).expect("EnvelopeNotification serializes for disk");
+        assert_eq!(
+            serialized.get("session_id"),
+            Some(&json!("local:disk-routing")),
+            "session_id must persist on disk so recovery can rebuild routing",
+        );
+        assert_eq!(
+            serialized.get("topic"),
+            Some(&json!("planning")),
+            "topic must persist on disk so topic-scoped recovery routes correctly",
+        );
+        assert!(
+            serialized.get("envelope").is_some(),
+            "envelope body must be present on disk",
+        );
+
+        // Deserialize back — routing fields must round-trip byte-equal.
+        let parsed: EnvelopeNotification = serde_json::from_value(serialized)
+            .expect("EnvelopeNotification deserializes from disk");
+        assert_eq!(
+            parsed, original,
+            "disk round-trip must preserve all fields including routing",
+        );
+
+        // Defensive: a `topic: None` envelope omits the field on disk
+        // (no behavioural change — just keeps the disk shape compact
+        // when topic isn't set).
+        let no_topic = EnvelopeNotification {
+            session_id: SessionKey("local:disk-no-topic".into()),
+            topic: None,
+            envelope: original.envelope.clone(),
+        };
+        let serialized = serde_json::to_value(&no_topic).expect("serialize");
+        assert!(
+            serialized.get("topic").is_none(),
+            "absent topic is omitted on disk; deserialize defaults back to None",
+        );
+        let parsed: EnvelopeNotification = serde_json::from_value(serialized).expect("deserialize");
+        assert_eq!(parsed, no_topic);
+    }
+
+    /// Codex #1336 round-2 BLOCKER 4 — wire shape regression guard.
+    /// `into_rpc_notification` is the ONLY place the wire shape is
+    /// produced; routing fields are stripped here and ONLY here. The
+    /// disk-persistence test above pins that the routing fields DO
+    /// survive when the envelope is serialized directly (not through
+    /// into_rpc_notification).
+    #[test]
+    fn envelope_notification_into_rpc_notification_strips_routing_fields() {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey("local:wire-strip".into()),
+            topic: Some("planning".into()),
+            envelope: Envelope {
+                thread_id: "thread-wire".into(),
+                seq: 5,
+                client_message_id: None,
+                payload: Payload::AssistantDelta { text: "x".into() },
+            },
+        });
+        let rpc = notif.into_rpc_notification().expect("serialize");
+        assert_eq!(rpc.method, methods::PROJECTION_ENVELOPE);
+        let params = &rpc.params;
+        assert!(
+            params.get("session_id").is_none(),
+            "wire MUST strip session_id (spec § 14.1)",
+        );
+        assert!(
+            params.get("topic").is_none(),
+            "wire MUST strip topic (spec § 14.1)",
+        );
+        // Bare envelope on the wire — `thread_id`, `seq`, `payload`
+        // are top-level keys (no `envelope` nesting).
+        assert_eq!(params.get("thread_id"), Some(&json!("thread-wire")));
+        assert_eq!(params.get("seq"), Some(&json!(5)));
+    }
+
+    // ------------------------------------------------------------------
+    // Wave4-A: router/status, router/failover, queue/state, router/set_mode,
+    // router/get_metrics round-trip + wire-shape tests.
+    // ------------------------------------------------------------------
+
+    /// Wave4-A: `router/status` notification round-trips through JSON-RPC
+    /// with deterministic `BTreeMap` ordering and the correct wire tag.
+    #[test]
+    fn router_status_notification_round_trips_with_deterministic_order() {
+        let mut lane_scores = BTreeMap::new();
+        lane_scores.insert("zai/glm-5-turbo".into(), 0.21);
+        lane_scores.insert("dashscope/qwen3.5-plus".into(), 0.41);
+        lane_scores.insert("ollama/llama3.2".into(), 0.62);
+
+        let mut breakers = BTreeMap::new();
+        breakers.insert("zai/glm-5-turbo".into(), "closed".into());
+        breakers.insert("dashscope/qwen3.5-plus".into(), "half_open".into());
+        breakers.insert("ollama/llama3.2".into(), "open".into());
+
+        let notif = UiNotification::RouterStatus(RouterStatusEvent {
+            session_id: SessionKey("local:demo".into()),
+            provider_name: "zai/glm-5-turbo".into(),
+            mode: "lane".into(),
+            qos_ranking: true,
+            lane_scores: lane_scores.clone(),
+            circuit_breakers: breakers.clone(),
+        });
+
+        // Method tag matches the constant.
+        assert_eq!(notif.method(), methods::ROUTER_STATUS);
+
+        // Round-trip through JSON-RPC notification envelope.
+        let rpc = notif
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize router/status");
+        assert_eq!(rpc.method, methods::ROUTER_STATUS);
+
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str rpc");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed_rpc).expect("decode router/status");
+        assert_eq!(decoded, notif);
+
+        // BTreeMap ordering is deterministic — the first key in the wire
+        // payload must be the lex-smallest, so a re-serialization byte-
+        // matches.
+        let wire_keys: Vec<String> = serde_json::to_value(&notif)
+            .expect("value")
+            .get("lane_scores")
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            wire_keys,
+            vec![
+                "dashscope/qwen3.5-plus".to_string(),
+                "ollama/llama3.2".to_string(),
+                "zai/glm-5-turbo".to_string(),
+            ],
+            "lane_scores keys must be in BTreeMap (lex-sorted) order"
+        );
+    }
+
+    /// Wave4-A: `router/failover` round-trips with the failover metadata
+    /// the AdaptiveRouter emits when it crosses a lane.
+    #[test]
+    fn router_failover_notification_round_trips() {
+        let notif = UiNotification::RouterFailover(RouterFailoverEvent {
+            session_id: SessionKey("local:demo".into()),
+            from_provider: "zai/glm-5-turbo".into(),
+            to_provider: "dashscope/qwen3.5-plus".into(),
+            reason: "circuit_breaker_open".into(),
+            elapsed_ms: 12_345,
+        });
+        assert_eq!(notif.method(), methods::ROUTER_FAILOVER);
+
+        let rpc = notif
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize router/failover");
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed_rpc).expect("decode router/failover");
+        assert_eq!(decoded, notif);
+    }
+
+    /// Wave4-A: `queue/state` round-trips with `head_client_message_id`
+    /// both populated (in-flight) and absent (queue idle).
+    #[test]
+    fn queue_state_notification_round_trips_with_and_without_head() {
+        // In-flight: head_client_message_id present.
+        let notif_active = UiNotification::QueueState(QueueStateEvent {
+            session_id: SessionKey("local:demo".into()),
+            pending_count: 3,
+            head_client_message_id: Some("cmid-12345".into()),
+        });
+        assert_eq!(notif_active.method(), methods::QUEUE_STATE);
+        let rpc = notif_active
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize active");
+        let json = serde_json::to_string(&rpc).expect("to_string active");
+        // head_client_message_id is on the wire when populated.
+        assert!(json.contains("head_client_message_id"));
+        assert!(json.contains("cmid-12345"));
+
+        let parsed: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str active");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed).expect("decode queue/state active");
+        assert_eq!(decoded, notif_active);
+
+        // Empty queue: head_client_message_id absent.
+        let notif_empty = UiNotification::QueueState(QueueStateEvent {
+            session_id: SessionKey("local:demo".into()),
+            pending_count: 0,
+            head_client_message_id: None,
+        });
+        let rpc = notif_empty
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize empty");
+        let json = serde_json::to_string(&rpc).expect("to_string empty");
+        assert!(
+            !json.contains("head_client_message_id"),
+            "head_client_message_id must be omitted when None — got {json}"
+        );
+
+        let parsed: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str empty");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed).expect("decode queue/state empty");
+        assert_eq!(decoded, notif_empty);
+    }
+
+    /// Wave4-A: `router/set_mode` command round-trips and dispatches
+    /// through the standard `UiCommand` request shape.
+    #[test]
+    fn router_set_mode_command_round_trips() {
+        let command = UiCommand::RouterSetMode(RouterSetModeParams {
+            session_id: SessionKey("local:demo".into()),
+            mode: "hedge".into(),
+        });
+        assert_eq!(command.method(), methods::ROUTER_SET_MODE);
+
+        let rpc = command
+            .clone()
+            .into_rpc_request("req-set-mode")
+            .expect("serialize router/set_mode");
+        assert_eq!(rpc.method, methods::ROUTER_SET_MODE);
+        assert_eq!(rpc.params["mode"], json!("hedge"));
+
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+        let decoded = UiCommand::from_rpc_request(parsed_rpc).expect("decode router/set_mode");
+        assert_eq!(decoded, command);
+    }
+
+    /// Wave4-A: `router/get_metrics` request + result round-trip. Mirrors
+    /// the wire shape of the `router/status` notification so clients can
+    /// reuse the deserializer.
+    #[test]
+    fn router_get_metrics_command_and_result_round_trip() {
+        let command = UiCommand::RouterGetMetrics(RouterGetMetricsParams {
+            session_id: SessionKey("local:demo".into()),
+        });
+        assert_eq!(command.method(), methods::ROUTER_GET_METRICS);
+
+        let rpc = command
+            .clone()
+            .into_rpc_request("req-get-metrics")
+            .expect("serialize router/get_metrics");
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+        let decoded = UiCommand::from_rpc_request(parsed_rpc).expect("decode router/get_metrics");
+        assert_eq!(decoded, command);
+
+        // Result round-trips with deterministic BTreeMap order.
+        let mut lane_scores = BTreeMap::new();
+        lane_scores.insert("a/b".into(), 0.1);
+        lane_scores.insert("c/d".into(), 0.2);
+        let mut breakers = BTreeMap::new();
+        breakers.insert("a/b".into(), "closed".into());
+        breakers.insert("c/d".into(), "closed".into());
+        let result = RouterGetMetricsResult {
+            provider_name: "a/b".into(),
+            mode: "lane".into(),
+            qos_ranking: false,
+            lane_scores: lane_scores.clone(),
+            circuit_breakers: breakers.clone(),
+        };
+        let json = serde_json::to_string(&result).expect("serialize result");
+        let parsed: RouterGetMetricsResult =
+            serde_json::from_str(&json).expect("deserialize result");
+        assert_eq!(parsed.provider_name, result.provider_name);
+        assert_eq!(parsed.lane_scores, lane_scores);
+        assert_eq!(parsed.circuit_breakers, breakers);
+    }
+
+    /// Wave4-A: capability advertisement carries the three new notification
+    /// methods (`router/status`, `router/failover`, `queue/state`) so
+    /// clients that negotiate at handshake time can subscribe.
+    #[test]
+    fn wave4a_router_methods_are_in_capabilities() {
+        let caps = UiProtocolCapabilities::first_server_slice();
+        assert!(
+            caps.supported_notifications
+                .contains(&methods::ROUTER_STATUS.to_owned()),
+            "router/status must be advertised as a supported notification"
+        );
+        assert!(
+            caps.supported_notifications
+                .contains(&methods::ROUTER_FAILOVER.to_owned()),
+            "router/failover must be advertised as a supported notification"
+        );
+        assert!(
+            caps.supported_notifications
+                .contains(&methods::QUEUE_STATE.to_owned()),
+            "queue/state must be advertised as a supported notification"
+        );
+        assert!(
+            caps.supports_method(methods::ROUTER_SET_MODE),
+            "router/set_mode must be a supported command method"
+        );
+        assert!(
+            caps.supports_method(methods::ROUTER_GET_METRICS),
+            "router/get_metrics must be a supported command method"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #1329 — topic-scope routing class fix
+    //
+    // The 6 events listed below (ToolStarted/Progress/Completed,
+    // ApprovalAutoResolved/Decided/Cancelled), plus FileAttached
+    // (already covered by the P0-A regression), gained an explicit
+    // `topic: Option<String>` field. `UiNotification::topic()` now
+    // consults that field FIRST and only falls back to
+    // `SessionKey.topic()`. Each test:
+    //   1. Builds the event with an explicit `topic` field — `topic()`
+    //      returns the field's value, even when `session_id` was
+    //      stripped to `base_key()` (the P0-A failure mode).
+    //   2. Builds the same event with a topic-suffixed session_id but
+    //      NO explicit topic — `topic()` falls back to the suffix
+    //      (backward compat; `stamp_topic_from_session` then promotes
+    //      it to the explicit field at append time).
+    //   3. Builds the event with neither — `topic()` returns `None`.
+    // -----------------------------------------------------------------
+
+    fn topic_session() -> SessionKey {
+        SessionKey("local:slides-soak#slides".into())
+    }
+
+    fn bare_session() -> SessionKey {
+        SessionKey("local:slides-soak".into())
+    }
+
+    #[test]
+    fn tool_started_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(
+            with_field.topic(),
+            Some("slides"),
+            "explicit topic field wins over base_key() session_id"
+        );
+
+        let fallback = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(
+            fallback.topic(),
+            Some("slides"),
+            "missing explicit topic falls back to session_id suffix"
+        );
+
+        let neither = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-3".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        assert_eq!(neither.topic(), None, "no topic anywhere → None");
+    }
+
+    #[test]
+    fn tool_progress_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            message: Some("step 1".into()),
+            progress_pct: Some(25.0),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            message: None,
+            progress_pct: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn tool_completed_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-1".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: Some(10),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-2".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_auto_resolved_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_decided_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    #[test]
+    fn approval_cancelled_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    /// #1329 sibling test: FileAttached gained the same `topic` field
+    /// as the 6 ApprovalDecided-class events; verify the same access
+    /// rule (explicit first, suffix fallback). This was the bug the
+    /// P0-A exemption patched; with explicit field, the exemption is
+    /// no longer needed.
+    #[test]
+    fn file_attached_topic_method_reads_explicit_field_then_session_suffix() {
+        let with_field = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: Some("tc-slides".into()),
+            mime: None,
+        });
+        assert_eq!(with_field.topic(), Some("slides"));
+
+        let fallback = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: None,
+            mime: None,
+        });
+        assert_eq!(fallback.topic(), Some("slides"));
+    }
+
+    /// `stamp_topic_from_session` MUST populate the new explicit
+    /// `topic` field for the 6 vulnerable variants (and FileAttached)
+    /// from the SessionKey suffix when the field is absent. This is
+    /// the safety net that runs in `into_rpc_notification`: even if a
+    /// caller forgets to stamp, the wire-emit path stamps it for them
+    /// so a topic-scoped subscriber always routes the event correctly.
+    #[test]
+    fn stamp_topic_from_session_populates_new_topic_class_events() {
+        // ToolStarted
+        let mut event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        event.stamp_topic_from_session();
+        assert_eq!(event.topic(), Some("slides"));
+        if let UiNotification::ToolStarted(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        } else {
+            panic!("event variant changed unexpectedly");
+        }
+
+        // ToolProgress
+        let mut event = UiNotification::ToolProgress(ToolProgressEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            message: None,
+            progress_pct: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ToolProgress(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ToolCompleted
+        let mut event = UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            output_preview: None,
+            duration_ms: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ToolCompleted(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalAutoResolved
+        let mut event = UiNotification::ApprovalAutoResolved(ApprovalAutoResolvedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            scope: approval_scopes::SESSION.into(),
+            scope_match: "exact".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalAutoResolved(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalDecided
+        let mut event = UiNotification::ApprovalDecided(ApprovalDecidedEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            decided_at: Utc::now(),
+            decided_by: "user:test".into(),
+            auto_resolved: false,
+            policy_id: None,
+            client_note: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalDecided(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // ApprovalCancelled
+        let mut event = UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
+            session_id: topic_session(),
+            topic: None,
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            reason: approval_cancelled_reasons::TURN_INTERRUPTED.into(),
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::ApprovalCancelled(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+
+        // FileAttached (sibling)
+        let mut event = UiNotification::FileAttached(FileAttachedEvent {
+            session_id: topic_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: None,
+            mime: None,
+        });
+        event.stamp_topic_from_session();
+        if let UiNotification::FileAttached(inner) = &event {
+            assert_eq!(inner.topic.as_deref(), Some("slides"));
+        }
+    }
+
+    /// #1329 wire-shape guarantee: the new `topic` field must
+    /// serialize when present and stay omitted when absent (so v0
+    /// clients never see a surprise field). Verified for one
+    /// representative variant (the same `skip_serializing_if` is
+    /// applied uniformly across all 7).
+    #[test]
+    fn tool_started_topic_field_round_trips_on_the_wire() {
+        let event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: Some("slides".into()),
+            turn_id: TurnId(Uuid::from_u128(0x1329)),
+            tool_call_id: "tc-1329".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        let wire = serde_json::to_value(event.clone().into_rpc_notification().expect("serialize"))
+            .expect("to_value");
+        assert_eq!(wire["params"]["topic"], json!("slides"));
+
+        let decoded: RpcNotification<Value> =
+            serde_json::from_value(wire).expect("deserialize wire");
+        let decoded_event = UiNotification::from_rpc_notification(decoded).expect("decode");
+        assert_eq!(decoded_event.topic(), Some("slides"));
+
+        // Absent topic stays omitted.
+        let bare_event = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: bare_session(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "tc-bare".into(),
+            tool_name: "shell".into(),
+            arguments: None,
+        });
+        let wire =
+            serde_json::to_value(bare_event.into_rpc_notification().expect("serialize bare"))
+                .expect("to_value");
+        assert!(
+            wire["params"].get("topic").is_none(),
+            "absent topic field must stay omitted on the wire (no v0 breakage)"
         );
     }
 }

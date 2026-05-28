@@ -39,7 +39,9 @@ use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
-use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
+use crate::workspace_contract::{
+    SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
+};
 
 /// Per-tool-call result returned from the in-process dispatcher. Kept as a
 /// tuple so the aggregation path can reuse today's `futures::join_all` style
@@ -118,6 +120,34 @@ fn relativize_workspace_path(path: &str, workspace_root: Option<&std::path::Path
     match abs.strip_prefix(root) {
         Ok(rel) => rel.to_string_lossy().into_owned(),
         Err(_) => path.to_string(),
+    }
+}
+
+/// Decide what `content` to put on the spawn-only background-result payload
+/// when the workspace contract reports `Satisfied`.
+///
+/// Wave-3b regression guard: a contract entry with no declared artifact
+/// (e.g. `mofa_publish`, whose deliverable is a live URL, not a file)
+/// returns `Satisfied { output_files: [] }`. Before this fix the handler
+/// fell through to `content: String::new()`, dropping the tool's stdout
+/// text (the deploy URL itself for `mofa_publish`) and the user saw a
+/// blank completion.
+///
+/// Rule:
+///
+/// - When `output_files` is non-empty: emit empty content; the files
+///   themselves carry the deliverable. This matches the legacy
+///   file-attached behaviour for `fm_tts` / `podcast_generate` / etc.
+/// - When `output_files` is empty: emit the tool's stdout `output` as
+///   content. The contract verified the artifact-shaped portion of the
+///   deliverable (e.g. the HttpProbe asserting deploy_url returned
+///   `<!DOCTYPE`), but the user-visible text payload (the live URL) is
+///   what the LLM/user actually consumes.
+pub(super) fn satisfied_completion_content(output_files: &[String], tool_output: &str) -> String {
+    if output_files.is_empty() {
+        tool_output.to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -208,6 +238,13 @@ impl Agent {
         // both stamp it onto every tool call. The spawn tool reads
         // `ctx.spawn_depth` and refuses further nesting at the cap.
         let spawn_depth = self.spawn_depth;
+        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
+        // snapshot the agent's `session_scope` so the foreground and
+        // spawn_only `ToolContext` builders below thread it onto every
+        // tool call. `None` keeps pre-Phase-1 behaviour; downstream
+        // consumers (pipeline workers, file tools, plugins) come online
+        // in Phase 2.
+        let session_scope = self.session_scope.clone();
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -318,6 +355,47 @@ impl Agent {
                     }
                 }
 
+                // Pre-flight validation: catch known-bad arguments (e.g.
+                // structurally invalid DOT for `run_pipeline`) synchronously
+                // so the LLM gets the error as a tool_result in this
+                // iteration and can retry with corrected input. Without
+                // this, the foreground would return "started in background"
+                // to the LLM, the background task would fail validation,
+                // and the LLM-side conversation would never see the error.
+                // The pre-flight hook is opt-in per tool — default impl is
+                // Ok(()). See `Tool::pre_flight_validate`.
+                if let Some(tool) = tools.get(&tc_name) {
+                    if let Err(msg) = tool.pre_flight_validate(&effective_args).await {
+                        tracing::warn!(
+                            tool = %tc_name,
+                            error = %msg,
+                            "spawn_only pre-flight validation failed"
+                        );
+                        let err_msg = format!(
+                            "[VALIDATION FAILED] Tool '{tc_name}' rejected input: {msg}\n\n\
+                             Fix the input and retry."
+                        );
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: err_msg,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tc_id),
+                                reasoning_content: None,
+                                client_message_id: None,
+                                thread_id: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            false,
+                            None,
+                        );
+                    }
+                }
+
                 tracing::info!(
                     tool = %tc_name,
                     "running spawn_only tool in background"
@@ -336,6 +414,21 @@ impl Agent {
                 // correct turn even after subsequent unrelated user turns
                 // have advanced the per-chat sticky thread_id.
                 let bg_originating_thread_id = bg_reporter.thread_id().map(str::to_string);
+                // Issue #960 fix (M10 Phase 4 plumbing): the originating
+                // user prompt's `client_message_id`. Today the reporter's
+                // `thread_id()` IS the cmid on gateway-bound paths and IS
+                // the originating `TurnId` UUID on the WS standalone-turn
+                // path — the SPA reducer's thread-map keys on whichever
+                // shape the parent user-prompt row carries, so threading
+                // the same value through under both names lets the
+                // `turn/spawn_complete` envelope's
+                // `response_to_client_message_id` round-trip correctly.
+                // The field is documented separately on
+                // `BackgroundResultPayload` so a follow-up that decouples
+                // the two on the WS path (e.g. surfacing the SPA's
+                // pre-`turn/start` cmid) only has to update the capture
+                // site here.
+                let bg_originating_client_message_id = bg_originating_thread_id.clone();
                 // Issue #738 fix: thread the originating cmid into task
                 // registration so any SpawnOnlyFailureSignal emitted for
                 // this task carries it to the M8.9 synthetic recovery
@@ -384,6 +477,12 @@ impl Agent {
                 // Guard C (issue #607): clone the agent's spawn nesting
                 // depth into the spawn_only TOOL_CTX builder.
                 let bg_spawn_depth = spawn_depth;
+                // Phase 1 of the SessionScope migration: clone the
+                // agent's session scope into the spawn_only TOOL_CTX
+                // builder so background sub-agents see the same
+                // filesystem contract as the parent session. None
+                // keeps pre-Phase-1 behaviour.
+                let bg_session_scope = session_scope.clone();
                 let bg_session_id_for_watcher = format!("agent:{}", tc_id);
                 // M10 Phase 4: keep a copy of the task_id so the synthesized
                 // tool-result message returned to the LLM (built after this
@@ -438,6 +537,11 @@ impl Agent {
                         // sub-agents (e.g. fm_tts → spawn) see the
                         // higher value when their TOOL_CTX is read.
                         spawn_depth: bg_spawn_depth,
+                        // Phase 1 SessionScope migration: thread the
+                        // shared scope onto the spawn_only TOOL_CTX so
+                        // every background sub-agent sees the same
+                        // filesystem contract as the parent.
+                        session_scope: bg_session_scope.clone(),
                         ..ToolContext::zero()
                     };
 
@@ -515,26 +619,101 @@ impl Agent {
                                 success = true,
                                 "spawn_only background tool completed"
                             );
-                            match enforce_spawn_task_contract(
+                            // Forward the tool's `named_outputs` map (parsed
+                            // from its stdout envelope by the plugin
+                            // wrapper) so validators can resolve
+                            // `${output.<key>}` references against
+                            // tool-emitted values (e.g. `mofa_publish`
+                            // emitting `deploy_url`).
+                            let named_outputs_value = r.named_outputs.as_ref().map(|map| {
+                                serde_json::Value::Object(
+                                    map.iter()
+                                        .map(|(k, v)| {
+                                            (k.clone(), serde_json::Value::String(v.clone()))
+                                        })
+                                        .collect(),
+                                )
+                            });
+                            match enforce_spawn_task_contract_with_args_and_output(
                                 &bg_tools,
                                 &bg_name,
                                 &bg_tc_id,
                                 &r.files_to_send,
                                 bg_started_at,
                                 Some((&bg_supervisor, &task_id)),
+                                Some(&bg_args),
+                                named_outputs_value.as_ref(),
                             )
                             .await
                             {
                                 SpawnTaskContractResult::Satisfied { output_files } => {
+                                    // octos #997 (round-3 fix): the session-scope
+                                    // contract above runs validators at the SESSION
+                                    // root and writes
+                                    // `<session>/.octos/validator_outcomes.jsonl`,
+                                    // but `inspect_workspace_contract` reads
+                                    // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`.
+                                    // Without this call, a direct spawn_only
+                                    // invocation of `mofa_slides` (or any kind-
+                                    // managed tool) lands in the project workspace
+                                    // but never writes the project ledger — so a
+                                    // subsequent contract gate surfaces
+                                    // `ready = false` even when the hard-required
+                                    // validator (octos #997:
+                                    // `slides.mofa_slides.pptx_magic_bytes`)
+                                    // would have passed at the project root.
+                                    //
+                                    // Kind-agnostic: the helper iterates every
+                                    // slides/sites project beneath
+                                    // `workspace_root` and runs each project's
+                                    // own declared completion-phase validators.
+                                    // Non-slides/sites tools simply find no
+                                    // projects to validate and the helper
+                                    // returns an empty report.
+                                    if let Some(workspace_root) = bg_tools.workspace_root() {
+                                        let _project_root_report =
+                                            crate::workspace_contract::run_project_root_validators(
+                                                &bg_tools,
+                                                workspace_root,
+                                                None,
+                                                &r.files_to_send,
+                                            )
+                                            .await;
+                                    }
+                                    // When the tool emitted real text output
+                                    // (run_pipeline synthesize summary, plugin
+                                    // structured result), surface it in the
+                                    // chat bubble alongside any file
+                                    // attachments — otherwise the user sees an
+                                    // empty bubble with a `.md` attachment for
+                                    // research pipelines that explicitly
+                                    // produced a ~1000-word summary as their
+                                    // final text response.
+                                    //
+                                    // Empty / whitespace-only output falls back
+                                    // to `satisfied_completion_content`, which
+                                    // preserves the Wave-3b mofa_publish path
+                                    // (no files + URL text -> emit URL) and
+                                    // the legacy fm_tts / podcast_generate
+                                    // path (files + no text -> empty bubble,
+                                    // files carry the deliverable).
+                                    let bubble_content = if r.output.trim().is_empty() {
+                                        satisfied_completion_content(&output_files, &r.output)
+                                    } else {
+                                        r.output.clone()
+                                    };
                                     let result_persisted = if let Some(ref sender) = bg_sender {
                                         sender(BackgroundResultPayload {
                                             task_label: bg_name.clone(),
-                                            content: String::new(),
+                                            content: bubble_content,
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
                                             envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
                                             task_id: Some(task_id.clone()),
+                                            originating_client_message_id:
+                                                bg_originating_client_message_id.clone(),
+                                            tool_call_id: Some(bg_tc_id.clone()),
                                         })
                                         .await
                                     } else {
@@ -542,32 +721,48 @@ impl Agent {
                                     };
 
                                     if result_persisted {
-                                        // Issue #896: emit the produced-files
-                                        // notification ONLY after the supervisor
-                                        // validation passes. Codex review on
-                                        // PR #898 flagged the original ordering
-                                        // (notification before validation) as
-                                        // user-confusing — a success-looking
-                                        // paths block could land in chat right
-                                        // before a `✗ failed` notification if
-                                        // `mark_completed_with_validation`
-                                        // rejected the outputs. Matches the
-                                        // safer ordering used on the
-                                        // `NotConfigured` path below.
-                                        match bg_supervisor.mark_completed_with_validation(
-                                            &task_id,
-                                            output_files.clone(),
-                                        ) {
-                                            Ok(()) => {
-                                                if let Some(ref sender) = bg_sender {
-                                                    if let Some(produced_msg) =
-                                                        build_spawn_only_produced_files_message(
-                                                            &bg_name,
-                                                            &output_files,
-                                                            bg_tools.workspace_root(),
-                                                        )
-                                                    {
-                                                        let _ = sender(BackgroundResultPayload {
+                                        // Workspace contract already verified
+                                        // the declared artifacts. Trust it —
+                                        // the supervisor's job is to record
+                                        // the skill's reported outcome, not
+                                        // to re-validate file contents.
+                                        bg_supervisor
+                                            .mark_completed(&task_id, output_files.clone());
+                                        // Only emit the auto-generated
+                                        // "<tool> produced files: …" follow-up
+                                        // when the first payload carried no
+                                        // text — otherwise the chat would
+                                        // render TWO assistant bubbles in a
+                                        // row (summary, then a redundant
+                                        // file-list notice). For run_pipeline
+                                        // the synthesize node already supplied
+                                        // a user-readable executive summary
+                                        // in `r.output`, so we suppress the
+                                        // file-list bubble. For tools whose
+                                        // `r.output` was empty (some
+                                        // plugin-only flows that deliver via
+                                        // files alone) the fallback notice
+                                        // still fires.
+                                        //
+                                        // `trim().is_empty()` so whitespace-only
+                                        // output (e.g. a stray "\n" from a
+                                        // tool that meant to emit no summary)
+                                        // is NOT treated as a real summary —
+                                        // otherwise we'd suppress the file-list
+                                        // bubble and the user would see no
+                                        // signal that the task completed.
+                                        let already_sent_summary = !r.output.trim().is_empty();
+                                        if !already_sent_summary {
+                                            if let Some(ref sender) = bg_sender {
+                                                if let Some(produced_msg) =
+                                                    build_spawn_only_produced_files_message(
+                                                        &bg_name,
+                                                        &output_files,
+                                                        bg_tools.workspace_root(),
+                                                    )
+                                                {
+                                                    let _ =
+                                                        sender(BackgroundResultPayload {
                                                             task_label: bg_name.clone(),
                                                             content: produced_msg,
                                                             kind:
@@ -577,33 +772,12 @@ impl Agent {
                                                             originating_thread_id:
                                                                 bg_originating_thread_id.clone(),
                                                             task_id: Some(task_id.clone()),
+                                                            originating_client_message_id:
+                                                                bg_originating_client_message_id
+                                                                    .clone(),
+                                                            tool_call_id: Some(bg_tc_id.clone()),
                                                         })
                                                         .await;
-                                                    }
-                                                }
-                                            }
-                                            Err(validation_error) => {
-                                                tracing::warn!(
-                                                    tool = %bg_name,
-                                                    files = ?output_files,
-                                                    error = %validation_error,
-                                                    "workspace contract satisfied but supervisor artifact validation rejected outputs"
-                                                );
-                                                if let Some(ref sender) = bg_sender {
-                                                    let _ = sender(BackgroundResultPayload {
-                                                        task_label: bg_name.clone(),
-                                                        content: format!(
-                                                            "✗ {} failed: {}",
-                                                            bg_name, validation_error
-                                                        ),
-                                                        kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
-                                                        envelope_media: vec![],
-                                                        originating_thread_id:
-                                                            bg_originating_thread_id.clone(),
-                                                        task_id: Some(task_id.clone()),
-                                                    })
-                                                    .await;
                                                 }
                                             }
                                         }
@@ -644,6 +818,9 @@ impl Agent {
                                             envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
                                             task_id: Some(task_id.clone()),
+                                            originating_client_message_id:
+                                                bg_originating_client_message_id.clone(),
+                                            tool_call_id: Some(bg_tc_id.clone()),
                                         })
                                         .await;
                                     }
@@ -670,6 +847,9 @@ impl Agent {
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
                                             })
                                             .await;
                                         }
@@ -725,6 +905,9 @@ impl Agent {
                                                     originating_thread_id: bg_originating_thread_id
                                                         .clone(),
                                                     task_id: Some(task_id.clone()),
+                                                    originating_client_message_id:
+                                                        bg_originating_client_message_id.clone(),
+                                                    tool_call_id: Some(bg_tc_id.clone()),
                                                 })
                                                 .await;
                                             }
@@ -759,6 +942,9 @@ impl Agent {
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
                                             })
                                             .await;
                                         }
@@ -891,106 +1077,172 @@ impl Agent {
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
                                             })
                                             .await;
                                         }
                                     } else {
-                                        match bg_supervisor.mark_completed_with_validation(
-                                            &task_id,
-                                            sent_files.clone(),
-                                        ) {
-                                            Ok(()) => {
-                                                let file_info = format!(
-                                                    " ({})",
-                                                    sent_files
-                                                        .iter()
-                                                        .map(|f| f.rsplit('/').next().unwrap_or(f))
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ")
-                                                );
-                                                if let Some(ref sender) = bg_sender {
-                                                    // M10 Phase 5a (coalesce):
-                                                    // - `media: vec![]` keeps
-                                                    //   the persisted row's
-                                                    //   wire shape
-                                                    //   byte-identical to the
-                                                    //   pre-Phase-5a
-                                                    //   "spawn-ack with text
-                                                    //   only" row that old
-                                                    //   clients already render.
-                                                    //   Each `sent_files`
-                                                    //   entry has its OWN
-                                                    //   per-file
-                                                    //   `message/persisted`
-                                                    //   row from the
-                                                    //   `send_file` consumer
-                                                    //   above; double-listing
-                                                    //   them here would render
-                                                    //   the same attachments
-                                                    //   twice for old clients.
-                                                    // - `envelope_media:
-                                                    //   sent_files.clone()`
-                                                    //   surfaces those files
-                                                    //   on the
-                                                    //   `turn/spawn_complete`
-                                                    //   envelope so
-                                                    //   dual-negotiated
-                                                    //   clients (which
-                                                    //   suppress the per-file
-                                                    //   `Background` rows in
-                                                    //   `live_event_passes_capability_filter`)
-                                                    //   still see the
-                                                    //   attachments inline on
-                                                    //   the single completion
-                                                    //   bubble.
-                                                    //
-                                                    // Splitting persist-media
-                                                    // from envelope-media is
-                                                    // what lets the same
-                                                    // producer serve both
-                                                    // wire shapes correctly
-                                                    // without regressing
-                                                    // either.
-                                                    let _ = sender(BackgroundResultPayload {
-                                                        task_label: bg_name.clone(),
-                                                        content: format!(
-                                                            "✓ {} completed{}",
-                                                            bg_name, file_info
-                                                        ),
-                                                        kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
-                                                        envelope_media: sent_files.clone(),
-                                                        originating_thread_id:
-                                                            bg_originating_thread_id.clone(),
-                                                        task_id: Some(task_id.clone()),
-                                                    })
-                                                    .await;
+                                        // Workspace contract already verified
+                                        // the declared artifacts. Trust it —
+                                        // the supervisor's job is to record
+                                        // the skill's reported outcome, not
+                                        // to re-validate file contents.
+                                        bg_supervisor.mark_completed(&task_id, sent_files.clone());
+                                        {
+                                            let file_info = format!(
+                                                " ({})",
+                                                sent_files
+                                                    .iter()
+                                                    .map(|f| f.rsplit('/').next().unwrap_or(f))
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            );
+                                            if let Some(ref sender) = bg_sender {
+                                                // M10 Phase 5a (coalesce):
+                                                // - `media: vec![]` keeps
+                                                //   the persisted row's
+                                                //   wire shape
+                                                //   byte-identical to the
+                                                //   pre-Phase-5a
+                                                //   "spawn-ack with text
+                                                //   only" row that old
+                                                //   clients already render.
+                                                //   Each `sent_files`
+                                                //   entry has its OWN
+                                                //   per-file
+                                                //   `message/persisted`
+                                                //   row from the
+                                                //   `send_file` consumer
+                                                //   above; double-listing
+                                                //   them here would render
+                                                //   the same attachments
+                                                //   twice for old clients.
+                                                // - `envelope_media:
+                                                //   sent_files.clone()`
+                                                //   surfaces those files
+                                                //   on the
+                                                //   `turn/spawn_complete`
+                                                //   envelope so
+                                                //   dual-negotiated
+                                                //   clients (which
+                                                //   suppress the per-file
+                                                //   `Background` rows in
+                                                //   `live_event_passes_capability_filter`)
+                                                //   still see the
+                                                //   attachments inline on
+                                                //   the single completion
+                                                //   bubble.
+                                                //
+                                                // Splitting persist-media
+                                                // from envelope-media is
+                                                // what lets the same
+                                                // producer serve both
+                                                // wire shapes correctly
+                                                // without regressing
+                                                // either.
+                                                // Mirror the
+                                                // `Satisfied`-branch fix
+                                                // above: when the tool has
+                                                // produced a real textual
+                                                // result (e.g. run_pipeline's
+                                                // synthesize node returning a
+                                                // 5K-char executive summary
+                                                // in `r.output`), surface
+                                                // that as the chat bubble
+                                                // content. Without this, the
+                                                // user gets the bare ack
+                                                // `"✓ run_pipeline completed
+                                                // (research.md)"` while the
+                                                // summary lives only inside
+                                                // the attached file. The
+                                                // `NotConfigured` branch
+                                                // fires when the tool
+                                                // doesn't declare a
+                                                // workspace_policy.toml
+                                                // contract — which is the
+                                                // default for spawn_only
+                                                // tools whose deliverable is
+                                                // text + a file rather than
+                                                // a fixed-shape artifact.
+                                                // `trim().is_empty()` so a
+                                                // whitespace-only `r.output`
+                                                // doesn't masquerade as a real
+                                                // summary — without trim, the
+                                                // user would get a chat bubble
+                                                // containing just "\n" instead
+                                                // of the "✓ completed" notice.
+                                                let bubble_content = if r.output.trim().is_empty() {
+                                                    format!("✓ {} completed{}", bg_name, file_info)
+                                                } else {
+                                                    r.output.clone()
+                                                };
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content: bubble_content,
+                                                    kind: BackgroundResultKind::Notification,
+                                                    media: vec![],
+                                                    envelope_media: sent_files.clone(),
+                                                    originating_thread_id: bg_originating_thread_id
+                                                        .clone(),
+                                                    task_id: Some(task_id.clone()),
+                                                    originating_client_message_id:
+                                                        bg_originating_client_message_id.clone(),
+                                                    tool_call_id: Some(bg_tc_id.clone()),
+                                                })
+                                                .await;
 
-                                                    // Issue #896: append an
-                                                    // additional notification
-                                                    // listing the produced file
-                                                    // paths (workspace-relative
-                                                    // when possible) so the
-                                                    // LLM has stable filenames
-                                                    // to reference on its next
-                                                    // turn. The legacy "✓
-                                                    // completed (basenames)"
-                                                    // bubble above only shows
-                                                    // basenames in parentheses
-                                                    // — enough to display in
-                                                    // the chat UI, but not
-                                                    // enough for the LLM to
-                                                    // pass to `read_file({path:
-                                                    // ...})` on the next turn.
-                                                    // Token-budget invariant
-                                                    // (M10 Phase 4): paths
-                                                    // only, never file
-                                                    // contents. Emitted only
-                                                    // on success and only when
-                                                    // `sent_files` is
-                                                    // non-empty (the helper
-                                                    // returns None and we
-                                                    // skip otherwise).
+                                                // Issue #896: append an
+                                                // additional notification
+                                                // listing the produced file
+                                                // paths (workspace-relative
+                                                // when possible) so the
+                                                // LLM has stable filenames
+                                                // to reference on its next
+                                                // turn. The legacy "✓
+                                                // completed (basenames)"
+                                                // bubble above only shows
+                                                // basenames in parentheses
+                                                // — enough to display in
+                                                // the chat UI, but not
+                                                // enough for the LLM to
+                                                // pass to `read_file({path:
+                                                // ...})` on the next turn.
+                                                // Token-budget invariant
+                                                // (M10 Phase 4): paths
+                                                // only, never file
+                                                // contents. Emitted only
+                                                // on success and only when
+                                                // `sent_files` is
+                                                // non-empty (the helper
+                                                // returns None and we
+                                                // skip otherwise).
+                                                //
+                                                // Mirroring the `Satisfied`
+                                                // branch above: when the
+                                                // tool emitted real summary
+                                                // text in `r.output` we
+                                                // already used it as the
+                                                // primary bubble content,
+                                                // so suppressing this
+                                                // file-path notice keeps
+                                                // the chat from rendering
+                                                // two trailing assistant
+                                                // bubbles (summary, then a
+                                                // redundant file-list).
+                                                //
+                                                // `trim().is_empty()` so a
+                                                // whitespace-only `r.output`
+                                                // (e.g. a stray "\n") doesn't
+                                                // suppress the file-path
+                                                // notice — without trim, the
+                                                // LLM loses its stable
+                                                // filename reference for the
+                                                // next turn.
+                                                let already_sent_summary =
+                                                    !r.output.trim().is_empty();
+                                                if !already_sent_summary {
                                                     if let Some(produced_msg) =
                                                         build_spawn_only_produced_files_message(
                                                             &bg_name,
@@ -1008,33 +1260,13 @@ impl Agent {
                                                             originating_thread_id:
                                                                 bg_originating_thread_id.clone(),
                                                             task_id: Some(task_id.clone()),
+                                                            originating_client_message_id:
+                                                                bg_originating_client_message_id
+                                                                    .clone(),
+                                                            tool_call_id: Some(bg_tc_id.clone()),
                                                         })
                                                         .await;
                                                     }
-                                                }
-                                            }
-                                            Err(validation_error) => {
-                                                tracing::warn!(
-                                                    tool = %bg_name,
-                                                    files = ?sent_files,
-                                                    error = %validation_error,
-                                                    "delivered outputs but supervisor artifact validation rejected them"
-                                                );
-                                                if let Some(ref sender) = bg_sender {
-                                                    let _ = sender(BackgroundResultPayload {
-                                                        task_label: bg_name.clone(),
-                                                        content: format!(
-                                                            "✗ {} failed: {}",
-                                                            bg_name, validation_error
-                                                        ),
-                                                        kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
-                                                        envelope_media: vec![],
-                                                        originating_thread_id:
-                                                            bg_originating_thread_id.clone(),
-                                                        task_id: Some(task_id.clone()),
-                                                    })
-                                                    .await;
                                                 }
                                             }
                                         }
@@ -1059,6 +1291,9 @@ impl Agent {
                                     envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
                                     task_id: Some(task_id.clone()),
+                                    originating_client_message_id: bg_originating_client_message_id
+                                        .clone(),
+                                    tool_call_id: Some(bg_tc_id.clone()),
                                 })
                                 .await;
                             }
@@ -1079,6 +1314,9 @@ impl Agent {
                                     envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
                                     task_id: Some(task_id.clone()),
+                                    originating_client_message_id: bg_originating_client_message_id
+                                        .clone(),
+                                    tool_call_id: Some(bg_tc_id.clone()),
                                 })
                                 .await;
                             }
@@ -1179,6 +1417,10 @@ impl Agent {
                 // when deciding whether the next nested spawn is
                 // allowed.
                 spawn_depth,
+                // Phase 1 SessionScope migration: thread the shared
+                // scope onto the foreground TOOL_CTX so tools and the
+                // pipeline host context snapshot the same handle.
+                session_scope: session_scope.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
@@ -1384,6 +1626,21 @@ impl Agent {
         Vec<std::path::PathBuf>,
         TokenUsage,
         Vec<(String, serde_json::Value)>,
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): per-tool-call success bit
+        // keyed by `tool_call_id`. The dispatcher already computes this for
+        // the M8.8 serial-cascade scheduler (see [`ToolCallResult`] field 5);
+        // we surface it now so `any_tool_invocation_errored` in the
+        // loop_runner can authoritatively decide whether a tool failed
+        // without guessing from content prefixes. The content-based
+        // classifier was missing many real failure shapes — shell
+        // timeouts ("Command timed out after ..."), sandbox path
+        // rejections ("Path outside working directory ..."), browser
+        // navigation failures, plugin tools with `success: false` and
+        // arbitrary error messages — every one of which renders a red
+        // error chip but did NOT carry a recognised error envelope, so
+        // the synth-ack branch would still fabricate a "Background work
+        // started" bubble alongside it.
+        Vec<(String, bool)>,
     )> {
         let tool_names: Vec<&str> = response
             .tool_calls
@@ -1467,7 +1724,7 @@ impl Agent {
                         tools = %tool_names.join(", "),
                         "tool execution timed out -- spawned tasks continue running for cleanup"
                     );
-                    let messages = response
+                    let messages: Vec<Message> = response
                         .tool_calls
                         .iter()
                         .map(|tc| Message {
@@ -1485,7 +1742,24 @@ impl Agent {
                             timestamp: chrono::Utc::now(),
                         })
                         .collect();
-                    return Ok((messages, vec![], vec![], TokenUsage::default(), Vec::new()));
+                    // Batch-wide timeout: every tool in the batch failed.
+                    // Surface the success bit (false for all) so the
+                    // spawn_only synth-ack gate in loop_runner can suppress
+                    // the fabricated "Background work started" bubble
+                    // without depending on content-prefix matching.
+                    let success_by_id: Vec<(String, bool)> = response
+                        .tool_calls
+                        .iter()
+                        .map(|tc| (tc.id.clone(), false))
+                        .collect();
+                    return Ok((
+                        messages,
+                        vec![],
+                        vec![],
+                        TokenUsage::default(),
+                        Vec::new(),
+                        success_by_id,
+                    ));
                 }
             }
         };
@@ -1510,16 +1784,27 @@ impl Agent {
         let mut files_to_send = Vec::new();
         let mut tokens_used = TokenUsage::default();
         let mut structured_metadata: Vec<(String, serde_json::Value)> = Vec::new();
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): collect the per-call
+        // `success` bit keyed by `tool_call_id` so the loop_runner can
+        // authoritatively decide whether the synth-ack branch fires
+        // alongside a failed tool. Capacity matches the result count.
+        let mut success_by_id: Vec<(String, bool)> = Vec::with_capacity(results.len());
 
         for (
             message,
             tool_files_modified,
             tool_files_to_send,
             tool_tokens,
-            _success,
+            success,
             tool_structured_metadata,
         ) in results
         {
+            // Pair every executed tool result with its `tool_call_id` so
+            // downstream gating logic does not need to guess at the
+            // identity from content shape.
+            if let Some(id) = message.tool_call_id.clone() {
+                success_by_id.push((id, success));
+            }
             messages.push(message);
             files_modified.extend(tool_files_modified);
             files_to_send.extend(tool_files_to_send);
@@ -1538,6 +1823,7 @@ impl Agent {
             files_to_send,
             tokens_used,
             structured_metadata,
+            success_by_id,
         ))
     }
 
@@ -1688,7 +1974,7 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 mod tests {
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
-        should_auto_send_tool_files,
+        satisfied_completion_content, should_auto_send_tool_files,
     };
 
     #[test]
@@ -1712,12 +1998,12 @@ mod tests {
             "/tmp/ws/research/x/x.md".to_string(),
             "/tmp/ws/research/x/_search_results.md".to_string(),
         ];
-        let msg = build_spawn_only_produced_files_message("deep_search", &files, Some(&root))
+        let msg = build_spawn_only_produced_files_message("search", &files, Some(&root))
             .expect("non-empty file list must yield Some(message)");
 
         // Format pinning: header + bulleted workspace-relative paths.
         assert!(
-            msg.starts_with("`deep_search` produced files:"),
+            msg.starts_with("`search` produced files:"),
             "expected header line, got: {msg}"
         );
         assert!(
@@ -1740,7 +2026,7 @@ mod tests {
         // Token-budget invariant: never persist a stub message when the
         // tool produced no files (e.g. failed run, text-only result).
         assert!(
-            build_spawn_only_produced_files_message("deep_search", &[], None).is_none(),
+            build_spawn_only_produced_files_message("search", &[], None).is_none(),
             "empty files must return None so caller suppresses follow-up"
         );
     }
@@ -1766,7 +2052,7 @@ mod tests {
         let files: Vec<String> = (1..=10)
             .map(|i| format!("/tmp/ws/research/topic/{i:02}_source.md"))
             .collect();
-        let msg = build_spawn_only_produced_files_message("deep_search", &files, Some(&root))
+        let msg = build_spawn_only_produced_files_message("search", &files, Some(&root))
             .expect("non-empty");
         // Stays small: 10 paths × ~40 chars + header ≈ ~500 bytes.
         assert!(
@@ -1800,6 +2086,75 @@ mod tests {
         assert_eq!(
             relativize_workspace_path("/u/me/ws/a.md", None),
             "/u/me/ws/a.md"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: `Satisfied { output_files: [] }` text-fallback regression.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn satisfied_completion_keeps_tool_text_when_no_output_files() {
+        // codex P1 regression guard: a contract with no declared artifact
+        // (e.g. mofa_publish, whose deliverable is a URL) returns
+        // `Satisfied { output_files: [] }`. The background completion
+        // payload must surface the tool's stdout text (the deploy URL),
+        // not an empty string.
+        let result = satisfied_completion_content(&[], "https://deployed.example.com");
+        assert_eq!(result, "https://deployed.example.com");
+    }
+
+    #[test]
+    fn satisfied_completion_emits_empty_content_when_files_carry_deliverable() {
+        // Legacy artifact-carrying contracts (fm_tts, podcast_generate,
+        // mofa_slides, ...) still emit empty content because the files
+        // themselves are the deliverable.
+        let files = vec!["/tmp/a.mp3".to_string(), "/tmp/b.mp3".to_string()];
+        let result = satisfied_completion_content(&files, "skill text result");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn satisfied_completion_keeps_empty_text_when_no_files_and_no_text() {
+        // Defensive: empty tool output with empty output_files stays empty
+        // — the legacy "no output produced" branch downstream will surface
+        // a typed failure via the `r.success` check, not here.
+        let result = satisfied_completion_content(&[], "");
+        assert_eq!(result, "");
+    }
+
+    /// NEW-09 regression pin (paired with
+    /// `crates/octos-pipeline/src/tool.rs::tests::pipeline_timeout_returns_ok_failure_result_not_err`):
+    /// the spawn_only background execution arm at `Ok(r) if !r.success`
+    /// formats the failure bubble as `✗ <tool> failed: <r.output>`. The
+    /// pipeline-level timeout now returns
+    /// `Ok(ToolResult { success: false, output: "pipeline timed out
+    /// after Ns" })` so this contract test pins the bubble text the
+    /// WS client renders end-to-end. If either the pipeline-side
+    /// output text OR the execution.rs failure-arm format string
+    /// drift, this test catches the divergence at the same site.
+    ///
+    /// Mirroring the format string here (rather than refactoring the
+    /// failure arm to call a helper) keeps the unit test surface
+    /// dependency-free: the failure arm runs inside a tokio::spawn
+    /// closure that captures a dozen contextual variables (supervisor,
+    /// reporter, output router, …); extracting a helper would require
+    /// either threading every capture through a function signature or
+    /// boxing them into a struct, both of which would obscure the
+    /// in-place control flow that's load-bearing for the M8.7 cleanup
+    /// path that runs unconditionally after the `match result` block.
+    #[test]
+    fn spawn_only_failure_arm_bubble_format_pins_pipeline_timeout_text() {
+        let bg_name = "run_pipeline";
+        let pipeline_output = "pipeline timed out after 1200s";
+        let bubble = format!("✗ {} failed: {}", bg_name, pipeline_output);
+        assert_eq!(
+            bubble, "✗ run_pipeline failed: pipeline timed out after 1200s",
+            "the bubble surface text the WS client renders on a \
+             run_pipeline timeout must match the soak-evidence \
+             reference exactly — any wording drift breaks the harness's \
+             `isFinalArrived` heuristic plus any downstream regex \
+             matchers in dashboards / debugging tooling"
         );
     }
 }

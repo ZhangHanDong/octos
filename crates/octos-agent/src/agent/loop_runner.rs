@@ -22,11 +22,82 @@ use crate::harness_errors::HarnessError;
 use crate::harness_events::write_event_to_sink;
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
+use crate::prompt_context::PromptContextPhase;
 use crate::session::SessionLimits;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
+const MAX_TOKENS_CONTINUATION_LIMIT: usize = 2;
+const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your output was truncated at the token limit. Continue directly from where you stopped. Do not repeat or summarize what you already wrote.";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
+
+/// Audit Gap-8 helper: consult the workspace-contract layer at EndTurn time
+/// and return a human-readable summary of failing validators when the
+/// contract is NOT ready. Returns `None` when the workspace has no
+/// policy-managed repos under `working_dir` (today's silent-success path).
+///
+/// This is the harness-side mirror of the LLM-callable
+/// `check_workspace_contract` tool — same source of truth
+/// (`inspect_workspace_contracts`), no parallel framework. Errors from the
+/// underlying inspector are swallowed with a warning so a transient git
+/// failure (e.g. corrupt `.git` directory) cannot block an otherwise
+/// successful task; the previous behaviour is preserved on inspector error.
+fn inspect_workspace_contract_failures(working_dir: &std::path::Path) -> Option<String> {
+    let contracts = match crate::workspace_git::inspect_workspace_contracts(working_dir) {
+        Ok(contracts) => contracts,
+        Err(err) => {
+            warn!(
+                workspace_root = %working_dir.display(),
+                error = %err,
+                "workspace contract inspector failed at EndTurn; treating as no-policy"
+            );
+            return None;
+        }
+    };
+
+    // Only fail on policy-managed repos that aren't ready.
+    let failing: Vec<_> = contracts
+        .iter()
+        .filter(|status| status.policy_managed && !status.ready)
+        .collect();
+    if failing.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(failing.len() * 2);
+    // Lowercase "workspace contract" so the message matches the same
+    // grep predicate used by the existing spawn-task contract failure
+    // assertions (`error.contains("workspace contract")` in spawn.rs).
+    lines.push(format!(
+        "workspace contract not ready for {} repo(s):",
+        failing.len()
+    ));
+    for status in failing {
+        lines.push(format!("- {} (kind={})", status.repo_label, status.kind));
+        if let Some(ref error) = status.error {
+            lines.push(format!("    error: {error}"));
+        }
+        for check in &status.completion_checks {
+            if !check.passed {
+                let reason = check.reason.as_deref().unwrap_or("(no reason given)");
+                lines.push(format!("    completion failed: {} — {reason}", check.spec));
+            }
+        }
+        for check in &status.turn_end_checks {
+            if !check.passed {
+                let reason = check.reason.as_deref().unwrap_or("(no reason given)");
+                lines.push(format!("    turn_end failed: {} — {reason}", check.spec));
+            }
+        }
+        for missing in status.artifacts.iter().filter(|a| !a.present) {
+            lines.push(format!(
+                "    artifact missing: {} (pattern={})",
+                missing.name, missing.pattern
+            ));
+        }
+    }
+    Some(lines.join("\n"))
+}
 
 fn split_tool_calls(
     tool_calls: &[octos_core::ToolCall],
@@ -363,6 +434,11 @@ impl Agent {
                     "loop retry: compacting context before retry"
                 );
                 self.maybe_run_turn_compaction(messages, iteration);
+                self.prepare_prompt_with_context_manager(
+                    messages,
+                    PromptContextPhase::Retry,
+                    iteration,
+                );
                 LoopErrorAction::Retry
             }
             LoopDecision::RotateAndRetry => {
@@ -420,7 +496,7 @@ impl Agent {
     ) -> bool {
         if !matches!(
             stop,
-            BudgetStop::MaxIterations | BudgetStop::MaxTokens { .. }
+            BudgetStop::MaxIterations { .. } | BudgetStop::MaxTokens { .. }
         ) {
             return false;
         }
@@ -656,7 +732,7 @@ impl Agent {
                     base_content
                 };
 
-                messages.push(Message {
+                let current_user = Message {
                     role: MessageRole::User,
                     content,
                     media,
@@ -666,7 +742,30 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
-                });
+                };
+                messages.push(current_user.clone());
+
+                // NEW-16 (codex design): append-only per-turn output log.
+                //
+                // The persisted `ConversationResponse.messages` MUST NOT be
+                // derived from the LLM prompt buffer (`messages`) by slicing
+                // at `1 + history.len()`. That buffer is mutated during the
+                // loop by `prepare_conversation_messages` (which calls
+                // `repair_message_order`) and by the AppUI context-window
+                // bridge in `ui_protocol.rs`. After mutation, OLD rows from
+                // prior turns can end up past the stale boundary and get
+                // returned as "new", which causes re-persistence and the
+                // 7x duplicate-content drag-forward seen in soak captures
+                // (mini3 Yuan-dynasty content, 2026-05-23).
+                //
+                // Instead, we build an append-only log of just the rows we
+                // genuinely produce in THIS turn (current User, assistant
+                // replies + tool results from `handle_tool_use`, synthetic
+                // loop-detector rows, and any terminal/synthesised assistant
+                // row a return site adds). The log is never read back from
+                // — only pushed to — so no mutation pass can shift OLD rows
+                // into it.
+                let mut turn_output_log: Vec<Message> = vec![current_user];
 
                 let config = self.chat_config();
                 let mut files_modified = Vec::new();
@@ -708,8 +807,9 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed: false,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                     }
@@ -753,6 +853,15 @@ impl Agent {
                     // tool-pair repair + system-message normalization). This
                     // also feeds the validator rail on subsequent iterations.
                     self.maybe_run_turn_compaction(&mut messages, iteration);
+                    self.prepare_prompt_with_context_manager(
+                        &mut messages,
+                        if iteration == 1 {
+                            PromptContextPhase::TurnStart
+                        } else {
+                            PromptContextPhase::Iteration
+                        },
+                        iteration,
+                    );
                     let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {
@@ -871,7 +980,7 @@ impl Agent {
 
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
-                            self.emit_cost_update(turn.total_usage(), &response.usage);
+                            self.emit_cost_update(turn.total_usage(), &response);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
@@ -882,8 +991,9 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                         StopReason::ToolUse => {
@@ -965,7 +1075,7 @@ impl Agent {
                                             decision = %outcome.decision,
                                             "shell spiral terminal: returning recovered content as final assistant reply"
                                         );
-                                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                                        self.emit_cost_update(turn.total_usage(), &response);
                                         return Ok(ConversationResponse {
                                             content: terminal_content,
                                             reasoning_content: None,
@@ -974,38 +1084,94 @@ impl Agent {
                                             files_modified,
                                             files_to_send,
                                             streamed,
-                                            messages: LoopTurnState::new_messages(
-                                                &messages,
-                                                history.len(),
-                                            ),
+                                            messages: turn_output_log.clone(),
                                             tool_results: tool_structured_metadata.clone(),
+                                            synthesized_from_spawn_only: false,
                                         });
                                     }
-                                    // Single-fire-per-burst: first fire emits the
-                                    // warning; subsequent fires within the same
-                                    // burst (before the next process_message reset)
-                                    // surface a terminal error instead of repeating
-                                    // identical noise.
-                                    let warning_content = self.dedup_loop_warning(warning)?;
-                                    // Don't execute the tools — break out with a message
-                                    self.emit_cost_update(turn.total_usage(), &response.usage);
-                                    return Ok(ConversationResponse {
-                                        content: warning_content,
-                                        reasoning_content: None,
-                                        provider_metadata: None,
-                                        token_usage: turn.total_usage().clone(),
-                                        files_modified,
-                                        files_to_send,
-                                        streamed,
-                                        messages: LoopTurnState::new_messages(
-                                            &messages,
-                                            history.len(),
-                                        ),
-                                        tool_results: tool_structured_metadata.clone(),
-                                    });
+                                    // Two-stage loop-detector recovery:
+                                    //
+                                    // 1. First fire in this turn — inject the
+                                    //    warning as a SYNTHETIC tool-result
+                                    //    message paired with the looping
+                                    //    assistant message, then continue
+                                    //    the loop. The LLM gets one more
+                                    //    iteration to synthesise an answer
+                                    //    from prior context or switch
+                                    //    tools/arguments. This rescues the
+                                    //    kimi-k2.5 news_fetch retry spiral
+                                    //    documented in PR
+                                    //    `fix/news-fetch-loop-and-detect-recovery`
+                                    //    (session `web-1779494658716-mxrxe8`,
+                                    //    ledger seq 214-562).
+                                    //
+                                    // 2. Second fire in the same turn — the
+                                    //    LLM ignored the warning and looped
+                                    //    again. Return a terminal
+                                    //    ConversationResponse with a
+                                    //    hard-stop message so the user sees
+                                    //    a clean reply rather than a thrash.
+                                    //
+                                    // The single-fire-per-burst flag
+                                    // (`loop_detected_recently`) is owned by
+                                    // `dedup_loop_warning`. The Err it
+                                    // returns on second fire is caught and
+                                    // converted to a terminal Ok response
+                                    // here so callers don't see an error.
+                                    self.emit_cost_update(turn.total_usage(), &response);
+                                    match self.dedup_loop_warning(warning) {
+                                        Ok(warning_content) => {
+                                            inject_loop_detected_synthetic_results_with_log(
+                                                &mut messages,
+                                                &response,
+                                                &warning_content,
+                                                self,
+                                                Some(&mut turn_output_log),
+                                            );
+                                            warn!(
+                                                "loop detected — injected synthetic tool results with warning and continuing for ONE more iteration"
+                                            );
+                                            continue;
+                                        }
+                                        Err(_) => {
+                                            warn!(
+                                                "loop detected AGAIN after warning was already injected — terminating turn"
+                                            );
+                                            return Ok(ConversationResponse {
+                                                content: loop_detected_terminal_message(),
+                                                reasoning_content: None,
+                                                provider_metadata: None,
+                                                token_usage: turn.total_usage().clone(),
+                                                files_modified,
+                                                files_to_send,
+                                                streamed,
+                                                messages: turn_output_log.clone(),
+                                                tool_results: tool_structured_metadata.clone(),
+                                                synthesized_from_spawn_only: false,
+                                            });
+                                        }
+                                    }
                                 }
                             }
-                            if let Err(e) = self
+                            // Codex round-2 MAJOR 2 (PR #1187 fixup): collect
+                            // per-tool-call success bits for THIS iteration
+                            // only. Declared fresh inside the loop body so
+                            // the spawn_only synth-ack gate reads bits for
+                            // the current iteration, never stale bits from
+                            // earlier ones in the same turn.
+                            let mut iter_tool_success: Vec<(String, bool)> = Vec::new();
+                            // Codex round-3 MAJOR (PR #1187 follow-up): bind
+                            // the SANITIZED response returned by
+                            // `handle_tool_use` so the synth-ack gate below
+                            // sees the same tool_call_ids that the
+                            // dispatcher keyed `iter_tool_success` by. If we
+                            // kept using the original `response`, a real
+                            // `success=false` could be missed when
+                            // sanitization rewrote the id (colon, empty,
+                            // duplicate) — and the content-fallback in the
+                            // gate also keys on the original id, so it
+                            // misses too. See doc on `handle_tool_use`.
+                            let sanitized_response = match self
                                 .handle_tool_use(
                                     &response,
                                     &mut messages,
@@ -1015,19 +1181,24 @@ impl Agent {
                                     &mut retry_state,
                                     tracker,
                                     Some(&mut tool_structured_metadata),
+                                    Some(&mut iter_tool_success),
+                                    Some(&mut turn_output_log),
                                 )
                                 .await
                             {
-                                match self.handle_loop_error_with_dispatch(
-                                    &e,
-                                    &mut retry_state,
-                                    iteration,
-                                    &mut messages,
-                                ) {
-                                    LoopErrorAction::Retry => continue,
-                                    LoopErrorAction::Bail => return Err(e),
+                                Ok(sanitized) => sanitized,
+                                Err(e) => {
+                                    match self.handle_loop_error_with_dispatch(
+                                        &e,
+                                        &mut retry_state,
+                                        iteration,
+                                        &mut messages,
+                                    ) {
+                                        LoopErrorAction::Retry => continue,
+                                        LoopErrorAction::Bail => return Err(e),
+                                    }
                                 }
-                            }
+                            };
 
                             let spiral_iteration = turn.iteration();
                             if let Some(outcome) = self.dispatch_shell_retry_recovery(
@@ -1078,7 +1249,7 @@ impl Agent {
                                     decision = %outcome.decision,
                                     "shell spiral terminal: returning recovered content as final assistant reply"
                                 );
-                                self.emit_cost_update(turn.total_usage(), &response.usage);
+                                self.emit_cost_update(turn.total_usage(), &response);
                                 return Ok(ConversationResponse {
                                     content: terminal_content,
                                     reasoning_content: None,
@@ -1091,53 +1262,177 @@ impl Agent {
                                     files_modified,
                                     files_to_send,
                                     streamed,
-                                    messages: LoopTurnState::new_messages(
-                                        &messages,
-                                        history.len(),
-                                    ),
+                                    messages: turn_output_log.clone(),
                                     tool_results: tool_structured_metadata.clone(),
+                                    synthesized_from_spawn_only: false,
                                 });
                             }
 
-                            if self.tools.spawn_only_was_invoked() {
-                                self.emit_cost_update(turn.total_usage(), &response.usage);
-                                let background_tools = response
-                                    .tool_calls
-                                    .iter()
-                                    .filter(|tc| self.tools.is_spawn_only(&tc.name))
-                                    .map(|tc| tc.name.as_str())
-                                    .collect::<Vec<_>>();
-                                let content = if background_tools.is_empty() {
-                                    "Background work started. The final result will be delivered automatically when it is ready.".to_string()
-                                } else if background_tools.len() == 1 {
-                                    format!(
-                                        "Background work started for `{}`. The final result will be delivered automatically when it is ready.",
-                                        background_tools[0]
-                                    )
+                            // Codex round-2 MAJOR 1 (PR #1187 fixup):
+                            // the previous gate read
+                            // `self.tools.spawn_only_was_invoked()`, which is
+                            // a TURN-wide AtomicBool set by `execution.rs`
+                            // when ANY iteration in the turn invokes a
+                            // spawn_only tool. Once flipped it stays true
+                            // until the next turn begins, so on a
+                            // multi-iteration turn the LLM could call
+                            // run_pipeline (spawn_only) in iter 1, get an
+                            // error response, react by calling read_file
+                            // (regular) in iter 2, then EndTurn in iter 3 —
+                            // and the iter-2 ToolUse arm would still see
+                            // the flag set and synthesise "Background work
+                            // started." even though THIS iteration never
+                            // touched a spawn_only tool. The synth-ack is
+                            // only ever appropriate when the CURRENT
+                            // iteration's response actually contains a
+                            // spawn_only tool call, so gate on that
+                            // directly.
+                            let current_iter_has_spawn_only = response
+                                .tool_calls
+                                .iter()
+                                .any(|tc| self.tools.is_spawn_only(&tc.name));
+                            if current_iter_has_spawn_only {
+                                // Fleet-UX soak B4 (mini1 / dspfac, 2026-05-22):
+                                // when the LLM called a spawn_only tool AND
+                                // any tool in the same turn-batch produced an
+                                // error-shaped result (pre-flight rejection,
+                                // provider/hook deny, panic, timeout, or
+                                // sibling-cancel in a serial batch), the
+                                // synthesized "Background work started for
+                                // `<tool>`." acknowledgement would sit
+                                // alongside the red error chip the UI
+                                // already renders for the failed tool — a
+                                // confusing dual signal where the user sees
+                                // both a successful-looking ack bubble and a
+                                // failed-tool chip for the same turn.
+                                //
+                                // When the gate fires, skip the synthesized
+                                // ack and fall through to the normal
+                                // next-iteration path so the LLM sees the
+                                // error tool result and can react. The
+                                // background task — when one was actually
+                                // dispatched — still completes asynchronously
+                                // and routes its outcome via the
+                                // BackgroundResultSender, so the legitimate
+                                // "task finished" signal still arrives on
+                                // that channel; we only suppress the
+                                // turn-final fabricated "started" bubble
+                                // that the foreground can't actually verify.
+                                // Codex round-3 MAJOR (PR #1187 follow-up):
+                                // pass the SANITIZED response so the
+                                // tool_call_id keys here line up with the
+                                // ones the dispatcher used for
+                                // `iter_tool_success`. Using the original
+                                // `response` here is the bug: sanitization
+                                // may have rewritten an id (colon, empty,
+                                // duplicate) and the lookup would miss,
+                                // letting a real `success=false` slip past
+                                // the gate.
+                                if any_tool_invocation_errored(
+                                    &messages,
+                                    &sanitized_response,
+                                    &iter_tool_success,
+                                ) {
+                                    warn!(
+                                        "tool invocation errored in spawn_only turn — suppressing synthesized 'Background work started' ack and letting the LLM react to the error"
+                                    );
                                 } else {
-                                    format!(
-                                        "Background work started for {} tasks ({}). The final results will be delivered automatically when they are ready.",
-                                        background_tools.len(),
-                                        background_tools.join(", ")
-                                    )
-                                };
-                                return Ok(ConversationResponse {
-                                    content,
-                                    reasoning_content: None,
-                                    provider_metadata: Some(
-                                        self.llm.provider_metadata_for_index(response.provider_index),
-                                    ),
-                                    token_usage: turn.total_usage().clone(),
-                                    files_modified,
-                                    files_to_send,
-                                    streamed,
-                                    messages: LoopTurnState::new_messages(&messages, history.len()),
-                                    tool_results: tool_structured_metadata.clone(),
-                                });
+                                    self.emit_cost_update(turn.total_usage(), &response);
+                                    // Post-spawn failure feedback loop
+                                    // (feat/spawn-only-failure-feedback-loop):
+                                    // record that the synth-ack went out for
+                                    // every spawn_only tool_call_id in this
+                                    // turn. The supervisor's `notify_failure`
+                                    // gates `SpawnOnlyFailureSignal` emission
+                                    // on this set so an eventual post-spawn
+                                    // failure (Gemini API error, plugin
+                                    // crash, late validator rejection) can
+                                    // reach the session actor and drive a
+                                    // recovery turn. Sibling-error
+                                    // suppression (the `if` branch above)
+                                    // intentionally skips this — the LLM
+                                    // already saw the sibling's error
+                                    // tool_result.
+                                    //
+                                    // Codex round-4 MAJOR (PR #1324 follow-up):
+                                    // iterate `sanitized_response.tool_calls`
+                                    // — not `response.tool_calls` — so the
+                                    // recorded id matches the one the
+                                    // dispatcher used to register the
+                                    // background task in
+                                    // `execution.rs::register_task_with_input_and_cmid`.
+                                    // `handle_tool_use` rewrites every
+                                    // tool_call_id via `sanitize_tool_call_id`
+                                    // (colon → underscore, empty/duplicate
+                                    // repair), and the supervisor stores the
+                                    // sanitized id on the `BackgroundTask`.
+                                    // Recording the ORIGINAL `tc.id` here
+                                    // (e.g. `call:1`) would key the
+                                    // synth-ack set on a value that
+                                    // `notify_failure` never looks up
+                                    // (it checks the sanitized `call_1`),
+                                    // permanently dropping the recovery
+                                    // signal. The `background_tools` chip
+                                    // collection uses the sanitized response
+                                    // for the same reason — it stays in
+                                    // lock-step with what the LLM observed.
+                                    let supervisor = self.tools.supervisor();
+                                    for tc in &sanitized_response.tool_calls {
+                                        if self.tools.is_spawn_only(&tc.name) {
+                                            supervisor.mark_synth_ack_emitted(&tc.id);
+                                        }
+                                    }
+                                    let background_tools = sanitized_response
+                                        .tool_calls
+                                        .iter()
+                                        .filter(|tc| self.tools.is_spawn_only(&tc.name))
+                                        .map(|tc| tc.name.as_str())
+                                        .collect::<Vec<_>>();
+                                    let content = if background_tools.is_empty() {
+                                        "Background work started. The final result will be delivered automatically when it is ready.".to_string()
+                                    } else if background_tools.len() == 1 {
+                                        format!(
+                                            "Background work started for `{}`. The final result will be delivered automatically when it is ready.",
+                                            background_tools[0]
+                                        )
+                                    } else {
+                                        format!(
+                                            "Background work started for {} tasks ({}). The final results will be delivered automatically when they are ready.",
+                                            background_tools.len(),
+                                            background_tools.join(", ")
+                                        )
+                                    };
+                                    return Ok(ConversationResponse {
+                                        content,
+                                        reasoning_content: None,
+                                        provider_metadata: Some(
+                                            self.llm.provider_metadata_for_index(response.provider_index),
+                                        ),
+                                        token_usage: turn.total_usage().clone(),
+                                        files_modified,
+                                        files_to_send,
+                                        streamed,
+                                        messages: turn_output_log.clone(),
+                                        tool_results: tool_structured_metadata.clone(),
+                                        // dspfac "two bubbles per turn" fix: this
+                                        // branch synthesises `content` as the
+                                        // "Background work started for `<tool>`..."
+                                        // acknowledgement. The API persist site
+                                        // reads this flag and tags the wire
+                                        // envelope for the synthesised row with
+                                        // `MessagePersistedSource::Background`,
+                                        // which the existing capability filter
+                                        // for `event.spawn_complete.v1` clients
+                                        // suppresses. Legacy clients (without
+                                        // the capability) still see the ack as
+                                        // an assistant row — backward-compatible.
+                                        synthesized_from_spawn_only: true,
+                                    });
+                                }
                             }
                         }
                         StopReason::MaxTokens => {
-                            self.emit_cost_update(turn.total_usage(), &response.usage);
+                            self.emit_cost_update(turn.total_usage(), &response);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1148,14 +1443,15 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                         StopReason::ContentFiltered => {
                             // After retries in call_llm_with_hooks, content is still filtered.
                             // Return a user-visible message instead of empty content.
-                            self.emit_cost_update(turn.total_usage(), &response.usage);
+                            self.emit_cost_update(turn.total_usage(), &response);
                             warn!("content filtered by provider safety/moderation after retries");
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_else(|| {
@@ -1171,8 +1467,9 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                                messages: turn_output_log.clone(),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                     }
@@ -1207,6 +1504,8 @@ impl Agent {
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
+            let mut max_token_continuations = 0usize;
+            let mut max_token_fragments = Vec::new();
             // M6.2: per-run retry-bucket state machine. Same instance lives
             // across all iterations of the task loop so bucket counters
             // accumulate the way operators expect.
@@ -1264,6 +1563,15 @@ impl Agent {
                 let protected_ids = collect_protected_tool_call_ids(&messages);
                 self.run_tier1_compaction(&mut messages, &protected_ids);
                 prepare_task_messages(self, &mut messages, &mut turn);
+                self.prepare_prompt_with_context_manager(
+                    &mut messages,
+                    if iteration == 1 {
+                        PromptContextPhase::TurnStart
+                    } else {
+                        PromptContextPhase::Iteration
+                    },
+                    iteration,
+                );
                 let total_usage = turn.total_usage().clone();
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
@@ -1314,8 +1622,10 @@ impl Agent {
 
                 match response.stop_reason {
                     StopReason::EndTurn | StopReason::StopSequence => {
+                        let final_response =
+                            response_with_max_token_fragments(&response, &max_token_fragments);
                         if self.config.save_episodes {
-                            let summary = response.content.clone().unwrap_or_default();
+                            let summary = final_response.content.clone().unwrap_or_default();
                             let summary_truncated =
                                 octos_core::truncated_utf8(&summary, 500, "...");
 
@@ -1362,9 +1672,47 @@ impl Agent {
                             }
                         }
 
-                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &final_response);
+
+                        // Audit Gap-8: auto-fire `check_workspace_contract`
+                        // on Completion. The LLM-callable wrapper stays for
+                        // introspection but no longer the only enforcement
+                        // path — the harness consults the contract before
+                        // declaring SUCCESS.
+                        //
+                        // Workspaces without a policy-managed repo under the
+                        // working_dir stay Success unchanged (returns
+                        // `None`). When at least one policy-managed repo is
+                        // not ready, the result is demoted to `success =
+                        // false` and the failing validators are appended to
+                        // the result output so the caller (or LLM next turn)
+                        // sees the contract failure.
+                        //
+                        // octos #997 (round-2 fix): RUN declared project-root
+                        // validators BEFORE inspecting the contract. The
+                        // contract gate reads
+                        // `<kind>/<slug>/.octos/validator_outcomes.jsonl` — a
+                        // path that was never written to in production
+                        // pre-round-2 because the declared validator chain
+                        // was only invoked at the SESSION root. Without this
+                        // call, a real valid deck whose project policy
+                        // declares a hard-required validator (octos #997:
+                        // `slides.mofa_slides.pptx_magic_bytes`) shows
+                        // `ready = false` purely because the persisted
+                        // outcome is missing.
+                        let _project_root_report =
+                            crate::workspace_contract::run_project_root_validators(
+                                self.tools.as_ref(),
+                                &task.context.working_dir,
+                                None,
+                                &files_to_send,
+                            )
+                            .await;
+                        let contract_failures =
+                            inspect_workspace_contract_failures(&task.context.working_dir);
+
                         self.reporter().report(ProgressEvent::TaskCompleted {
-                            success: true,
+                            success: contract_failures.is_none(),
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
@@ -1375,16 +1723,36 @@ impl Agent {
                             iterations = iteration,
                             files_modified = files_modified.len(),
                             duration_ms = task_start.elapsed().as_millis() as u64,
+                            contract_failed = contract_failures.is_some(),
                             "task completed"
                         );
-                        return Ok(self.build_result(
-                            &response,
+                        let mut result = self.build_result(
+                            &final_response,
                             turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
-                        ));
+                        );
+                        if let Some(failure_msg) = contract_failures {
+                            warn!(
+                                workspace_root = %task.context.working_dir.display(),
+                                "task EndTurn but workspace contract is not ready; demoting to ContractFailed"
+                            );
+                            result.success = false;
+                            if result.output.is_empty() {
+                                result.output = failure_msg;
+                            } else {
+                                result.output = format!("{}\n\n{}", result.output, failure_msg);
+                            }
+                        }
+                        return Ok(result);
                     }
                     StopReason::ToolUse => {
+                        // Task loop never emits the synth-ack so the per-call
+                        // success-bit sink is unused here — pass `None`. (The
+                        // conversation loop wires this up to the spawn_only
+                        // gate; see the matching call site above.) Codex
+                        // round-3: ignore the sanitized response too — task
+                        // loop has no synth-ack gate that would need it.
                         if let Err(e) = self
                             .handle_tool_use(
                                 &response,
@@ -1393,6 +1761,8 @@ impl Agent {
                                 Some(&mut files_to_send),
                                 &mut turn,
                                 &mut retry_state,
+                                None,
+                                None,
                                 None,
                                 None,
                             )
@@ -1410,14 +1780,33 @@ impl Agent {
                         }
                     }
                     StopReason::MaxTokens => {
-                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                        if max_token_continuations < MAX_TOKENS_CONTINUATION_LIMIT {
+                            if let Some(content) = response.content.clone() {
+                                if !content.trim().is_empty() {
+                                    max_token_fragments.push(content);
+                                }
+                            }
+                            push_max_tokens_continuation(&mut messages, &response);
+                            max_token_continuations += 1;
+                            warn!(
+                                iteration,
+                                continuation = max_token_continuations,
+                                max = MAX_TOKENS_CONTINUATION_LIMIT,
+                                "task output hit max_tokens; continuing in the same agent loop"
+                            );
+                            continue;
+                        }
+
+                        let final_response =
+                            response_with_max_token_fragments(&response, &max_token_fragments);
+                        self.emit_cost_update(turn.total_usage(), &final_response);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
                         return Ok(self.build_result(
-                            &response,
+                            &final_response,
                             turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
@@ -1425,7 +1814,7 @@ impl Agent {
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
-                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &response);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -1457,11 +1846,21 @@ impl Agent {
         files_modified: Vec<std::path::PathBuf>,
         files_to_send: Vec<std::path::PathBuf>,
     ) -> TaskResult {
-        let success = response.stop_reason != StopReason::MaxTokens;
+        let truncated = response.stop_reason == StopReason::MaxTokens;
+        let success = !truncated;
+        let mut output = response.content.clone().unwrap_or_default();
+        if truncated {
+            let marker = "[partial output: max_output_tokens reached before a final answer]";
+            output = if output.trim().is_empty() {
+                marker.to_string()
+            } else {
+                format!("{marker}\n\n{output}")
+            };
+        }
         TaskResult {
             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success,
-            output: response.content.clone().unwrap_or_default(),
+            output,
             files_modified,
             files_to_send,
             subtasks: Vec::new(),
@@ -1474,6 +1873,20 @@ impl Agent {
     }
 
     /// Execute tool calls from an LLM response and accumulate results.
+    ///
+    /// On success returns the SANITIZED response — IDs after
+    /// `sanitize_tool_call_id` + empty/duplicate repair + name+args dedup.
+    /// Callers that subsequently key into `tool_success_by_id` MUST use the
+    /// sanitized response so the lookup matches; the original response's
+    /// tool_call_ids are stale once sanitization rewrites them.
+    ///
+    /// Codex round-3 MAJOR (PR #1187 follow-up): the prior signature returned
+    /// `Result<()>`, leaving the synth-ack gate at the call site to feed the
+    /// CALLER'S original `response` into `any_tool_invocation_errored`. When
+    /// sanitization changed an ID (colon, empty, duplicate) the success-bit
+    /// lookup in the gate missed and the content-fallback also missed (it
+    /// keys on the original ID too), so a real `success=false` slipped past
+    /// and synth-ack still fired alongside the red error chip.
     #[allow(clippy::too_many_arguments)]
     async fn handle_tool_use(
         &self,
@@ -1485,7 +1898,21 @@ impl Agent {
         retry_state: &mut LoopRetryState,
         tracker: Option<&TokenTracker>,
         tool_structured_metadata: Option<&mut Vec<(String, serde_json::Value)>>,
-    ) -> Result<()> {
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): out-parameter that, when
+        // supplied, receives the per-tool-call success bit keyed by
+        // `tool_call_id`. The conversation-loop call site uses this to
+        // gate the synth-ack branch authoritatively (rather than reading
+        // the content shape of each tool message). Background callers
+        // pass `None` because the task-loop never emits the synth-ack.
+        tool_success_by_id: Option<&mut Vec<(String, bool)>>,
+        // NEW-16: append-only per-turn output log sink for the
+        // conversation loop. When supplied, the SAME assistant message
+        // and merged tool-result rows that go into `messages` are also
+        // appended here. The task loop passes `None` (it returns
+        // `TaskResult`, not `ConversationResponse`, so no log is
+        // needed there).
+        turn_output_log: Option<&mut Vec<Message>>,
+    ) -> Result<ChatResponse> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
         // Also sanitize characters: some providers (e.g. Moonshot/kimi) generate IDs
@@ -1530,7 +1957,8 @@ impl Agent {
                 );
             }
         }
-        messages.push(self.response_to_message(&response));
+        let assistant_msg = self.response_to_message(&response);
+        messages.push(assistant_msg.clone());
         let (limited_response, blocked_messages) =
             self.enforce_session_limits_on_tool_calls(&response);
         let tool_batches = split_tool_calls(
@@ -1551,20 +1979,37 @@ impl Agent {
         let mut tool_send_files = Vec::new();
         let mut tool_tokens = TokenUsage::default();
         let mut tool_metadata: Vec<(String, serde_json::Value)> = Vec::new();
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): collect per-tool-call
+        // success bits across every batch in this turn. Threaded out via
+        // `tool_success_by_id` so the synth-ack gate can read the
+        // authoritative `ToolResult.success` value rather than guessing
+        // from content prefixes (which missed shell timeouts, sandbox
+        // path rejections, browser nav failures, etc.).
+        let mut tool_success: Vec<(String, bool)> = Vec::new();
         for batch in tool_batches {
             let mut batch_response = limited_response.clone();
             batch_response.tool_calls = batch.to_vec();
-            let (batch_messages, batch_files, batch_send_files, batch_tokens, batch_metadata) =
-                self.execute_tools(&batch_response).await?;
+            let (
+                batch_messages,
+                batch_files,
+                batch_send_files,
+                batch_tokens,
+                batch_metadata,
+                batch_success,
+            ) = self.execute_tools(&batch_response).await?;
             tool_messages.extend(batch_messages);
             tool_files.extend(batch_files);
             tool_send_files.extend(batch_send_files);
             tool_tokens.input_tokens += batch_tokens.input_tokens;
             tool_tokens.output_tokens += batch_tokens.output_tokens;
             tool_metadata.extend(batch_metadata);
+            tool_success.extend(batch_success);
         }
         if let Some(sink) = tool_structured_metadata {
             sink.extend(tool_metadata);
+        }
+        if let Some(sink) = tool_success_by_id {
+            sink.extend(tool_success);
         }
 
         let merged = merge_tool_messages_in_order(
@@ -1585,14 +2030,148 @@ impl Agent {
             }
         }
 
+        // NEW-16: mirror the same assistant + merged rows into the
+        // append-only turn log when the caller (conversation loop)
+        // supplied a sink. The clone is intentional — the prompt
+        // buffer `messages` will be mutated downstream by
+        // `prepare_conversation_messages` /
+        // `repair_message_order`, but the log must stay frozen as the
+        // chronological record of what THIS turn produced.
+        if let Some(log) = turn_output_log {
+            log.push(assistant_msg);
+            log.extend(merged.iter().cloned());
+        }
         messages.extend(merged);
         files_modified.extend(tool_files);
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
         }
         turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
-        Ok(())
+        // Codex round-3: return the sanitized response so the caller's
+        // synth-ack gate sees the SAME tool_call_ids that the success-bit
+        // sink was keyed by. See doc-comment on this fn.
+        Ok(response)
     }
+}
+
+/// Classify a tool-result `content` string as an error / denial / cancellation
+/// emitted by the in-process tool dispatcher.
+///
+/// Mirrors the well-known conventions emitted by [`crate::agent::execution`]:
+///
+/// - `"Error: …"` — wrapper text added by `execute_tools` for any tool whose
+///   `execute_with_context` call returned `Err`.
+/// - `"[VALIDATION FAILED] …"` — spawn_only pre-flight rejection (the
+///   `Tool::pre_flight_validate` hook returned `Err`).
+/// - `"[POLICY DENIED] …"` / `"[HOOK DENIED] …"` — registry / lifecycle-hook
+///   refusals at the call boundary.
+/// - `"[SESSION LIMIT] …"` / `"[SHELL RETRY LIMIT] …"` — session-scoped
+///   limiter refusals.
+/// - `"Tool '<name>' panicked …"` / `"Tool '<name>' timed out …"` /
+///   `"Tool '<name>' cancelled due to earlier sibling error …"` — synthetic
+///   results minted by `panic_result` / the batch timeout path /
+///   `cancelled_result`.
+///
+/// Used by the spawn_only branch in [`Agent::process_message_inner`] to
+/// decide whether the synthesized "Background work started for `<tool>`."
+/// acknowledgement is safe to emit. When any spawn_only tool the LLM called
+/// produced one of these error-shaped results, the ack would otherwise sit
+/// alongside the red error chip the UI already shows for the failed
+/// invocation — a confusing dual signal (the fleet-UX soak symptom B4).
+///
+/// Returns `false` for the canonical spawn_only success placeholder
+/// (`task_handle` envelope from `spawn_only_handle_message` /
+/// `spawn_only_message`) and for every regular successful tool body, so the
+/// detector never produces a false positive that suppresses the ack for a
+/// genuinely-started background task.
+fn is_error_tool_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("Error:")
+        || trimmed.starts_with("[VALIDATION FAILED]")
+        || trimmed.starts_with("[POLICY DENIED]")
+        || trimmed.starts_with("[HOOK DENIED]")
+        || trimmed.starts_with("[SESSION LIMIT]")
+        || trimmed.starts_with("[SHELL RETRY LIMIT]")
+    {
+        return true;
+    }
+    if trimmed.starts_with("Tool '")
+        && (trimmed.contains("panicked")
+            || trimmed.contains("timed out")
+            || trimmed.contains("cancelled due to earlier"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Scan the tool-result messages appended during this turn for any tool
+/// invocation (spawn_only or otherwise) that returned an error-shaped body.
+///
+/// Used by the spawn_only branch in [`Agent::process_message_inner`] to gate
+/// the synthesized "Background work started for `<tool>`." acknowledgement.
+/// When `true`, the ack is suppressed and the agent loop falls through to its
+/// normal next-iteration path so the LLM observes the error tool result and
+/// can react (acknowledge, retry, fall back, or surface the failure to the
+/// user) instead of the harness fabricating a "started" confirmation
+/// alongside the red error chip the UI already renders for the failed
+/// tool — see the fleet-UX soak B4 finding (mini1 / dspfac, 2026-05-22).
+///
+/// The check spans EVERY tool call in the response (not just the spawn_only
+/// ones) because the user-visible UX bug is the synth-ack rendering as a
+/// success bubble while any sibling tool's red error chip is showing. The
+/// LLM still has the next iteration to acknowledge / recover regardless of
+/// which tool failed, so suppressing the ack here is strictly better UX.
+///
+/// Codex round-2 MAJOR 2 (PR #1187 fixup): the per-call `tool_success_by_id`
+/// map is the AUTHORITATIVE signal. When the dispatcher reports
+/// `success == false` for a tool_call_id present in the current response
+/// we return `true` immediately, regardless of content shape. This catches
+/// every legitimate failure mode whose tool body did NOT carry one of the
+/// well-known error prefixes — shell timeouts ("Command timed out after
+/// ..."), sandbox path rejections ("Path outside working directory ..."),
+/// browser navigation failures, plugin tools returning `success: false`
+/// with arbitrary error messages — every one of which renders a red error
+/// chip but used to slip past the content-only classifier.
+///
+/// We retain the content-based fallback ([`is_error_tool_message`]) for
+/// tool_call_ids that have NO entry in the success map. That covers
+/// blocked-by-session-limit and other synthesised messages constructed
+/// outside `execute_tools` (see `session_limit_message` /
+/// `merge_tool_messages_in_order`) which never carry an executed `success`
+/// bit but DO start with `[SESSION LIMIT]` / `[SHELL RETRY LIMIT]` so the
+/// content classifier still gates them correctly.
+fn any_tool_invocation_errored(
+    messages: &[Message],
+    response: &ChatResponse,
+    tool_success_by_id: &[(String, bool)],
+) -> bool {
+    response.tool_calls.iter().any(|tc| {
+        // Primary path: read the executed-tool success bit.
+        if let Some((_, success)) = tool_success_by_id
+            .iter()
+            .find(|(id, _)| id.as_str() == tc.id)
+        {
+            return !*success;
+        }
+        // Fallback for tool_call_ids that bypassed `execute_tools` (e.g.
+        // session-limit blocks emit a synthetic tool message via
+        // `session_limit_message`). The dispatcher synthesises one Tool
+        // message per tool_call_id, so a linear scan over recent messages
+        // is bounded by the per-turn batch size
+        // (≤ MAX_PARALLEL_TOOL_CALLS_PER_BATCH = 8 in production).
+        messages.iter().rev().any(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id == tc.id)
+                && is_error_tool_message(&message.content)
+        })
+    })
 }
 
 /// Classify a tool-result `content` string as productive for the M6.2
@@ -1902,6 +2481,110 @@ fn shell_retry_terminal_user_message(content: &str) -> String {
     }
 }
 
+/// Inject a synthetic conversation pair when the loop detector fires for the
+/// FIRST time in a turn so the LLM gets the chance to course-correct.
+///
+/// Specifically:
+///   1. Push the looping assistant message (with its `tool_calls`).
+///   2. For EVERY tool call in the response, push a matching tool-result
+///      message — provider chat schemas require a 1:1 pairing.
+///   3. The FIRST tool-result carries `warning` (the loop-detector text +
+///      synthesis hint). Companion tool calls in the same response get a
+///      short stub so the LLM doesn't think they actually executed.
+///
+/// We never call the tools — the looping calls would just produce more
+/// drifted output. The synthesis hint tells the LLM to fall back to prior
+/// results already in the conversation or switch tools.
+///
+/// See PR `fix/news-fetch-loop-and-detect-recovery`
+/// (session `web-1779494658716-mxrxe8`, ledger seq 214-562).
+///
+/// NEW-16: kept alive for the test suite which exercises the legacy
+/// no-log API. Production callers go through
+/// `inject_loop_detected_synthetic_results_with_log`.
+#[cfg(test)]
+fn inject_loop_detected_synthetic_results(
+    messages: &mut Vec<Message>,
+    response: &ChatResponse,
+    warning: &str,
+    agent: &Agent,
+) {
+    inject_loop_detected_synthetic_results_with_log(messages, response, warning, agent, None);
+}
+
+/// NEW-16: same as `inject_loop_detected_synthetic_results`, but also
+/// mirrors the synthetic assistant + tool rows into the conversation
+/// loop's append-only `turn_output_log` when supplied. Keeps the
+/// `messages` mutation behaviour byte-identical for callers that pass
+/// `None` (tests in particular).
+fn inject_loop_detected_synthetic_results_with_log(
+    messages: &mut Vec<Message>,
+    response: &ChatResponse,
+    warning: &str,
+    agent: &Agent,
+    turn_output_log: Option<&mut Vec<Message>>,
+) {
+    let synthesis_hint = "\n\nTry a different approach — synthesise from prior tool results already in this conversation, call a different tool, or finish the turn with the partial information you have.";
+    let primary_body = format!("{warning}{synthesis_hint}");
+    let stub_body =
+        "[LOOP DETECTED] (companion call in the same batch; see paired result for the warning).";
+
+    // Sanitize tool_call_ids the same way the normal `handle_tool_use` path
+    // does (see loop_runner.rs line ~1685): some providers (Moonshot/kimi)
+    // emit IDs containing colons like "admin_view_sessions:11" which OpenAI
+    // and our duplicate-repair logic both reject/collapse. Skipping this on
+    // the synthetic path would leave the next LLM call with unanswered
+    // tool_calls or a 400 from the next request. We sanitize on a clone of
+    // the response so the SAME id flows into BOTH the assistant message's
+    // `tool_calls` (via `response_to_message`) and the matching tool-result
+    // `tool_call_id` below, preserving the 1:1 pairing end-to-end.
+    let mut sanitized_response = response.clone();
+    for tc in sanitized_response.tool_calls.iter_mut() {
+        tc.id = sanitize_tool_call_id(&tc.id);
+    }
+
+    // Push the assistant turn (carries the sanitized `tool_calls`) so the
+    // synthetic tool-result messages have a corresponding `tool_use` to
+    // bind to.
+    let assistant_msg = agent.response_to_message(&sanitized_response);
+    messages.push(assistant_msg.clone());
+    // Collect the same rows we just pushed so we can mirror them into
+    // the append-only turn log below (when a sink was supplied).
+    let mut rows_for_log: Vec<Message> =
+        Vec::with_capacity(1 + sanitized_response.tool_calls.len());
+    rows_for_log.push(assistant_msg);
+
+    for (idx, tc) in sanitized_response.tool_calls.iter().enumerate() {
+        let body = if idx == 0 { &primary_body } else { stub_body };
+        let tool_msg = Message {
+            role: MessageRole::Tool,
+            content: body.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tc.id.clone()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        messages.push(tool_msg.clone());
+        rows_for_log.push(tool_msg);
+    }
+
+    if let Some(log) = turn_output_log {
+        log.extend(rows_for_log);
+    }
+}
+
+/// Terminal message returned when the LLM ignores the loop-detector
+/// warning and trips the detector a SECOND time in the same turn.
+fn loop_detected_terminal_message() -> String {
+    "[LOOP DETECTED] The agent kept calling the same tool with the same arguments \
+     even after a warning was injected. Stopping the turn to avoid a thrash. \
+     Please rephrase your request or try a different angle."
+        .to_string()
+}
+
 fn is_useful_shell_output(content: &str) -> bool {
     let trimmed = content.trim();
     content.contains("Exit code: 0")
@@ -1964,6 +2647,36 @@ fn strip_success_exit_suffix(content: &str) -> String {
         .to_string()
 }
 
+fn push_max_tokens_continuation(messages: &mut Vec<Message>, response: &ChatResponse) {
+    let mut assistant = Message::assistant(response.content.clone().unwrap_or_default());
+    assistant.reasoning_content = response.reasoning_content.clone();
+    messages.push(assistant);
+    messages.push(Message::user(MAX_TOKENS_CONTINUATION_PROMPT));
+}
+
+fn response_with_max_token_fragments(
+    response: &ChatResponse,
+    fragments: &[String],
+) -> ChatResponse {
+    if fragments.is_empty() {
+        return response.clone();
+    }
+
+    let mut combined_parts: Vec<&str> = fragments
+        .iter()
+        .map(String::as_str)
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    let final_content = response.content.as_deref().unwrap_or_default();
+    if !final_content.trim().is_empty() {
+        combined_parts.push(final_content);
+    }
+
+    let mut combined = response.clone();
+    combined.content = Some(combined_parts.join("\n"));
+    combined
+}
+
 fn shell_retry_limit_message(content: &str) -> String {
     let latest_output =
         octos_core::truncated_utf8(content.trim(), 1200, "\n... (shell output truncated)");
@@ -1977,6 +2690,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
@@ -1988,6 +2702,9 @@ mod tests {
 
     use crate::plugins::PluginTool;
     use crate::plugins::manifest::PluginToolDef;
+    use crate::prompt_context::{
+        PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
+    };
     use crate::tools::{Tool, ToolRegistry, ToolResult, TurnAttachmentContext};
 
     struct FilesToSendOnlyTool {
@@ -2067,6 +2784,169 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct RecordingToolThenEndProvider {
+        calls: AtomicUsize,
+        observed_prompts: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    struct MaxTokensThenEndProvider {
+        calls: AtomicUsize,
+        observed_prompts: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MaxTokensThenEndProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.observed_prompts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(
+                    messages
+                        .iter()
+                        .map(|message| message.content.clone())
+                        .collect(),
+                );
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: Some("part one".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::MaxTokens,
+                    usage: LlmTokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 10,
+                        ..Default::default()
+                    },
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("part two".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage {
+                        input_tokens: 4,
+                        output_tokens: 11,
+                        ..Default::default()
+                    },
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingToolThenEndProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.observed_prompts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(
+                    messages
+                        .iter()
+                        .map(|message| message.content.clone())
+                        .collect(),
+                );
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_alpha".to_string(),
+                        name: "alpha".to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct SpyPromptContextManager {
+        phases: Arc<StdMutex<Vec<PromptContextPhase>>>,
+    }
+
+    impl PromptContextManager for SpyPromptContextManager {
+        fn prepare_prompt(
+            &self,
+            request: PromptContextRequest,
+            messages: &mut Vec<Message>,
+        ) -> Result<PromptContextReport, String> {
+            self.phases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request.phase);
+            let before = messages.len();
+            let mut prompt_replaced = false;
+            if request.phase == PromptContextPhase::Iteration {
+                messages.insert(
+                    0,
+                    Message {
+                        role: MessageRole::System,
+                        content: "[managed prompt from context manager]".to_string(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        client_message_id: None,
+                        thread_id: None,
+                        timestamp: chrono::Utc::now(),
+                    },
+                );
+                prompt_replaced = true;
+            }
+            Ok(PromptContextReport {
+                prompt_replaced,
+                compaction_performed: false,
+                messages_before: before,
+                messages_after: messages.len(),
+                token_estimate: Some(messages.iter().map(|message| message.content.len()).sum()),
+                generation: Some(request.iteration as u64),
+            })
         }
     }
 
@@ -2379,6 +3259,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_task_continues_after_max_tokens_in_same_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let observed_prompts = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(MaxTokensThenEndProvider {
+            calls: AtomicUsize::new(0),
+            observed_prompts: Arc::clone(&observed_prompts),
+        });
+        let provider_for_agent: Arc<dyn LlmProvider> = provider.clone();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("max-tokens-test"),
+            provider_for_agent,
+            tools,
+            memory,
+        );
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "Write a long report".to_string(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            result.output,
+            "part one
+part two"
+        );
+        assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(result.token_usage.input_tokens, 7);
+        assert_eq!(result.token_usage.output_tokens, 21);
+        let prompts = observed_prompts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].iter().any(|content| content == "part one"));
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|content| content.contains("Continue directly from where you stopped"))
+        );
+    }
+
+    #[tokio::test]
     async fn process_message_preserves_tool_pair_order_across_iterations() {
         let dir = tempfile::tempdir().unwrap();
         let mut tools = ToolRegistry::with_builtins(dir.path());
@@ -2428,6 +3359,53 @@ mod tests {
         assert_eq!(
             result.messages[5].tool_call_id.as_deref(),
             Some("call_gamma")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_uses_prompt_context_manager_before_each_llm_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let observed_prompts = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn LlmProvider> = Arc::new(RecordingToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+            observed_prompts: Arc::clone(&observed_prompts),
+        });
+        let phases = Arc::new(StdMutex::new(Vec::new()));
+        let context_manager: Arc<dyn PromptContextManager> = Arc::new(SpyPromptContextManager {
+            phases: Arc::clone(&phases),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory)
+            .with_prompt_context_manager(context_manager);
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+        assert_eq!(result.content, "done");
+        let phases = phases.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            phases.as_slice(),
+            [PromptContextPhase::TurnStart, PromptContextPhase::Iteration]
+        );
+        let prompts = observed_prompts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            !prompts[0]
+                .iter()
+                .any(|content| content.contains("[managed prompt from context manager]")),
+            "turn-start prompt should remain unchanged in this spy"
+        );
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|content| content.contains("[managed prompt from context manager]")),
+            "second LLM call must use the prompt vector prepared by the context manager"
         );
     }
 
@@ -4274,5 +5252,1432 @@ printf '{"output":"voice saved","success":true}\n'
         // Reset at start of process_message clears the flag, so a brand-new
         // burst is allowed and emits a warning (Ok), not a terminal Err.
         assert!(second.is_ok(), "second call should not error after reset");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // PR `fix/news-fetch-loop-and-detect-recovery` —
+    // LOOP DETECTED non-terminal recovery (`session web-1779494658716-mxrxe8`,
+    // ledger seq 214-562). On first fire we now inject a synthetic tool
+    // result carrying the warning and continue the loop for one more LLM
+    // iteration; on second fire we return a terminal `ConversationResponse`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_a".to_string(),
+                    name: "news_fetch".to_string(),
+                    arguments: serde_json::json!({"categories": ["tech"]}),
+                    metadata: None,
+                },
+                ToolCall {
+                    id: "call_b".to_string(),
+                    name: "news_fetch".to_string(),
+                    arguments: serde_json::json!({"categories": ["world"]}),
+                    metadata: None,
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let memory = runtime.block_on(async {
+            Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap())
+        });
+        let agent = Agent::new(AgentId::new("inject-test"), provider, tools, memory);
+
+        let mut messages: Vec<Message> = Vec::new();
+        super::super::loop_runner::inject_loop_detected_synthetic_results(
+            &mut messages,
+            &response,
+            "[LOOP DETECTED] cycle length 1.",
+            &agent,
+        );
+
+        // 1 assistant + 2 tool results (one per tool_call).
+        assert_eq!(messages.len(), 3, "expected 1 assistant + 2 tool results");
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(
+            messages[0]
+                .tool_calls
+                .as_ref()
+                .map(|tcs| tcs.len())
+                .unwrap_or(0),
+            2,
+            "assistant message must carry the looping tool_calls so providers \
+             can bind the synthetic tool-result messages back to them"
+        );
+
+        for (idx, msg) in messages[1..].iter().enumerate() {
+            assert_eq!(msg.role, MessageRole::Tool, "tool message #{idx}");
+            let id_expected = if idx == 0 { "call_a" } else { "call_b" };
+            assert_eq!(msg.tool_call_id.as_deref(), Some(id_expected));
+        }
+
+        // First tool-result carries the warning + synthesis hint; second is
+        // a short companion stub so the LLM doesn't think the second call
+        // actually executed.
+        assert!(
+            messages[1].content.contains("[LOOP DETECTED]"),
+            "primary tool result must echo the warning: got `{}`",
+            messages[1].content
+        );
+        assert!(
+            messages[1].content.contains("synthesise")
+                || messages[1].content.contains("different tool"),
+            "primary tool result must contain a synthesis hint so the LLM \
+             knows how to course-correct: got `{}`",
+            messages[1].content
+        );
+        assert!(
+            messages[2].content.contains("[LOOP DETECTED]")
+                && messages[2].content.contains("companion"),
+            "companion tool result should mark itself as such: got `{}`",
+            messages[2].content
+        );
+    }
+
+    /// Codex MAJOR on PR #1181: the synthetic injection path bypassed the
+    /// `sanitize_tool_call_id` step that the normal `handle_tool_use` path
+    /// applies (loop_runner.rs ~line 1685). Moonshot/kimi (which dspfac uses)
+    /// emits IDs with colons like `admin_view_sessions:11` — OpenAI-style
+    /// schemas reject those, and our own duplicate-repair logic can collapse
+    /// them, leaving unanswered tool_calls on the next LLM call.
+    ///
+    /// This test simulates a looping ChatResponse with a colon-bearing id and
+    /// asserts:
+    ///   1. The injected synthetic messages carry a sanitized id (no colon).
+    ///   2. The assistant message's `tool_calls[].id` matches the tool
+    ///      result's `tool_call_id` 1:1 (same sanitized id end-to-end).
+    #[test]
+    fn inject_synthetic_results_sanitizes_tool_call_ids_with_colons() {
+        let raw_id = "admin_view_sessions:11";
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: raw_id.to_string(),
+                name: "news_fetch".to_string(),
+                arguments: serde_json::json!({"categories": ["tech"]}),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let memory = runtime.block_on(async {
+            Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap())
+        });
+        let agent = Agent::new(AgentId::new("sanitize-test"), provider, tools, memory);
+
+        let mut messages: Vec<Message> = Vec::new();
+        super::super::loop_runner::inject_loop_detected_synthetic_results(
+            &mut messages,
+            &response,
+            "[LOOP DETECTED] cycle length 1.",
+            &agent,
+        );
+
+        // Layout: 1 assistant + 1 tool result.
+        assert_eq!(messages.len(), 2, "expected 1 assistant + 1 tool result");
+
+        // Extract the assistant tool_call id and the tool result's
+        // tool_call_id; both must be the SAME sanitized value.
+        let assistant_tc_id = messages[0]
+            .tool_calls
+            .as_ref()
+            .and_then(|tcs| tcs.first())
+            .map(|tc| tc.id.clone())
+            .expect("assistant message must carry sanitized tool_calls");
+        let tool_result_id = messages[1]
+            .tool_call_id
+            .clone()
+            .expect("tool result must carry tool_call_id");
+
+        // 1. Sanitized — no colon left over.
+        assert!(
+            !assistant_tc_id.contains(':'),
+            "assistant tool_call id must be sanitized (no colon): got `{assistant_tc_id}`"
+        );
+        assert!(
+            !tool_result_id.contains(':'),
+            "tool result tool_call_id must be sanitized (no colon): got `{tool_result_id}`"
+        );
+
+        // 2. Same id on BOTH sides — providers bind tool_use ↔ tool_result
+        // by exact id match, so any drift here would orphan the pair.
+        assert_eq!(
+            assistant_tc_id, tool_result_id,
+            "assistant tool_calls[].id and tool result tool_call_id must \
+             share the SAME sanitized id (1:1 pairing); raw_id was `{raw_id}`"
+        );
+
+        // 3. Concrete sanitized form: `:` → `_` per `sanitize_tool_call_id`.
+        assert_eq!(
+            assistant_tc_id, "admin_view_sessions_11",
+            "sanitize_tool_call_id should replace `:` with `_`"
+        );
+    }
+
+    #[test]
+    fn loop_detected_terminal_message_is_user_facing_and_non_empty() {
+        let msg = super::super::loop_runner::loop_detected_terminal_message();
+        assert!(msg.contains("[LOOP DETECTED]"));
+        assert!(
+            msg.contains("rephrase") || msg.contains("different angle"),
+            "terminal message should guide the user to rephrase: got `{msg}`"
+        );
+    }
+
+    /// LLM mock that always returns the SAME tool call so the loop
+    /// detector fires repeatedly. Counts invocations so the test can
+    /// assert how many LLM calls happened across the recovery window.
+    struct CountingAlwaysSameToolProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingAlwaysSameToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_loopy".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "loopy.txt"}),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_detected_first_fire_continues_then_second_fire_terminates() {
+        // Exercises the full PR `fix/news-fetch-loop-and-detect-recovery`
+        // recovery contract end-to-end:
+        //   1. The looping LLM trips the detector on the 4th call (cycle-1).
+        //   2. First detection MUST NOT terminate — it injects a synthetic
+        //      tool result with the warning and calls the LLM again.
+        //   3. If the LLM repeats the same call, the SECOND detection
+        //      terminates with `loop_detected_terminal_message()`.
+        //
+        // We assert via:
+        //   - The flag (`is_loop_detected_recently`) is set after the run.
+        //   - The terminal `content` matches `loop_detected_terminal_message`
+        //     (proves the second-fire path ran, not the original first-fire
+        //     return-immediately path).
+        //   - The mock LLM was called AT LEAST 5 times (>=4 to trigger first
+        //     fire, +1 for the recovery iteration), confirming the loop
+        //     continued after the first fire.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loopy.txt"), b"x").unwrap();
+        let provider = Arc::new(CountingAlwaysSameToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
+            crate::AgentConfig {
+                max_iterations: 30,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let result = agent
+            .process_message("please loop", &[], vec![])
+            .await
+            .expect("process_message should return Ok even when the loop terminates");
+
+        // The terminal message proves the second-fire branch ran. The
+        // pre-fix behaviour would have returned the FIRST-fire warning
+        // text and stopped before issuing another LLM call.
+        assert_eq!(
+            result.content,
+            loop_detected_terminal_message(),
+            "expected the terminal hard-stop message after the second \
+             loop detection; pre-fix code would have returned the warning \
+             text on the first fire"
+        );
+        assert!(agent.is_loop_detected_recently());
+
+        let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
+        assert!(
+            total_calls >= 5,
+            "expected at least 5 LLM calls (4 to trigger first detection + \
+             1 recovery iteration); got {total_calls}"
+        );
+    }
+
+    // ----- Audit Gap-8: auto-fire check_workspace_contract on Completion -----
+
+    /// LLM stub that always returns a single EndTurn — used by the
+    /// Gap-8 tests to drive `run_task` straight to the contract-check
+    /// branch without iterating through tool calls.
+    struct EndTurnOnlyProvider;
+    #[async_trait]
+    impl LlmProvider for EndTurnOnlyProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: Some("done".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Build a slides workspace fixture, optionally fully-ready.
+    ///
+    /// Pure-filesystem setup. Callers that want a "ready" deck must also
+    /// invoke [`run_managed_slides_workspace_validators`] (async) or
+    /// [`run_managed_slides_workspace_validators_sync`] (blocking) to
+    /// exercise the PRODUCTION project-root validator helper. Splitting
+    /// the helper this way avoids the "Cannot start a runtime from within a
+    /// runtime" panic when async tests call the fixture inside their own
+    /// Tokio runtime.
+    fn make_managed_slides_workspace(tmp_root: &std::path::Path, slug: &str, ready: bool) {
+        use crate::workspace_git::WorkspaceProjectKind;
+        use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
+        let repo_root = tmp_root.join("slides").join(slug);
+        std::fs::create_dir_all(&repo_root).unwrap();
+        write_workspace_policy(
+            &repo_root,
+            &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        // Every slides workspace requires script.js / memory.md / changelog.md
+        // for turn_end + output/deck.pptx + slide png for completion.
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+        if ready {
+            std::fs::create_dir_all(repo_root.join("output/imgs")).unwrap();
+            // octos #997: write real PPTX magic bytes so the project-scope
+            // PPTX `MagicBytes` validator wired in
+            // `WorkspacePolicy::for_kind(Slides)` does not fail the gate.
+            let mut pptx = vec![0x50, 0x4B, 0x03, 0x04];
+            pptx.extend_from_slice(&[0u8; 32]);
+            std::fs::write(repo_root.join("output/deck.pptx"), &pptx).unwrap();
+            std::fs::write(repo_root.join("output/imgs/slide-01.png"), "fake-png").unwrap();
+            // NOTE: caller must invoke
+            // `run_managed_slides_workspace_validators[_sync]` to write the
+            // slides-kind PPTX MagicBytes Pass row.
+        }
+    }
+
+    /// octos #997 (round-2 fix): async variant — exercise the production
+    /// project-root validator helper so the ready fixture writes a Pass row
+    /// into the same project ledger that the spawn loop writes to in
+    /// production. Pre-round-2 the fixture manually `ledger.append(...)`ed a
+    /// fake Pass; codex flagged that as masking the gap (the validator was
+    /// declared but never RUN at the project root in production).
+    async fn run_managed_slides_workspace_validators(tmp_root: &std::path::Path, slug: &str) {
+        use crate::workspace_git::WorkspaceProjectKind;
+        let registry = std::sync::Arc::new(crate::ToolRegistry::new());
+        // Mirror production: the spawn loop hands the plugin's
+        // `files_to_send` list through. The fixture stages the deck at
+        // the legacy in-project path so the filter accepts it.
+        let files_to_send = vec![tmp_root.join("slides").join(slug).join("output/deck.pptx")];
+        let _ = crate::workspace_contract::run_project_root_validators(
+            &registry,
+            tmp_root,
+            Some(WorkspaceProjectKind::Slides),
+            &files_to_send,
+        )
+        .await;
+    }
+
+    /// Sync variant of [`run_managed_slides_workspace_validators`] for
+    /// non-async `#[test]` callers that don't already have a Tokio runtime
+    /// (and can therefore build one without nesting).
+    fn run_managed_slides_workspace_validators_sync(tmp_root: &std::path::Path, slug: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime for fixture validator run");
+        runtime.block_on(run_managed_slides_workspace_validators(tmp_root, slug));
+    }
+
+    #[test]
+    fn should_return_none_when_workspace_has_no_policy_managed_repos() {
+        // Bare working_dir with no `slides/` or `sites/` subdir →
+        // inspect_workspace_contracts yields an empty Vec → helper returns
+        // None → loop_runner keeps Success.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(inspect_workspace_contract_failures(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn should_return_none_when_all_managed_repos_are_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_managed_slides_workspace(tmp.path(), "demo", true);
+        run_managed_slides_workspace_validators_sync(tmp.path(), "demo");
+
+        let failures = inspect_workspace_contract_failures(tmp.path());
+        assert!(
+            failures.is_none(),
+            "ready workspace should not produce contract failure summary: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn should_return_failure_summary_when_managed_repo_is_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        // slug=broken with NO output/ artifacts → completion checks fail.
+        make_managed_slides_workspace(tmp.path(), "broken", false);
+
+        let failures = inspect_workspace_contract_failures(tmp.path())
+            .expect("broken workspace must produce contract failure summary");
+        assert!(
+            failures.contains("slides/broken"),
+            "summary should name the failing repo:\n{}",
+            failures
+        );
+        assert!(
+            failures.contains("completion failed") || failures.contains("artifact missing"),
+            "summary should describe what failed:\n{}",
+            failures
+        );
+    }
+
+    #[test]
+    fn should_return_failure_summary_with_mixed_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_managed_slides_workspace(tmp.path(), "ready-deck", true);
+        make_managed_slides_workspace(tmp.path(), "broken-deck", false);
+        run_managed_slides_workspace_validators_sync(tmp.path(), "ready-deck");
+
+        let failures = inspect_workspace_contract_failures(tmp.path())
+            .expect("at least one broken repo must produce failures");
+        assert!(failures.contains("slides/broken-deck"));
+        // Only the broken repo should appear in the failures listing —
+        // ready-deck is not in the failing set.
+        assert!(
+            !failures.contains("ready-deck") || failures.contains("broken-deck"),
+            "ready-deck should not appear as a failure:\n{}",
+            failures
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_demotes_success_when_contract_fails() {
+        // End-to-end integration: an EndTurn that would otherwise be Success
+        // gets demoted to success=false when the working_dir contains a
+        // policy-managed repo that is not ready.
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-populate a broken slides repo so contract != ready.
+        make_managed_slides_workspace(dir.path(), "demo", false);
+
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("contract-demote"), provider, tools, memory);
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "Build it".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert!(
+            !result.success,
+            "broken workspace contract must demote task to failure"
+        );
+        assert!(
+            result.output.contains("workspace contract") || result.output.contains("slides/demo"),
+            "result output should explain the contract failure: {:?}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_keeps_success_when_workspace_has_no_policy() {
+        // No-policy workspace must stay Success (no regression).
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("no-contract"), provider, tools, memory);
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "Hi".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert!(
+            result.success,
+            "no-policy workspace must keep Success (got {:?})",
+            result.output
+        );
+    }
+
+    // ── Fleet-UX soak B4 (mini1 / dspfac, 2026-05-22) ─────────────────
+    //
+    // Suite for the spawn_only synthesized-ack suppression. When the LLM
+    // calls a spawn_only tool whose dispatcher returns an error, the agent
+    // must NOT fabricate a "Background work started for `<tool>`."
+    // acknowledgement — the user already sees a red error chip on the tool
+    // card and the synthesized ack reads as a confusing dual signal.
+
+    #[test]
+    fn is_error_tool_message_classifies_error_envelopes() {
+        // Positive cases — every well-known error convention emitted by
+        // crate::agent::execution must classify as an error.
+        assert!(is_error_tool_message("Error: tool dispatch failed"));
+        assert!(is_error_tool_message(
+            "[VALIDATION FAILED] Tool 'run_pipeline' rejected input: bad DOT"
+        ));
+        assert!(is_error_tool_message(
+            "[POLICY DENIED] Tool 'foo' is blocked by provider policy (deny)"
+        ));
+        assert!(is_error_tool_message(
+            "[HOOK DENIED] Tool 'foo' was blocked by a lifecycle hook."
+        ));
+        assert!(is_error_tool_message("[SESSION LIMIT] cap"));
+        assert!(is_error_tool_message("[SHELL RETRY LIMIT] stop"));
+        assert!(is_error_tool_message("Tool 'foo' panicked: boom"));
+        assert!(is_error_tool_message(
+            "Tool 'foo' timed out after 30 seconds"
+        ));
+        assert!(is_error_tool_message(
+            "Tool 'foo' cancelled due to earlier sibling error in the same batch."
+        ));
+
+        // Leading whitespace must not defeat the prefix check.
+        assert!(is_error_tool_message("   Error: trimmed"));
+
+        // Negative cases — successful and neutral bodies must NOT be flagged.
+        assert!(!is_error_tool_message(""));
+        assert!(!is_error_tool_message("   "));
+        assert!(!is_error_tool_message("ok"));
+        assert!(!is_error_tool_message(
+            "{\"task_handle\": \"abc\", \"output_dir\": \"/tmp\"}"
+        ));
+        assert!(!is_error_tool_message(
+            "Background research kicked off; results pending."
+        ));
+        // A "Tool '...'" message that doesn't match panicked/timed-out/
+        // cancelled-due-to-earlier is informational, not an error envelope.
+        assert!(!is_error_tool_message(
+            "Tool 'spawn' produced files: report.md"
+        ));
+    }
+
+    fn spawn_only_tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }
+    }
+
+    fn spawn_only_tool_result(tool_call_id: &str, content: &str) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.to_string()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn spawn_only_chat_response(tool_calls: Vec<ToolCall>) -> ChatResponse {
+        ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        }
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_detects_error_envelope() {
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_1", "any_tool")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_1",
+            "Error: any_tool dispatch failed",
+        )];
+
+        // Empty success-map exercises the content-classifier fallback path
+        // (the success bit is the post-#1187 authoritative input; absence
+        // means the call bypassed execute_tools, e.g. session-limit block).
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_false_when_all_results_successful() {
+        // Mix of a spawn_only-style handle envelope and a regular successful
+        // tool result — neither carries an error convention, so the gate must
+        // not fire.
+        let response = spawn_only_chat_response(vec![
+            spawn_only_tool_call("call_a", "bg_research"),
+            spawn_only_tool_call("call_b", "shell"),
+        ]);
+        let messages = vec![
+            spawn_only_tool_result(
+                "call_a",
+                "{\"task_handle\": \"abc\", \"output_dir\": \"/tmp/research\"}",
+            ),
+            spawn_only_tool_result("call_b", "ls\nfile1\nfile2\nExit code: 0"),
+        ];
+
+        assert!(!any_tool_invocation_errored(&messages, &response, &[]));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_detects_validation_failed_envelope() {
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_1", "run_pipeline")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_1",
+            "[VALIDATION FAILED] Tool 'run_pipeline' rejected input: bad arg\n\nFix the input and retry.",
+        )];
+
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_mixed_batch_one_failed() {
+        // The realistic production shape: spawn_only tool returned its
+        // task-handle envelope (foreground always reports success for
+        // spawn_only) AND a sibling regular tool errored in the same batch.
+        // The gate MUST fire so the synthesized "Background work started"
+        // ack is suppressed — otherwise the user sees a successful-looking
+        // ack alongside the red error chip from the sibling tool.
+        let response = spawn_only_chat_response(vec![
+            spawn_only_tool_call("call_pipeline", "run_pipeline"),
+            spawn_only_tool_call("call_shell", "shell"),
+        ]);
+        let messages = vec![
+            spawn_only_tool_result(
+                "call_pipeline",
+                "{\"task_handle\": \"deep-research-xyz\", \"output_dir\": \"/tmp/dr\"}",
+            ),
+            spawn_only_tool_result("call_shell", "Error: command not found: foo"),
+        ];
+
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_ignores_unrelated_error_in_history() {
+        // A historical error message from an EARLIER turn that doesn't
+        // correspond to any tool_call in the current response must NOT
+        // trip the gate — otherwise once any tool ever failed in the
+        // session, the spawn_only ack would be permanently suppressed.
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_now", "bg_research")]);
+        let messages = vec![
+            // Stale tool message from a previous iteration with a
+            // tool_call_id the current response doesn't reference.
+            spawn_only_tool_result("call_old", "Error: old failure"),
+            // Current invocation's successful handle envelope.
+            spawn_only_tool_result("call_now", "{\"task_handle\": \"abc\"}"),
+        ];
+
+        assert!(!any_tool_invocation_errored(&messages, &response, &[]));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_detects_panic_and_timeout_envelopes() {
+        let response = spawn_only_chat_response(vec![
+            spawn_only_tool_call("call_a", "tool_a"),
+            spawn_only_tool_call("call_b", "tool_b"),
+        ]);
+        let messages_panic = vec![spawn_only_tool_result(
+            "call_a",
+            "Tool 'tool_a' panicked: boom",
+        )];
+        assert!(any_tool_invocation_errored(&messages_panic, &response, &[],));
+
+        let messages_timeout = vec![spawn_only_tool_result(
+            "call_b",
+            "Tool 'tool_b' timed out after 30 seconds",
+        )];
+        assert!(any_tool_invocation_errored(
+            &messages_timeout,
+            &response,
+            &[],
+        ));
+    }
+
+    // ─── Codex round-2 MAJOR 2 (PR #1187 fixup) ────────────────────────
+    //
+    // The new authoritative path: success bit from the dispatcher's
+    // `ToolResult` is plumbed through as a (tool_call_id, success) slice.
+    // These cover the failure shapes the content-only classifier missed.
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_shell_timeout() {
+        // shell.rs:396 emits "Command timed out after ..." with success=false.
+        // The content does NOT start with "Error:" / "[VALIDATION FAILED]" /
+        // etc., so the content classifier returns false. With the success
+        // bit available, the gate MUST still fire.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_sh", "shell")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_sh",
+            "Command timed out after 60s\nExit code: -1",
+        )];
+        let success_map = vec![("call_sh".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_sandbox_path_reject() {
+        // coding_tools.rs:680 emits "Path outside working directory ..."
+        // with success=false. Same content-classifier blind spot as above.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_rf", "read_file")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_rf",
+            "Path outside working directory: /etc/passwd",
+        )];
+        let success_map = vec![("call_rf".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_browser_nav_fail() {
+        // Browser tool emits "Navigation failed: <reason>" with success=false.
+        // Content does not match any well-known prefix.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_br", "browser")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_br",
+            "Navigation failed: net::ERR_NAME_NOT_RESOLVED for https://example.invalid/",
+        )];
+        let success_map = vec![("call_br".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_plugin_failure() {
+        // Plugin tools emit arbitrary failure text with success=false. The
+        // body looks like normal output ("Could not connect to host" etc.)
+        // and the content classifier would miss it entirely.
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_pl", "deep_search")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_pl",
+            "Could not connect to host: search.api.invalid (connection refused)",
+        )];
+        let success_map = vec![("call_pl".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_success_bit_authoritative_over_content() {
+        // Authoritative-over-content: even if a tool's body happens to
+        // contain "Failed to execute" anywhere in it, when the success
+        // bit is TRUE the gate must NOT fire — the dispatcher signed off
+        // on the call, the body is just narrative.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_ok", "shell")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_ok",
+            "Failed to execute previously, retried, ran cleanly second time.\nExit code: 0",
+        )];
+        let success_map = vec![("call_ok".to_string(), true)];
+
+        assert!(!any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_falls_back_to_content_when_id_missing() {
+        // Bypass-execute_tools shape: session-limit blocking emits a
+        // synthetic tool message via `session_limit_message` whose
+        // tool_call_id has NO entry in the success map. The content
+        // classifier still catches `[SESSION LIMIT]` so the gate fires.
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_blocked", "shell")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_blocked",
+            "[SESSION LIMIT] Tool 'shell' was blocked: cap reached",
+        )];
+
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
+    }
+
+    /// Tool that mimics a regular sibling whose `execute` returns `Err`.
+    /// Mirrors what happens on mini1 / dspfac (2026-05-22) when the LLM
+    /// dispatches a tool whose host-side binary is missing — the
+    /// execution layer wraps the eyre error as `"Error: <reason>"` on the
+    /// tool-result message and tags the per-tool success bit as `false`.
+    struct ErroringTool {
+        name: &'static str,
+        message: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for ErroringTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Tool that always returns an Err to mimic a missing-host failure"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            Err(eyre::eyre!(self.message))
+        }
+    }
+
+    /// Provider that emits, in one turn, a spawn_only tool call AND a
+    /// sibling regular tool call (which errors). Then on its second call
+    /// emits an EndTurn with a terminal assistant message. Models the
+    /// fleet-UX soak symptom: the LLM batched both calls; the spawn_only
+    /// one launched (foreground returns success handle, flag set), the
+    /// sibling errored, AND the spawn_only branch in
+    /// `process_message_inner` would fabricate a "Background work started"
+    /// ack alongside the red error chip.
+    struct MixedBatchSpawnOnlyAndErroringProvider {
+        calls: AtomicUsize,
+        spawn_only_name: &'static str,
+        erroring_name: &'static str,
+        final_content: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MixedBatchSpawnOnlyAndErroringProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_pipeline".to_string(),
+                            name: self.spawn_only_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                        ToolCall {
+                            id: "call_sibling".to_string(),
+                            name: self.erroring_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some(self.final_content.to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Provider for the codex round-2 MAJOR 1 sticky-flag regression: emits
+    /// three iterations —
+    ///   iter 1: spawn_only call (foreground returns success handle, sets
+    ///           the turn-wide `spawn_only_was_invoked` flag).
+    ///   iter 2: a SINGLE regular non-spawn-only tool call. Its result is
+    ///           happy. The CURRENT iteration's response contains NO
+    ///           spawn_only call. The bug: the sticky flag is still `true`
+    ///           from iter 1, no tool in iter 2 errored, so the iter-2
+    ///           ToolUse arm would fall through to the synth-ack branch
+    ///           and fabricate "Background work started for `<spawn_only>`."
+    ///           even though the iter-2 LLM call invoked NO spawn_only
+    ///           tool. Without the fix, iter 1 ALREADY returns the
+    ///           synth-ack (everything succeeded) so the loop terminates
+    ///           before reaching iter 2 at all — we therefore reshape the
+    ///           sequence so iter 1's batch SUPPRESSES the synth-ack
+    ///           naturally (via the existing B4 erroring-sibling gate)
+    ///           and only the sticky-flag-only path reaches iter 2.
+    ///   iter 3: EndTurn — the LLM produces the actual user-facing reply.
+    struct StickyFlagThreeIterProvider {
+        calls: AtomicUsize,
+        spawn_only_name: &'static str,
+        erroring_sibling_name: &'static str,
+        iter2_regular_name: &'static str,
+        final_content: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StickyFlagThreeIterProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(match call {
+                0 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_iter1_spawnonly".to_string(),
+                            name: self.spawn_only_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                        ToolCall {
+                            id: "call_iter1_sibling".to_string(),
+                            name: self.erroring_sibling_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                1 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_iter2_regular".to_string(),
+                        name: self.iter2_regular_name.to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                _ => ChatResponse {
+                    content: Some(self.final_content.to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Integration: codex round-2 MAJOR 1 (PR #1187 fixup). The sticky
+    /// `spawn_only_was_invoked` AtomicBool stayed `true` across iterations
+    /// once any iteration in the turn called a spawn_only tool. If a
+    /// later iteration in the SAME turn (a) called only a regular
+    /// non-spawn-only tool, (b) got a happy result from it, and then
+    /// (c) reached the post-tool ToolUse arm, the synth-ack branch would
+    /// fabricate a "Background work started." bubble at that iteration
+    /// even though the LLM was just calling read_file / shell. The fix
+    /// narrows the gate to the CURRENT iteration's `response.tool_calls`
+    /// via [`ToolRegistry::is_spawn_only`].
+    ///
+    /// This test models a 3-iteration turn:
+    ///   iter 1: run_pipeline (spawn_only) + erroring sibling
+    ///           — existing B4 gate suppresses the synth-ack
+    ///   iter 2: read_task_output (regular) returns happy output
+    ///           — sticky flag would re-fire the gate without the fix
+    ///   iter 3: EndTurn — produces the user-facing reply
+    ///
+    /// With the bug, iter 2 returned a synthesised ack with
+    /// `synthesized_from_spawn_only = true` as the turn-final content.
+    /// With the fix, iter 2 falls through and iter 3's EndTurn becomes
+    /// the turn-final reply.
+    #[tokio::test]
+    async fn spawn_only_sticky_flag_does_not_synthesize_ack_in_later_regular_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        // Iter 1: spawn_only tool (succeeds on foreground; returns handle
+        // envelope — sets `spawn_only_was_invoked` AtomicBool to true).
+        tools.register(NamedEchoTool {
+            name: "run_pipeline",
+            output: "unused (foreground returns the handle envelope)",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        // Iter 1 sibling: erroring tool — the existing B4 gate suppresses
+        // the iter-1 synth-ack because of THIS error, allowing the loop
+        // to actually reach iter 2 where the sticky-flag bug fires.
+        tools.register(ErroringTool {
+            name: "shell",
+            message: "required tool(s) not available on this host: shell-helper",
+        });
+        // Iter 2: regular tool that returns a happy body. The CURRENT
+        // iteration's response calls only this tool — no spawn_only call.
+        tools.register(NamedEchoTool {
+            name: "read_task_output",
+            output: "<happy log lines>\nExit code: 0",
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(StickyFlagThreeIterProvider {
+            calls: AtomicUsize::new(0),
+            spawn_only_name: "run_pipeline",
+            erroring_sibling_name: "shell",
+            iter2_regular_name: "read_task_output",
+            final_content: "Pipeline launched; shell-helper failed; read_task_output is clean — done.",
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("spawn-only-sticky-test"),
+            provider,
+            tools,
+            memory,
+        );
+
+        let result = agent.process_message("run …", &[], vec![]).await.unwrap();
+
+        // Iter 2's regular tool MUST NOT trigger the synth-ack — the
+        // CURRENT iteration's response contains no spawn_only call. With
+        // the sticky-flag bug, the harness fabricates a "Background work
+        // started for `run_pipeline`." bubble at iter 2 even though iter
+        // 2 only called read_task_output (a regular tool).
+        assert!(
+            !result.content.starts_with("Background work started"),
+            "iter-2 regular tool must NOT synthesize spawn_only ack — current iteration has no spawn_only tool call. Got: {:?}",
+            result.content
+        );
+        assert!(
+            !result.synthesized_from_spawn_only,
+            "synthesized_from_spawn_only flag must be false when CURRENT iteration's response contains no spawn_only tool call, regardless of earlier iterations in the same turn"
+        );
+        assert_eq!(
+            result.content,
+            "Pipeline launched; shell-helper failed; read_task_output is clean — done.",
+            "the LLM's iter-3 EndTurn reply must be surfaced, not a synthesised ack"
+        );
+    }
+
+    /// Integration: when an LLM turn emits a spawn_only tool_call AND a
+    /// sibling tool_call whose dispatcher returned `Err`, the harness MUST
+    /// NOT fabricate a "Background work started for `<tool>`."
+    /// acknowledgement. The synthesized ack would render as a successful
+    /// bubble alongside the red error chip the UI already shows for the
+    /// failed sibling — a confusing dual signal. Instead the LLM must get
+    /// another iteration to react to the error and produce a real reply.
+    ///
+    /// Fleet-UX soak finding B4 (mini1 / dspfac, 2026-05-22): dspfac saw
+    /// `× run_pipeline error: required tool(s) not available on this host:
+    /// run_pipeline` AND a fake "已后台启动 …" outline bubble
+    /// simultaneously; the harness emitted the synthesised ack as the
+    /// turn-final assistant content even though a tool in the same batch
+    /// reported a failure result that the LLM still needed to acknowledge.
+    #[tokio::test]
+    async fn spawn_only_branch_skipped_when_invocation_returned_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        // The spawn_only tool succeeds on the foreground (returns the
+        // canonical handle envelope) and sets the `spawn_only_was_invoked`
+        // flag — exactly as `run_pipeline` does in production.
+        tools.register(NamedEchoTool {
+            name: "run_pipeline",
+            output: "unused (foreground returns the handle envelope, not this)",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        // The sibling tool errors synchronously; the dispatcher wraps the
+        // eyre into `"Error: <reason>"` on the tool-result message.
+        tools.register(ErroringTool {
+            name: "shell",
+            message: "required tool(s) not available on this host: shell-helper",
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MixedBatchSpawnOnlyAndErroringProvider {
+            calls: AtomicUsize::new(0),
+            spawn_only_name: "run_pipeline",
+            erroring_name: "shell",
+            final_content: "Pipeline launched; shell-helper failed and I cannot proceed without it.",
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("spawn-only-err-test"), provider, tools, memory);
+
+        let result = agent
+            .process_message("深度研究 James Webb...", &[], vec![])
+            .await
+            .unwrap();
+
+        // The synthesised ack would carry this prefix. With the gate
+        // active, the spawn_only branch is skipped, the loop continues,
+        // and the LLM's second (EndTurn) reply becomes the turn-final
+        // content.
+        assert!(
+            !result.content.starts_with("Background work started"),
+            "expected NO synthesized 'Background work started' ack alongside the failed sibling tool, got: {:?}",
+            result.content
+        );
+        assert!(
+            !result.synthesized_from_spawn_only,
+            "synthesized_from_spawn_only flag must be false when a tool in the same batch errored"
+        );
+        assert_eq!(
+            result.content,
+            "Pipeline launched; shell-helper failed and I cannot proceed without it.",
+            "the LLM's recovery reply must be surfaced, not the synthesized ack"
+        );
+
+        // The error tool-result MUST stay visible in the message history so
+        // the SPA can keep rendering the red error chip on the tool card.
+        let error_visible = result.messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .content
+                    .contains("required tool(s) not available on this host")
+        });
+        assert!(
+            error_visible,
+            "the failed sibling tool-result must remain in messages so the SPA keeps the red error chip: {:?}",
+            result
+                .messages
+                .iter()
+                .map(|m| (m.role, m.content.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Provider for the codex round-3 MAJOR (PR #1187 follow-up): emits, in
+    /// a single turn, a spawn_only tool call AND a sibling regular tool call
+    /// whose tool_call_id contains a `:` so that `handle_tool_use` rewrites
+    /// it via `sanitize_tool_call_id`. Then on the next call emits an
+    /// EndTurn with a terminal assistant message.
+    ///
+    /// Models the round-3 bug: with the pre-fix code, the post-tool gate
+    /// at `any_tool_invocation_errored` was called with the CALLER'S
+    /// ORIGINAL response (`admin_view:11` still on it), so the success-bit
+    /// lookup keyed by the SANITIZED id (`admin_view_11`) missed, the
+    /// content-fallback scan also keyed on the original id (still missed),
+    /// and the synth-ack fired even though the sibling reported
+    /// `success=false`.
+    struct SanitizedIdSpawnOnlyAndErroringProvider {
+        calls: AtomicUsize,
+        spawn_only_name: &'static str,
+        erroring_name: &'static str,
+        erroring_raw_id: &'static str,
+        final_content: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SanitizedIdSpawnOnlyAndErroringProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_pipeline".to_string(),
+                            name: self.spawn_only_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                        ToolCall {
+                            // Colon in the id mirrors the dspfac /
+                            // Moonshot-kimi pattern (`admin_view_sessions:11`).
+                            // `handle_tool_use` rewrites this to
+                            // `admin_view_sessions_11` via
+                            // `sanitize_tool_call_id`. With the round-3
+                            // bug, the post-tool gate sees the ORIGINAL id
+                            // (with the colon) and misses the success-bit
+                            // entry that the dispatcher keyed by the
+                            // SANITIZED id.
+                            id: self.erroring_raw_id.to_string(),
+                            name: self.erroring_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some(self.final_content.to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Codex round-3 MAJOR (PR #1187 follow-up). The post-tool synth-ack
+    /// gate (`any_tool_invocation_errored`) was called with the CALLER'S
+    /// ORIGINAL response, but `handle_tool_use` had sanitized/dedup'd a
+    /// CLONE before executing tools. When sanitization rewrote a tool_call_id
+    /// (e.g. `admin_view:11` → `admin_view_11`), the success-bit lookup
+    /// (keyed by the sanitized id) missed, the content-fallback scan (also
+    /// keyed on the original id) also missed, and a real `success=false`
+    /// would slip past the gate — the synth-ack still fired.
+    ///
+    /// Fix: `handle_tool_use` now returns the sanitized response; the
+    /// caller passes that sanitized response into the gate so the keys
+    /// align with the success-bit sink.
+    ///
+    /// This test verifies: when the sibling failing tool has a
+    /// colon-bearing id that gets sanitized AND `success=false` is
+    /// reported, the synth-ack is correctly suppressed (the bug would
+    /// produce a `synthesized_from_spawn_only=true` ack here).
+    #[tokio::test]
+    async fn synth_ack_suppressed_when_failing_tool_has_sanitized_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        // spawn_only foreground returns the handle envelope (success=true)
+        // and flips the spawn_only-was-invoked flag.
+        tools.register(NamedEchoTool {
+            name: "run_pipeline",
+            output: "unused (foreground returns the handle envelope, not this)",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        // Sibling tool errors; dispatcher keys the success-bit entry by
+        // the SANITIZED tool_call_id (the LLM-supplied id had a colon).
+        tools.register(ErroringTool {
+            name: "shell",
+            message: "required tool(s) not available on this host: shell-helper",
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(SanitizedIdSpawnOnlyAndErroringProvider {
+            calls: AtomicUsize::new(0),
+            spawn_only_name: "run_pipeline",
+            erroring_name: "shell",
+            erroring_raw_id: "admin_view_sessions:11",
+            final_content: "Pipeline launched; shell-helper failed — cannot proceed.",
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("spawn-only-sanitized-id-test"),
+            provider,
+            tools,
+            memory,
+        );
+
+        let result = agent
+            .process_message("kick off a deep search", &[], vec![])
+            .await
+            .unwrap();
+
+        // With the pre-fix code, the gate misses the sanitized-id
+        // success=false entry and the synth-ack fires:
+        //   result.content starts with "Background work started for `run_pipeline`."
+        //   result.synthesized_from_spawn_only == true
+        //
+        // With the round-3 fix, the gate sees the sanitized id, finds
+        // success=false, suppresses the ack, the loop continues, and the
+        // LLM's iter-2 EndTurn produces the terminal reply.
+        assert!(
+            !result.content.starts_with("Background work started"),
+            "synth-ack must be suppressed when sibling tool errored AND its \
+             tool_call_id was rewritten by sanitization; got: {:?}",
+            result.content
+        );
+        assert!(
+            !result.synthesized_from_spawn_only,
+            "synthesized_from_spawn_only must be false when sibling with \
+             sanitized tool_call_id reported success=false"
+        );
+        assert_eq!(
+            result.content, "Pipeline launched; shell-helper failed — cannot proceed.",
+            "the LLM's recovery reply must surface, not the synth-ack"
+        );
+
+        // Sanity: the failing-sibling tool-result lives under a SANITIZED
+        // id (no colon). After `handle_tool_use` sanitizes the colon to
+        // `_`, downstream prepare-message steps (`normalize_tool_call_ids`,
+        // see loop_compaction.rs) may additionally add the `call_` prefix
+        // before the next LLM call — so we accept either
+        // `admin_view_sessions_11` or `call_admin_view_sessions_11`. What
+        // matters is: NO message carries the original colon-bearing id,
+        // proving sanitization ran end-to-end.
+        let sanitized_tool_msg = result.messages.iter().find(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| !id.contains(':') && id.contains("admin_view_sessions_11"))
+        });
+        assert!(
+            sanitized_tool_msg.is_some(),
+            "expected the failing sibling's tool-result keyed by a sanitized id \
+             (containing `admin_view_sessions_11`, no colon); messages were: {:?}",
+            result
+                .messages
+                .iter()
+                .map(|m| (m.role, m.tool_call_id.clone()))
+                .collect::<Vec<_>>()
+        );
+        // And NOT under the original colonized id — sanitization rewrote it.
+        let original_colonized_msg = result.messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id == "admin_view_sessions:11")
+        });
+        assert!(
+            !original_colonized_msg,
+            "no tool-result should carry the original colon-bearing id; \
+             sanitization should have rewritten it"
+        );
+    }
+
+    #[ignore = "Pre-migration test: the SpawnOnlyFiles-source MagicBytes validator \
+                (post-#997 round-3) rejects no-files-emitted tasks at the project-scope \
+                gate. This test's `EndTurnOnlyProvider` agent never calls a plugin tool, \
+                so `files_to_send` stays empty and the loop_runner's project-scope \
+                validator run after run_task fails the freshly-staged ready workspace. \
+                Re-enable by giving the agent a stub plugin tool that returns the staged \
+                deck in `tool_result.files_to_send`."]
+    #[tokio::test]
+    async fn run_task_keeps_success_when_contract_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fully-ready workspace.
+        make_managed_slides_workspace(dir.path(), "ready", true);
+        run_managed_slides_workspace_validators(dir.path(), "ready").await;
+
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("contract-ok"), provider, tools, memory);
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "All good".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert!(
+            result.success,
+            "ready workspace must keep Success (got {:?})",
+            result.output
+        );
     }
 }

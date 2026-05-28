@@ -155,12 +155,22 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:fs",
         description: "File operations: read, write, edit, and diff-edit files",
-        tools: &["read_file", "write_file", "edit_file", "diff_edit"],
+        tools: &[
+            "read_file",
+            "write_file",
+            "apply_patch",
+            "edit_file",
+            "diff_edit",
+        ],
     },
     ToolGroupInfo {
         name: "group:runtime",
+        // #1172: include the Codex-compatible `bash` alias so a policy
+        // denying / deferring `group:runtime` covers every shell entry
+        // point. Otherwise a profile that disabled runtime execution
+        // would still be reachable via `bash(cmd=…)`.
         description: "Shell command execution",
-        tools: &["shell"],
+        tools: &["shell", "exec_command", "write_stdin", "bash"],
     },
     ToolGroupInfo {
         name: "group:web",
@@ -174,8 +184,23 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     },
     ToolGroupInfo {
         name: "group:sessions",
+        // #1172: include the Codex-compatible `delegate` one-call
+        // wrapper so a policy denying / deferring `group:sessions`
+        // covers every subagent entry point. The wrapper keeps an
+        // Arc<dyn Tool> for the bound `spawn_agent`, so a policy that
+        // removes `spawn` / `spawn_agent` from the visible registry
+        // would still leave `delegate` capable of spawning a child
+        // without this entry.
         description: "Spawn background subagents for parallel tasks",
-        tools: &["spawn"],
+        tools: &[
+            "spawn",
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+            "delegate",
+        ],
     },
     ToolGroupInfo {
         name: "group:memory",
@@ -185,7 +210,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:research",
         description: "Deep multi-round web research and synthesis",
-        tools: &["deep_search", "synthesize_research", "deep_crawl"],
+        tools: &["search", "synthesize_research", "deep_crawl"],
     },
     ToolGroupInfo {
         name: "group:admin",
@@ -231,6 +256,28 @@ pub fn tool_group_info(name: &str) -> Option<&'static ToolGroupInfo> {
 /// Expand a group name to its tool names. Returns None if not a group.
 fn expand_group(name: &str) -> Option<&'static [&'static str]> {
     tool_group_info(name).map(|g| g.tools)
+}
+
+/// Predicate that hides every `mofa_*` skill except `mofa_slides` for a
+/// slides session. Designed to be passed to [`crate::ToolRegistry::retain`]
+/// in `session_actor.rs` after `tools.activate("group:media")` so that:
+///
+/// 1. The slides system prompt's "ALWAYS use mofa_slides" rule is enforced
+///    structurally — weaker LLMs (kimi-k2.6 fallback on mini1's dspfac
+///    profile, 2026-05-24) cannot misroute the slides workflow to
+///    `mofa_site` / `mofa_youtube` even when the prompt rule is buried
+///    mid-text.
+/// 2. Non-mofa skills (fm_tts, plugin tools that don't share the prefix)
+///    pass through untouched.
+/// 3. `mofa_slides` itself is preserved.
+///
+/// Returns `true` if the tool should be kept, `false` if it should be
+/// evicted from the registry.
+pub fn keep_tool_in_slides_session(tool_name: &str) -> bool {
+    if tool_name == "mofa_slides" {
+        return true;
+    }
+    !tool_name.starts_with("mofa_")
 }
 
 #[cfg(test)]
@@ -382,5 +429,69 @@ mod tests {
         // Tools not in the group remain allowed by default.
         assert!(policy.is_allowed("read_file"));
         assert!(policy.is_allowed("shell"));
+    }
+
+    #[test]
+    fn should_keep_mofa_slides_in_slides_session() {
+        // The canonical slides skill must survive the per-session filter
+        // — that's the one tool the system prompt instructs the LLM to
+        // call. Evicting it would break the slides workflow entirely.
+        assert!(keep_tool_in_slides_session("mofa_slides"));
+    }
+
+    #[test]
+    fn should_drop_sibling_mofa_skills_in_slides_session() {
+        // The bug originally reported (kimi-k2.6 fallback on mini1
+        // dspfac, 2026-05-24): the LLM saw `mofa_site` /
+        // `mofa_youtube` next to `mofa_slides` and misrouted to them
+        // with empty `audio_path` / `content_dir`. The filter must
+        // hide every non-slides mofa_ skill so the LLM literally
+        // cannot call them in a slides session.
+        for unwanted in [
+            "mofa_site",
+            "mofa_youtube",
+            "mofa_publish",
+            "mofa_research",
+            "mofa_pdf",
+            "mofa_xlsx",
+            "mofa_cli",
+            "mofa_fm",
+            "mofa_frame",
+            "mofa_podcast",
+            "mofa_infographic",
+            "mofa_cards",
+            "mofa_comic",
+        ] {
+            assert!(
+                !keep_tool_in_slides_session(unwanted),
+                "{unwanted} should be hidden in a slides session"
+            );
+        }
+    }
+
+    #[test]
+    fn should_preserve_non_mofa_tools_in_slides_session() {
+        // Slides sessions still need general tools: research,
+        // file ops, shell (gated by the prompt to git + PNG-cache
+        // delete), task-status checks, the auto-delivery surface.
+        // The filter only targets the `mofa_*` skill prefix.
+        for kept in [
+            "read_file",
+            "write_file",
+            "glob",
+            "shell",
+            "send_file",
+            "check_background_tasks",
+            "check_workspace_contract",
+            "web_search",
+            "web_fetch",
+            "fm_tts",
+            "fm_voice_list",
+        ] {
+            assert!(
+                keep_tool_in_slides_session(kept),
+                "{kept} must remain available in a slides session"
+            );
+        }
     }
 }

@@ -38,6 +38,7 @@ use eyre::Result;
 use octos_core::TokenUsage;
 
 use crate::progress::ProgressReporter;
+use octos_core::{PathClassification, SessionScope};
 
 /// Registry of [`AgentDefinition`]-style manifests available to tools.
 ///
@@ -273,6 +274,21 @@ pub struct ToolContext {
     /// Beyond [`crate::tools::spawn::MAX_SPAWN_DEPTH`] the spawn tool
     /// refuses further nesting to bound mutual-recursion blowups.
     pub spawn_depth: u8,
+    /// Phase 1 of the [`SessionScope`] migration (PR #1198 follow-up):
+    /// the single filesystem contract for this session. Constructed at
+    /// the host entry point (`chat.rs` for solo, `serve.rs` /
+    /// `runtime/session.rs` for multi-tenant) and threaded through
+    /// `TOOL_CTX` so any tool can derive its CWD and validate paths
+    /// against the same scope.
+    ///
+    /// `Optional` because Phase 1 is additive — no consumer reads this
+    /// yet. Phase 2 PRs will migrate `RunPipelineTool.working_dir`,
+    /// plugin tool `work_dir`, file tools, shell, etc. to read from
+    /// this field; Phase 3 will retire bespoke validators like
+    /// `api_session_workspace_dirs` in favour of
+    /// [`SessionScope::workspace`]. See `octos_core::session_scope`
+    /// for the contract and migration notes.
+    pub session_scope: Option<Arc<SessionScope>>,
 }
 
 impl ToolContext {
@@ -298,6 +314,7 @@ impl ToolContext {
             cost_accountant: None,
             parent_session_key: None,
             spawn_depth: 0,
+            session_scope: None,
         }
     }
 }
@@ -412,6 +429,14 @@ pub struct ToolResult {
     /// panel can render real per-node attribution. Absent (`None`) for
     /// every tool that does not opt in — keeps legacy callers byte-identical.
     pub structured_metadata: Option<serde_json::Value>,
+    /// Optional named outputs the tool wants the contract layer to read.
+    /// spawn_only plugin tools emit this via `"named_outputs": {"key": "value"}`
+    /// in their stdout JSON envelope. The contract layer forwards each entry
+    /// to validators so `${output.<key>}` interpolation can resolve against
+    /// tool-emitted values (e.g. `mofa_publish` emitting `deploy_url`).
+    /// Values are restricted to strings in v1; key shape must match
+    /// `[a-z][a-z0-9_]*`. Absent (`None`) when the tool emits nothing.
+    pub named_outputs: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Trait for implementing tools.
@@ -471,6 +496,28 @@ pub trait Tool: Send + Sync {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         self.execute(args).await
+    }
+
+    /// Pre-flight argument validation that runs synchronously in the
+    /// foreground before the `spawn_only` intercept dispatches the tool to
+    /// the background.
+    ///
+    /// Returning `Err(msg)` causes the spawn_only intercept to surface the
+    /// error as a normal tool_result `Message` (mirroring the policy-deny
+    /// path) so the LLM sees the failure in its next iteration and can
+    /// retry with corrected arguments. Without this, an LLM-generated bad
+    /// argument (e.g. a structurally invalid DOT graph for `run_pipeline`)
+    /// fails inside the background task with no chance for the agent to
+    /// re-engage — the user sees an error bubble but the LLM thinks it
+    /// succeeded.
+    ///
+    /// Default: no pre-flight check (returns `Ok`). Override in tools whose
+    /// arguments are LLM-generated and cheap to validate, where catching
+    /// malformed input synchronously avoids a wasted background round-trip.
+    /// Keep the check fast (parse + structural validation, no network /
+    /// long-running work) since it blocks the agent's foreground turn.
+    async fn pre_flight_validate(&self, _args: &serde_json::Value) -> Result<(), String> {
+        Ok(())
     }
 
     /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
@@ -576,7 +623,15 @@ pub use registry::ToolRegistry;
 
 // Tool policy
 pub mod policy;
-pub use policy::{PolicyDecision, ToolPolicy};
+pub use policy::{PolicyDecision, ToolPolicy, keep_tool_in_slides_session};
+
+// Shared dispatch-policy gate (#714 / #713) re-exported from the
+// crate root so [`SpawnTool::with_dispatch_policy`] callers can pull
+// the type alongside the other `tools::*` re-exports.
+pub use crate::dispatch_policy::{
+    DispatchBackendMetadata, DispatchPolicy, DispatchTarget, GateDenial, enforce_dispatch_gates,
+    enforce_dispatch_gates_for_backend,
+};
 
 // Robot safety-tier groups consulted by ToolPolicy evaluation.
 pub mod robot_groups;
@@ -586,6 +641,7 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
+pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
 pub mod diff_edit;
@@ -627,6 +683,12 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use coding_tools::{
+    ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
+    ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,
+    ToolCatalogEntry, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
+    WaitAgentTool, WriteStdinTool,
+};
 pub use deep_search::DeepSearchTool;
 pub use delegate::{
     DELEGATED_DENY_GROUP, DELEGATION_METRIC, DelegateTool, DelegationEvent, DelegationOutcome,
@@ -640,9 +702,9 @@ pub use list_dir::ListDirTool;
 pub use manage_skills::ManageSkillsTool;
 pub use mcp_agent::{
     DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
-    DEFAULT_HTTP_READ_TIMEOUT_SECS, DispatchOutcome, DispatchRequest, DispatchResponse,
-    HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, SharedBackend, StdioMcpAgent,
-    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    DEFAULT_HTTP_READ_TIMEOUT_SECS, DispatchContextContract, DispatchOutcome, DispatchRequest,
+    DispatchResponse, HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, SharedBackend,
+    StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
 pub use message::MessageTool;
@@ -675,45 +737,217 @@ pub use code_structure::CodeStructureTool;
 
 use std::path::{Component, Path};
 
-/// Resolve a user-provided path, ensuring it stays within base_dir.
+use crate::policy::FilesystemScope;
+
+/// Resolve a user-provided tool-argument path, ensuring it stays within
+/// `base_dir` **or** inside the authenticated upload tmpdir.
 ///
-/// Rejects absolute paths and prevents traversal via `../`.
-/// Does NOT follow symlinks (normalize only, no filesystem access).
+/// This is a thin compatibility wrapper around
+/// [`octos_bus::file_handle::resolve_tool_path`] — the unified resolver
+/// introduced by `refactor: unified file-path resolver`. The wrapper
+/// preserves the historical signature (`(base_dir, user_path) ->
+/// Result<PathBuf>`) so existing tool implementations keep compiling,
+/// but the actual policy now lives in `octos-bus` so every entry point
+/// (read_file/write_file/edit_file/glob/grep/list_dir, plugin tools,
+/// `send_file`, `read_task_output`) follows the same resolution table:
+///
+/// - `up/<base64>` / `up/<base64>/<display>` upload-handle short-circuit
+/// - `pf/<base64>` / `pf/<base64>/<display>` profile-handle short-circuit
+///   (only honoured when the call site supplies a profile root)
+/// - absolute paths inside upload tmpdir, workspace, or profile root
+/// - bare basenames that exist under the upload tmpdir
+/// - workspace-relative paths (with `..` traversal rejected)
+///
+/// Symlink rejection is the caller's responsibility — use
+/// `read_no_follow` / `write_no_follow` on the returned path. The
+/// resolver only checks containment; the open-time `O_NOFOLLOW` is
+/// what closes the symlink-redirect class of escape.
+///
+/// Callers that need to know whether the resolved file lives inside
+/// the upload tmpdir vs the workspace (e.g. for read-only enforcement
+/// on profile files) should call
+/// [`octos_bus::file_handle::resolve_tool_path`] directly and inspect
+/// the [`octos_bus::file_handle::ToolPathScope`].
 pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
-    if PathBuf::from(user_path).is_absolute() {
-        eyre::bail!("absolute paths are not allowed: {}", user_path);
+    match octos_bus::file_handle::resolve_tool_path(base_dir, None, user_path) {
+        Ok(resolved) => Ok(resolved.absolute),
+        Err(octos_bus::file_handle::ToolPathError::Traversal) => {
+            eyre::bail!("path outside working directory: {}", user_path)
+        }
+        Err(octos_bus::file_handle::ToolPathError::OutsideAllowedRoots) => {
+            // Preserve the legacy error text — call sites and tests
+            // string-match on "absolute paths are not allowed" to
+            // identify the upload-tmpdir-only escape rejection.
+            eyre::bail!(
+                "absolute paths are not allowed outside the upload tmpdir: {}",
+                user_path
+            )
+        }
+        Err(octos_bus::file_handle::ToolPathError::DecodeFailed) => {
+            // Should not happen for callers that pass `profile_root =
+            // None` (only `pf/...` handles produce `DecodeFailed`). If
+            // we ever do see one, surface it as the closest matching
+            // legacy message rather than silently swallowing it.
+            eyre::bail!("path outside working directory: {}", user_path)
+        }
     }
-
-    let path = base_dir.join(user_path);
-    let normalized = normalize_path(&path);
-    let base_normalized = normalize_path(base_dir);
-
-    if !normalized.starts_with(&base_normalized) {
-        eyre::bail!("path outside working directory: {}", user_path);
-    }
-
-    Ok(normalized)
 }
 
-/// Normalize path by resolving `.` and `..` components without filesystem access.
-fn normalize_path(path: &Path) -> PathBuf {
+// Note: lexical-normalisation and lossy-canonicalisation now live in
+// `octos_bus::file_handle::resolve_tool_path` so every entry point (file
+// tools, plugin tools, send_file, read_task_output) shares the same
+// machinery. The previously-inline helpers were retired with that
+// unification.
+
+/// Resolve a user-provided path under an explicit filesystem scope.
+///
+/// [`FilesystemScope::Workspace`] (default) preserves the historical
+/// workspace fence and delegates to [`resolve_path`] (unified resolver).
+///
+/// [`FilesystemScope::Host`] is used only by the explicit
+/// `DangerFullAccess` permission profile (solo-runtime only). It accepts
+/// absolute paths anywhere on disk after syntactic normalization and
+/// resolves relative paths against `base_dir`. The workspace fence is
+/// explicitly bypassed — the safety guarantee comes from the gating on
+/// `PermissionProfile::DangerFullAccess` + `RuntimeMode::Solo`.
+pub fn resolve_path_with_scope(
+    base_dir: &Path,
+    user_path: &str,
+    filesystem_scope: FilesystemScope,
+) -> Result<PathBuf> {
+    if filesystem_scope.is_host() {
+        let candidate = PathBuf::from(user_path);
+        if candidate.is_absolute() {
+            return Ok(normalize_lexical(&candidate));
+        }
+        return Ok(normalize_lexical(&base_dir.join(user_path)));
+    }
+    resolve_path(base_dir, user_path)
+}
+
+/// Resolve and classify a user-supplied path against a [`SessionScope`]
+/// for Phase 2-C file tools. Relative paths anchor at
+/// `scope.workspace()`; absolute paths are accepted but must classify
+/// inside one of the scope's zones.
+///
+/// **Symlink containment.** [`SessionScope::classify_lexical_path`] is
+/// intentionally lexical-only — a candidate like
+/// `<workspace>/symlink/out`, where `symlink` is a symbolic link
+/// pointing outside the workspace, would classify as `InWorkspace`
+/// even though the actual on-disk location is elsewhere. `O_NOFOLLOW`
+/// (applied in [`read_no_follow`] / [`write_no_follow`]) only protects
+/// the FINAL component, not symlinked ancestors. To close that gap
+/// before classification we canonicalize both the candidate and each
+/// zone root via [`canonicalize_lossy`], matching the containment
+/// guarantee `octos_bus::file_handle::resolve_tool_path` gave the
+/// pre-Phase-2C path. See PR #1201 codex review for the precise
+/// scenario (`<workspace>/link/out`).
+///
+/// Returns the (lexically-normalised, NOT canonicalized) absolute path
+/// the file tool should open. We deliberately return the lexical form
+/// so callers can pass it back to `read_no_follow`/`write_no_follow`
+/// without re-resolving — the canonicalization here is for
+/// classification only.
+pub fn resolve_path_for_session_scope_read(
+    scope: &SessionScope,
+    user_path: &str,
+) -> Result<PathBuf, &'static str> {
+    resolve_for_scope(scope, user_path, /*for_write=*/ false)
+}
+
+/// Same as [`resolve_path_for_session_scope_read`] but with the
+/// write-side policy: `InSharedZone` is refused.
+pub fn resolve_path_for_session_scope_write(
+    scope: &SessionScope,
+    user_path: &str,
+) -> Result<PathBuf, &'static str> {
+    resolve_for_scope(scope, user_path, /*for_write=*/ true)
+}
+
+fn resolve_for_scope(
+    scope: &SessionScope,
+    user_path: &str,
+    for_write: bool,
+) -> Result<PathBuf, &'static str> {
+    let candidate = PathBuf::from(user_path);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        scope.workspace().join(candidate)
+    };
+    // Refuse `..` lexically first so the subsequent canonicalize walk
+    // cannot accidentally surface inside a zone after climbing out.
+    let lex_normalised = match lexical_normalise_strict(&absolute) {
+        Some(p) => p,
+        None => return Err("Path outside session scope"),
+    };
+    // PR-A round-2 (codex BLOCKER 1 follow-up): delegate the canonical
+    // containment guard to `SessionScope::classify_canonical_path` so
+    // every consumer (file tools here, plugin tools in
+    // `plugins/tool.rs`) shares one implementation. The helper lives in
+    // `octos-core` next to `classify_lexical_path` because it has no
+    // dependency on tool-side state.
+    match scope.classify_canonical_path(&lex_normalised) {
+        PathClassification::InWorkspace => Ok(lex_normalised),
+        PathClassification::InGrantedDir { .. } => Ok(lex_normalised),
+        PathClassification::InSharedZone { .. } => {
+            if for_write {
+                Err("Writes to shared zones are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
+        // PR-A: read-only plugin skill dirs. Mirror the
+        // `InSharedZone` policy — reads pass through, writes refuse.
+        // The SKILL.md auto-inject teaches the agent to read files
+        // under the plugin's install directory but never write back.
+        PathClassification::InSkillDir { .. } => {
+            if for_write {
+                Err("Writes to plugin skill directories are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
+        PathClassification::OutOfScope => Err("Path outside session scope"),
+    }
+}
+
+/// Lexical normalise (collapse `.`, refuse `..`). Mirrors the helper
+/// inside `octos_core::session_scope` so the canonicalize walk above
+/// can't absorb a traversal escape.
+pub(crate) fn lexical_normalise_strict(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::ParentDir => {
-                out.pop();
-            }
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
             Component::CurDir => {}
-            // RootDir and Prefix reset the path (absolute path semantics)
-            Component::RootDir | Component::Prefix(_) => {
-                out.push(component.as_os_str());
-            }
-            Component::Normal(seg) => {
-                out.push(seg);
-            }
+            Component::ParentDir => return None,
+            Component::Normal(part) => out.push(part),
         }
     }
-    out
+    Some(out)
+}
+
+/// Syntactic path normalization (no filesystem access). Collapses `.`
+/// components and resolves `..` against in-memory parents without
+/// canonicalising symlinks. Used by the Host-scope branch above where
+/// the workspace fence is intentionally absent.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => normalized.push(p.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
 }
 
 /// Check that a path is not a symlink. Returns error message if it is.
@@ -772,9 +1006,42 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
             }
         }
         let mut file = opts.open(&path)?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)?;
-        Ok(content)
+
+        // Peek the first 5 bytes to detect a PDF (`%PDF-`). The symlink-safe
+        // open above is already done; the bytes we read here can't have
+        // followed a symlink. PDF content is binary so `read_to_string`
+        // would fail with a UTF-8 error — for those we route through
+        // `pdf-extract` to recover plain text. Pinned by the mini5 invoice
+        // upload regression (2026-05-12): the LLM couldn't summarize a PDF
+        // because read_to_string aborted immediately.
+        let mut magic = [0u8; 5];
+        match file.read(&mut magic) {
+            Ok(n) if n >= 5 && &magic == b"%PDF-" => {
+                // PDF detected — close the partial read, load whole bytes,
+                // hand to pdf-extract. Errors from extraction get wrapped
+                // as io::Error so callers see a single error type.
+                drop(file);
+                let bytes = std::fs::read(&path)?;
+                match pdf_extract::extract_text_from_mem(&bytes) {
+                    Ok(text) => Ok(text),
+                    Err(err) => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("pdf extraction failed: {err}"),
+                    )),
+                }
+            }
+            Ok(n) => {
+                // Not a PDF. Re-open at the start and read as UTF-8 text.
+                // (Seeking back works on regular files but we re-open for
+                // simplicity — the path is already known-safe.)
+                drop(file);
+                let mut file = opts.open(&path)?;
+                let mut content = String::with_capacity(n);
+                file.read_to_string(&mut content)?;
+                Ok(content)
+            }
+            Err(err) => Err(err),
+        }
     })
     .await
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
@@ -847,6 +1114,34 @@ mod nofollow_tests {
 
         let content = read_no_follow(&file).await.unwrap();
         assert_eq!(content, "hello");
+    }
+
+    /// Pins the PDF auto-extract path (mini5 invoice regression
+    /// 2026-05-12 PT): files whose first 5 bytes are `%PDF-` must be
+    /// routed through `pdf-extract` instead of `read_to_string`. We
+    /// don't ship a real PDF in tests, but feeding a malformed PDF
+    /// proves the route is taken — without the route we'd get a UTF-8
+    /// error; with it we get an `InvalidData("pdf extraction failed:
+    /// ...")` from pdf-extract.
+    #[tokio::test]
+    async fn test_read_no_follow_routes_pdf_through_extractor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf = dir.path().join("invalid.pdf");
+        // Real PDF magic; body is garbage so pdf-extract should fail
+        // with a parse error (NOT a UTF-8 error). The point is to prove
+        // the dispatch happened, not that we can parse this junk.
+        std::fs::write(&pdf, b"%PDF-1.4\nthis is not a valid pdf body").unwrap();
+
+        let err = read_no_follow(&pdf).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "pdf-extract failures must surface as InvalidData, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("pdf extraction failed"),
+            "error should identify the extractor, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -925,6 +1220,90 @@ mod path_tests {
         assert!(resolve_path(base, "/home/user/project/../../../etc/shadow").is_err());
     }
 
+    /// Authenticated upload tmpdir is whitelisted — uploaded files
+    /// land outside the workspace, so `read_file(<absolute upload path>)`
+    /// must succeed (pinned by the mini5 redbank.md regression,
+    /// 2026-05-12: WS upload handles now resolve to absolute tmpdir
+    /// paths, but the LLM hit "absolute paths are not allowed" before
+    /// this fix).
+    ///
+    /// Post-`resolve_tool_path` migration: the resolver now always
+    /// returns the canonical form (firmlinks collapsed via
+    /// `canonicalize_lossy`), so the containment check uses the
+    /// canonicalised upload root instead of the un-prefixed one — the
+    /// macOS firmlink companion test already uses this same shape.
+    #[test]
+    fn test_resolve_allows_absolute_path_inside_upload_root() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        // Ensure the upload root exists so canonicalize succeeds even on
+        // pristine Linux CI runners that haven't touched the tmpdir yet.
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
+        let abs = upload_root.join("abc-redbank-proposal.md");
+        let resolved = resolve_path(Path::new("/home/user/project"), &abs.to_string_lossy())
+            .expect("upload-tmpdir absolute paths must be accepted");
+        let canonical_upload_root = std::fs::canonicalize(&upload_root).unwrap_or(upload_root);
+        assert!(
+            resolved.starts_with(&canonical_upload_root),
+            "resolved path {} should canonicalise under {}",
+            resolved.display(),
+            canonical_upload_root.display()
+        );
+    }
+
+    /// Pins the mini5 redbank.md regression (2026-05-12 PT). On macOS,
+    /// `resolve_upload_reference` canonicalizes via `std::fs::canonicalize`,
+    /// returning the firmlink-resolved form `/private/var/folders/...`. But
+    /// `temp_upload_root()` returns the un-prefixed `/var/folders/...`. A
+    /// purely-syntactic `starts_with` check rejected the canonicalized path
+    /// and `read_file` errored with "absolute paths are not allowed". This
+    /// test exercises the firmlink path: it creates a real file inside the
+    /// upload tmpdir, hands `resolve_path` the canonical (post-firmlink)
+    /// absolute path, and asserts acceptance.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_resolve_macos_firmlink_form_inside_upload_root() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir must be creatable");
+        let probe = upload_root.join(format!("probe-firmlink-{}.txt", std::process::id()));
+        std::fs::write(&probe, b"hi").unwrap();
+        let canonical = std::fs::canonicalize(&probe).expect("canonicalize uploaded file");
+        // Sanity: macOS firmlinks should give us a /private/ prefix when
+        // probing real tmpdir paths. If this ever fails it means the
+        // platform changed; the test still proves the whitelist works.
+        let canonical_str = canonical.to_string_lossy();
+        assert!(
+            canonical_str.starts_with("/private/var/") || canonical_str.starts_with("/var/"),
+            "expected macOS tmpdir under /var/folders/, got {canonical_str}"
+        );
+        let resolved = resolve_path(
+            Path::new("/home/user/project"),
+            &canonical.to_string_lossy(),
+        )
+        .expect("firmlink-canonical upload path must be accepted");
+        assert!(
+            resolved.starts_with(std::fs::canonicalize(&upload_root).unwrap()),
+            "resolved path {} must canonicalize under upload root",
+            resolved.display()
+        );
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    /// Absolute paths outside the upload tmpdir stay rejected — the
+    /// whitelist is narrow, not a general "absolute is OK" loophole.
+    #[test]
+    fn test_resolve_rejects_absolute_path_outside_upload_root() {
+        let base = Path::new("/home/user/project");
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let parent = upload_root.parent().unwrap_or_else(|| Path::new("/"));
+        let sneaky = parent.join("not-uploads/secret.txt");
+        let err = resolve_path(base, &sneaky.to_string_lossy())
+            .expect_err("paths outside both base_dir and upload_root must be rejected");
+        assert!(
+            err.to_string().contains("absolute paths are not allowed"),
+            "expected upload-root rejection message, got: {err}"
+        );
+    }
+
     #[test]
     fn test_resolve_blocks_parent_traversal() {
         let base = Path::new("/home/user/project");
@@ -961,17 +1340,11 @@ mod path_tests {
         assert_eq!(p, PathBuf::from("/home/user/project/a/b/c/d/e/f.rs"));
     }
 
-    #[test]
-    fn test_normalize_handles_complex_paths() {
-        assert_eq!(
-            normalize_path(Path::new("/a/b/../c/./d")),
-            PathBuf::from("/a/c/d")
-        );
-        assert_eq!(
-            normalize_path(Path::new("/a/b/../../c")),
-            PathBuf::from("/c")
-        );
-    }
+    // Note: `test_normalize_handles_complex_paths` retired with the
+    // `normalize_path` helper. Lexical normalisation now lives in
+    // `octos_bus::file_handle::normalize_lexical` and is covered by the
+    // resolver's own `Traversal` rejection tests (see
+    // `crates/octos-bus/tests/file_handle_resolve_tool_path.rs`).
 
     /// Per-profile CWD isolation: when cwd is narrowed to a profile's data_dir,
     /// resolve_path must block access to other profiles' directories.
@@ -1012,6 +1385,124 @@ mod path_tests {
         if let Ok(p) = &result {
             assert!(p.starts_with(base));
         }
+    }
+
+    /// Codex review P1 pin (2026-05-13): the unified resolver MUST NOT
+    /// follow symlinks for workspace-relative paths. File tools layer
+    /// `O_NOFOLLOW` over the resolved path; if the resolver
+    /// canonicalised first, a symlink `workspace/secret -> /etc/passwd`
+    /// would become a plain `/etc/passwd` open and the leaf gate would
+    /// have nothing left to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_workspace_relative_does_not_follow_symlinks() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let outside = tempfile::tempdir().expect("outside tmpdir");
+        let target = outside.path().join("passwd");
+        std::fs::write(&target, b"root:x:0:0").unwrap();
+        let link = workspace.path().join("secret");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let resolved = resolve_path(workspace.path(), "secret")
+            .expect("workspace symlink path must resolve (the leaf-open gate refuses it)");
+        // The resolver returned the LEXICAL workspace path, not the
+        // canonical target outside the workspace.
+        assert_eq!(resolved, workspace.path().join("secret"));
+        assert_ne!(resolved, target);
+    }
+
+    // -------- PR-A: skill_read_zones resolve-for-scope behaviour --------
+
+    /// Reads from a registered skill_dir succeed via the read-side
+    /// resolver. The classifier (canonicalize-both-sides path)
+    /// reports `InSkillDir` and `for_write=false` accepts it.
+    #[test]
+    fn read_file_from_skill_dir_resolves_under_skill_read_zone() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let skill_file = skill.path().join("SKILL.md");
+        std::fs::write(&skill_file, b"# skill").unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .expect("skill_dir is absolute");
+
+        let resolved = resolve_path_for_session_scope_read(&scope, &skill_file.to_string_lossy())
+            .expect("read inside skill_dir must succeed");
+        // The lexical absolute form passes through unchanged
+        // (canonicalisation is only used for classification).
+        assert_eq!(resolved, skill_file);
+    }
+
+    /// PR-A core invariant: write attempts inside a registered
+    /// skill_dir are refused even though reads succeed.
+    /// `for_write=true` (the write-side resolver) must take the
+    /// `InSkillDir` branch and bail with the read-only message.
+    #[test]
+    fn write_file_to_skill_dir_classifies_in_skill_dir_but_resolve_for_write_refuses() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let skill_file = skill.path().join("SKILL.md");
+        std::fs::write(&skill_file, b"# skill").unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .expect("skill_dir is absolute");
+
+        // Read side: accept.
+        let read_ok = resolve_path_for_session_scope_read(&scope, &skill_file.to_string_lossy());
+        assert!(read_ok.is_ok(), "read must succeed inside skill_dir");
+
+        // Write side: refuse. The error text comes from the
+        // `InSkillDir` arm of `resolve_for_scope`.
+        let write_err = resolve_path_for_session_scope_write(&scope, &skill_file.to_string_lossy())
+            .expect_err("write must refuse inside skill_dir");
+        assert!(
+            write_err.contains("Writes to plugin skill directories are not permitted"),
+            "expected skill-dir read-only message, got: {write_err}"
+        );
+    }
+
+    /// Writes inside the workspace still succeed when skill_read_zones
+    /// are configured (additive — no regression to existing tools).
+    #[test]
+    fn write_to_workspace_still_works_when_skill_read_zones_configured() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .unwrap();
+        let target = workspace.path().join("out.txt");
+        let resolved = resolve_path_for_session_scope_write(&scope, &target.to_string_lossy())
+            .expect("writes inside workspace must succeed");
+        assert_eq!(resolved, target);
+    }
+
+    /// Reads outside any registered zone still refuse after
+    /// skill_read_zones land. Pre-PR-A out-of-scope paths must keep
+    /// failing.
+    #[test]
+    fn read_outside_skill_dir_and_workspace_still_refused() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let skill = tempfile::tempdir().expect("skill tmpdir");
+        let outside = tempfile::tempdir().expect("outside tmpdir");
+        std::fs::write(outside.path().join("secret"), b"x").unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
+            .unwrap()
+            .with_skill_read_zones(vec![skill.path().to_path_buf()])
+            .unwrap();
+
+        let target = outside.path().join("secret");
+        let err = resolve_path_for_session_scope_read(&scope, &target.to_string_lossy())
+            .expect_err("path outside scope must be refused");
+        assert!(
+            err.contains("Path outside session scope"),
+            "expected out-of-scope refusal, got: {err}"
+        );
     }
 }
 

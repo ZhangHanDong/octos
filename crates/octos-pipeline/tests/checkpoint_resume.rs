@@ -109,6 +109,7 @@ fn base_config(
         working_dir,
         provider_policy: None,
         plugin_dirs: vec![],
+        plugin_require_signed: false,
         status_bridge: None,
         shutdown: Arc::new(AtomicBool::new(false)),
         max_parallel_workers: 1,
@@ -117,6 +118,8 @@ fn base_config(
         hook_executor: None,
         workspace_context: octos_pipeline::context::PipelineContext::default(),
         host_context: octos_pipeline::host_context::PipelineHostContext::default(),
+        embedder: None,
+        catalog_dir: None,
     }
 }
 

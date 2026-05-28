@@ -72,6 +72,7 @@ impl ProgressReporter for LedgerToolProgressReporter {
         {
             let notification = UiNotification::ToolProgress(ToolProgressEvent {
                 session_id: self.session_id.clone(),
+                topic: self.session_id.topic().map(ToOwned::to_owned),
                 turn_id: self.turn_id.clone(),
                 tool_call_id: tool_id.clone(),
                 message: Some(message.clone()),
@@ -136,7 +137,7 @@ mod tests {
         );
 
         reporter.report(ProgressEvent::ToolProgress {
-            name: "deep_search".into(),
+            name: "search".into(),
             tool_id: "call_42".into(),
             message: "phase 2/4".into(),
         });
@@ -150,7 +151,7 @@ mod tests {
                 tool_id,
                 message,
             } => {
-                assert_eq!(name, "deep_search");
+                assert_eq!(name, "search");
                 assert_eq!(tool_id, "call_42");
                 assert_eq!(message, "phase 2/4");
             }
@@ -226,7 +227,7 @@ mod tests {
         // Fire a single ProgressEvent::ToolProgress, identical to what
         // deep_research emits during a long-running spawn_only run.
         bridged.report(ProgressEvent::ToolProgress {
-            name: "deep_search".into(),
+            name: "search".into(),
             tool_id: "call_42".into(),
             message: "phase 2/4".into(),
         });

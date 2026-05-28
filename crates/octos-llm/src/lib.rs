@@ -15,6 +15,7 @@ pub mod credential_pool;
 pub mod embedding;
 mod failover;
 mod fallback;
+pub mod lane;
 pub mod pricing;
 mod provider;
 pub mod responsiveness;
@@ -40,9 +41,11 @@ pub mod openrouter;
 pub mod registry;
 
 pub use adaptive::{
-    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, BaselineEntry, MetricsSnapshot,
-    ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy, SharedProviderMetrics,
-    StatusCallback, derive_cold_start_catalog,
+    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, AutoEscalationCallback,
+    AutoEscalationConfig, AutoEscalationDecision, AutoEscalationEvent, BaselineEntry,
+    FailoverEvent, MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, RouterContext,
+    SharedMetrics, SharedPolicy, SharedProviderMetrics, StatusCallback, derive_cold_start_catalog,
+    with_router_context,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
@@ -63,6 +66,10 @@ pub use error::{LlmError, LlmErrorKind};
 pub use failover::ProviderChain;
 pub use fallback::FallbackProvider;
 pub use high_level::LlmClient;
+pub use lane::{
+    LANE_CONTEXT, Lane, LaneContext, LaneRoutingConfig, current_lane_context,
+    default_lane_candidates, resolve_lane_for_topic, topic_prefix, with_lane_context,
+};
 pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{

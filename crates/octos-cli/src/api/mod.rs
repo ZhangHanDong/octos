@@ -9,17 +9,25 @@
 
 pub mod admin;
 pub mod admin_setup;
+pub(crate) mod agent_orchestrator;
 pub mod auth_handlers;
+pub(crate) mod coding_tool_contract;
 mod events;
 mod events_harness;
 mod frps_plugin;
+pub(crate) mod goal_loop_runtime;
 mod handlers;
+pub(crate) mod master_continuation_scheduler;
 pub mod metrics;
+pub mod preview;
+pub mod preview_tokens;
 pub mod purge;
 mod router;
+pub(crate) mod specialist_runner;
 mod static_files;
+pub(crate) mod supervisor_store;
 pub mod swarm;
-mod ui_protocol;
+pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha3_bridge;
 mod ui_protocol_alpha4_bridge;
@@ -34,10 +42,50 @@ mod ui_protocol_scope;
 mod ui_protocol_task_output;
 pub mod user_admin;
 pub mod webhook_proxy;
+pub mod ws_slash;
 
 pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
+pub use preview_tokens::{
+    DEFAULT_PREVIEW_SWEEP_INTERVAL, IssueError as PreviewTokenIssueError, PreviewSweeperHandle,
+    PreviewTokens, SharedPreviewTokens, SignedPreviewResponse,
+};
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
+
+/// Test-only re-exports for the build_output_dir validation suite.
+/// Not part of the public API — used by
+/// `crates/octos-cli/tests/build_output_dir_validation.rs` to assert
+/// the handler-layer HTTP status mapping without spinning up the
+/// full Axum router. Codex round-2 follow-up to issue #996.
+#[doc(hidden)]
+pub mod testing {
+    pub use super::handlers::{SiteBuildError, preview_build_error_response};
+}
+
+// #995 follow-up round 3 — Integration tests in
+// `crates/octos-cli/tests/x_profile_id_strip.rs` need to drive
+// `handlers::session_messages` directly: the REST route
+// `GET /api/sessions/{id}/messages` was retired in M12 Phase D-5, so
+// there's no `build_router` path to hit the bypass shape codex flagged.
+// The function (already `pub`) and its query params type are exposed
+// here for that purpose, plus `AuthIdentity` so tests can construct
+// non-admin and admin identities directly without booting a real auth
+// middleware stack.
+//
+// Issue #999 — `session_files` and `session_workspace_contract` are
+// exposed via the same harness for the same reason: the legacy REST
+// routes `GET /api/sessions/{id}/files` and
+// `GET /api/sessions/{id}/workspace-contract` were retired, so the
+// only way to exercise the gateway-mode tenant-leak bypass shape end
+// -to-end is to call the WS handlers directly.
+#[doc(hidden)]
+pub use handlers::{
+    PaginationParams as TestSessionMessagesPaginationParams, session_files as test_session_files,
+    session_messages as test_session_messages,
+    session_workspace_contract as test_session_workspace_contract,
+};
+#[doc(hidden)]
+pub use router::AuthIdentity as TestAuthIdentity;
 pub use swarm::{
     BroadcasterSwarmEventSink, CostAttributionView, CostAttributionsResponse, DispatchIndexRow,
     SubtaskView, SwarmBudgetSpec, SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest,
@@ -235,6 +283,26 @@ pub struct AppState {
     /// serve cwd under launchd is `~`, outside the profile root, and
     /// `/api/files` would 403 anything written there).
     pub appui_default_session_cwd: Option<PathBuf>,
+    /// In-memory signed-preview token cache (issue #1001 follow-up).
+    ///
+    /// The SPA mints a token via `POST /api/my/preview/sign` and serves
+    /// the iframe at `GET /api/preview-signed/{token}/{*path}` — that
+    /// public route consumes the token as its auth credential, so the
+    /// iframe can drop the missing `Authorization: Bearer ...` header
+    /// that the post-PR-#1001 `/api/preview/...` route requires.
+    ///
+    /// Cache is process-local (no disk persistence) so a daemon restart
+    /// invalidates every outstanding grant. See
+    /// [`crate::api::preview_tokens`] for full design rationale.
+    pub preview_tokens: SharedPreviewTokens,
+    /// Owning handle to the background sweeper task spawned for
+    /// `preview_tokens` (issue #1009). Storing it here ties the
+    /// task's lifetime to `AppState`: when the last `Arc<AppState>` is
+    /// dropped (clean shutdown OR any abnormal exit path), the inner
+    /// `PreviewSweeperHandle::drop` aborts the task instead of leaking
+    /// it. `None` in tests and code paths that don't spawn the
+    /// sweeper.
+    pub preview_sweeper: Option<PreviewSweeperHandle>,
 }
 
 impl AppState {
@@ -291,6 +359,11 @@ impl AppState {
             content_classifier: None,
             task_query_store: None,
             appui_default_session_cwd: None,
+            preview_tokens: Arc::new(PreviewTokens::new()),
+            // Tests don't spawn the sweeper. Tests that exercise the
+            // sweeper either drive `sweep_expired_all` directly or
+            // build their own `PreviewSweeperHandle::spawn(...)`.
+            preview_sweeper: None,
         }
     }
 }

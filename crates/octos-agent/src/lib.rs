@@ -17,6 +17,7 @@ pub mod bundled_app_skills;
 pub mod compaction;
 pub mod compaction_tiered;
 pub mod cost_ledger;
+pub mod dispatch_policy;
 pub mod event_bus;
 pub mod exec_env;
 pub mod file_state_cache;
@@ -31,9 +32,12 @@ pub mod plugins;
 pub mod policy;
 pub mod profile;
 pub mod progress;
+pub mod prompt_context;
 pub mod prompt_guard;
 pub mod prompt_layer;
 pub mod provider_tools;
+pub mod recorder;
+pub mod role_template;
 pub mod sandbox;
 mod sanitize;
 pub mod session;
@@ -54,7 +58,8 @@ pub mod workspace_policy;
 pub use abi_schema::{
     COMPACTION_POLICY_SCHEMA_VERSION, COST_ATTRIBUTION_SCHEMA_VERSION,
     CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
-    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, SESSION_SUMMARY_SCHEMA_VERSION,
+    HARNESS_PROGRESS_EVENT_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION,
+    PROGRESS_EVENT_SCHEMA_VERSION, SESSION_SUMMARY_SCHEMA_VERSION,
     SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION,
     SWARM_REVIEW_DECISION_SCHEMA_VERSION, SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION,
     TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
@@ -68,6 +73,7 @@ pub use agent::{
         LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
         SHELL_SPIRAL_VARIANT,
     },
+    memory::MIN_EPISODE_SIMILARITY,
     realtime::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
@@ -82,6 +88,10 @@ pub use cost_ledger::{
     BudgetProjection, BudgetRejectionReason, COST_ATTRIBUTION_COUNTER, COST_LEDGER_FILE,
     COST_USD_HISTOGRAM, ContractCostRollup, CostAccountant, CostAttributionEvent, CostBudgetPolicy,
     CostLedger, PersistentCostLedger, project_cost_usd,
+};
+pub use dispatch_policy::{
+    DispatchBackendMetadata, DispatchPolicy, DispatchTarget, GateDenial, enforce_dispatch_gates,
+    enforce_dispatch_gates_for_backend,
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
@@ -106,9 +116,22 @@ pub use hooks::{
 pub use mcp::{McpClient, McpServerConfig};
 pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig};
+pub use policy::{
+    ApprovalPolicy, EffectivePermissions, FileAccessMode, FilesystemScope, NetworkPolicy,
+    PermissionProfile, PermissionProfileError, RuntimeMode,
+};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
+pub use prompt_context::{
+    PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
+};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
+pub use recorder::{BlackBoxRecorder, RecordEntry};
+pub use role_template::{
+    APPROVAL_ASK, APPROVAL_NEVER, ModelPreference, ROLE_EXPLORER, ROLE_IMPLEMENTER, ROLE_REVIEWER,
+    ROLE_TEST_WORKER, RoleTemplate, RoleTemplateSummary, SANDBOX_AUTO, SANDBOX_NONE,
+    UnknownModelPreference,
+};
 pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
@@ -123,26 +146,27 @@ pub use subagent_summary::{
 };
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
-    ArtifactMimeClass, BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal,
-    TaskCancelError, TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState,
-    TaskStatus, TaskSupervisor, parse_alternatives, validate_spawn_only_artifacts,
+    BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
+    TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,
+    TaskSupervisor, parse_alternatives,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConcurrencyClass, ConfigureToolTool,
     DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,
-    DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool, DispatchOutcome,
-    DispatchRequest, DispatchResponse, EditFileTool, GlobTool, GrepTool, HttpMcpAgent, ListDirTool,
-    MAX_DEPTH, ManageSkillsTool, McpAgentBackend, McpAgentBackendConfig, MessageTool,
-    PolicyDecision, ReadFileTool, ReadTaskOutputTool, RecallMemoryTool, RobotToolRegistry,
-    SaveMemoryTool, SendAppCardTool, SendFileTool, SharedBackend, ShellTool, ShowWeatherCardTool,
-    SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool, ToolApprovalDecision,
-    ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy, ToolRegistry,
-    ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
+    DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool,
+    DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,
+    GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, ManageSkillsTool, McpAgentBackend,
+    McpAgentBackendConfig, MessageTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool,
+    RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool, SendFileTool,
+    SharedBackend, ShellTool, ShowWeatherCardTool, SpawnTool, StdioMcpAgent,
+    SynthesizeResearchTool, Tool, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester,
+    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
+    WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
     build_backend_from_config, build_delegated_child_policy, build_dispatch_event_payload,
-    dispatch_with_metrics, install_robot_registry, record_dispatch,
+    dispatch_with_metrics, install_robot_registry, keep_tool_in_slides_session, record_dispatch,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{

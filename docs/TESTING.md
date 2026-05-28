@@ -93,8 +93,9 @@ cargo test -p octos-cli ui_protocol --features api -- --nocapture
 # 4. Build and boot a local API server for live browser/protocol checks.
 cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000
-curl -sf http://localhost:3000/api/status \
-  -H "Authorization: Bearer ci-test-token"
+# M12 Phase D-5: `/api/status` was retired; use `/health` for liveness
+# probes and the WS `system/status.get` RPC for the structured payload.
+curl -sf http://localhost:3000/health
 
 # 5. M9 wire protocol Playwright gate against the local server.
 npm --prefix e2e install
@@ -125,6 +126,87 @@ KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh session
 The M9 Playwright harness reads `OCTOS_LIVE_URL`, `OCTOS_LIVE_TOKEN` (or
 `OCTOS_AUTH_TOKEN`), and optional `OCTOS_LIVE_PROFILE`. The fixture flags keep
 approval/replay cases deterministic for the protocol gate.
+
+### M12 Solo AppUI Soak
+
+Use this gate for M12 solo-mode runtime evidence. The runner records AppUI
+stdio/WebSocket transcripts and policy artifacts without requiring a model
+provider. Live transports require an API-enabled `octos` binary with the
+`serve` subcommand; set `OCTOS_BIN` if it is not `target/debug/octos`:
+
+```bash
+# Offline artifact schema and no-OTP assertion.
+./scripts/m12-solo-appui-soak.sh self-test
+
+# Live stdio dry-run against the current local backend.
+OCTOS_M12_SOAK_TRANSPORT=stdio ./scripts/m12-solo-appui-soak.sh run
+
+# Live stdio + WebSocket matrix.
+OCTOS_M12_SOAK_TRANSPORT=both ./scripts/m12-solo-appui-soak.sh run
+```
+
+Artifacts are written under `e2e/test-results-m12-solo-soak/<run-id>/`. Each
+transport directory contains:
+
+- `server.log`
+- `appui-transcript.jsonl`
+- `runtime-policy-stamp.json`
+- `tool-registry-snapshot.json`
+- `approval-events.jsonl`
+- `filesystem-probe.json`
+- `soak-summary.json`
+- `summary.env`
+
+The runner calls `profile/local/create` for local no-OTP onboarding and fails if
+the retained transcript contains `auth/send_code` or `auth/verify`. Until
+Workers M12-A/C land their backend methods, non-strict runs may finish with
+`"status": "blocked"` and detailed blockers in `soak-summary.json`. Set
+`OCTOS_M12_SOAK_STRICT=1` once those workers land to require a fully passing
+run.
+
+On shared 249/mini hosts, prefer an explicit run id and port to avoid collisions:
+
+```bash
+OCTOS_M12_SOAK_RUN_ID="$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)" \
+OCTOS_M12_SOAK_PORT=50249 \
+OCTOS_M12_SOAK_ARTIFACT_ROOT="$PWD/e2e/test-results-m12-solo-soak" \
+OCTOS_M12_SOAK_TRANSPORT=both \
+  ./scripts/m12-solo-appui-soak.sh run
+```
+
+The focused fixture test is:
+
+```bash
+npm --prefix e2e run test -- --workers=1 tests/m12-solo-soak-artifacts.spec.ts
+```
+
+### M22 TUI Solo Onboarding Gate
+
+Use this gate for first-run TUI onboarding product-surface evidence. The full
+contract, issue roster, test matrix, and required artifacts live in
+`docs/M22_TUI_SOLO_ONBOARDING_CONTRACT_2026-05-18.md`.
+
+Required backend checks:
+
+```bash
+./scripts/m12-solo-appui-soak.sh self-test
+OCTOS_M12_SOAK_TRANSPORT=both OCTOS_M12_SOAK_STRICT=1 \
+  ./scripts/m12-solo-appui-soak.sh run
+```
+
+Required TUI checks in `../octos-tui`:
+
+```bash
+cargo test --all --workspace onboarding
+cargo test --all --workspace permissions
+scripts/run-onboarding-tmux-soak.sh solo-self-test
+OCTOS_TUI_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh drive-solo
+OCTOS_TUI_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh verify-solo
+```
+
+The M22 release gate must fail on OTP calls in local solo onboarding, secret
+leaks, missing runtime policy stamps, unsupported AppUI calls that should have
+been capability-gated, invalid workspace bypass, or blank/stuck tmux captures.
 
 ---
 

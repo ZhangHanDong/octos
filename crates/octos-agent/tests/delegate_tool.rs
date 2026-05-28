@@ -2,13 +2,18 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use octos_agent::harness_errors::HarnessError;
 use octos_agent::task_supervisor::{TaskLifecycleState, TaskStatus, TaskSupervisor};
+use octos_agent::tools::spawn::ChildPromptContextRequest;
 use octos_agent::tools::{
     DELEGATED_DENY_GROUP, DelegateTool, DepthBudget, MAX_DEPTH, Tool, ToolPolicy,
     build_delegated_child_policy,
+};
+use octos_agent::{
+    PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
 };
 use octos_core::Message;
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
@@ -20,6 +25,30 @@ use tempfile::TempDir;
 /// `Agent::run_task`, so one scripted reply per run is enough.
 struct EchoProvider {
     reply: String,
+}
+
+#[derive(Default)]
+struct RecordingPromptContextManager {
+    calls: Arc<AtomicUsize>,
+}
+
+impl PromptContextManager for RecordingPromptContextManager {
+    fn prepare_prompt(
+        &self,
+        request: PromptContextRequest,
+        messages: &mut Vec<Message>,
+    ) -> Result<PromptContextReport, String> {
+        assert_eq!(request.phase, PromptContextPhase::TurnStart);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(PromptContextReport {
+            prompt_replaced: false,
+            compaction_performed: false,
+            messages_before: messages.len(),
+            messages_after: messages.len(),
+            token_estimate: None,
+            generation: Some(1),
+        })
+    }
 }
 
 #[async_trait]
@@ -97,6 +126,130 @@ async fn should_block_parent_until_child_terminal() {
         child.lifecycle_state()
     );
     assert_eq!(child.status, TaskStatus::Completed);
+}
+
+#[tokio::test]
+async fn should_wire_prompt_context_manager_into_delegated_child() {
+    let dir = TempDir::new().unwrap();
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let memory = memory(&dir).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests: Arc<std::sync::Mutex<Vec<ChildPromptContextRequest>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_calls = calls.clone();
+    let factory_requests = requests.clone();
+
+    let tool = DelegateTool::new(llm("done"), memory, PathBuf::from(dir.path()))
+        .with_task_supervisor(supervisor.clone(), "api:test-session")
+        .with_child_prompt_context_manager_factory(Arc::new(move |request| {
+            factory_requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request);
+            Some(Arc::new(RecordingPromptContextManager {
+                calls: factory_calls.clone(),
+            }))
+        }));
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "use managed delegated context",
+            "label": "managed-delegate"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.success, "child should succeed: {}", result.output);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "delegated child must call the runtime prompt context manager before its model prompt"
+    );
+    let captured = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0];
+    assert_eq!(
+        request.parent_session_key.as_deref(),
+        Some("api:test-session")
+    );
+    // #1132: when a TaskSupervisor is wired, DelegateTool MUST forward
+    // the supervisor-registered `child_session_key` so the persisted
+    // context ledger and the supervisor's task ledger share the same
+    // key. Synthesising a separate `parent#spawn-delegate-N` key
+    // (PR #1126) caused audit/resume paths that follow
+    // `child_session_key` to miss the delegated worker's forked context.
+    let registered_tasks = supervisor.get_tasks_for_session("api:test-session");
+    assert_eq!(registered_tasks.len(), 1, "register must record one task");
+    let registered = &registered_tasks[0];
+    let expected_child_key = format!("api:test-session#child-{}", registered.id);
+    assert_eq!(
+        request.child_session_key.as_deref(),
+        Some(expected_child_key.as_str()),
+        "child_session_key must match the supervisor-derived key (got {:?}, expected {:?})",
+        request.child_session_key,
+        expected_child_key,
+    );
+    assert_eq!(
+        registered.child_session_key.as_deref(),
+        Some(expected_child_key.as_str()),
+        "supervisor must persist the same child_session_key it forwarded to the factory"
+    );
+    assert_eq!(request.task_id.as_deref(), Some(registered.id.as_str()));
+    assert_eq!(request.worker_id, "delegate-0");
+    assert_eq!(request.task_label, "managed-delegate");
+}
+
+#[tokio::test]
+async fn should_pass_none_child_session_key_when_supervisor_absent() {
+    // #1132: legacy / standalone path — when no TaskSupervisor is wired
+    // there is no registered BackgroundTask to read a key from, so
+    // DelegateTool must fall back to `None` and let the factory mint a
+    // unique key (mirrors the SpawnTool path).
+    let dir = TempDir::new().unwrap();
+    let memory = memory(&dir).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests: Arc<std::sync::Mutex<Vec<ChildPromptContextRequest>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_calls = calls.clone();
+    let factory_requests = requests.clone();
+
+    let tool = DelegateTool::new(llm("done"), memory, PathBuf::from(dir.path()))
+        .with_child_prompt_context_manager_factory(Arc::new(move |request| {
+            factory_requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request);
+            Some(Arc::new(RecordingPromptContextManager {
+                calls: factory_calls.clone(),
+            }))
+        }));
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "delegate without supervisor",
+            "label": "standalone-delegate"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.success, "child should succeed: {}", result.output);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let captured = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0];
+    assert!(
+        request.parent_session_key.is_none(),
+        "no supervisor means no parent session key (got {:?})",
+        request.parent_session_key,
+    );
+    assert!(
+        request.child_session_key.is_none(),
+        "without a supervisor the fallback must keep child_session_key=None (got {:?})",
+        request.child_session_key,
+    );
+    assert!(request.task_id.is_some());
+    assert_eq!(request.worker_id, "delegate-0");
+    assert_eq!(request.task_label, "standalone-delegate");
 }
 
 #[tokio::test]

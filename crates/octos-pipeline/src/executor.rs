@@ -314,6 +314,10 @@ pub struct ExecutorConfig {
     pub working_dir: PathBuf,
     pub provider_policy: Option<octos_agent::ToolPolicy>,
     pub plugin_dirs: Vec<PathBuf>,
+    /// Section B (codex review P1.1): pipeline-level strict-signing policy.
+    /// When `true`, the per-node `CodergenHandler` rejects unsigned plugins
+    /// at cache build time. Defaults to `false` (legacy permissive path).
+    pub plugin_require_signed: bool,
     /// Optional status bridge for live progress updates to messaging channels.
     pub status_bridge: Option<PipelineStatusBridge>,
     /// Shared shutdown signal — set to true to cancel all pipeline workers.
@@ -350,6 +354,30 @@ pub struct ExecutorConfig {
     /// at run_pipeline dispatch. Default = empty, which keeps every
     /// pre-M8 invocation site bitwise identical.
     pub host_context: crate::host_context::PipelineHostContext,
+    /// NEW-06 fix: parent-session embedder forwarded onto every per-
+    /// node worker [`octos_agent::Agent`] so episodic memory recall
+    /// stays on the contamination-safe hybrid scored + filtered path.
+    ///
+    /// `None` keeps the legacy unfiltered cwd-only fallback in
+    /// `EpisodeStore::find_relevant` — identical to pre-fix behaviour
+    /// for callers that don't propagate the orchestrator's embedder.
+    pub embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    /// Phase 2-A — directory used to load `pipeline_models.json` and
+    /// `model_catalog.json` for per-node model assignment, plus to
+    /// surface profile-level defaults that must not move when
+    /// `working_dir` is overridden onto a session-scoped workspace.
+    ///
+    /// Pipeline runs invoked from a scoped session set this to the
+    /// **profile** data dir so catalog reads resolve against the
+    /// persistent profile root, even though `working_dir` was swapped
+    /// to `scope.workspace()` for per-node worker CWD isolation.
+    ///
+    /// `None` keeps the pre-Phase-2-A path: catalog reads fall back to
+    /// `working_dir` (which, for non-scoped callers, IS the profile
+    /// dir). Codex review of #1203 caught this overload — without the
+    /// split, scoped runs silently lost strong/fast model defaults +
+    /// cost projections.
+    pub catalog_dir: Option<PathBuf>,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -380,6 +408,94 @@ pub(crate) fn report_progress(message: &str) {
             message: message.to_string(),
         });
     }
+}
+
+/// Shared status snapshot updated by the pipeline executor and read by the
+/// periodic heartbeat task. Lets the chat bubble see a refreshing status
+/// chip during long-running phases (`plan_and_search` 13min, `analyze`
+/// 9min) where existing milestone-only emits leave a 5+ min gap between
+/// visible updates.
+#[derive(Clone, Debug)]
+pub(crate) struct PipelineStatusSnapshot {
+    pub(crate) pipeline_id: String,
+    pub(crate) current_node: String,
+    pub(crate) nodes_done: usize,
+    pub(crate) nodes_total: usize,
+    pub(crate) start: Instant,
+}
+
+/// RAII guard around the heartbeat `JoinHandle` so the spawned task is
+/// aborted on every return path of `run_with_handlers` (Ok, Err, early
+/// returns inside the main loop, panics that unwind through).
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn the heartbeat. Captures `reporter` + `tool_id` from `TOOL_CTX`
+/// synchronously (tokio::spawn would otherwise lose the task-local), then
+/// ticks every `interval` and emits a refreshing `ToolProgress` event.
+/// Returns `None` when no `TOOL_CTX` is active (out-of-band callers / unit
+/// tests) — in that case the heartbeat would be silent anyway.
+fn spawn_pipeline_heartbeat(
+    status: Arc<std::sync::Mutex<PipelineStatusSnapshot>>,
+    interval_secs: u64,
+) -> Option<HeartbeatGuard> {
+    let ctx = TOOL_CTX.try_with(|c| c.clone()).ok()?;
+    let reporter = ctx.reporter.clone();
+    let tool_id = ctx.tool_id.clone();
+    tracing::info!(
+        target: "octos::pipeline::heartbeat",
+        tool_id = %tool_id,
+        interval_secs,
+        "spawn_pipeline_heartbeat: spawned"
+    );
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        // Skip the immediate first tick — the executor itself emits a
+        // `"Pipeline '...' started"` event at T+0, and we don't want a
+        // duplicate before it lands.
+        interval.tick().await;
+        let mut tick_count: u64 = 0;
+        loop {
+            interval.tick().await;
+            tick_count += 1;
+            let snap = match status.lock() {
+                Ok(g) => g.clone(),
+                Err(p) => p.into_inner().clone(),
+            };
+            let elapsed = snap.start.elapsed().as_secs();
+            let message = if snap.nodes_total > 0 {
+                format!(
+                    "Pipeline '{}' running: {} ({}/{} nodes, {}s elapsed)",
+                    snap.pipeline_id, snap.current_node, snap.nodes_done, snap.nodes_total, elapsed,
+                )
+            } else {
+                format!(
+                    "Pipeline '{}' running: {} ({}s elapsed)",
+                    snap.pipeline_id, snap.current_node, elapsed,
+                )
+            };
+            tracing::info!(
+                target: "octos::pipeline::heartbeat",
+                tick = tick_count,
+                elapsed_s = elapsed,
+                node = %snap.current_node,
+                "heartbeat tick: {message}"
+            );
+            reporter.report(ProgressEvent::ToolProgress {
+                name: "run_pipeline".to_string(),
+                tool_id: tool_id.clone(),
+                message,
+            });
+        }
+    });
+    Some(HeartbeatGuard { handle })
 }
 
 /// Resolve an LLM provider from a model key using an optional router.
@@ -551,6 +667,31 @@ fn extract_json_array(text: &str) -> Option<&str> {
     }
 
     None
+}
+
+fn total_pipeline_tokens(usage: &TokenUsage) -> u32 {
+    usage.input_tokens.saturating_add(usage.output_tokens)
+}
+
+fn remaining_pipeline_tokens(max_total_tokens: Option<u32>, usage: &TokenUsage) -> Option<u32> {
+    let max_total_tokens = max_total_tokens?;
+    Some(max_total_tokens.saturating_sub(total_pipeline_tokens(usage)))
+}
+
+fn cap_node_output_tokens_for_remaining_budget(
+    node: &mut PipelineNode,
+    remaining_tokens: u32,
+    peer_count: usize,
+) {
+    if !matches!(node.handler, HandlerKind::Codergen) || remaining_tokens == 0 {
+        return;
+    }
+    let divisor = u32::try_from(peer_count.max(1)).unwrap_or(u32::MAX).max(1);
+    let per_node_cap = remaining_tokens.saturating_div(divisor).max(1);
+    node.max_output_tokens = Some(
+        node.max_output_tokens
+            .map_or(per_node_cap, |existing| existing.min(per_node_cap).max(1)),
+    );
 }
 
 /// Process results from parallel worker execution, producing merged content and summaries.
@@ -822,7 +963,37 @@ impl PipelineExecutor {
         handlers: HandlerRegistry,
     ) -> Result<PipelineResult> {
         // Parse and validate
-        let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+        let mut graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+
+        // Replace the historical pipeline-guard plugin's
+        // before_tool_call hook with an in-process pass that fills
+        // `node.model` / `node.planner_model` for any node the LLM
+        // left unset, using the profile's `model_catalog.json` /
+        // `pipeline_models.json`.
+        //
+        // The plugin form has been observed to silently degrade when
+        // its manifest fails to parse on daemon bootstrap (load order
+        // race); since this assignment is correctness-critical for
+        // strong-vs-fast cost/quality routing across nodes, moving it
+        // in-process makes the behavior deterministic. See
+        // `book/src/skill-development.md`'s "Before You Start: Skill
+        // vs. Workspace Contract" rubric and the pipeline-guard case
+        // study for the full rationale.
+        //
+        // Phase 2-A — catalog reads MUST resolve against the profile
+        // data dir, NOT the per-session workspace `working_dir` was
+        // overridden onto. `catalog_dir` is the explicit split: it
+        // defaults to `working_dir` for backward compat (legacy
+        // callers where the two are the same), and scoped callers
+        // (e.g. `RunPipelineTool::execute`) set it to the profile dir
+        // so model assignment + cost projection don't silently degrade.
+        // Caught in codex review of PR #1203.
+        let catalog_dir = self
+            .config
+            .catalog_dir
+            .as_deref()
+            .unwrap_or(&self.config.working_dir);
+        crate::model_assignment::assign_from_catalog_dir(&mut graph, catalog_dir);
 
         // ── Pipeline start: log graph structure ──
         let node_summary: Vec<String> = graph
@@ -1111,6 +1282,7 @@ impl PipelineExecutor {
                 &policy.validation.validators,
                 "pipeline",
                 ValidatorPhase::Completion,
+                None,
             )
             .await?;
         }
@@ -1187,6 +1359,7 @@ impl PipelineExecutor {
             &scoped,
             &format!("pipeline-node-{node_id}"),
             ValidatorPhase::Completion,
+            None,
         )
         .await
         .map(|_| ())
@@ -1198,10 +1371,22 @@ impl PipelineExecutor {
     /// as the synthetic tool name (`pipeline:<node_id>`) and the
     /// `parent_tool_call_id` from the host context as the
     /// `tool_call_id` so the UI can stitch the node tree under the
-    /// invoking run_pipeline pill. Returns `None` when no supervisor
-    /// is wired (legacy callers).
-    fn register_node_task(&self, node_id: &str) -> Option<String> {
-        let supervisor = self.config.host_context.task_supervisor.as_ref()?;
+    /// invoking run_pipeline pill.
+    ///
+    /// NEW-18b — uses the supervisor's strict
+    /// [`octos_agent::task_supervisor::TaskSupervisor::try_register_node_task`]
+    /// entry point so a child registration against an already-terminal
+    /// parent (e.g. orphan-swept on restart) is refused. Returns:
+    /// * `Ok(None)` when no supervisor is wired (legacy callers).
+    /// * `Ok(Some(task_id))` on a successful registration.
+    /// * `Err(reason)` when the parent is terminal OR the cap fires.
+    ///   The caller short-circuits the local node future so dropped
+    ///   workers don't continue burning CPU/tokens against a parent
+    ///   that no longer has a live failure-recovery path.
+    fn register_node_task(&self, node_id: &str) -> Result<Option<String>, String> {
+        let Some(supervisor) = self.config.host_context.task_supervisor.as_ref() else {
+            return Ok(None);
+        };
         let parent_tool_call_id = self
             .config
             .host_context
@@ -1210,14 +1395,26 @@ impl PipelineExecutor {
             .unwrap_or("");
         let session_key = self.config.host_context.parent_session_key.as_deref();
         let tool_name = format!("pipeline:{node_id}");
-        let task_id = supervisor.register(&tool_name, parent_tool_call_id, session_key);
-        info!(
-            node = %node_id,
-            task_id = %task_id,
-            parent_tool_call_id = %parent_tool_call_id,
-            "registered pipeline node child task"
-        );
-        Some(task_id)
+        match supervisor.try_register_node_task(&tool_name, parent_tool_call_id, session_key) {
+            Ok(task_id) => {
+                info!(
+                    node = %node_id,
+                    task_id = %task_id,
+                    parent_tool_call_id = %parent_tool_call_id,
+                    "registered pipeline node child task"
+                );
+                Ok(Some(task_id))
+            }
+            Err(err) => {
+                warn!(
+                    node = %node_id,
+                    parent_tool_call_id = %parent_tool_call_id,
+                    error = %err,
+                    "pipeline node child registration refused; aborting node future"
+                );
+                Err(err.to_string())
+            }
+        }
     }
 
     /// Reserve sub-budget for a single LLM-call node. Returns:
@@ -1274,11 +1471,21 @@ impl PipelineExecutor {
         )
         .with_provider_policy(self.config.provider_policy.clone())
         .with_plugin_dirs(self.config.plugin_dirs.clone())
+        .with_plugin_require_signed(self.config.plugin_require_signed)
         // M8 parity (W1.A1): propagate the host context so per-node
         // Agents inherit the parent session's FileStateCache /
         // SubAgentOutputRouter / AgentSummaryGenerator. Empty context
         // keeps pre-M8 behaviour bitwise identical.
         .with_host_context(self.config.host_context.clone());
+
+        // NEW-06 fix: thread the parent embedder through to the
+        // handler so every per-node worker Agent runs the
+        // contamination-safe hybrid memory recall path. When unset
+        // (legacy callers without an embedder configured) workers stay
+        // on the cwd-only fallback — identical to pre-fix behaviour.
+        if let Some(ref embedder) = self.config.embedder {
+            codergen = codergen.with_embedder(embedder.clone());
+        }
 
         if let Some(ref router) = self.config.provider_router {
             codergen = codergen.with_provider_router(router.clone());
@@ -1365,7 +1572,31 @@ impl PipelineExecutor {
             graph.nodes.len()
         ));
 
+        // Periodic heartbeat (issue #964 follow-up): a fresh `ToolProgress`
+        // event every 5s with the current node + nodes-done counter +
+        // elapsed seconds. Existing milestone-only emits leave 5+ min gaps
+        // (analyze can run 9 min between events) — without the heartbeat
+        // the chat bubble appears frozen for entire pipeline phases.
+        let heartbeat_status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: graph.id.clone(),
+            current_node: current_node_id.clone(),
+            nodes_done: 0,
+            nodes_total: graph.nodes.len(),
+            start: Instant::now(),
+        }));
+        let _heartbeat = spawn_pipeline_heartbeat(heartbeat_status.clone(), 5);
+
         loop {
+            // Refresh the heartbeat snapshot at every iteration so the
+            // periodic chip reflects the node currently executing. The
+            // counter increments after each handler completes (see the
+            // `parallel_executed` short-circuit + the post-handler block
+            // further down where `completed.insert(...)` runs).
+            if let Ok(mut g) = heartbeat_status.lock() {
+                g.current_node = current_node_id.clone();
+                g.nodes_done = completed.len();
+            }
+
             let node = graph
                 .nodes
                 .get(&current_node_id)
@@ -1508,6 +1739,29 @@ impl PipelineExecutor {
                     return Err(eyre::eyre!(err));
                 }
 
+                let llm_target_count = targets
+                    .iter()
+                    .filter_map(|target_id| graph.nodes.get(target_id))
+                    .filter(|target| matches!(target.handler, HandlerKind::Codergen))
+                    .count()
+                    .max(1);
+                let parallel_remaining_tokens =
+                    remaining_pipeline_tokens(graph.max_total_tokens, &total_tokens);
+                if matches!(parallel_remaining_tokens, Some(0)) {
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted before parallel node '{}': spent {} tokens",
+                            node.id,
+                            total_pipeline_tokens(&total_tokens)
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
+
                 let fan_start = Instant::now();
 
                 // Prepare and execute all targets concurrently, capped by semaphore
@@ -1546,6 +1800,13 @@ impl PipelineExecutor {
                     }
                     if target_with_prompt.model.is_none() {
                         target_with_prompt.model = graph.default_model.clone();
+                    }
+                    if let Some(remaining_tokens) = parallel_remaining_tokens {
+                        cap_node_output_tokens_for_remaining_budget(
+                            &mut target_with_prompt,
+                            remaining_tokens,
+                            llm_target_count,
+                        );
                     }
 
                     // Reserve budget for each LLM-call branch before
@@ -1782,6 +2043,22 @@ impl PipelineExecutor {
                 if let Some(ref bridge) = self.config.status_bridge {
                     bridge.add_tokens(&plan_usage);
                 }
+                let dynamic_remaining_tokens =
+                    remaining_pipeline_tokens(graph.max_total_tokens, &total_tokens);
+                if matches!(dynamic_remaining_tokens, Some(0)) {
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted after dynamic_parallel planner '{}': spent {} tokens",
+                            node.id,
+                            total_pipeline_tokens(&total_tokens)
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
 
                 // Build synthetic PipelineNodes for each dynamic task
                 let worker_prompt_template = node.worker_prompt.as_deref().unwrap_or(
@@ -1917,6 +2194,13 @@ impl PipelineExecutor {
                             resolved = resolved.replace(&placeholder, value);
                         }
                         synth_node.prompt = Some(resolved.trim_end().to_string());
+                    }
+                    if let Some(remaining_tokens) = dynamic_remaining_tokens {
+                        cap_node_output_tokens_for_remaining_budget(
+                            &mut synth_node,
+                            remaining_tokens,
+                            total_workers,
+                        );
                     }
 
                     if let Some(handle) = self.reserve_node_budget(&graph.id, &synth_node).await? {
@@ -2079,6 +2363,30 @@ impl PipelineExecutor {
                 node_with_prompt.model = graph.default_model.clone();
             }
 
+            if let Some(remaining_tokens) =
+                remaining_pipeline_tokens(graph.max_total_tokens, &total_tokens)
+            {
+                if remaining_tokens == 0 {
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted before node '{}': spent {} tokens",
+                            node.id,
+                            total_pipeline_tokens(&total_tokens)
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
+                cap_node_output_tokens_for_remaining_budget(
+                    &mut node_with_prompt,
+                    remaining_tokens,
+                    1,
+                );
+            }
+
             let input_bytes = input_text.len();
 
             let seq_label = node.label.as_deref().unwrap_or(&node.id);
@@ -2124,7 +2432,30 @@ impl PipelineExecutor {
             // the session actor) bridges every state transition onto
             // the SSE stream so the chat UI's NodeCard can render the
             // node tree live.
-            let node_task_id = self.register_node_task(&node.id);
+            //
+            // NEW-18b — refuse to register when the parent task is
+            // already terminal (e.g. orphan-swept on serve restart).
+            // Bail out of the executor loop instead of letting the
+            // straggler worker burn CPU/tokens producing output that
+            // will never be reaped by the dead parent.
+            let node_task_id = match self.register_node_task(&node.id) {
+                Ok(opt) => opt,
+                Err(reason) => {
+                    warn!(
+                        node = %node.id,
+                        reason = %reason,
+                        "pipeline executor aborting: parent task is terminal — registration refused"
+                    );
+                    return Ok(PipelineResult {
+                        output: format!("Pipeline aborted before node '{}': {reason}", node.id),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
+            };
             if let Some(ref id) = node_task_id {
                 node_task_ids.insert(node.id.clone(), id.clone());
                 if let Some(ref supervisor) = self.config.host_context.task_supervisor {
@@ -2418,7 +2749,7 @@ impl PipelineExecutor {
             }
 
             // Handle errors
-            if outcome.status == OutcomeStatus::Error {
+            if outcome.status == OutcomeStatus::Error && !node.continue_on_error {
                 warn!(
                     node = %node.id,
                     "node returned error, stopping pipeline"
@@ -2431,6 +2762,37 @@ impl PipelineExecutor {
                     files_modified: vec![],
                     node_costs: node_costs.clone(),
                 });
+            }
+            if outcome.status == OutcomeStatus::Error && node.continue_on_error {
+                warn!(
+                    node = %node.id,
+                    "node returned error, continuing because continue_on_error=true"
+                );
+            }
+
+            if let Some(max_total_tokens) = graph.max_total_tokens {
+                let spent = total_tokens
+                    .input_tokens
+                    .saturating_add(total_tokens.output_tokens);
+                if spent >= max_total_tokens {
+                    warn!(
+                        pipeline = %graph.id,
+                        spent,
+                        max_total_tokens,
+                        "pipeline token budget exhausted"
+                    );
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted after node '{}': spent {spent}/{max_total_tokens} tokens",
+                            node.id
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
             }
 
             // Select next edge
@@ -2770,6 +3132,7 @@ mod tests {
             working_dir: PathBuf::from("/tmp"),
             provider_policy: None,
             plugin_dirs: vec![],
+            plugin_require_signed: false,
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
@@ -2778,6 +3141,8 @@ mod tests {
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
             host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            catalog_dir: None,
         }
     }
 
@@ -2818,6 +3183,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    #[test]
+    fn caps_codergen_output_tokens_by_remaining_pipeline_budget() {
+        let mut node = PipelineNode {
+            handler: HandlerKind::Codergen,
+            ..Default::default()
+        };
+        cap_node_output_tokens_for_remaining_budget(&mut node, 900, 3);
+        assert_eq!(node.max_output_tokens, Some(300));
+
+        node.max_output_tokens = Some(100);
+        cap_node_output_tokens_for_remaining_budget(&mut node, 900, 3);
+        assert_eq!(node.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn leaves_non_llm_nodes_uncapped_by_pipeline_budget() {
+        let mut node = PipelineNode {
+            handler: HandlerKind::Shell,
+            max_output_tokens: Some(500),
+            ..Default::default()
+        };
+        cap_node_output_tokens_for_remaining_budget(&mut node, 900, 3);
+        assert_eq!(node.max_output_tokens, Some(500));
     }
 
     // --- extract_json_array tests ---
@@ -2915,6 +3305,7 @@ mod tests {
             working_dir: PathBuf::from("/tmp"),
             provider_policy: None,
             plugin_dirs: vec![],
+            plugin_require_signed: false,
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
@@ -2923,6 +3314,8 @@ mod tests {
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
             host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            catalog_dir: None,
         }
     }
 
@@ -2996,6 +3389,308 @@ mod tests {
         assert!(
             result.is_ok(),
             "fan-out below cap should complete: {result:?}"
+        );
+    }
+
+    // ── Heartbeat (#964 follow-up) ─────────────────────────────────────
+    //
+    // Verifies that `spawn_pipeline_heartbeat` ticks at the configured
+    // interval, reads the shared `PipelineStatusSnapshot` each tick, and
+    // emits `ProgressEvent::ToolProgress` events through the captured
+    // reporter. The guard's `Drop` aborts the task so it doesn't outlive
+    // the surrounding `run_with_handlers` call.
+
+    /// Capturing reporter — collects every emitted `ProgressEvent` into a
+    /// `Vec` so the test can assert on the messages.
+    #[derive(Default, Clone)]
+    struct CapturingReporter {
+        events: Arc<std::sync::Mutex<Vec<octos_agent::progress::ProgressEvent>>>,
+    }
+
+    impl octos_agent::progress::ProgressReporter for CapturingReporter {
+        fn report(&self, event: octos_agent::progress::ProgressEvent) {
+            if let Ok(mut g) = self.events.lock() {
+                g.push(event);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_emits_periodic_progress_with_current_node() {
+        let reporter = CapturingReporter::default();
+        let captured = reporter.events.clone();
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-heartbeat".to_string(),
+            reporter: Arc::new(reporter),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: "research".to_string(),
+            current_node: "plan_and_search".to_string(),
+            nodes_done: 0,
+            nodes_total: 3,
+            start: Instant::now(),
+        }));
+
+        // Run the heartbeat inside TOOL_CTX.scope so the spawn helper can
+        // capture reporter + tool_id synchronously. The 1s interval keeps
+        // the test fast while still proving the periodic shape.
+        let status_for_advance = status.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                let _guard = spawn_pipeline_heartbeat(status_for_advance.clone(), 1)
+                    .expect("heartbeat should spawn when TOOL_CTX is set");
+                // Wait long enough for ≥2 ticks: first tick is consumed
+                // by `interval.tick().await` (the skip-immediate guard),
+                // the next two fire at +1s and +2s. Sleep 2.4s real time.
+                tokio::time::sleep(Duration::from_millis(2_400)).await;
+
+                // Update the snapshot mid-flight so the next tick
+                // reflects the new node — guards against a stale snapshot
+                // baked at spawn time.
+                if let Ok(mut g) = status_for_advance.lock() {
+                    g.current_node = "analyze".to_string();
+                    g.nodes_done = 1;
+                }
+                tokio::time::sleep(Duration::from_millis(1_100)).await;
+                // Guard drops here — heartbeat task aborts.
+            })
+            .await;
+
+        let events = captured.lock().unwrap();
+        // Expect ≥2 ticks (sleep 2.4s skips first immediate tick, then
+        // fires at +1s and +2s) plus possibly +3.5s for the post-update
+        // tick. Lower bound: 2.
+        assert!(
+            events.len() >= 2,
+            "expected ≥2 heartbeat events in 3.5s; got {}: {:?}",
+            events.len(),
+            events,
+        );
+
+        let messages: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                octos_agent::progress::ProgressEvent::ToolProgress { message, .. } => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages.len(),
+            events.len(),
+            "heartbeat must emit ToolProgress events only — got: {:?}",
+            events,
+        );
+
+        let combined = messages.join("\n");
+        assert!(
+            combined.contains("research"),
+            "heartbeat must include the pipeline id; got: {combined}",
+        );
+        assert!(
+            combined.contains("plan_and_search") || combined.contains("analyze"),
+            "heartbeat must surface the current_node from the snapshot; got: {combined}",
+        );
+        // Each tick should also include an elapsed-seconds suffix so
+        // every message is unique — protects against SPA dedup-by-message
+        // that would otherwise collapse identical chips.
+        assert!(
+            combined.contains("s elapsed"),
+            "heartbeat message must contain '<N>s elapsed'; got: {combined}",
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_guard_drop_stops_emission() {
+        let reporter = CapturingReporter::default();
+        let captured = reporter.events.clone();
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-heartbeat-stop".to_string(),
+            reporter: Arc::new(reporter),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: "p".to_string(),
+            current_node: "n".to_string(),
+            nodes_done: 0,
+            nodes_total: 1,
+            start: Instant::now(),
+        }));
+
+        TOOL_CTX
+            .scope(ctx, async move {
+                {
+                    let _guard = spawn_pipeline_heartbeat(status.clone(), 1).unwrap();
+                    tokio::time::sleep(Duration::from_millis(1_200)).await;
+                    // _guard drops here when block exits.
+                }
+                let count_at_drop = captured.lock().unwrap().len();
+                // Sleep past 2 more theoretical tick intervals.
+                tokio::time::sleep(Duration::from_millis(2_500)).await;
+                let count_after_drop = captured.lock().unwrap().len();
+                assert_eq!(
+                    count_at_drop, count_after_drop,
+                    "no new heartbeat events should fire after the guard drops; got {count_at_drop} -> {count_after_drop}",
+                );
+            })
+            .await;
+    }
+
+    /// Phase 2-A integration — the `working_dir` set on
+    /// [`ExecutorConfig`] must flow all the way down through
+    /// [`PipelineExecutor::build_codergen`] onto the per-node
+    /// [`CodergenHandler`]'s `working_dir`. This is the wire that
+    /// `RunPipelineTool::execute` rides when it swaps the tool's
+    /// pinned working dir for `scope.workspace()`. If this regresses,
+    /// the mini5 NEW-06 fix silently goes dead even though the
+    /// resolver still computes the right CWD.
+    ///
+    /// `make_test_config` opens its own runtime so it can't be called
+    /// from inside `#[tokio::test]`; we mirror the `make_capped_config`
+    /// pattern (async test + async config builder) so we share the
+    /// outer runtime.
+    #[tokio::test]
+    async fn build_codergen_propagates_executor_working_dir_to_handler() {
+        let custom_wd = tempfile::tempdir().expect("temp dir");
+        let mut config = ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            working_dir: PathBuf::from("/tmp"),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            plugin_require_signed: false,
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            catalog_dir: None,
+        };
+        config.working_dir = custom_wd.path().to_path_buf();
+        let executor = PipelineExecutor::new(config);
+        let codergen = executor.build_codergen_for_test();
+        assert_eq!(
+            codergen.working_dir_for_test(),
+            custom_wd.path(),
+            "CodergenHandler must inherit ExecutorConfig.working_dir so the \
+             Phase 2-A scope override actually reaches per-node worker CWDs"
+        );
+    }
+
+    /// Phase 2-A codex review (#1203) — when the pipeline runs inside a
+    /// session, the worker CWD (`working_dir`) and the catalog/profile
+    /// root MUST be separable. The executor's model assignment pass
+    /// reads `pipeline_models.json` / `model_catalog.json` from the
+    /// profile data dir, not the per-session workspace. Without the
+    /// split, scoped runs would silently lose strong/fast model
+    /// defaults and cost projections would fall back to the minimum
+    /// estimate. Pin the split: with `catalog_dir` populated, catalog
+    /// reads resolve against it even though `working_dir` was swapped.
+    #[tokio::test]
+    async fn catalog_dir_overrides_working_dir_for_model_assignment() {
+        let profile_root = tempfile::tempdir().expect("profile root");
+        let session_workspace = tempfile::tempdir().expect("session workspace");
+
+        // Write a minimal catalog only under the profile root. If the
+        // assignment pass reads from working_dir (the session
+        // workspace) it will find nothing and silently no-op; if it
+        // reads from catalog_dir (the profile root) it will load the
+        // file.
+        let pipeline_models = profile_root.path().join("pipeline_models.json");
+        std::fs::write(&pipeline_models, b"{\"strong\":[],\"fast\":[]}").unwrap();
+
+        let config = ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            // worker CWD = per-session workspace (what Phase 2-A
+            // overrides onto when a scope is present).
+            working_dir: session_workspace.path().to_path_buf(),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            plugin_require_signed: false,
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            // catalog reads must hit the PROFILE root, not the worker CWD.
+            catalog_dir: Some(profile_root.path().to_path_buf()),
+        };
+
+        // Pin the helper that the executor uses for catalog lookup:
+        // unwrap_or-fallback must yield the catalog_dir when set.
+        let executor = PipelineExecutor::new(config);
+        let catalog_dir = executor
+            .config
+            .catalog_dir
+            .as_deref()
+            .unwrap_or(&executor.config.working_dir);
+        assert_eq!(
+            catalog_dir,
+            profile_root.path(),
+            "catalog_dir must be preferred over working_dir for catalog reads — \
+             scoped runs lose model defaults without this split (codex #1203 P2)"
+        );
+        assert_ne!(
+            catalog_dir, executor.config.working_dir,
+            "the test setup must actually exercise the split path \
+             (catalog_dir != working_dir)"
+        );
+    }
+
+    /// Backward-compat — when `catalog_dir` is `None` (legacy callers
+    /// that didn't opt into the split), catalog reads still resolve
+    /// against `working_dir`. This is exactly the pre-Phase-2-A path.
+    #[tokio::test]
+    async fn catalog_dir_falls_back_to_working_dir_when_unset() {
+        let only_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            working_dir: PathBuf::from("/tmp"),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            plugin_require_signed: false,
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            catalog_dir: None,
+        };
+        config.working_dir = only_dir.path().to_path_buf();
+        let executor = PipelineExecutor::new(config);
+        let catalog_dir = executor
+            .config
+            .catalog_dir
+            .as_deref()
+            .unwrap_or(&executor.config.working_dir);
+        assert_eq!(
+            catalog_dir,
+            only_dir.path(),
+            "without catalog_dir the executor must fall back to working_dir \
+             (legacy callers, pre-Phase-2-A behaviour)"
         );
     }
 }

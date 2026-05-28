@@ -293,6 +293,24 @@ pkg_hint() {
 # Install a package using the command from pkg_hint.
 # Usage: install_pkg <package>
 # Returns 0 on success, 1 on failure.
+#
+# Pre-2026-05-18: this helper silenced stderr (`eval "$cmd" >/dev/null 2>&1`)
+# and printed only "<pkg> install failed" on a non-zero exit. That hid the
+# most common real-world failure on a fresh macOS host — `brew install`
+# returns "command not found: brew" because Homebrew itself isn't installed
+# — and let operators believe their fleet was correctly bootstrapped while
+# silently shipping without Node.js / ffmpeg / chromium. Live mini2/3/5
+# regression 2026-05-18 (mofa-slides `input=script.js` codepath broken on
+# three hosts; not noticed for weeks).
+#
+# Now:
+#   * On macOS, if the install command starts with `brew` and `brew` is
+#     not in PATH, refuse early with the canonical Homebrew bootstrap
+#     hint instead of running an `eval "brew …"` that's guaranteed to
+#     fail.
+#   * Capture the eval's stderr to a tempfile and surface the LAST few
+#     lines on failure, so the operator sees the actual reason rather
+#     than just "<pkg> install failed".
 install_pkg() {
     local pkg="$1"
     local cmd
@@ -301,12 +319,34 @@ install_pkg() {
         warn "don't know how to install $pkg on this system"
         return 1
     fi
+    # macOS gate: if the install plan calls `brew` and brew is missing,
+    # do not even try — the eval would emit "command not found: brew"
+    # to stderr, which the legacy code silenced. Tell the operator
+    # exactly what to run first.
+    if [ "$OS" = "Darwin" ] && [[ "$cmd" == brew* ]] && ! command -v brew >/dev/null 2>&1; then
+        warn "$pkg install failed: Homebrew is not installed on this host"
+        hint "Install Homebrew first, then re-run this script:"
+        hint '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+        hint "then: $cmd"
+        return 1
+    fi
     echo "    Installing $pkg..."
-    if eval "$cmd" >/dev/null 2>&1; then
+    local stderr_log
+    stderr_log=$(mktemp -t octos-install-pkg-stderr.XXXXXX)
+    if eval "$cmd" >/dev/null 2>"$stderr_log"; then
+        rm -f "$stderr_log"
         return 0
     else
         warn "$pkg install failed"
         hint "$cmd"
+        if [ -s "$stderr_log" ]; then
+            # Surface the LAST 5 lines of stderr so the operator can see
+            # the proximate cause without scrolling through a brew/apt
+            # download log.
+            hint "Captured error output (last 5 lines):"
+            tail -5 "$stderr_log" 2>/dev/null | sed 's/^/    /' >&2 || true
+        fi
+        rm -f "$stderr_log"
         return 1
     fi
 }
@@ -522,8 +562,16 @@ write_octos_service() {
         <string>--auth-token</string>
         <string>$AUTH_TOKEN</string>
     </array>
+    <!--
+      UserName: prefer SUDO_USER (the operator who invoked sudo) over `whoami`.
+      When this installer is run as `sudo ./install.sh`, `whoami` resolves to
+      `root` and the daemon would start as root — which then writes its caches
+      (e.g. `.main_verified` under skill dirs) with root ownership, locking out
+      the operator's interactive `octos` CLI. Falling back to `whoami` keeps
+      the non-sudo path working unchanged.
+    -->
     <key>UserName</key>
-    <string>$(whoami)</string>
+    <string>${SUDO_USER:-$(whoami)}</string>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>
@@ -1235,7 +1283,7 @@ case "$TRIPLE" in
         err "macOS x86_64 does not have pre-built binaries yet."
         hint "Build from source with the canonical feature set:"
         hint "  cargo install --path crates/octos-cli \\"
-        hint "      --features \"api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot\""
+        hint "      --features \"api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3\""
         hint "(matches scripts/milestone-ci.sh; \`api\` is required for \`octos serve\`.)"
         ;;
 esac
@@ -1672,7 +1720,9 @@ if [ "$ENABLE_TUNNEL" = true ]; then
         echo "    Check logs: tail -f /var/log/frpc.log"
     fi
 
-    if curl -sf --max-time 3 "http://localhost:${PORT}/api/status" > /dev/null 2>&1; then
+    # `/api/status` was retired in M12 Phase D-5 (ADR PR #910). Use the
+    # public `/health` endpoint as a daemon liveness probe instead.
+    if curl -sf --max-time 3 "http://localhost:${PORT}/health" > /dev/null 2>&1; then
         ok "octos serve is running on port ${PORT}"
     else
         warn "octos serve is not responding on port ${PORT} (tunnel will retry once it starts)"
@@ -1705,6 +1755,11 @@ if [ -n "$CADDY_DOMAIN" ]; then
     # Determine serve port (match what octos serve uses)
     CADDY_UPSTREAM="localhost:${PORT}"
 
+    # Regex-escape the configured domain so dots match literally
+    # (each '.' becomes '\\.' in the emitted Caddyfile, which CEL parses
+    # to '\.' and RE2 then treats as a literal dot). Closes #1124.
+    CADDY_DOMAIN_RE="${CADDY_DOMAIN//./\\\\.}"
+
     # Write Caddyfile
     CADDYFILE_PATH="$DATA_DIR/Caddyfile"
     cat > "$CADDYFILE_PATH" << CADDYEOF
@@ -1715,7 +1770,23 @@ if [ -n "$CADDY_DOMAIN" ]; then
 }
 
 :9999 {
-    respond /check 200
+    # On-demand TLS gate. Only the configured apex or exactly one
+    # label before it (matching the *.${CADDY_DOMAIN} route below)
+    # may trigger ACME issuance — any other SNI returns 403 so Caddy
+    # refuses to ask Let's Encrypt for a cert. Deeper names like
+    # a.b.${CADDY_DOMAIN} are NOT routed and must not consume the
+    # configured domain's ACME rate limit. This is the security
+    # boundary that prevents arbitrary DNS pointed at this server
+    # from burning ACME rate limits. See codex P1 follow-up to
+    # #380 / #1070, and #1124 for the apex+single-label tightening.
+    @octos_tls expression \`{query.domain}.matches("^([^.]+\\\\.)?${CADDY_DOMAIN_RE}\$")\`
+    respond @octos_tls 200
+    respond /check 403
+}
+
+http:// {
+    @octos host ${CADDY_DOMAIN} *.${CADDY_DOMAIN}
+    redir @octos https://{host}{uri} 308
 }
 
 ${CADDY_DOMAIN} {
@@ -1736,32 +1807,36 @@ ${CADDY_DOMAIN} {
     }
 }
 
-*.${CADDY_DOMAIN} {
+https:// {
+    # Site address is intentionally catch-all so Caddy issues per-host
+    # on-demand certs via HTTP/TLS-ALPN challenges (a wildcard site
+    # address would force Caddy to manage a literal *.${CADDY_DOMAIN}
+    # subject, which Let's Encrypt only issues via DNS challenge). The
+    # security boundary is the /check ask endpoint above, which only
+    # green-lights ACME for ${CADDY_DOMAIN} and its subdomains.
     tls {
         on_demand
     }
 
-    @api path /api/*
-    @admin path /admin*
-    @auth path /auth/*
+    @sub host *.${CADDY_DOMAIN}
 
-    handle @api {
-        reverse_proxy ${CADDY_UPSTREAM} {
-            header_up X-Profile-Id {labels.2}
+    handle @sub {
+        @api path /api/*
+        @admin path /admin*
+        @auth path /auth/*
+
+        handle @api {
+            reverse_proxy ${CADDY_UPSTREAM}
         }
-    }
-    handle @admin {
-        reverse_proxy ${CADDY_UPSTREAM} {
-            header_up X-Profile-Id {labels.2}
+        handle @admin {
+            reverse_proxy ${CADDY_UPSTREAM}
         }
-    }
-    handle @auth {
-        reverse_proxy ${CADDY_UPSTREAM} {
-            header_up X-Profile-Id {labels.2}
+        handle @auth {
+            reverse_proxy ${CADDY_UPSTREAM}
         }
-    }
-    handle {
-        reverse_proxy ${CADDY_UPSTREAM}
+        handle {
+            reverse_proxy ${CADDY_UPSTREAM}
+        }
     }
 }
 CADDYEOF

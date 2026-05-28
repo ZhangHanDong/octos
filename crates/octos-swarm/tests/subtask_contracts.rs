@@ -59,6 +59,7 @@ impl McpAgentBackend for OkBackend {
             output: format!("ok:{contract_id}"),
             files_to_send: Vec::new(),
             error: None,
+            context_contract: None,
         }
     }
 }
@@ -85,6 +86,7 @@ fn required_file_validator(id: &str, path: &str) -> Validator {
     Validator {
         id: id.into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -104,6 +106,9 @@ fn aggregate_validator(
         phase: ValidatorPhase::Completion,
         workspace_root: workspace_dir.to_path_buf(),
         repo_label: "swarm-subtask-test".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     AggregateValidator {
         runner,

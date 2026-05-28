@@ -50,12 +50,11 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
     ),
     // voice-skill removed — voice TTS/ASR is handled by platform-skill "voice".
     // Voice cloning is handled by mofa-fm.
-    (
-        "pipeline-guard",
-        "pipeline-guard",
-        include_str!("../../app-skills/pipeline-guard/SKILL.md"),
-        include_str!("../../app-skills/pipeline-guard/manifest.json"),
-    ),
+    // pipeline-guard removed — its before_tool_call hook was a category
+    // mismatch for correctness-critical logic. The model-assignment work it
+    // did is now in-process at `octos_pipeline::model_assignment` (see
+    // `book/src/skill-development.md` "Before You Start: Skill vs. Workspace
+    // Contract" for the rubric and PR #962 for the inline replacement).
     (
         "skill-evolve",
         "skill-evolve",
@@ -134,5 +133,33 @@ mod tests {
                 "SKILL.md for '{dir_name}' should contain frontmatter '---' or a markdown heading '#'"
             );
         }
+    }
+
+    #[test]
+    fn voice_synthesize_manifest_marks_spawn_only_for_workspace_policy_parity() {
+        // P1-6: `for_session()` puts voice_synthesize into spawn_tasks,
+        // which gates on the manifest's spawn_only flag in
+        // `enforce_spawn_task_contract_with_args`. Drift between the two
+        // would silently drop the contract — assert the manifest stays
+        // aligned.
+        let manifest = PLATFORM_SKILLS
+            .iter()
+            .find(|(dir_name, _, _, _)| *dir_name == "voice")
+            .expect("voice manifest registered in PLATFORM_SKILLS");
+        let parsed: serde_json::Value =
+            serde_json::from_str(manifest.3).expect("voice manifest parses as JSON");
+        let tools = parsed
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("manifest has tools array");
+        let synth = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("voice_synthesize"))
+            .expect("manifest declares voice_synthesize");
+        assert_eq!(
+            synth.get("spawn_only").and_then(|v| v.as_bool()),
+            Some(true),
+            "voice_synthesize must be spawn_only to match `WorkspacePolicy::for_session()`"
+        );
     }
 }

@@ -12,7 +12,9 @@ use crate::tools::ToolRegistry;
 use crate::validators::{
     ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner, ValidatorStatus,
 };
-use crate::workspace_git::open_workspace_validator_ledger;
+use crate::workspace_git::{
+    WorkspaceProjectKind, list_workspace_repos, open_workspace_validator_ledger,
+};
 use crate::workspace_policy::{
     Validator, ValidatorPhaseKind, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSpawnTaskPolicy,
     read_workspace_policy,
@@ -46,6 +48,70 @@ pub async fn enforce_spawn_task_contract(
     files_to_send: &[PathBuf],
     task_started_at: SystemTime,
     supervisor: Option<(&TaskSupervisor, &str)>,
+) -> SpawnTaskContractResult {
+    enforce_spawn_task_contract_with_args_and_output(
+        tools,
+        tool_name,
+        tool_call_id,
+        files_to_send,
+        task_started_at,
+        supervisor,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Variant of [`enforce_spawn_task_contract`] that threads the originating
+/// spawn task's input args so domain validators (`HttpProbe`,
+/// `OminixVoiceExists`) can resolve `${args.<key>}` references against them.
+///
+/// Production callers in the agent loop should prefer
+/// [`enforce_spawn_task_contract_with_args_and_output`] (which also threads
+/// the tool's `named_outputs` for `${output.<key>}` interpolation). This
+/// entry point exists for callers that have args but no tool output to
+/// forward.
+pub async fn enforce_spawn_task_contract_with_args(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    tool_call_id: &str,
+    files_to_send: &[PathBuf],
+    task_started_at: SystemTime,
+    supervisor: Option<(&TaskSupervisor, &str)>,
+    input_args: Option<&serde_json::Value>,
+) -> SpawnTaskContractResult {
+    enforce_spawn_task_contract_with_args_and_output(
+        tools,
+        tool_name,
+        tool_call_id,
+        files_to_send,
+        task_started_at,
+        supervisor,
+        input_args,
+        None,
+    )
+    .await
+}
+
+/// Full variant of [`enforce_spawn_task_contract`] that threads BOTH the
+/// originating spawn task's input args (for `${args.<key>}` interpolation)
+/// AND the tool's `named_outputs` (for `${output.<key>}` interpolation).
+///
+/// `tool_named_outputs` is a JSON object built from the tool's stdout
+/// envelope; pass `None` for tools that emit nothing. The contract layer
+/// forwards it verbatim to [`run_declared_validators_with_output`] so the
+/// validator runner can interpolate templated URLs (e.g. `mofa_publish`
+/// emitting `deploy_url` then `HttpProbe { url_template = "${output.deploy_url}" }`).
+#[allow(clippy::too_many_arguments)]
+pub async fn enforce_spawn_task_contract_with_args_and_output(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    tool_call_id: &str,
+    files_to_send: &[PathBuf],
+    task_started_at: SystemTime,
+    supervisor: Option<(&TaskSupervisor, &str)>,
+    input_args: Option<&serde_json::Value>,
+    tool_named_outputs: Option<&serde_json::Value>,
 ) -> SpawnTaskContractResult {
     let required_by_default = default_session_policy_requires_contract(tool_name);
     let Some(workspace_root) = tools.workspace_root() else {
@@ -124,12 +190,27 @@ pub async fn enforce_spawn_task_contract(
     // failure above — we treat a required validator failure as a hard contract
     // error and return Failed without entering the delivery phase. Optional
     // failures surface as warning counters through the ledger.
-    match run_declared_validators(
+    //
+    // Merge workspace-wide validators with the per-spawn-task
+    // `on_completion` list so domain validators declared inline next to the
+    // spawn task contract run in the same gate.
+    let mut combined_validators: Vec<Validator> = policy.validation.validators.clone();
+    for (index, entry) in task_policy.on_completion.iter().enumerate() {
+        combined_validators.push(entry.clone().into_validator(tool_name, index));
+    }
+    match run_declared_validators_with_output(
         tools,
         workspace_root,
-        &policy.validation.validators,
+        &combined_validators,
         tool_name,
         ValidatorPhase::Completion,
+        input_args.cloned(),
+        tool_named_outputs.cloned(),
+        // octos #1034: forward the plugin's `files_to_send` so the
+        // file-list-driven validators (`MagicBytes`, `AudioNonSilent`,
+        // `PerFileNonSilent`) declaring `source = "spawn_only_files"`
+        // can consume the authoritative path set the skill emitted.
+        Some(files_to_send.to_vec()),
     )
     .await
     {
@@ -208,6 +289,17 @@ fn resolve_artifacts(
 
     let artifact_sources = task_policy.artifact_sources();
     if artifact_sources.is_empty() {
+        // Contract declares no artifact-source — this is allowed for
+        // spawn tasks that produce no on-disk file (e.g. `fm_voice_save`
+        // which mutates an external API). Skip artifact resolution and
+        // hand the validator runner an empty resolved context; typed
+        // validators in `on_completion` will still run.
+        if task_policy.on_verify.is_empty() && task_policy.delivery_actions().is_empty() {
+            return Ok(ResolvedArtifacts {
+                context: ActionContext::default(),
+                paths: Vec::new(),
+            });
+        }
         return Err("workspace contract has no artifact source".into());
     }
 
@@ -452,12 +544,57 @@ fn default_session_policy_requires_contract(tool_name: &str) -> bool {
 /// `Err(reason)` if any required validator fails — the caller treats this as
 /// a contract-gate failure, matching the behaviour of a missing declared
 /// artifact.
+///
+/// `input_args` carries the originating spawn task's input JSON so that
+/// domain validators (`HttpProbe`, `OminixVoiceExists`) can resolve
+/// `${args.<key>}` references. Pass `None` for non-spawn contexts (e.g.
+/// turn-end validators that don't reference task inputs).
+///
+/// Thin wrapper for non-spawn-only callers that have no tool output to
+/// forward. Spawn-only callers should use [`run_declared_validators_with_output`].
 pub async fn run_declared_validators(
     tools: &ToolRegistry,
     workspace_root: &Path,
     validators: &[Validator],
     repo_label_hint: &str,
     phase: ValidatorPhase,
+    input_args: Option<serde_json::Value>,
+) -> Result<Vec<ValidatorOutcome>, String> {
+    run_declared_validators_with_output(
+        tools,
+        workspace_root,
+        validators,
+        repo_label_hint,
+        phase,
+        input_args,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Variant of [`run_declared_validators`] that also threads the spawn
+/// task's `named_outputs` (`tool_output`) into the validator invocation so
+/// domain validators can resolve `${output.<key>}` references against
+/// tool-emitted values (e.g. `mofa_publish` emitting `deploy_url` for the
+/// HttpProbe to call).
+///
+/// `spawn_only_files` is the plugin-reported `files_to_send` list from the
+/// originating spawn_only tool. Consumed by file-list-driven validators
+/// (`MagicBytes`, `AudioNonSilent`, `PerFileNonSilent`) when their spec
+/// declares `source = "spawn_only_files"` (octos #1034). Pass `None` for
+/// callers that have no plugin output to forward (turn-end validators,
+/// non-spawn contexts).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_declared_validators_with_output(
+    tools: &ToolRegistry,
+    workspace_root: &Path,
+    validators: &[Validator],
+    repo_label_hint: &str,
+    phase: ValidatorPhase,
+    input_args: Option<serde_json::Value>,
+    tool_output: Option<serde_json::Value>,
+    spawn_only_files: Option<Vec<PathBuf>>,
 ) -> Result<Vec<ValidatorOutcome>, String> {
     if validators.is_empty() {
         return Ok(Vec::new());
@@ -497,6 +634,9 @@ pub async fn run_declared_validators(
         phase,
         workspace_root: workspace_root.to_path_buf(),
         repo_label: repo_label_hint.to_string(),
+        input_args,
+        tool_output,
+        spawn_only_files: spawn_only_files.unwrap_or_default(),
     };
 
     let outcomes = runner.run_all(&invocation, &scoped).await;
@@ -513,6 +653,167 @@ pub async fn run_declared_validators(
         return Err(format!("required validator failure: {joined}"));
     }
     Ok(outcomes)
+}
+
+/// octos #997 (round-2 fix): aggregated result for project-root validator runs.
+///
+/// `run_project_root_validators` iterates every policy-managed
+/// slides/sites project beneath the session's `working_dir` and runs each
+/// project's declared completion-phase validators AT THE PROJECT ROOT —
+/// so the resulting ledger writes land at
+/// `<working_dir>/<kind>/<slug>/.octos/validator_outcomes.jsonl`, which is
+/// the exact path `inspect_workspace_contract` reads.
+#[derive(Debug, Default, Clone)]
+pub struct ProjectRootValidatorReport {
+    /// Number of project roots beneath `working_dir` that had at least one
+    /// declared validator and ran the validator chain (Pass or Fail).
+    pub projects_run: usize,
+    /// `(repo_label, reason)` for any project whose declared validator chain
+    /// failed at its OWN project root. Callers should treat the first entry as
+    /// the load-bearing failure reason that demotes the spawn contract.
+    pub failures: Vec<(String, String)>,
+}
+
+impl ProjectRootValidatorReport {
+    pub fn is_empty(&self) -> bool {
+        self.projects_run == 0
+    }
+
+    pub fn first_failure_reason(&self) -> Option<String> {
+        self.failures
+            .first()
+            .map(|(repo_label, reason)| format!("{repo_label}: {reason}"))
+    }
+}
+
+/// octos #997 (round-2 fix): run each managed project's declared
+/// completion-phase validators AT THE PROJECT ROOT.
+///
+/// The session-scope spawn-task contract calls
+/// [`run_declared_validators`] with the SESSION root as `workspace_root`,
+/// which is correct for session-scope policies (the validator ledger lives
+/// under `<session>/.octos/validator_outcomes.jsonl`). But the
+/// project-scope contract gate — `inspect_workspace_contract` —
+/// reads `<session>/slides/<slug>/.octos/validator_outcomes.jsonl`. If
+/// nobody writes to that path, a real valid deck whose declared validator
+/// is hard-required (octos #997: `slides.mofa_slides.pptx_magic_bytes`)
+/// shows `ready = false` because the persisted outcome is missing — even
+/// though the artifact is genuinely on disk.
+///
+/// This helper closes the gap: for each slides/sites project beneath
+/// `working_dir`, read the project's own `WorkspacePolicy` and invoke
+/// [`run_declared_validators`] with that project root as `workspace_root`.
+/// The resulting outcomes naturally land in the project ledger that
+/// `inspect_workspace_contract` reads.
+///
+/// Returns a [`ProjectRootValidatorReport`] aggregating the per-project
+/// outcomes. Callers that want to short-circuit the spawn contract on a
+/// project-root validator failure should consult
+/// [`ProjectRootValidatorReport::first_failure_reason`].
+pub async fn run_project_root_validators(
+    tools: &ToolRegistry,
+    working_dir: &Path,
+    expected_kind: Option<WorkspaceProjectKind>,
+    files_to_send: &[PathBuf],
+) -> ProjectRootValidatorReport {
+    let mut report = ProjectRootValidatorReport::default();
+    let repos = match list_workspace_repos(working_dir) {
+        Ok(repos) => repos,
+        Err(error) => {
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                error = %error,
+                "project-root validator: failed to list workspace repos"
+            );
+            return report;
+        }
+    };
+
+    for repo in repos {
+        if let Some(kind) = expected_kind {
+            if repo.kind != kind {
+                continue;
+            }
+        }
+        let project_root = repo.root.clone();
+        let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
+
+        let policy = match read_workspace_policy(&project_root) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    project_root = %project_root.display(),
+                    error = %error,
+                    "project-root validator: failed to read project policy"
+                );
+                continue;
+            }
+        };
+
+        if policy.validation.validators.is_empty() {
+            continue;
+        }
+
+        // Filter `files_to_send` to the files that belong to THIS
+        // project. The host rebinds plugin work_dir to
+        // `<session>/skill-output/`, so a slides project's deck lands
+        // at `<session>/skill-output/slides/<slug>/output/deck.pptx`.
+        // Tests / legacy paths may also stage files directly under
+        // `<session>/<kind>/<slug>/`. The `SpawnOnlyFiles` validator
+        // source consumes this filtered list.
+        let project_files =
+            filter_files_for_project(files_to_send, working_dir, repo.kind, &repo.slug);
+
+        report.projects_run = report.projects_run.saturating_add(1);
+        match run_declared_validators_with_output(
+            tools,
+            &project_root,
+            &policy.validation.validators,
+            &repo_label,
+            ValidatorPhase::Completion,
+            None,
+            None,
+            Some(project_files),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(reason) => {
+                report.failures.push((repo_label, reason));
+            }
+        }
+    }
+
+    report
+}
+
+/// Select files from `files_to_send` whose absolute path lives under
+/// either `<session>/skill-output/<kind>/<slug>/` (the canonical
+/// post-rebind plugin output location) or `<session>/<kind>/<slug>/`
+/// (legacy / test fallback where files were staged directly inside the
+/// project dir).
+fn filter_files_for_project(
+    files_to_send: &[PathBuf],
+    session_root: &Path,
+    kind: WorkspaceProjectKind,
+    slug: &str,
+) -> Vec<PathBuf> {
+    let kind_dir = kind.directory_name();
+    let prefix_skill_output = session_root.join("skill-output").join(kind_dir).join(slug);
+    let prefix_in_project = session_root.join(kind_dir).join(slug);
+    files_to_send
+        .iter()
+        .filter(|path| {
+            let absolute = if path.is_absolute() {
+                (*path).clone()
+            } else {
+                session_root.join(path)
+            };
+            absolute.starts_with(&prefix_skill_output) || absolute.starts_with(&prefix_in_project)
+        })
+        .cloned()
+        .collect()
 }
 
 fn build_validator_runner(tools: &ToolRegistry, workspace_root: &Path) -> ValidatorRunner {
@@ -576,7 +877,15 @@ mod tests {
     #[tokio::test]
     async fn tts_contract_resolves_new_mp3_for_actor_delivery() {
         let temp = tempfile::tempdir().unwrap();
-        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("fm_tts") {
+            // This test exercises legacy artifact resolution for actor
+            // delivery. The default fm_tts validator now decodes the
+            // plugin-reported MP3 from files_to_send; validator behavior is
+            // covered separately and would reject these fake MP3 bytes.
+            task.on_completion.clear();
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
         let output = temp.path().join("tts_result.mp3");
         std::fs::write(&output, vec![1u8; 2048]).unwrap();
 
@@ -625,7 +934,17 @@ mod tests {
     #[tokio::test]
     async fn podcast_contract_resolves_generated_audio_for_actor_delivery() {
         let temp = tempfile::tempdir().unwrap();
-        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        // The default session contract now declares MP3-specific
+        // `magic_bytes` + `audio_non_silent` domain validators on
+        // `podcast_generate`. This test only exercises the artifact-
+        // resolution path, so we strip the per-task validators to focus
+        // on the legacy contract semantics. Tests for the new validators
+        // live in the inline `validators` module.
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("podcast_generate") {
+            task.on_completion.clear();
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
         let output = temp
             .path()
             .join("skill-output/mofa-podcast/podcast_full_123.wav");
@@ -648,6 +967,128 @@ mod tests {
             }
             other => panic!("expected success, got {other:?}"),
         }
+    }
+
+    /// octos #1035 P1 follow-up: a `mofa-podcast` payload that carries only
+    /// the final audio (no `seg_*.wav` segment scratch files) MUST satisfy
+    /// the default `podcast_generate` contract end-to-end through the
+    /// validator runner. This pins the regression where a `PerFileNonSilent`
+    /// gate over `**/segments/seg_*.wav` was declared on the contract: the
+    /// deployed plugin does not preserve segments after assembly, so the
+    /// gate matched zero files and `require_at_least:1` hard-failed every
+    /// podcast call with "expected >=1 audio files, found 0" (mini3 live
+    /// regression 2026-05-18, dropped at commit e68f9f487).
+    ///
+    /// We retain the validator chain shape (MagicBytes + AudioNonSilent over
+    /// `SpawnOnlyFiles`) but flip the audio format from MP3 to WAV so the
+    /// validator runner can decode the fixture without the optional
+    /// `audio_mp3` feature. The structural assertion — final-audio-only
+    /// `files_to_send` passes both whole-file checks with no per-segment
+    /// gate failing — is identical for MP3 once the feature is enabled.
+    #[tokio::test]
+    async fn podcast_contract_satisfied_by_final_audio_only_payload_for_octos_1035() {
+        use crate::workspace_policy::{MagicByteKind, SpawnTaskValidatorSpec, ValidatorSpec};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        let task = policy
+            .spawn_tasks
+            .get_mut("podcast_generate")
+            .expect("podcast_generate contract");
+
+        // Rewrite the on_completion chain to validate WAV bytes so the
+        // decoder runs without the optional `audio_mp3` feature. The shape
+        // (MagicBytes + AudioNonSilent over SpawnOnlyFiles, no per-segment
+        // gate) mirrors the deployed contract on main exactly.
+        let mut rewritten = Vec::with_capacity(task.on_completion.len());
+        for entry in std::mem::take(&mut task.on_completion) {
+            let spec = match entry {
+                SpawnTaskValidatorSpec::Bare(spec) => spec,
+                SpawnTaskValidatorSpec::Full(validator) => validator.spec,
+            };
+            let rewritten_spec = match spec {
+                ValidatorSpec::MagicBytes {
+                    glob,
+                    source,
+                    extension,
+                    ..
+                } => ValidatorSpec::MagicBytes {
+                    glob,
+                    format: MagicByteKind::Wav,
+                    source,
+                    extension: extension.map(|ext| if ext == "mp3" { "wav".into() } else { ext }),
+                },
+                ValidatorSpec::AudioNonSilent {
+                    glob,
+                    min_ratio,
+                    source,
+                    extension,
+                } => ValidatorSpec::AudioNonSilent {
+                    glob,
+                    min_ratio,
+                    source,
+                    extension: extension.map(|ext| if ext == "mp3" { "wav".into() } else { ext }),
+                },
+                other => other,
+            };
+            rewritten.push(SpawnTaskValidatorSpec::Bare(rewritten_spec));
+        }
+        task.on_completion = rewritten;
+
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        // Topic-suffixed output dir mirrors the mini5 regression shape
+        // (chat topic 《逐玉》 → `mofa-podcast-zhuyu/`).
+        let output = temp
+            .path()
+            .join("skill-output/mofa-podcast-zhuyu/podcast_full_1779067937.wav");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        write_sine_wav_for_test(&output, 8_000);
+
+        // The crux of the test: files_to_send carries ONLY the final audio
+        // path — no `seg_*.wav` segment scratch files, mirroring the
+        // deployed mofa-podcast plugin's actual output shape.
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "podcast_generate",
+            "tool-call-final-audio-only",
+            std::slice::from_ref(&output),
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(output_files, vec![output.to_string_lossy().to_string()]);
+            }
+            other => panic!(
+                "final-audio-only payload must satisfy podcast contract \
+                 (regression guard for the PerFileNonSilent segment gate \
+                 dropped in octos #1035 follow-up): {other:?}"
+            ),
+        }
+    }
+
+    /// Generate a loud sine WAV at `path` whose samples sit above the
+    /// `AudioNonSilent` floor so the validator passes.
+    fn write_sine_wav_for_test(path: &Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        let amplitude = i16::MAX / 2;
+        for index in 0..samples {
+            let phase = (index as f32) * std::f32::consts::TAU * 440.0 / 8_000.0;
+            let value = (phase.sin() * amplitude as f32) as i16;
+            // Keep value away from zero crossings so every sample is above
+            // the non-silent floor.
+            let value = if value.abs() < 4_000 { 4_000 } else { value };
+            writer.write_sample(value).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
     }
 
     #[tokio::test]
@@ -675,6 +1116,7 @@ mod tests {
                 on_complete: Vec::new(),
                 on_deliver: Vec::new(),
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();
@@ -728,6 +1170,7 @@ mod tests {
                 on_complete: vec!["file_exists:missing.txt".into()],
                 on_deliver: vec!["notify_user:bundle delivered".into()],
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();
@@ -780,6 +1223,7 @@ mod tests {
                 on_complete: vec!["send_file:$legacy".into()],
                 on_deliver: vec!["send_file:$report".into(), "send_file:$audio".into()],
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();
@@ -845,6 +1289,7 @@ mod tests {
                 on_complete: Vec::new(),
                 on_deliver: Vec::new(),
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();
@@ -935,4 +1380,828 @@ mod tests {
         assert!(error.contains("file_size_min:$artifact:1024"));
         assert!(error.contains("output.mp3 is 1 bytes, minimum is 1024"));
     }
+
+    /// Smallest valid PNG (1x1 transparent pixel) — used to satisfy
+    /// MagicBytes (Png) without pulling in an encoder dependency.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+        0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R', // IHDR header
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // width=1, height=1
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, // bit depth+color
+        0x00, 0x00, 0x00, 0x0D, b'I', b'D', b'A', b'T', // IDAT chunk
+        0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+        0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', // IEND chunk
+        0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    #[tokio::test]
+    async fn mofa_slides_contract_satisfies_when_pptx_is_present() {
+        // P1-4: the default session policy for `mofa_slides` should
+        // verify a PPTX with a valid ZIP signature is present.
+        //
+        // octos #1036: the contract now consumes the plugin's
+        // `files_to_send` directly (the spawn_only_files source). Mirror
+        // the live call path by passing the reported PPTX in the slice.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let pptx = temp.path().join("output/deck.pptx");
+        std::fs::create_dir_all(pptx.parent().unwrap()).unwrap();
+        // PK\x03\x04 followed by enough padding so the magic-byte read
+        // succeeds and the file is non-trivial.
+        let mut bytes = vec![0x50, 0x4B, 0x03, 0x04];
+        bytes.extend(std::iter::repeat_n(0u8, 256));
+        std::fs::write(&pptx, &bytes).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_slides",
+            "tool-call-slides",
+            std::slice::from_ref(&pptx),
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "output/deck.pptx"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_slides_contract_fails_when_artifact_is_html_error_page() {
+        // Catches the silent-failure path: tool wrote an HTML error page
+        // in place of the PPTX. MagicBytes (Pptx) rejects it.
+        //
+        // octos #1036: the contract now consumes the plugin's
+        // `files_to_send` directly. Pass the HTML-shaped "PPTX" via the
+        // file list so the magic-bytes check inspects the exact path
+        // the skill reported.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let pptx = temp.path().join("output/deck.pptx");
+        std::fs::create_dir_all(pptx.parent().unwrap()).unwrap();
+        std::fs::write(&pptx, b"<!DOCTYPE html>\n<html>Internal error</html>\n").unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_slides",
+            "tool-call-slides-fail",
+            std::slice::from_ref(&pptx),
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "output/deck.pptx"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("magic_bytes") || error.contains("pptx"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Slide generation failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_cards_contract_satisfies_when_png_files_match_recursive_glob() {
+        // P1-5: mofa_cards emits PNGs under a per-task card_dir.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let card_dir = temp.path().join("cards/abc");
+        std::fs::create_dir_all(&card_dir).unwrap();
+        std::fs::write(card_dir.join("a.png"), PNG_1X1).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_cards",
+            "tool-call-cards",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"card_dir": "cards/abc"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_comic_contract_uses_args_out_for_file_exists_and_magic_bytes() {
+        // P1-5: mofa_comic has a required `out` arg pointing at a single
+        // PNG file. FileExists interpolates `${args.out}` to assert the
+        // path the LLM declared exists; MagicBytes (octos #1040 sweep)
+        // now consumes the plugin's `files_to_send` list so it inspects
+        // the exact path the skill reported instead of any `**/*.png`
+        // match in the workspace.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let comic = temp.path().join("comic.png");
+        // Pad to meet the 1024-byte min_bytes check on the FileExists.
+        let mut padded = PNG_1X1.to_vec();
+        padded.extend(std::iter::repeat_n(0u8, 2048));
+        std::fs::write(&comic, &padded).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_comic",
+            "tool-call-comic",
+            std::slice::from_ref(&comic),
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "comic.png"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_comic_contract_does_not_pass_on_stale_unrelated_png_octos_1040() {
+        // octos #1040: with `MagicBytes { source: SpawnOnlyFiles }`, the
+        // validator must consume the plugin's reported PNG path, NOT
+        // any `**/*.png` match in the session workspace. Lay down a
+        // stale HTML-shaped `aaa-stale.png` to prove that an empty
+        // `files_to_send` list does not silently pass via a workspace
+        // glob.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+
+        // Stale-but-valid PNG that an `**/*.png` glob would have matched.
+        let stale = temp.path().join("aaa-stale.png");
+        let mut padded = PNG_1X1.to_vec();
+        padded.extend(std::iter::repeat_n(0u8, 2048));
+        std::fs::write(&stale, &padded).unwrap();
+
+        // The real expected output never lands. Plugin reports nothing.
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_comic",
+            "tool-call-comic-stale",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "comic.png"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, .. } => {
+                assert!(
+                    error.contains("comic.png")
+                        || error.contains("does not exist")
+                        || error.contains("files_to_send"),
+                    "expected a failure that references the missing comic.png or missing \
+                     files_to_send (not a stale-PNG fallback); got: {error}"
+                );
+            }
+            other => panic!("expected failure for missing comic.png, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_frame_contract_rejects_stale_png_without_files_to_send_octos_1040() {
+        // octos #1040: `mofa_frame` flips to MagicBytes(SpawnOnlyFiles)
+        // preemptively (the manifest is not `spawn_only: true` today —
+        // contract is dormant — but the script at
+        // `mofa-skills/mofa-frame/main` already emits `files_to_send`).
+        // This test is a cleaner cross-check than the `mofa_comic` stale
+        // case because the `mofa_frame` contract has NO FileExists
+        // validator: the SpawnOnlyFiles source is the only gate, so a
+        // regression to the workspace glob would silently pass on any
+        // stale PNG in the workspace.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+
+        // Stale-but-valid PNG that an `**/*.png` glob would have matched.
+        let stale = temp.path().join("aaa-stale.png");
+        let mut padded = PNG_1X1.to_vec();
+        padded.extend(std::iter::repeat_n(0u8, 2048));
+        std::fs::write(&stale, &padded).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_frame",
+            "tool-call-frame-stale",
+            // Plugin reported nothing (the dormant-contract simulation).
+            &[],
+            UNIX_EPOCH,
+            None,
+            // mofa_frame's required args are `video_path` and `timestamp`;
+            // `out_path` is optional. Pass none so the dormant-contract
+            // mode is what we exercise.
+            Some(&json!({})),
+        )
+        .await;
+
+        // Either artifact-resolution catches it ("could not find
+        // artifact 'image_png'") because nothing in the workspace
+        // matches the artifact glob with the task-started-at filter
+        // applied, OR the SpawnOnlyFiles validator surfaces the
+        // empty-list failure. Both are valid because we want
+        // "stale PNG does NOT silently pass" — the assertion below
+        // just requires a Failed outcome with notify_user.
+        match result {
+            SpawnTaskContractResult::Failed { notify_user, .. } => {
+                assert_eq!(notify_user.as_deref(), Some("Frame extraction failed"));
+            }
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                panic!(
+                    "mofa_frame contract MUST NOT silently pass on a stale workspace PNG; \
+                     got Satisfied with files {output_files:?}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_comic_contract_fails_when_args_out_file_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        // Note: the file `comic.png` is never created — the LLM-declared
+        // path doesn't exist. The contract should fail; with octos
+        // #1040 the failure surfaces earlier at the artifact-resolution
+        // step (no `**/*.png` matches in the workspace), before the
+        // FileExists `${args.out}` validator runs. The outcome is the
+        // same: notify_user fires with "Comic generation failed".
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_comic",
+            "tool-call-comic-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "comic.png"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("does not exist")
+                        || error.contains("comic.png")
+                        || error.contains("could not find artifact 'image_png'"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Comic generation failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fm_voice_save_contract_file_exists_succeeds_when_voice_wav_present() {
+        // P0-1: the `fm_voice_save` contract now asserts the voice WAV
+        // landed at `voice_profiles/<name>.wav` via FileExists +
+        // `${args.name}` interpolation, in addition to the
+        // OminixVoiceExists API probe.
+        let temp = tempfile::tempdir().unwrap();
+        // Strip the OminixVoiceExists validator so this test focuses on
+        // the new FileExists check. The OminixVoiceExists validator is
+        // covered by validators::tests inside `validators.rs`.
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("fm_voice_save") {
+            task.on_completion.retain(|spec| {
+                matches!(
+                    spec,
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                        crate::workspace_policy::ValidatorSpec::FileExists { .. }
+                    )
+                )
+            });
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        std::fs::create_dir_all(temp.path().join("voice_profiles")).unwrap();
+        std::fs::write(
+            temp.path().join("voice_profiles/yangmi.wav"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fm_voice_save",
+            "tool-call-voice-save",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"name": "yangmi", "audio_path": "/tmp/in.wav"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fm_voice_save_contract_file_exists_fails_when_voice_wav_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("fm_voice_save") {
+            task.on_completion.retain(|spec| {
+                matches!(
+                    spec,
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                        crate::workspace_policy::ValidatorSpec::FileExists { .. }
+                    )
+                )
+            });
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        // Don't write the WAV — FileExists with `${args.name}` must fail.
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fm_voice_save",
+            "tool-call-voice-save-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"name": "no_such_voice"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("no_such_voice.wav") || error.contains("does not exist"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Voice registration failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: named_outputs end-to-end through enforce_spawn_task_contract.
+    // -------------------------------------------------------------------
+
+    /// Tiny synchronous HTTP server scripted via `responses`. Re-used from
+    /// the validators test module to drive end-to-end probes.
+    fn spawn_test_http_server(responses: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        addr
+    }
+
+    /// Build a `mofa_publish` policy with the HttpProbe forced to
+    /// `required = true` so the test gate fails on a missing
+    /// named_output. Mirrors the eventual post-mofa-skills-follow-up
+    /// state of the policy.
+    fn mofa_publish_required_policy(url_template: &str) -> WorkspacePolicy {
+        use crate::Validator;
+        use crate::workspace_policy::{SpawnTaskValidatorSpec, ValidatorPhaseKind, ValidatorSpec};
+
+        let mut policy = WorkspacePolicy::for_session();
+        let publish = policy.spawn_tasks.entry("mofa_publish".into()).or_default();
+        publish.on_failure = vec!["notify_user:Publish probe failed".into()];
+        publish.on_completion = vec![SpawnTaskValidatorSpec::Full(Validator {
+            id: "mofa_publish.deploy_url_probe".into(),
+            required: true,
+            soft_fail: false,
+            timeout_ms: Some(2000),
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::HttpProbe {
+                url_template: url_template.to_string(),
+                expected_status: 200,
+                expected_contains: Some("<!DOCTYPE".into()),
+            },
+        })];
+        policy
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_contract_satisfies_when_named_outputs_deploy_url_serves_doctype() {
+        // End-to-end: tool emits `named_outputs.deploy_url`; contract
+        // probes that URL; server returns a 200 with `<!DOCTYPE` body.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n<!DOCTYPE html>";
+        let addr = spawn_test_http_server(vec![response]);
+        let temp = tempfile::tempdir().unwrap();
+        // Force the validator to `required = true` so a missing/failing
+        // probe blocks the contract.
+        write_workspace_policy(
+            temp.path(),
+            &mofa_publish_required_policy("${output.deploy_url}"),
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-ok",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            Some(&json!({"deploy_url": format!("http://{addr}/site")})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave-3a: end-to-end contract gate exercises the three new variants
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn enforce_spawn_task_contract_with_args_runs_sha256_match_via_interpolation() {
+        // End-to-end probe through `enforce_spawn_task_contract_with_args`
+        // for the new `Sha256Match` variant. Mirrors how `manage_skills`
+        // would wire its manifest-declared hash through input args.
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"manage_skills binary payload\n";
+        let expected_hex = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(bytes))
+        };
+
+        let skill_dir = temp.path().join("skills/example");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let binary_path = skill_dir.join("main");
+        std::fs::write(&binary_path, bytes).unwrap();
+
+        // Sole spawn-task contract: Sha256Match resolves the expected hash
+        // through args, and no artifact source / on_verify means the
+        // contract gate only runs the typed validators.
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "manage_skills_test".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: vec!["notify_user:skill install verification failed".into()],
+                on_completion: vec![crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                    crate::workspace_policy::ValidatorSpec::Sha256Match {
+                        glob: "skills/example/main".into(),
+                        sha256: "${args.expected_sha256}".into(),
+                    },
+                )],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "manage_skills_test",
+            "tool-call-sha-ok",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"expected_sha256": expected_hex.clone()})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected satisfied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_contract_fails_when_probe_returns_soft_404_html() {
+        // 200 OK with a body that lacks `<!DOCTYPE` (e.g. a JSON soft-404
+        // wrapper) must fail the contract.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"error\":\"missing\"}";
+        let addr = spawn_test_http_server(vec![response]);
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(
+            temp.path(),
+            &mofa_publish_required_policy("${output.deploy_url}"),
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-soft-404",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            Some(&json!({"deploy_url": format!("http://{addr}/missing")})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("<!DOCTYPE") || error.contains("did not contain"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Publish probe failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_spawn_task_contract_with_args_fails_when_sha256_does_not_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("skills/example");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("main"), b"actual contents").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "manage_skills_test".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: vec!["notify_user:install verification failed".into()],
+                on_completion: vec![crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                    crate::workspace_policy::ValidatorSpec::Sha256Match {
+                        glob: "skills/example/main".into(),
+                        sha256: "${args.expected_sha256}".into(),
+                    },
+                )],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let wrong_hex = "f".repeat(64);
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "manage_skills_test",
+            "tool-call-sha-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"expected_sha256": wrong_hex})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("sha256_match") || error.contains("expected="),
+                    "expected sha256 mismatch error, got: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("install verification failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_contract_fails_when_named_outputs_deploy_url_missing() {
+        // The skill claimed success but emitted NO named_outputs.
+        // With a `required = true` probe, the contract should reject
+        // the result because `${output.deploy_url}` is unresolvable.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(
+            temp.path(),
+            &mofa_publish_required_policy("${output.deploy_url}"),
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-missing-url",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            // tool_output absent — emulates the current mofa_publish
+            // skill (before the mofa-skills repo follow-up).
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, .. } => {
+                assert!(
+                    error.contains("deploy_url"),
+                    "error should name the missing output key: {error}"
+                );
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_default_contract_does_not_block_when_skill_not_yet_emitting_output() {
+        // Until the mofa-skills repo follow-up lands, mofa_publish does
+        // NOT yet emit `named_outputs.deploy_url`. The default contract
+        // ships the probe as `required = false` so the missing key
+        // produces a diagnostic ledger entry but does NOT fail the gate.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-default-policy",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            // No named_outputs from the skill (current state).
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!(
+                "default mofa_publish policy must not block users until mofa-skills \
+                 catches up; got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_only_envelope_named_outputs_threads_through_contract_to_validator() {
+        // Wave-3b protocol invariant: a spawn_only tool emits
+        // `named_outputs` on stdout → the contract forwards it to the
+        // validator runner → the runner uses `${output.X}` interpolation
+        // to drive (in this case) a FileExists check against a tool-
+        // emitted path. Validates the full chain end-to-end without
+        // depending on HTTP.
+        use crate::Validator;
+        use crate::workspace_policy::{
+            SpawnTaskValidatorSpec, ValidatorPhaseKind, ValidatorSpec, WorkspaceSpawnTaskPolicy,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "fake_publish".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: vec![],
+                on_deliver: vec![],
+                on_failure: vec!["notify_user:Fake publish failed".into()],
+                on_completion: vec![SpawnTaskValidatorSpec::Full(Validator {
+                    id: "fake_publish.target_exists".into(),
+                    required: true,
+                    soft_fail: false,
+                    timeout_ms: None,
+                    phase: ValidatorPhaseKind::Completion,
+                    spec: ValidatorSpec::FileExists {
+                        path: "${output.target_path}".into(),
+                        min_bytes: None,
+                    },
+                })],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        std::fs::write(temp.path().join("artifact.txt"), b"x").unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fake_publish",
+            "tool-call-fake",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            Some(&json!({"target_path": "artifact.txt"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected named_outputs path to satisfy contract, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_spawn_task_contract_with_args_treats_soft_fail_validator_as_warning() {
+        // Wire-target end-to-end probe for `Required::Soft`: a hard-required
+        // validator that's also `soft_fail` MUST surface a Fail outcome to
+        // the ledger but NOT demote the spawn task. Mirrors the
+        // `synthesize_research`/`deep_search` partial-artifact contract.
+        let temp = tempfile::tempdir().unwrap();
+        // Drop a primary report so the hard-required validator passes; the
+        // soft-fail one points at a non-existent sub-artifact and warns.
+        let primary = temp.path().join("primary.md");
+        std::fs::write(&primary, b"primary report").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "partial_artifact_task".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: vec!["notify_user:partial failed".into()],
+                on_completion: vec![
+                    // Hard-required: must pass for the spawn task to satisfy.
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Full(Validator {
+                        id: "primary_required".into(),
+                        required: true,
+                        soft_fail: false,
+                        timeout_ms: None,
+                        phase: ValidatorPhaseKind::Completion,
+                        spec: crate::workspace_policy::ValidatorSpec::FileExists {
+                            path: "primary.md".into(),
+                            min_bytes: None,
+                        },
+                    }),
+                    // Soft-fail: surfaces as a warning without demoting the
+                    // gate even though `required = true`.
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Full(Validator {
+                        id: "sub_artifact_warn".into(),
+                        required: true,
+                        soft_fail: true,
+                        timeout_ms: None,
+                        phase: ValidatorPhaseKind::Completion,
+                        spec: crate::workspace_policy::ValidatorSpec::FileExists {
+                            path: "sub-artifact.md".into(),
+                            min_bytes: None,
+                        },
+                    }),
+                ],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "partial_artifact_task",
+            "tool-call-soft-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+        )
+        .await;
+
+        // Soft-fail validator must NOT demote the task even though it
+        // failed. The ledger still records the failure for operator
+        // visibility (covered by validators::tests::soft_fail_*).
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected satisfied (soft-fail must not block), got {other:?}"),
+        }
+
+        let ledger_path = temp.path().join(".octos").join("validator_outcomes.jsonl");
+        let ledger = crate::validators::ValidatorLedger::open(&ledger_path).unwrap();
+        let outcomes = ledger.read_all().unwrap();
+        let warn = outcomes
+            .iter()
+            .find(|o| o.validator_id == "sub_artifact_warn")
+            .expect("soft-fail warning should persist to the ledger");
+        assert_eq!(warn.required_tier, "soft");
+        assert!(
+            !warn.required,
+            "soft-fail must surface as required = false to legacy replayers"
+        );
+        assert!(warn.is_soft_warning());
+    }
+
+    // The Wave-3b PerFileNonSilent e2e tests for `podcast_generate` were
+    // removed alongside the validator itself: the deployed mofa-podcast
+    // plugin does not preserve `seg_*.wav` segment files after assembly
+    // (live mini3 regression 2026-05-18), so the per-segment gate matched
+    // zero files and hard-failed every podcast call. The whole-file
+    // `AudioNonSilent` validator above still guards the deliverable. The
+    // `PerFileNonSilent` validator type retains coverage through its own
+    // roundtrip + default-value tests in `workspace_policy.rs`; re-arm
+    // the podcast e2e path once the plugin emits segment scratch files
+    // (or carries them in `files_to_send`).
 }

@@ -118,6 +118,7 @@ fn policy_with_required_validator(required_file_path: &str) -> WorkspacePolicy {
             validators: vec![Validator {
                 id: "required-artifact".into(),
                 required: true,
+                soft_fail: false,
                 timeout_ms: None,
                 phase: ValidatorPhaseKind::Completion,
                 spec: ValidatorSpec::FileExists {
@@ -366,6 +367,7 @@ impl McpAgentBackend for AlwaysSuccessMcpBackend {
             output: "fake remote success".to_string(),
             files_to_send: Vec::new(),
             error: None,
+            context_contract: None,
         }
     }
 }

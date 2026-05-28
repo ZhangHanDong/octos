@@ -78,7 +78,17 @@ impl ModelHints {
             || m.starts_with("minimax")
             || m.contains("codestral")
             || m.starts_with("mistral")
-            || m.starts_with("yi-");
+            || m.starts_with("yi-")
+            // 2026-05-18: kimi-k2.5 returns
+            //   `400 InvalidParameter: incorrect modal "image" was entered,
+            //    which may not be supported by the model`
+            // when image_url content parts are present. Production users on
+            // mini3 (dspfac profile) hit this when attaching slide PNGs as
+            // user-uploaded media. The text-only fallback (`[user-uploaded
+            // files: ...]`) lets kimi still process the turn and ask the
+            // agent to `read_file` the attachment if needed.
+            || m.contains("kimi")
+            || m.contains("moonshot");
 
         Self {
             uses_completion_tokens,
@@ -333,11 +343,26 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "API error ({}): {status} - {}",
-                self.model,
-                crate::provider::truncate_error_body(&body)
-            );
+            // Route through LlmError so the loop-boundary classifier
+            // (`HarnessError::classify_report`) can downcast and pick the
+            // correct user-facing variant (auth / quota / bad-request /
+            // rate-limited / server) instead of falling through to
+            // Internal/Bug. The truncated body is preserved so the
+            // operator sees the provider's actual error payload.
+            //
+            // Codex round-2 MINOR: thread the provider_label so the
+            // operator sees e.g. "minimax/MiniMax-M2.5-highspeed"
+            // instead of just "MiniMax-M2.5-highspeed". This is the
+            // lane label the AdaptiveRouter and failover ledger use,
+            // so the wire envelope can be cross-referenced with the
+            // router events.
+            let body = crate::provider::truncate_error_body(&body);
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                format!("{}/{}", self.provider_label, self.model),
+            )
+            .into());
         }
 
         let api_response: OpenAIResponse = response
@@ -439,11 +464,15 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "API error ({}): {status} - {}",
-                self.model,
-                crate::provider::truncate_error_body(&text)
-            );
+            let body = crate::provider::truncate_error_body(&text);
+            // Codex round-2 MINOR: see chat() — thread provider_label so
+            // the streaming error path identifies the lane the same way.
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                format!("{}/{}", self.provider_label, self.model),
+            )
+            .into());
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);
@@ -557,7 +586,20 @@ fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<
 }
 
 fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
-    let images: Vec<_> = if hints.lacks_vision {
+    // Only inline images on USER messages. Tool outputs (Assistant/Tool
+    // role with `media`) are previous-turn artifacts the agent emitted —
+    // e.g. `send_file(skill-output/slides/<slug>/output/slide-NN.png)` —
+    // and feeding them back into the LLM as `image_url` content on every
+    // subsequent turn is both wasteful (~1 MB per slide per call) and
+    // wrong: the LLM never asked to see the rendered output, and some
+    // providers (kimi-k2.5, deepseek, minimax) reject `image_url` parts
+    // outright. Mini3 dspfac slides session 1779130130502-th18yr hit
+    // this when generated slide PNGs were re-encoded on every turn.
+    //
+    // The `read_file` text path still works: the assistant can read the
+    // image's bytes if it really needs to inspect them, but the file is
+    // not pushed unsolicited into vision content.
+    let images: Vec<_> = if hints.lacks_vision || msg.role != MessageRole::User {
         vec![]
     } else {
         msg.media.iter().filter(|p| vision::is_image(p)).collect()
@@ -585,8 +627,15 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
                     parts.push(name);
                 }
             }
+            // Mini5 2026-05-12: phrasing is intentional — earlier
+            // wording ("Use read_file to access them.") caused DeepSeek
+            // to refuse `/private/var/...` upload paths thinking they
+            // were outside the workspace. Stating authorization in the
+            // note keeps the model on the happy path.
             Some(format!(
-                "[attached files: {}. Use read_file to access them.]",
+                "[user-uploaded files: {}. These are authenticated attachments — \
+                 call read_file with this exact path. The path is whitelisted \
+                 even if it lies outside the workspace root.]",
                 parts.join(", ")
             ))
         } else {
@@ -860,7 +909,12 @@ mod tests {
         let h = ModelHints::detect("kimi-k2.5");
         assert!(!h.uses_completion_tokens);
         assert!(h.fixed_temperature);
-        assert!(!h.lacks_vision);
+        // 2026-05-18: empirically kimi-k2.5 returns
+        //   `400 InvalidParameter: incorrect modal "image" was entered`
+        // when sent image_url content parts. Reproduced live on mini3
+        // (dspfac profile, session slides-1779130130502-th18yr) with
+        // a user-uploaded PNG. Treat kimi as text-only.
+        assert!(h.lacks_vision);
     }
 
     #[test]
@@ -922,6 +976,34 @@ mod tests {
         assert!(p.hints.fixed_temperature);
         assert!(p.hints.lacks_vision);
         assert!(!p.hints.merge_system_messages);
+    }
+
+    #[test]
+    fn test_build_content_strips_images_on_assistant_messages() {
+        // Regression for live mini3 dspfac slides session
+        // 1779130130502-th18yr: send_file(slide-NN.png) populated
+        // assistant_msg.media in session_actor.rs, and on every
+        // subsequent turn the openai provider re-encoded the same
+        // generated PNGs into image_url content. That broke kimi
+        // (400 InvalidParameter: "incorrect modal image") and wasted
+        // ~1 MB per slide per call on vision-capable models.
+        //
+        // Inlining vision content should only flow from user→model,
+        // never assistant→model on echo of its own tool outputs.
+        let hints = ModelHints::default(); // lacks_vision: false
+        let mut assistant = msg("I delivered the deck.");
+        assistant.role = MessageRole::Assistant;
+        assistant.media = vec!["skill-output/slides/deck/output/slide-01.png".to_string()];
+        let content = build_openai_content(&assistant, &hints)
+            .expect("assistant content should still be built");
+        match content {
+            OpenAIContent::Text(text) => {
+                assert_eq!(text, "I delivered the deck.");
+            }
+            OpenAIContent::Parts(_) => {
+                panic!("assistant message media must not produce image_url parts");
+            }
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::Result;
 use octos_core::{AgentId, Task, TaskContext, TaskKind, TokenUsage};
-use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
+use octos_llm::{ContextWindowOverride, EmbeddingProvider, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use tracing::{info, warn};
 
@@ -17,6 +17,9 @@ use octos_agent::tools::{TOOL_CTX, Tool, ToolRegistry};
 
 use crate::condition;
 use crate::graph::{HandlerKind, NodeOutcome, OutcomeStatus, PipelineNode};
+
+const DEFAULT_PIPELINE_MAX_OUTPUT_TOKENS: u32 = 4096;
+const PIPELINE_INPUT_COMPACTION_RESERVE_TOKENS: u32 = 1024;
 
 /// Cached snapshot of plugin tools loaded from `plugin_dirs`.
 ///
@@ -66,14 +69,33 @@ impl CachedPluginRegistration {
 /// throw-away registry. Errors are downgraded to a warn (matching the
 /// legacy pipeline behaviour) and an empty registration is cached so
 /// the warning fires at most once per handler lifetime.
-fn build_cached_plugin_registration(plugin_dirs: &[PathBuf]) -> CachedPluginRegistration {
+fn build_cached_plugin_registration(
+    plugin_dirs: &[PathBuf],
+    require_signed: bool,
+    verified_cache_dir: Option<PathBuf>,
+) -> CachedPluginRegistration {
     if plugin_dirs.is_empty() {
         return CachedPluginRegistration::default();
     }
 
     let started = std::time::Instant::now();
     let mut staging = ToolRegistry::new();
-    let load_result = octos_agent::PluginLoader::load_into(&mut staging, plugin_dirs, &[]);
+    // Section B (codex review P1.1): honour the pipeline's
+    // strict-signing policy. Default is `false` (legacy permissive
+    // path) but operators who opt into `plugins.require_signed` on
+    // their host config expect the pipeline cache to enforce the
+    // same gate.
+    let load_result = octos_agent::PluginLoader::load_into_with_options(
+        &mut staging,
+        plugin_dirs,
+        &[],
+        octos_agent::PluginLoadOptions {
+            work_dir: None,
+            synthesis_config: None,
+            require_signed,
+            verified_cache_dir,
+        },
+    );
     let elapsed = started.elapsed();
 
     let load_result = match load_result {
@@ -252,6 +274,13 @@ pub struct CodergenHandler {
     provider_router: Option<Arc<ProviderRouter>>,
     provider_policy: Option<octos_agent::ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
+    /// Section B (codex review P1.1): pipeline-level strict-signing
+    /// policy. Defaults to `false` (legacy permissive path). When the
+    /// host has opted into `plugins.require_signed`, the
+    /// `CodergenHandler` builder threads it through via
+    /// [`Self::with_plugin_require_signed`] so the plugin-load cache
+    /// enforces the same gate.
+    plugin_require_signed: bool,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Declared compaction policy to propagate onto child Agents
     /// (coding-blue FA-7). `None` = legacy path, no compaction runner
@@ -277,6 +306,21 @@ pub struct CodergenHandler {
     /// the SHA-256 verification + 100 MB executable read that would
     /// otherwise re-run on every node and starve the SSE window.
     plugin_cache: Arc<OnceLock<Arc<CachedPluginRegistration>>>,
+    /// NEW-06 fix: optional embedder propagated onto every worker
+    /// `Agent` built by this handler so episodic memory recall stays
+    /// on the contamination-safe hybrid scored + filtered path
+    /// (`MIN_EPISODE_SIMILARITY`). Without it, workers fall back to
+    /// the unfiltered cwd-only path in `EpisodeStore::find_relevant`
+    /// — the round-3 fleet soak (mini5 / deep_research) proved this
+    /// is the missing wiring that lets cross-domain episodes
+    /// contaminate worker prompts.
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Override the directory used to store verified-exe copies
+    /// (`PluginLoadOptions::verified_cache_dir`). When `None`, the
+    /// loader picks `~/.octos/cache/verified/` (production) or a
+    /// per-process tempdir (`cfg(test)` inside octos-agent). Tests
+    /// pass a tempdir here to isolate from the user's cache.
+    plugin_verified_cache_dir: Option<PathBuf>,
 }
 
 impl CodergenHandler {
@@ -293,13 +337,63 @@ impl CodergenHandler {
             provider_router: None,
             provider_policy: None,
             plugin_dirs: Vec::new(),
+            plugin_require_signed: false,
             shutdown,
             compaction_policy: None,
             compaction_workspace: None,
             compaction_llm_provider: None,
             host_context: crate::host_context::PipelineHostContext::default(),
             plugin_cache: Arc::new(OnceLock::new()),
+            embedder: None,
+            plugin_verified_cache_dir: None,
         }
+    }
+
+    /// Override where plugin verified-exe copies live. Production
+    /// callers leave this unset; tests pass a tempdir.
+    pub fn with_plugin_verified_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.plugin_verified_cache_dir = dir;
+        // Reset the cache so a builder-time override is honoured.
+        self.plugin_cache = Arc::new(OnceLock::new());
+        self
+    }
+
+    /// NEW-06 fix: attach the parent embedder. Each per-node worker
+    /// [`Agent`] built by this handler will receive a `.with_embedder`
+    /// call so episodic memory recall runs the modality-aware hybrid
+    /// scored + filtered path (`MIN_EPISODE_SIMILARITY`) instead of
+    /// the unfiltered cwd-only fallback.
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Doc-hidden test accessor — confirms the embedder propagation
+    /// path is wired (NEW-06 regression guard).
+    #[doc(hidden)]
+    pub fn embedder_for_test(&self) -> Option<&Arc<dyn EmbeddingProvider>> {
+        self.embedder.as_ref()
+    }
+
+    /// Doc-hidden test accessor — exposes the per-handler working dir
+    /// so Phase 2-A acceptance tests can confirm the session-scoped
+    /// override is propagated from `RunPipelineTool` -> `ExecutorConfig`
+    /// -> `CodergenHandler` -> per-node worker spawn CWD.
+    #[doc(hidden)]
+    pub fn working_dir_for_test(&self) -> &std::path::Path {
+        &self.working_dir
+    }
+
+    /// Section B (codex review P1.1): opt into strict signature
+    /// enforcement for the pipeline's plugin-load cache. Set this
+    /// when the host config carries `plugins.require_signed = true`.
+    pub fn with_plugin_require_signed(mut self, require_signed: bool) -> Self {
+        self.plugin_require_signed = require_signed;
+        // Mirror `with_plugin_dirs`: a policy change must invalidate the
+        // cache so a builder reordering doesn't surface a stale permissive
+        // registration.
+        self.plugin_cache = Arc::new(OnceLock::new());
+        self
     }
 
     /// M8 parity (W1.A1): attach the parent session's
@@ -411,7 +505,13 @@ impl CodergenHandler {
     /// load and an `Arc::clone`.
     fn cached_plugin_registration(&self) -> Arc<CachedPluginRegistration> {
         self.plugin_cache
-            .get_or_init(|| Arc::new(build_cached_plugin_registration(&self.plugin_dirs)))
+            .get_or_init(|| {
+                Arc::new(build_cached_plugin_registration(
+                    &self.plugin_dirs,
+                    self.plugin_require_signed,
+                    self.plugin_verified_cache_dir.clone(),
+                ))
+            })
             .clone()
     }
 
@@ -659,6 +759,18 @@ impl Handler for CodergenHandler {
             worker = worker.with_harness_event_sink(sink);
         }
 
+        // NEW-06 fix: thread the parent embedder onto the worker so
+        // `build_initial_messages` runs the hybrid scored + filtered
+        // memory recall path (`MIN_EPISODE_SIMILARITY` gate). Without
+        // this the worker falls back to the cwd-only unfiltered path
+        // in `EpisodeStore::find_relevant` and pulls cross-domain
+        // episodes into its prompt (e.g. round-3 mini5/deep_research:
+        // JWST research contaminated by an Apple CEO / GPT-5.5 podcast
+        // episode).
+        if let Some(ref embedder) = self.embedder {
+            worker = worker.with_embedder(embedder.clone());
+        }
+
         // M8 parity (W1.A1): wire the parent session's shared
         // resources onto the per-node worker so file tools see the
         // shared FileStateCache, sub-agent output flows through the
@@ -682,6 +794,22 @@ impl Handler for CodergenHandler {
             worker = worker.with_parent_session_key(session_key.clone());
         }
 
+        // Phase 3-A plumbing follow-up (Phase 1 gap): propagate the
+        // parent session's `SessionScope` snapshotted into
+        // `PipelineHostContext::session_scope` (see
+        // `octos_pipeline::host_context::PipelineHostContext::from_tool_context`)
+        // onto the per-node worker. Without this every pipeline-spawned
+        // child Agent would observe `session_scope: None` and the
+        // Phase-2 consumers (file tools, shell/spawn CWD, plugin tool
+        // work_dir) inside the child would fall through to legacy
+        // paths — re-introducing the mini5 NEW-06 contamination class
+        // through `run_pipeline` even when the parent turn carried a
+        // scope. Legacy callers (CLI / unit tests where the host
+        // context is empty) stay on the `None` branch byte-for-byte.
+        if let Some(ref scope) = self.host_context.session_scope {
+            worker = worker.with_session_scope(scope.clone());
+        }
+
         // coding-blue FA-7: propagate parent's declarative compaction
         // onto every LLM-call node so the worker honours preflight +
         // post-call compaction and the policy's preserved-artifacts
@@ -689,7 +817,10 @@ impl Handler for CodergenHandler {
         // policy must be present — the workspace is how the runner
         // resolves declared artifact names to glob patterns.
         if let Some(compaction_policy) = self.compaction_policy.clone() {
-            let compaction_provider = self.compaction_llm_provider.clone().unwrap_or(provider);
+            let compaction_provider = self
+                .compaction_llm_provider
+                .clone()
+                .unwrap_or_else(|| provider.clone());
             let runner = octos_agent::compaction::CompactionRunner::with_provider(
                 compaction_policy,
                 compaction_provider,
@@ -705,9 +836,11 @@ impl Handler for CodergenHandler {
             }
         }
 
+        let instruction =
+            compact_pipeline_instruction(&ctx.input, Some(provider.context_window()), max_tokens);
         let task = Task::new(
             TaskKind::Code {
-                instruction: ctx.input.clone(),
+                instruction,
                 files: vec![],
             },
             TaskContext {
@@ -953,6 +1086,44 @@ impl Handler for NoopHandler {
     }
 }
 
+fn compact_pipeline_instruction(
+    input: &str,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> String {
+    let Some(context_window) = context_window else {
+        return input.to_string();
+    };
+    let reserved = max_output_tokens
+        .unwrap_or(DEFAULT_PIPELINE_MAX_OUTPUT_TOKENS)
+        .saturating_add(PIPELINE_INPUT_COMPACTION_RESERVE_TOKENS);
+    let half_context = context_window / 2;
+    let budget = half_context
+        .min(context_window.saturating_sub(reserved))
+        .max(512);
+    if octos_llm::context::estimate_tokens(input) <= budget {
+        return input.to_string();
+    }
+
+    let max_chars = (budget as usize).saturating_mul(4).max(256);
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+
+    let head_chars = max_chars.saturating_mul(7) / 10;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let head: String = input.chars().take(head_chars).collect();
+    let tail: String = input
+        .chars()
+        .skip(char_count.saturating_sub(tail_chars))
+        .collect();
+    format!(
+        "{head}\n\n[... pipeline input compacted: omitted approximately {} tokens ...]\n\n{tail}",
+        octos_llm::context::estimate_tokens(input).saturating_sub(budget)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1175,7 @@ mod tests {
                     session_output_tokens: 110,
                     response_cost: Some(0.0008),
                     session_cost: Some(0.0008),
+                    model: Some("claude-sonnet".into()),
                 });
             })
             .await;
@@ -1093,6 +1265,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1161,6 +1334,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1213,6 +1387,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1275,6 +1450,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1337,6 +1513,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1397,6 +1574,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1437,5 +1615,16 @@ mod tests {
             e,
             ProgressEvent::ToolProgress { name, .. } if name == "run_pipeline"
         )));
+    }
+
+    #[test]
+    fn compact_pipeline_instruction_keeps_head_and_tail() {
+        let input = format!("HEAD:{}:TAIL", " middle".repeat(2_000));
+        let compacted = super::compact_pipeline_instruction(&input, Some(1_024), Some(256));
+
+        assert!(compacted.starts_with("HEAD:"));
+        assert!(compacted.ends_with(":TAIL"));
+        assert!(compacted.contains("pipeline input compacted"));
+        assert!(compacted.len() < input.len());
     }
 }

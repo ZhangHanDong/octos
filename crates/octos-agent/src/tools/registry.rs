@@ -8,18 +8,75 @@ use std::sync::atomic::Ordering;
 use eyre::Result;
 use octos_llm::ToolSpec;
 
+use crate::policy::EffectivePermissions;
 use crate::task_supervisor::TaskSupervisor;
 
 #[cfg(feature = "ast")]
 use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
-    BrowserTool, CheckWorkspaceContractTool, ConfigureToolTool, DiffEditTool, EditFileTool,
-    GlobTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle,
-    ToolResult, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
-    WorkspaceShowTool, WriteFileTool,
+    ApplyPatchTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool, ConfigureToolTool,
+    DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool, ImageGenerationTool,
+    ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, ShellTool,
+    SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolLifecycle, ToolResult,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
+    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
+    WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
+
+fn policy_equivalent_tool_names(name: &str) -> Vec<&str> {
+    match name {
+        "spawn_agent" => vec!["spawn_agent", "spawn"],
+        "wait_agent" => vec!["wait_agent", "read_task_output"],
+        _ => vec![name],
+    }
+}
+
+fn evaluate_provider_policy_equivalent(policy: &ToolPolicy, name: &str) -> policy::PolicyDecision {
+    let names = policy_equivalent_tool_names(name);
+    for entry in &policy.deny {
+        if names
+            .iter()
+            .any(|candidate| policy::entry_matches(entry, candidate))
+        {
+            return policy::PolicyDecision::Deny {
+                reason: policy::GENERIC_DENY_REASON,
+            };
+        }
+    }
+    if policy.allow.is_empty()
+        || policy.allow.iter().any(|entry| {
+            names
+                .iter()
+                .any(|candidate| policy::entry_matches(entry, candidate))
+        })
+    {
+        return policy::PolicyDecision::Allow;
+    }
+    policy::PolicyDecision::Deny {
+        reason: policy::GENERIC_DENY_REASON,
+    }
+}
+
+fn provider_policy_allows_equivalent_with_tags(
+    policy: &ToolPolicy,
+    name: &str,
+    tool_tags: &[&str],
+) -> bool {
+    if !matches!(
+        evaluate_provider_policy_equivalent(policy, name),
+        policy::PolicyDecision::Allow
+    ) {
+        return false;
+    }
+    if policy.require_tags.is_empty() || tool_tags.is_empty() {
+        return true;
+    }
+    tool_tags
+        .iter()
+        .any(|tag| policy.require_tags.iter().any(|required| required == tag))
+}
 
 /// Estimate the serialized JSON size without allocating.
 /// Walks the serde_json::Value tree recursively, counting bytes.
@@ -102,6 +159,13 @@ pub struct ToolRegistry {
     supervisor: Arc<TaskSupervisor>,
     /// Set to true when any spawn_only tool is actually invoked in this agent run.
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
+    /// #1148 codex P2: shared live catalog cell used by `tool_search` /
+    /// `tool_suggest`. Updated on every mutation (`register`,
+    /// `register_arc`, `apply_policy`, `mark_spawn_only`, etc.) so
+    /// the discovery surface always reflects the live registry's
+    /// visible tools. The Mutex is fine here — refreshes are cheap
+    /// (clones a small Vec) and only happen on registry mutations.
+    live_catalog: Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>>,
     /// Session key for tagging background tasks (set per-session).
     session_key: Option<String>,
     /// Precomputed output directory hint for spawn_only tool messaging.
@@ -131,6 +195,7 @@ impl ToolRegistry {
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: None,
         }
@@ -344,13 +409,41 @@ impl ToolRegistry {
 
     /// Register a tool.
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.name().to_string(), Arc::new(tool));
+        let name = tool.name().to_string();
+        let tool: Arc<dyn Tool> = Arc::new(tool);
+        self.tools.insert(name.clone(), tool.clone());
+        if name == "spawn" {
+            let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
+            self.tools
+                .insert("spawn_agent".to_string(), spawn_agent.clone());
+            // #1172: the `delegate` alias wraps spawn_agent + wait_agent.
+            // Re-bind it whenever spawn_agent moves so the Codex alias
+            // sees the live delegate, not the no-op default.
+            self.tools.insert(
+                "delegate".to_string(),
+                Arc::new(super::coding_tools::DelegateAliasTool::with_spawn_agent(
+                    spawn_agent,
+                )),
+            );
+        }
         self.invalidate_cache();
     }
 
     /// Register a tool from an existing Arc (for keeping a separate reference).
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        self.tools.insert(name.clone(), tool.clone());
+        if name == "spawn" {
+            let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
+            self.tools
+                .insert("spawn_agent".to_string(), spawn_agent.clone());
+            self.tools.insert(
+                "delegate".to_string(),
+                Arc::new(super::coding_tools::DelegateAliasTool::with_spawn_agent(
+                    spawn_agent,
+                )),
+            );
+        }
         self.invalidate_cache();
     }
 
@@ -432,7 +525,7 @@ impl ToolRegistry {
             return false;
         };
         if let Some(ref policy) = self.provider_policy {
-            if !policy.is_allowed_with_tags(name, tool.tags()) {
+            if !provider_policy_allows_equivalent_with_tags(policy, name, tool.tags()) {
                 return false;
             }
         }
@@ -458,9 +551,9 @@ impl ToolRegistry {
             .values()
             .filter(|t| !deferred.contains(t.name()))
             .filter(|t| {
-                self.provider_policy
-                    .as_ref()
-                    .is_none_or(|p| p.is_allowed_with_tags(t.name(), t.tags()))
+                self.provider_policy.as_ref().is_none_or(|p| {
+                    provider_policy_allows_equivalent_with_tags(p, t.name(), t.tags())
+                })
             })
             .filter(|t| {
                 self.context_filter.as_ref().is_none_or(|tags| {
@@ -503,7 +596,11 @@ impl ToolRegistry {
                         .filter_map(|name| {
                             let tool = self.tools.get(name)?;
                             if let Some(ref policy) = self.provider_policy {
-                                if !policy.is_allowed_with_tags(name, tool.tags()) {
+                                if !provider_policy_allows_equivalent_with_tags(
+                                    policy,
+                                    name,
+                                    tool.tags(),
+                                ) {
                                     return None;
                                 }
                             }
@@ -717,7 +814,7 @@ impl ToolRegistry {
         };
         drop(parent);
 
-        Self {
+        let mut snapshot = Self {
             tools,
             workspace_root: self.workspace_root.clone(),
             provider_policy: self.provider_policy.clone(),
@@ -731,9 +828,26 @@ impl ToolRegistry {
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
+        };
+        // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
+        // Arcs still point to the PARENT's catalog cell. Re-register
+        // fresh instances bound to the snapshot's own cell so search
+        // reflects the snapshot's (possibly filtered) tool surface,
+        // not the parent's. The `register` call below also fires
+        // `refresh_live_catalog` via `invalidate_cache`.
+        if snapshot.tools.contains_key("tool_search") {
+            let cell = snapshot.live_catalog_handle();
+            snapshot.register(ToolSearchTool::new(cell));
         }
+        if snapshot.tools.contains_key("tool_suggest") {
+            let cell = snapshot.live_catalog_handle();
+            snapshot.register(ToolSuggestTool::new(cell));
+        }
+        snapshot.refresh_live_catalog();
+        snapshot
     }
 
     // -- Deferred tool activation -------------------------------------------
@@ -781,6 +895,7 @@ impl ToolRegistry {
         }
 
         if !activated.is_empty() {
+            drop(deferred);
             self.invalidate_cache_shared();
         }
         activated
@@ -821,6 +936,19 @@ impl ToolRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
+    }
+
+    /// Names of tools currently in the deferred set. Deferred tools are
+    /// registered but filtered out of `specs()` (typically because the
+    /// auto-eviction step removed them to keep the LLM tool-count low).
+    /// They remain recoverable via the `activate_tools` tool, so AppUI
+    /// surfaces (e.g. the M14 coding tool contract) should treat them as
+    /// available rather than missing. Sorted for deterministic output.
+    pub fn deferred_tool_names(&self) -> Vec<String> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = deferred.iter().cloned().collect();
+        names.sort();
+        names
     }
 
     // -- LRU auto-eviction --------------------------------------------------
@@ -921,11 +1049,20 @@ impl ToolRegistry {
             .cached_specs
             .get_mut()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        // #1148 codex P2: refresh the live catalog cell so the
+        // `tool_search` / `tool_suggest` discovery surface sees this
+        // mutation. Every existing mutation site already calls
+        // `invalidate_cache`, so threading the refresh through here
+        // covers all of them in one shot.
+        self.refresh_live_catalog();
     }
 
     /// Clear the cached specs through &self (for interior-mutability callers).
     fn invalidate_cache_shared(&self) {
         *self.cached_specs.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // #1148 codex P2: refresh the live catalog cell. See the
+        // `&mut self` variant above.
+        self.refresh_live_catalog();
     }
 
     /// Execute a tool by name.
@@ -953,7 +1090,9 @@ impl ToolRegistry {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         if let Some(ref policy) = self.provider_policy {
-            if let policy::PolicyDecision::Deny { reason } = policy.evaluate(name) {
+            if let policy::PolicyDecision::Deny { reason } =
+                evaluate_provider_policy_equivalent(policy, name)
+            {
                 eyre::bail!("tool '{}' denied by provider policy ({})", name, reason);
             }
         }
@@ -1021,17 +1160,81 @@ impl ToolRegistry {
 
     /// Create a registry with built-in tools and a custom sandbox for shell commands.
     pub fn with_builtins_and_sandbox(cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
+        let permissions = EffectivePermissions::workspace_write();
+        Self::with_builtins_and_permissions(cwd, sandbox, permissions)
+    }
+
+    /// Create a registry with built-in tools under explicit runtime permissions.
+    pub fn with_builtins_and_permissions(
+        cwd: impl AsRef<Path>,
+        sandbox: Box<dyn Sandbox>,
+        permissions: EffectivePermissions,
+    ) -> Self {
         let cwd = cwd.as_ref();
         let mut registry = Self::new();
         registry.workspace_root = Some(cwd.to_path_buf());
-        registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
-        registry.register(ReadFileTool::new(cwd));
-        registry.register(DiffEditTool::new(cwd));
-        registry.register(EditFileTool::new(cwd));
-        registry.register(WriteFileTool::new(cwd));
-        registry.register(GlobTool::new(cwd));
+        let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
+        registry.register(
+            ShellTool::new(cwd)
+                .with_shared_sandbox(sandbox.clone())
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry.register(
+            ExecCommandTool::new(cwd, sandbox.clone())
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        // #1172: Codex-compatible `bash` alias. Shares command policy /
+        // approval policy / sandbox with `shell` and `exec_command`, so a
+        // deny in one path denies in all three.
+        registry.register(
+            super::coding_tools::BashTool::new(cwd, sandbox)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry.register(WriteStdinTool);
+        registry.register(UpdatePlanTool);
+        registry.register(RequestUserInputTool);
+        registry.register(SpawnAgentTool::new());
+        // #1172: Codex-compatible `delegate` one-call wrapper. The default
+        // instance has no spawn_agent bound — `register("spawn")` swaps
+        // both `spawn_agent` and `delegate` in lockstep, so when the
+        // session runtime wires a native spawn delegate this alias picks
+        // up the live one.
+        registry.register(super::coding_tools::DelegateAliasTool::new());
+        registry.register(SendInputTool);
+        registry.register(ResumeAgentTool);
+        registry.register(WaitAgentTool);
+        registry.register(CloseAgentTool);
+        registry
+            .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
+        registry.register(
+            ApplyPatchTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            DiffEditTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            EditFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            WriteFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(GlobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(GrepTool::new(cwd));
-        registry.register(ListDirTool::new(cwd));
+        registry
+            .register(ListDirTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
         registry.register(BrowserTool::new());
@@ -1043,15 +1246,101 @@ impl ToolRegistry {
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
+        // #972 / M14-B P1: `view_image`, `tool_search`, `tool_suggest`.
+        //
+        // `view_image` inherits the workspace filesystem scope so it can only
+        // read images inside the active project.
+        registry.register(
+            ViewImageTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        // #1148 codex P2: pass the LIVE shared catalog cell instead
+        // of a frozen Vec snapshot. The registry refreshes the cell
+        // on every mutation via `refresh_live_catalog` (called from
+        // `invalidate_cache` / `invalidate_cache_shared`), so the
+        // discovery surface reflects post-builtin registrations
+        // (chat/gateway/profile setup, MCP/plugin/pipeline/memory).
+        let catalog_cell = registry.live_catalog_handle();
+        registry.register(ToolSearchTool::new(catalog_cell.clone()));
+        registry.register(ToolSuggestTool::new(catalog_cell));
+        // #1149 / M14-B P2: register the canonical Codex
+        // `image_generation` entry. It currently returns a typed
+        // `coding_tool_unsupported` envelope because no native or
+        // skill backend is bound; the wire-level contract is complete
+        // so the model gets a clean error instead of a "tool not
+        // found" miss. Follow-up to wire a real backend lives on
+        // issue #1149.
+        registry.register(ImageGenerationTool::new());
+        // Final refresh so the catalog reflects the just-registered
+        // search/suggest tools too (cosmetic — they show up in their
+        // own search results).
+        registry.refresh_live_catalog();
         registry
+    }
+
+    /// Snapshot of every currently model-visible tool as a [`ToolCatalogEntry`]
+    /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
+    /// against the effective coding tool contract.
+    pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        self.tools
+            .values()
+            .filter(|tool| !deferred.contains(tool.name()))
+            .filter(|tool| {
+                self.provider_policy.as_ref().is_none_or(|policy| {
+                    provider_policy_allows_equivalent_with_tags(policy, tool.name(), tool.tags())
+                })
+            })
+            .filter(|tool| {
+                self.context_filter.as_ref().is_none_or(|tags| {
+                    let tool_tags = tool.tags();
+                    tool_tags.is_empty()
+                        || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
+                })
+            })
+            .map(|tool| {
+                ToolCatalogEntry::new(
+                    tool.name(),
+                    tool.description(),
+                    tool.tags().iter().map(|t| (*t).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// #1148 codex P2 — return the shared live-catalog cell so
+    /// `ToolSearchTool` / `ToolSuggestTool` see post-mutation tool
+    /// state. Cloning the `Arc` is cheap; readers acquire the inner
+    /// Mutex briefly at execute time.
+    pub fn live_catalog_handle(&self) -> Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>> {
+        self.live_catalog.clone()
+    }
+
+    /// #1148 codex P2 — rebuild the live catalog from the current
+    /// visible tool set. Called from every mutation site
+    /// (`register`, `register_arc`, `unregister`, `apply_policy`,
+    /// `mark_spawn_only`, ...). Idempotent + cheap; the inner Vec
+    /// is replaced wholesale to avoid stale entries.
+    pub(crate) fn refresh_live_catalog(&self) {
+        let snapshot = self.catalog_snapshot();
+        if let Ok(mut guard) = self.live_catalog.lock() {
+            *guard = snapshot;
+        }
     }
 
     /// Tool names that are bound to a working directory (cwd / base_dir).
     /// Used by `rebind_cwd()` to re-register these tools with a new workspace path.
     pub const CWD_BOUND_TOOLS: &'static [&'static str] = &[
         "shell",
+        "exec_command",
+        // #1172: `bash` alias holds a workspace base_dir for workdir
+        // resolution and must follow `rebind_cwd` so a re-scoped session
+        // doesn't keep running commands under the old project root.
+        "bash",
         "read_file",
         "write_file",
+        "apply_patch",
         "edit_file",
         "diff_edit",
         "glob",
@@ -1061,6 +1350,10 @@ impl ToolRegistry {
         "workspace_log",
         "workspace_show",
         "workspace_diff",
+        // #972 / M14-B P1: `view_image` reads files from the workspace and
+        // must follow `rebind_cwd` so a session targeting a new project root
+        // does not leak previously bound paths.
+        "view_image",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -1071,19 +1364,71 @@ impl ToolRegistry {
     /// to use a new working directory and sandbox. Non-cwd tools (web_search,
     /// web_fetch, browser, MCP, plugins, etc.) are preserved via Arc cloning.
     pub fn rebind_cwd(&self, cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
+        self.rebind_cwd_with_permissions(cwd, sandbox, EffectivePermissions::workspace_write())
+    }
+
+    /// Like [`Self::rebind_cwd`], but applies explicit runtime permissions.
+    pub fn rebind_cwd_with_permissions(
+        &self,
+        cwd: impl AsRef<Path>,
+        sandbox: Box<dyn Sandbox>,
+        permissions: EffectivePermissions,
+    ) -> Self {
         let cwd = cwd.as_ref();
-        // Clone everything except cwd-bound tools
-        let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
+        // Clone everything except cwd-bound tools and the dynamic-discovery
+        // tools, which hold a snapshot of the *previous* catalog and would
+        // otherwise advertise stale tool descriptions after a rebind.
+        let mut exclude: Vec<&str> = Self::CWD_BOUND_TOOLS.to_vec();
+        exclude.extend_from_slice(&["tool_search", "tool_suggest"]);
+        let mut registry = self.snapshot_excluding(&exclude);
         registry.workspace_root = Some(cwd.to_path_buf());
+        let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
         // Re-register cwd-bound tools with the new workspace
-        registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
-        registry.register(ReadFileTool::new(cwd));
-        registry.register(DiffEditTool::new(cwd));
-        registry.register(EditFileTool::new(cwd));
-        registry.register(WriteFileTool::new(cwd));
-        registry.register(GlobTool::new(cwd));
+        registry.register(
+            ShellTool::new(cwd)
+                .with_shared_sandbox(sandbox.clone())
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry.register(
+            ExecCommandTool::new(cwd, sandbox.clone())
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        // #1172: re-register the `bash` alias against the new cwd.
+        registry.register(
+            super::coding_tools::BashTool::new(cwd, sandbox)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry
+            .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
+        registry.register(
+            ApplyPatchTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            DiffEditTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            EditFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            WriteFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(GlobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(GrepTool::new(cwd));
-        registry.register(ListDirTool::new(cwd));
+        registry
+            .register(ListDirTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(CheckWorkspaceContractTool::new(cwd));
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
@@ -1092,6 +1437,19 @@ impl ToolRegistry {
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
+        // #972 / M14-B P1: re-register cwd-bound `view_image` and refresh the
+        // dynamic-discovery catalog so `tool_search` / `tool_suggest` reflect
+        // the rebound workspace's tool surface.
+        registry.register(
+            ViewImageTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        // #1148 codex P2: live shared catalog cell — see `with_builtins`.
+        let catalog_cell = registry.live_catalog_handle();
+        registry.register(ToolSearchTool::new(catalog_cell.clone()));
+        registry.register(ToolSuggestTool::new(catalog_cell));
+        registry.refresh_live_catalog();
         registry
     }
 
@@ -1207,6 +1565,36 @@ mod cwd_isolation_tests {
     use super::*;
     use crate::sandbox::NoSandbox;
 
+    /// #970 — when a tool group is deferred at the profile level, the
+    /// session-level registry produced by `rebind_cwd_with_permissions`
+    /// must carry the same deferred names so the M14 coding tool
+    /// contract can still see them as "registered but deferred" rather
+    /// than reporting them as missing.
+    #[test]
+    fn deferred_group_survives_rebind_cwd_to_per_session_registry() {
+        let cwd = std::path::Path::new("/tmp");
+        let mut profile_tools = ToolRegistry::with_builtins_and_sandbox(cwd, Box::new(NoSandbox));
+        profile_tools.defer_group("group:runtime");
+
+        let session_tools = profile_tools.rebind_cwd(cwd, Box::new(NoSandbox));
+        let deferred = session_tools.deferred_tool_names();
+        assert!(
+            deferred.contains(&"shell".to_string()),
+            "shell should remain deferred after session rebind; deferred={:?}",
+            deferred
+        );
+        assert!(
+            deferred.contains(&"exec_command".to_string()),
+            "exec_command should remain deferred after session rebind; deferred={:?}",
+            deferred
+        );
+        assert!(
+            deferred.contains(&"write_stdin".to_string()),
+            "write_stdin should remain deferred after session rebind; deferred={:?}",
+            deferred
+        );
+    }
+
     #[tokio::test]
     async fn test_rebind_cwd_file_tools_reject_outside_paths() {
         let broad_cwd = std::path::Path::new("/tmp");
@@ -1321,7 +1709,7 @@ mod cwd_isolation_tests {
             ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
         registry.set_session_key("api:base-session".to_string());
         registry.mark_spawn_only_invoked();
-        let base_task = registry.register_task("deep_search", "call-base");
+        let base_task = registry.register_task("search", "call-base");
 
         let new_cwd = tempfile::tempdir().expect("create temp dir");
         let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
@@ -1335,7 +1723,7 @@ mod cwd_isolation_tests {
             "spawn-only invocation state is per agent run/session"
         );
 
-        let rebound_task = rebound.register_task("deep_search", "call-rebound");
+        let rebound_task = rebound.register_task("search", "call-rebound");
         let rebound_task = rebound
             .supervisor()
             .get_task(&rebound_task)
@@ -1708,11 +2096,11 @@ mod lifecycle_tests {
     #[test]
     fn spawn_only_handle_message_returns_task_handle_envelope() {
         let mut reg = make_registry(5, 3);
-        reg.mark_spawn_only("deep_search", None);
+        reg.mark_spawn_only("search", None);
         reg.set_output_dir_hint("/tmp/octos/skill-output");
 
         let payload = reg.spawn_only_handle_message(
-            "deep_search",
+            "search",
             "task_abc123",
             &["research/_report.md".to_string()],
         );
@@ -1760,6 +2148,49 @@ mod lifecycle_tests {
         );
     }
 
+    #[tokio::test]
+    async fn spawn_agent_execution_policy_is_equivalent_to_spawn_alias() {
+        let mut reg = make_registry(5, 3);
+        reg.set_provider_policy(ToolPolicy {
+            deny: vec!["spawn".to_owned()],
+            ..Default::default()
+        });
+        assert!(
+            !reg.is_tool_visible("spawn_agent"),
+            "spawn_agent should be hidden when policy denies its backend spawn alias"
+        );
+        let denied = match reg
+            .execute("spawn_agent", &serde_json::json!({ "message": "review" }))
+            .await
+        {
+            Ok(result) => panic!(
+                "spawn deny should deny spawn_agent alias, got: {}",
+                result.output
+            ),
+            Err(error) => error,
+        };
+        assert!(denied.to_string().contains("denied by provider policy"));
+
+        let mut reg = make_registry(5, 3);
+        reg.set_provider_policy(ToolPolicy {
+            allow: vec!["spawn".to_owned()],
+            ..Default::default()
+        });
+        assert!(
+            reg.is_tool_visible("spawn_agent"),
+            "spawn_agent should be visible when policy allows its backend spawn alias"
+        );
+        let allowed = reg
+            .execute("spawn_agent", &serde_json::json!({ "message": "review" }))
+            .await
+            .expect("spawn allow should allow spawn_agent alias to execute");
+        assert!(
+            !allowed.success,
+            "the alias should pass policy, then fail only because the bare builtin registry has no native spawn delegate"
+        );
+        assert!(allowed.output.contains("native spawn delegate"));
+    }
+
     #[test]
     fn is_tool_visible_returns_false_for_unregistered_tools() {
         let reg = make_registry(5, 3);
@@ -1771,9 +2202,9 @@ mod lifecycle_tests {
         // Phase 4 acceptance criterion: spawn_only tool result in agent
         // context is < 1KB (was 50KB+).
         let mut reg = make_registry(5, 3);
-        reg.mark_spawn_only("deep_search", None);
+        reg.mark_spawn_only("search", None);
 
-        let payload = reg.spawn_only_handle_message("deep_search", "task_xyz", &[]);
+        let payload = reg.spawn_only_handle_message("search", "task_xyz", &[]);
 
         assert!(
             payload.len() < 1024,
@@ -2107,5 +2538,99 @@ mod profile_filter_tests {
             reference_names, profiled_names,
             "coding profile must preserve behaviour parity with the default path",
         );
+    }
+
+    #[test]
+    fn should_retain_only_mofa_slides_when_slides_session_filter_runs() {
+        // Pins the wiring in session_actor.rs::spawn slides branch:
+        // `tools.retain(octos_agent::keep_tool_in_slides_session)` must
+        // evict every fake mofa skill except `mofa_slides`, and must NOT
+        // evict the unrelated tools (read_file, shell, etc.).
+        //
+        // Without this guardrail the kimi-k2.6 fallback on mini1 dspfac
+        // misrouted "Make a 3-slide intro deck" → mofa_site (2026-05-24
+        // soak). The structural filter makes that misroute literally
+        // impossible regardless of LLM judgement.
+        use super::policy::keep_tool_in_slides_session;
+        use async_trait::async_trait;
+        use eyre::Result;
+        use serde_json::Value;
+
+        struct FakeMofa(&'static str);
+        #[async_trait]
+        impl Tool for FakeMofa {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "fake mofa skill (test fixture)"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        // Simulate the fleet skill surface: every dspfac-installed mofa
+        // skill is registered as a plugin tool. (Real plugins go via
+        // PluginLoader; here we use a stub for an isolated unit test.)
+        for name in [
+            "mofa_slides",
+            "mofa_site",
+            "mofa_youtube",
+            "mofa_publish",
+            "mofa_research",
+            "mofa_pdf",
+            "mofa_xlsx",
+            "mofa_cli",
+            "mofa_fm",
+            "mofa_frame",
+            "mofa_podcast",
+            "mofa_infographic",
+            "mofa_cards",
+            "mofa_comic",
+        ] {
+            reg.register(FakeMofa(name));
+        }
+
+        reg.retain(keep_tool_in_slides_session);
+
+        let names = builtin_names(&reg);
+        assert!(
+            names.contains(&"mofa_slides".to_string()),
+            "mofa_slides MUST survive the slides-session filter",
+        );
+        for unwanted in [
+            "mofa_site",
+            "mofa_youtube",
+            "mofa_publish",
+            "mofa_research",
+            "mofa_pdf",
+            "mofa_xlsx",
+            "mofa_cli",
+            "mofa_fm",
+            "mofa_frame",
+            "mofa_podcast",
+            "mofa_infographic",
+            "mofa_cards",
+            "mofa_comic",
+        ] {
+            assert!(
+                !names.contains(&unwanted.to_string()),
+                "{unwanted} MUST be evicted from a slides session",
+            );
+        }
+        // Built-in non-mofa tools must remain — these are the tools the
+        // slides system prompt's "TOOL DISCIPLINE" block depends on.
+        for kept in ["read_file", "write_file", "glob", "shell"] {
+            assert!(
+                names.contains(&kept.to_string()),
+                "{kept} must NOT be evicted by the slides filter",
+            );
+        }
     }
 }

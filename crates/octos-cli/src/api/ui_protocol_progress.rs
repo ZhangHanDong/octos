@@ -113,6 +113,7 @@ pub(crate) fn map_progress_json(
         "thinking" => map_simple_status(context, event, progress_kinds::THINKING),
         "response" => map_simple_status(context, event, progress_kinds::RESPONSE),
         "cost_update" => map_cost_update(context, event),
+        "status_word" => map_status_word(context, event),
         "stream_end" => map_simple_status(context, event, progress_kinds::STREAM_END),
         "retry" | "retry_backoff" => map_retry_backoff(context, event),
         "approval_requested" | "approval_request" => map_approval_requested(context, event),
@@ -154,10 +155,26 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
         return UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(
             TaskUpdatedEvent {
                 session_id: context.session_id.clone(),
+                topic: None,
                 task_id,
+                tool_call_id: string_field(event, &["tool_call_id"]),
                 title: string_field(event, &["title"]).unwrap_or_else(|| "Task".into()),
                 state: UiTaskRuntimeState::Running,
                 runtime_detail: Some("task started".into()),
+                source: string_field(event, &["source"]),
+                role: string_field(event, &["role"]),
+                summary: string_field(event, &["summary"]),
+                artifact_count: u32_field(event, &["artifact_count"]),
+                // Codex P2 follow-up: a `null` runtime_policy_stamp from
+                // the progress producer must be treated as ABSENT (None),
+                // not Some(Value::Null). Otherwise serde emits
+                // `"runtime_policy_stamp": null` on `task/updated` and
+                // clients that cache the stamp see it wiped on every
+                // update tick.
+                runtime_policy_stamp: event
+                    .get("runtime_policy_stamp")
+                    .cloned()
+                    .filter(|v| !v.is_null()),
             },
         )]);
     }
@@ -212,10 +229,32 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
 
     UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(TaskUpdatedEvent {
         session_id: context.session_id.clone(),
+        topic: None,
         task_id,
+        tool_call_id: string_field(event, &["tool_call_id"]),
         title,
         state,
         runtime_detail: string_field(event, &["runtime_detail", "message", "status_message"]),
+        // #1123 codex P2 follow-up to #1113: thread the M13-B
+        // projection fields from the underlying progress JSON
+        // (produced by `background_task_to_progress_json`) onto the
+        // `task/updated` notification. Unset values stay `None`, which
+        // skip_serializing_if drops from the wire shape — so legacy
+        // emitters that don't supply the fields produce a bare
+        // payload identical to the pre-M13-B shape.
+        source: string_field(event, &["source"]),
+        role: string_field(event, &["role"]),
+        summary: string_field(event, &["summary"]),
+        artifact_count: u32_field(event, &["artifact_count"]),
+        // Codex P2 rev2 follow-up: same null-to-absent filtering as
+        // map_task_started above — a `null` stamp from the producer must
+        // not pass through, otherwise serde emits
+        // `"runtime_policy_stamp": null` on the regular `task/updated`
+        // tick and any client that caches the stamp sees it wiped.
+        runtime_policy_stamp: event
+            .get("runtime_policy_stamp")
+            .cloned()
+            .filter(|v| !v.is_null()),
     })])
 }
 
@@ -280,6 +319,7 @@ fn map_token(context: &ProgressMappingContext, event: &Value) -> UiProgressMappi
 
     UiProgressMapping::notifications(vec![UiNotification::MessageDelta(MessageDeltaEvent {
         session_id: context.session_id.clone(),
+        topic: None,
         turn_id: context.turn_id.clone(),
         text,
     })])
@@ -292,6 +332,7 @@ fn map_tool_start(context: &ProgressMappingContext, event: &Value) -> UiProgress
 
     UiProgressMapping::notifications(vec![UiNotification::ToolStarted(ToolStartedEvent {
         session_id: context.session_id.clone(),
+        topic: context.session_id.topic().map(ToOwned::to_owned),
         turn_id: context.turn_id.clone(),
         tool_call_id,
         tool_name,
@@ -306,6 +347,7 @@ fn map_tool_progress(context: &ProgressMappingContext, event: &Value) -> UiProgr
 
     UiProgressMapping::notifications(vec![UiNotification::ToolProgress(ToolProgressEvent {
         session_id: context.session_id.clone(),
+        topic: context.session_id.topic().map(ToOwned::to_owned),
         turn_id: context.turn_id.clone(),
         tool_call_id,
         message: string_field(event, &["message", "status"]),
@@ -337,6 +379,7 @@ fn map_tool_end(context: &ProgressMappingContext, event: &Value) -> UiProgressMa
     UiProgressMapping {
         notifications: vec![UiNotification::ToolCompleted(ToolCompletedEvent {
             session_id: context.session_id.clone(),
+            topic: context.session_id.topic().map(ToOwned::to_owned),
             turn_id: context.turn_id.clone(),
             tool_call_id,
             tool_name,
@@ -371,9 +414,34 @@ fn map_cost_update(context: &ProgressMappingContext, event: &Value) -> UiProgres
     update.response_cost = f64_field(event, &["response_cost"]);
     update.session_cost = f64_field(event, &["session_cost"]);
     update.currency = string_field(event, &["currency"]);
+    // Carry the model id forward when the agent emit layer populated it
+    // — the chat client renders `model · tokens_in / tokens_out · duration`
+    // footers from `metadata.token_cost.model`. Legacy clients that
+    // sniff `metadata.label` continue to work (we still emit the field
+    // omitted when absent).
+    update.model = string_field(event, &["model"]);
 
     let mut metadata = UiProgressMetadata::token_cost(update);
     metadata.message = string_field(event, &["message", "status"]);
+    UiProgressMapping::status(context, metadata)
+}
+
+/// Map the per-turn status-word rotator's frame
+/// (`{"type":"status_word", "label":"Pondering"}`) onto a
+/// `progress/updated{kind:"status_word"}` notification. The SPA
+/// `ThinkingIndicator` subscribes via the bridge's `crew:status_word`
+/// dispatcher and swaps the word in the in-flight bubble.
+fn map_status_word(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let word = string_field(event, &["label", "word"]).filter(|s| !s.is_empty());
+    let Some(word) = word else {
+        return UiProgressMapping::warning(
+            context,
+            "invalid_progress",
+            "status_word progress event missing string field `label`".to_string(),
+        );
+    };
+    let mut metadata = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+    metadata.label = Some(word);
     UiProgressMapping::status(context, metadata)
 }
 
@@ -483,13 +551,43 @@ fn ui_task_runtime_state(state: &str) -> Option<UiTaskRuntimeState> {
 }
 
 pub(crate) fn background_task_to_progress_json(task: &octos_agent::BackgroundTask) -> Value {
-    json!({
+    // Carry `tool_call_id` on every `task_updated` snapshot so the
+    // mapper below threads it onto `TaskUpdatedEvent`. The client uses
+    // the wire-side mapping instead of racing a `task/updated` watcher
+    // to build `task_id → tool_call_id` post-hoc.
+    //
+    // Codex P2 follow-up (#1113): the M13-B projection fields
+    // (source/role/summary/artifact_count/runtime_policy_stamp) live
+    // on `BackgroundTask` after `set_m13b_projection` runs, but the
+    // live `task/updated` JSON used to drop them, so connected
+    // subscribers had to refresh `task/list` to see the metadata.
+    // Include them here so the live wire matches the snapshot view.
+    let mut payload = json!({
         "type": "task_updated",
         "task_id": task.id,
+        "tool_call_id": task.tool_call_id,
         "title": task.tool_name,
         "state": task.lifecycle_state(),
         "runtime_detail": stable_task_runtime_detail(task),
-    })
+    });
+    if let Value::Object(obj) = &mut payload {
+        if let Some(source) = task.source.as_ref() {
+            obj.insert("source".into(), json!(source));
+        }
+        if let Some(role) = task.role.as_ref() {
+            obj.insert("role".into(), json!(role));
+        }
+        if let Some(summary) = task.summary.as_ref() {
+            obj.insert("summary".into(), json!(summary));
+        }
+        if let Some(count) = task.artifact_count {
+            obj.insert("artifact_count".into(), json!(count));
+        }
+        if let Some(stamp) = task.runtime_policy_stamp.as_ref() {
+            obj.insert("runtime_policy_stamp".into(), stamp.clone());
+        }
+    }
+    payload
 }
 
 fn stable_task_runtime_detail(task: &octos_agent::BackgroundTask) -> Option<String> {
@@ -645,6 +743,44 @@ mod tests {
     }
 
     #[test]
+    fn ui_protocol_progress_maps_status_word_to_progress_kinds_status_word() {
+        // Lock the wire contract that the per-turn rotator
+        // (`spawn_status_word_rotator`) emits — a flat
+        // `{"type":"status_word","label":"Pondering"}` JSON frame on
+        // the progress channel — onto a
+        // `progress/updated{kind:"status_word", label:"Pondering"}`
+        // notification the SPA bridge guards/parses.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "status_word",
+                "label": "Pondering",
+            }),
+        );
+
+        let status = mapping.status.expect("status_word status");
+        assert_eq!(status.event.metadata.kind, progress_kinds::STATUS_WORD);
+        assert_eq!(status.event.metadata.label.as_deref(), Some("Pondering"));
+        assert_eq!(mapping.warning, None);
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_status_word_missing_label_to_warning() {
+        // Defensive: a status_word frame with no label is malformed.
+        // Surface it as a `warning` so the SPA can ignore it instead
+        // of swapping the in-flight bubble to an empty caption.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "status_word",
+            }),
+        );
+        assert!(mapping.status.is_none());
+        let warning = mapping.warning.expect("warning emitted for empty label");
+        assert_eq!(warning.code, "invalid_progress");
+    }
+
+    #[test]
     fn ui_protocol_progress_maps_cost_update_to_token_cost_status() {
         let mapping = map_progress_json(
             &context(),
@@ -669,6 +805,37 @@ mod tests {
         assert_eq!(cost.input_tokens, Some(10));
         assert_eq!(cost.output_tokens, Some(4));
         assert_eq!(cost.session_cost, Some(0.0012));
+        // Back-compat: payloads without a `model` field land with
+        // `cost.model = None` and the client can fall back to the
+        // historical `metadata.label` sniff.
+        assert_eq!(cost.model, None);
+    }
+
+    /// New: chat bubble footer needs the model id to render
+    /// `model · tokens_in / tokens_out · duration`. The cost_update
+    /// mapper must thread the field from the wire payload into
+    /// `metadata.token_cost.model` so the UI Protocol consumer can
+    /// read it without going through the legacy `metadata.label`
+    /// sidecar.
+    #[test]
+    fn ui_protocol_progress_cost_update_carries_model_into_token_cost_metadata() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "cost_update",
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "model": "deepseek-v4-pro"
+            }),
+        );
+
+        let status = mapping.status.expect("cost status");
+        let cost = status
+            .event
+            .metadata
+            .token_cost
+            .expect("token cost metadata");
+        assert_eq!(cost.model.as_deref(), Some("deepseek-v4-pro"));
     }
 
     #[test]
@@ -768,7 +935,7 @@ mod tests {
             &json!({
                 "type": "task_updated",
                 "task_id": "01900000-0000-7000-8000-000000000002",
-                "title": "deep_search",
+                "title": "search",
                 "state": "verifying",
                 "runtime_detail": "checking outputs"
             }),
@@ -781,9 +948,38 @@ mod tests {
             updated.task_id.to_string(),
             "01900000-0000-7000-8000-000000000002"
         );
-        assert_eq!(updated.title, "deep_search");
+        assert_eq!(updated.title, "search");
         assert_eq!(updated.state, UiTaskRuntimeState::Running);
         assert_eq!(updated.runtime_detail.as_deref(), Some("checking outputs"));
+    }
+
+    /// Codex P2 rev2 follow-up on #1156: a `null` runtime_policy_stamp
+    /// emitted by the producer on a `task_updated` event must NOT
+    /// pass through as `Some(Value::Null)`. Otherwise serde emits
+    /// `"runtime_policy_stamp": null` on the wire and clients that
+    /// cache the stamp see it wiped on every update tick (the same
+    /// bug the `task_started` filter already prevents).
+    #[test]
+    fn ui_protocol_progress_treats_null_stamp_as_absent_on_task_updated() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-0000000000aa",
+                "title": "search",
+                "state": "verifying",
+                "runtime_policy_stamp": null,
+            }),
+        );
+
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert!(
+            updated.runtime_policy_stamp.is_none(),
+            "null stamp must be filtered to None, got {:?}",
+            updated.runtime_policy_stamp,
+        );
     }
 
     #[test]
@@ -912,7 +1108,7 @@ mod tests {
     fn background_task_progress_json_uses_stable_detail() {
         let task = octos_agent::BackgroundTask {
             id: "01900000-0000-7000-8000-000000000003".into(),
-            tool_name: "deep_search".into(),
+            tool_name: "search".into(),
             tool_call_id: "call-1".into(),
             parent_session_key: Some("local:demo".into()),
             child_session_key: None,
@@ -939,13 +1135,107 @@ mod tests {
             session_key: Some("local:demo".into()),
             tool_input: None,
             originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         };
 
         let event = background_task_to_progress_json(&task);
         assert_eq!(event["type"], "task_updated");
         assert_eq!(event["task_id"], "01900000-0000-7000-8000-000000000003");
-        assert_eq!(event["title"], "deep_search");
+        assert_eq!(event["title"], "search");
         assert_eq!(event["state"], "verifying");
         assert_eq!(event["runtime_detail"], "Writing report");
+    }
+
+    /// #1113 codex P2 follow-up: when `set_m13b_projection` populates
+    /// the source/role/summary/artifact_count/runtime_policy_stamp
+    /// fields, the live `task/updated` JSON used to drop them, leaving
+    /// connected subscribers to refresh `task/list` to see the
+    /// metadata. Pin that the live JSON now carries the projection
+    /// fields when they're populated, AND that unset fields stay
+    /// absent (no `null` leakage that would clobber a prior value).
+    #[test]
+    fn background_task_progress_json_carries_m13b_projection_fields() {
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-000000000004".into(),
+            tool_name: "review".into(),
+            tool_call_id: "call-r".into(),
+            parent_session_key: Some("local:demo".into()),
+            child_session_key: Some("local:demo#child-r".into()),
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Running,
+            runtime_state: octos_agent::TaskRuntimeState::ExecutingTool,
+            runtime_detail: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some("local:demo".into()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: Some("model".into()),
+            role: Some("reviewer".into()),
+            summary: Some("found 1 issue".into()),
+            artifact_count: Some(2),
+            runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+        };
+
+        let event = background_task_to_progress_json(&task);
+        assert_eq!(event["source"], "model");
+        assert_eq!(event["role"], "reviewer");
+        assert_eq!(event["summary"], "found 1 issue");
+        assert_eq!(event["artifact_count"], 2);
+        assert_eq!(
+            event["runtime_policy_stamp"]["approval_policy"],
+            "on-request"
+        );
+
+        // Now exercise the absent-field path — unset fields must NOT
+        // appear (no `null`) so a stale subscriber doesn't observe a
+        // spurious "reset" of fields it had already cached.
+        let bare = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-000000000005".into(),
+            tool_name: "search".into(),
+            tool_call_id: "call-s".into(),
+            parent_session_key: None,
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Running,
+            runtime_state: octos_agent::TaskRuntimeState::ExecutingTool,
+            runtime_detail: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: None,
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        let bare_event = background_task_to_progress_json(&bare);
+        let obj = bare_event.as_object().expect("object");
+        assert!(!obj.contains_key("source"));
+        assert!(!obj.contains_key("role"));
+        assert!(!obj.contains_key("summary"));
+        assert!(!obj.contains_key("artifact_count"));
+        assert!(!obj.contains_key("runtime_policy_stamp"));
     }
 }

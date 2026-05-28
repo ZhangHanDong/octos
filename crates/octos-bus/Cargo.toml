@@ -14,6 +14,7 @@ discord = ["serenity"]
 slack = ["tokio-tungstenite"]
 whatsapp = ["tokio-tungstenite"]
 feishu = ["tokio-tungstenite", "axum", "rustls", "rustls-native-certs"]
+line = ["axum"]
 twilio = ["axum"]
 wecom = ["axum"]
 matrix = ["axum"]
@@ -67,3 +68,4 @@ workspace = true
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
+proptest = { workspace = true }

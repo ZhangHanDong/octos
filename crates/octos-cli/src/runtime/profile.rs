@@ -26,7 +26,7 @@ use crate::commands::gateway::build_system_prompt;
 use crate::commands::gateway::profile_factory::{profile_plugin_env, profile_search_provider_keys};
 use crate::config::Config;
 use crate::cron_tool::CronTool;
-use crate::profiles::{UserProfile, config_from_profile};
+use crate::profiles::{ReviewConfig, UserProfile, config_from_profile};
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::skills_scope::{
     build_account_skills_loader, discover_ominix_url, push_runtime_plugin_env,
@@ -224,6 +224,13 @@ pub struct ProfileRuntime {
     /// re-running plugin discovery.
     pub plugin_hooks: Vec<octos_agent::HookConfig>,
 
+    /// Profile-owned coding review fanout template. `None` means the
+    /// AppUI `/review` path should use its built-in default
+    /// specialists. Keeping this on `ProfileRuntime` lets the review
+    /// workflow resolve specialists from the same profile runtime that
+    /// owns model, memory, sandbox, and tools.
+    pub review_config: Option<ReviewConfig>,
+
     /// Long-lived [`EpisodeStore`] for this profile (redb at
     /// `<data_dir>/episodes.redb`). Shared across all sessions of
     /// the profile so task summaries written in one session are
@@ -255,6 +262,37 @@ pub struct ProfileRuntime {
     /// terminate scheduled job execution.
     pub cron_service: Option<Arc<CronService>>,
 
+    /// Per-spawn `RunPipelineTool` factory (NEW-07 fix).
+    ///
+    /// Gateway-path parity: when a session LLM calls `spawn(allowed_tools =
+    /// ["run_pipeline", ...])`, the spawned child's
+    /// [`octos_agent::ToolRegistry`] must contain `run_pipeline` so the
+    /// spawn preflight ([`octos_agent::tools::spawn::
+    /// ensure_subagent_tools_available`]) succeeds. The gateway path threads
+    /// a [`crate::session_actor::PipelineToolFactory`] through
+    /// [`crate::session_actor::SessionActor::build_session_tools`] (see
+    /// `session_actor.rs:2744-2748`); the WS / UI Protocol path needs the
+    /// same factory but had no place to read it from — the
+    /// `RunPipelineTool` registered on [`Self::tool_specs`] is shared (one
+    /// instance, used by the parent registry) and cannot be re-handed to
+    /// every spawn child without violating ownership.
+    ///
+    /// `None` when no LLM provider is configured (the same precondition
+    /// that prevents parent registration; bootstrap returns `Err` long
+    /// before this point in that case). A second `None` slot exists for
+    /// upstream tests that build a minimal `ProfileRuntime` by hand
+    /// without an LLM provider chain.
+    ///
+    /// Production effect: round-7 soak NEW-07 reproducer was mini1
+    /// `deep_research` stalling 900s when the LLM wrapped `run_pipeline`
+    /// in `spawn(allowed_tools=[run_pipeline])` — the WS path child
+    /// registry only had `send_file` + base tools, so preflight failed
+    /// with `required tool(s) not available on this host: run_pipeline`
+    /// at `spawn.rs:1476`. Phase 2-A (PR #1203) plumbed scope through
+    /// `RunPipelineTool` but left this child-registry wiring gap on the
+    /// WS path. This field closes it.
+    pub pipeline_factory: Option<Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>>,
+
     /// Pre-built lifecycle hook executor (M11-F regression fix REG-3).
     ///
     /// Pre-M11-F `serve.rs::try_create_agent` merged `config.hooks +
@@ -268,6 +306,19 @@ pub struct ProfileRuntime {
     /// loop. `None` keeps the legacy behaviour when no hooks are
     /// configured (the agent's default `hooks: None` field).
     pub hook_executor: Option<Arc<HookExecutor>>,
+
+    /// RFC-3 (#1292) — per-topic model lane routing config (overrides
+    /// only; built-in defaults always apply on top of this).
+    ///
+    /// When `Some`, the session-actor and the WS turn handler use this
+    /// to resolve `session.topic()` to a [`octos_llm::Lane`] and pass
+    /// it to the chat call via [`octos_llm::with_lane_context`]. When
+    /// `None`, the built-in defaults from `octos_llm::lane` still apply
+    /// for the well-known prefixes (slides / site / podcast / research
+    /// / code); profiles that haven't opted into RFC-3 see no behavior
+    /// change because the [`octos_llm::AdaptiveRouter`] silently falls
+    /// through when zero candidates match.
+    pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
 }
 
 /// Which OS process is calling [`ProfileRuntime::bootstrap`].
@@ -342,8 +393,32 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
     ) -> Result<Arc<Self>> {
-        // Step 1: derive the per-profile Config.
-        let config = config_from_profile(profile, None, None);
+        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None).await
+    }
+
+    /// Section B (codex review round-3): bootstrap a profile runtime while
+    /// honouring the host-level `plugins.require_signed` policy. When the
+    /// caller (e.g. `octos serve`) has the top-level [`Config`] in scope,
+    /// it passes the host plugin policy here so the per-profile plugin
+    /// load enforces strict signing even when the profile JSON doesn't
+    /// repeat the setting. Profile-level `plugins.require_signed` is OR'd
+    /// with the host setting — neither side can silently relax the other.
+    pub async fn bootstrap_with_host_plugins(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        host_plugins: Option<&crate::config::PluginsConfig>,
+    ) -> Result<Arc<Self>> {
+        // Step 1: derive the per-profile Config. Apply the host plugin
+        // policy on top of the profile-derived one before any downstream
+        // step inspects `config.plugins.require_signed`.
+        let mut config = config_from_profile(profile, None, None);
+        if let Some(host) = host_plugins {
+            if host.require_signed {
+                config.plugins.require_signed = true;
+            }
+        }
 
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
@@ -493,13 +568,16 @@ impl ProfileRuntime {
         // M11-F regression fix REG-5: replace the hand-rolled
         // per-profile-only assembly with `Config::plugin_dirs_from_project`
         // (the canonical helper pre-M11-F serve.rs used) so the resulting
-        // set includes the *global* `~/.octos/plugins`, `~/.octos/skills`,
-        // `<octos_home>/plugins`, `<octos_home>/skills`, and the
-        // colon-separated `OCTOS_SKILLS_PATH` env var alongside the
-        // already-scanned `<octos_home>/bundled-app-skills/`. Platform
-        // skills (`<octos_home>/platform-skills/`, admin-only) and the
-        // per-profile `data_dir/skills/` are layered on top so the
+        // set includes the deployment-scoped `<octos_home>/plugins`,
+        // `<octos_home>/skills`, the colon-separated `OCTOS_SKILLS_PATH`
+        // env var, and the already-scanned `<octos_home>/bundled-app-skills/`.
+        // Platform skills (`<octos_home>/platform-skills/`, admin-only) and
+        // the per-profile `data_dir/skills/` are layered on top so the
         // gateway behaviour is matched 1:1.
+        //
+        // Legacy HOME-rooted globals (`~/.octos/plugins`, `~/.octos/skills`)
+        // are NO LONGER scanned — `Config::plugin_dirs_from_project` emits a
+        // one-shot migration warning on first detection.
         let plugin_work_dir = data_dir.join("skill-output");
         let _ = std::fs::create_dir_all(&plugin_work_dir);
         let mut plugin_dirs: Vec<PathBuf> = Config::plugin_dirs_from_project(&effective_octos_home);
@@ -521,6 +599,14 @@ impl ProfileRuntime {
                 PluginLoadOptions {
                     work_dir: Some(&plugin_work_dir),
                     synthesis_config: None,
+                    // Section B: honour the profile-derived
+                    // `plugins.require_signed`. Default is `false`
+                    // (backward compatible). Profile bootstrap reads
+                    // the flag from the flattened `Config` produced by
+                    // `config_from_profile` so operators can opt into
+                    // strict signature enforcement per deployment.
+                    require_signed: config.plugins.require_signed,
+                    verified_cache_dir: None,
                 },
             ) {
                 Ok(result) => plugin_result = result,
@@ -585,6 +671,127 @@ impl ProfileRuntime {
         // session inherits the same memory_store.
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+
+        // REG-7 follow-up: register `run_pipeline` at profile scope so
+        // the serve path (`/api/sessions/*`, UI Protocol WS) exposes
+        // it just like the gateway path does at
+        // `crates/octos-cli/src/session_actor.rs:2283-2305`. The serve
+        // path is the one `octos serve` mounts for web clients; prior
+        // to this, only the gateway (octos chat / bus channels)
+        // registered `run_pipeline`, so the LLM in serve mode received
+        // `"No tools matched"` when it tried `activate_tools(["run_pipeline"])`
+        // for `深度研究X` queries (per PR #930's ACT-DIRECTLY rule).
+        //
+        // The original M11-D split-out at `e01a07e4` (PR #764) called
+        // this gap out as a follow-up but never landed; PR #903
+        // restored 6 of 10 regressions and explicitly deferred this
+        // one. PR #930's prompt rewrite — which makes the LLM call
+        // `run_pipeline` directly rather than wrapping it in `spawn`
+        // — turned the latent gap into an observable production
+        // failure on the dspfac profile (May 13 2026).
+        //
+        // Profile scope is sufficient: `RunPipelineTool` only captures
+        // `llm` / `memory` / `data_dir` / `plugin_dirs` / optional
+        // `adaptive_router` / `provider_policy`, all of which are
+        // profile-level. Per-session workspace context is threaded
+        // separately via `PipelineHostContext` at execute time (see
+        // `crates/octos-pipeline/src/tool.rs::execute`).
+        //
+        // `mark_spawn_only` keeps the tool out of LRU eviction and
+        // tells the execution loop to background the call so the chat
+        // bubble doesn't block on the long-running pipeline. The
+        // message text mirrors session_actor.rs:2287-2291 verbatim.
+        // `RunPipelineTool::with_provider_router` takes
+        // `octos_llm::ProviderRouter` (a sub-provider routing
+        // registry assembled from `config.sub_providers` in the
+        // gateway path). The serve path doesn't build that table
+        // — the adaptive router that lives on `ProfileRuntime`
+        // is `AdaptiveRouter`, a distinct concrete type for
+        // top-level multi-provider QoS routing. Skipping
+        // `with_provider_router` here is correct; the
+        // `default_provider` we hand in (`llm`) is already wrapped
+        // by `RetryProvider` → `ProviderChain` → `AdaptiveRouter`
+        // when adaptive is configured, so per-node calls still
+        // fan out through the adaptive layer.
+        //
+        // NEW-07: hoist the per-instance `RunPipelineTool` builder
+        // into a [`crate::session_actor::PipelineToolFactory`] impl
+        // so the WS / UI Protocol spawn-wiring site can hand a fresh
+        // `run_pipeline` instance to every spawned child registry
+        // (mirroring the gateway path at `session_actor.rs:2744-2748`).
+        // Without this, an LLM emitting
+        // `spawn(allowed_tools=["run_pipeline"])` on the WS path
+        // failed the spawn preflight
+        // (`spawn.rs::ensure_subagent_tools_available`) with
+        // `"required tool(s) not available on this host: run_pipeline"`
+        // — reproduced by mini1 `deep_research` round-7 soak (binary
+        // `5cfd85f3`).
+        let pipeline_factory: Option<
+            Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
+        > = {
+            struct AppUiPipelineToolFactory {
+                llm: Arc<dyn LlmProvider>,
+                memory: Arc<EpisodeStore>,
+                data_dir: PathBuf,
+                policy: Option<ToolPolicy>,
+                plugin_dirs: Vec<PathBuf>,
+                octos_home: PathBuf,
+                plugin_require_signed: bool,
+                /// NEW-06 fix: forwarded to every worker `Agent` via
+                /// `RunPipelineTool::with_embedder` so pipeline-spawned
+                /// agents inherit the contamination-safe hybrid scored
+                /// + filtered memory recall path.
+                embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+            }
+
+            impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
+                fn create(&self) -> Arc<dyn octos_agent::tools::Tool> {
+                    let mut pt = octos_pipeline::RunPipelineTool::new(
+                        self.llm.clone(),
+                        self.memory.clone(),
+                        self.data_dir.clone(),
+                        self.data_dir.clone(),
+                    )
+                    .with_provider_policy(self.policy.clone())
+                    .with_plugin_dirs(self.plugin_dirs.clone())
+                    .with_plugin_require_signed(self.plugin_require_signed)
+                    .with_octos_home(self.octos_home.clone());
+                    if let Some(ref embedder) = self.embedder {
+                        pt = pt.with_embedder(embedder.clone());
+                    }
+                    Arc::new(pt)
+                }
+            }
+
+            let embedder =
+                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+
+            let factory: Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync> =
+                Arc::new(AppUiPipelineToolFactory {
+                    llm: llm.clone(),
+                    memory: memory.clone(),
+                    data_dir: data_dir.to_path_buf(),
+                    policy: config.tool_policy.clone(),
+                    plugin_dirs: plugin_dirs.clone(),
+                    octos_home: effective_octos_home.clone(),
+                    plugin_require_signed: config.plugins.require_signed,
+                    embedder,
+                });
+
+            // Register the parent `run_pipeline` via the same factory
+            // so the parent registry and every spawn-child registry
+            // observe byte-identical config.
+            tools.register_arc(factory.create());
+            tools.mark_spawn_only(
+                "run_pipeline",
+                Some(
+                    "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
+                        .to_string(),
+                ),
+            );
+
+            Some(factory)
+        };
 
         // M11-F regression fix REG-2: restore the CronTool registration.
         //
@@ -756,12 +963,15 @@ impl ProfileRuntime {
             plugin_dirs,
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
+            review_config: profile.config.review.clone(),
             system_prompt,
             memory,
             memory_store,
             tool_config,
             cron_service: Some(cron_service),
+            pipeline_factory,
             hook_executor,
+            lane_routing: profile.config.lane_routing.clone(),
         }))
     }
 }
@@ -1341,6 +1551,64 @@ mod tests {
         );
     }
 
+    /// Section B (codex review round-3): the host's `plugins.require_signed`
+    /// policy must reach the per-profile bootstrap so an unsigned skill
+    /// installed under `<data_dir>/skills/` is rejected even when the
+    /// profile JSON omits the flag. We plant an unsigned skill and assert
+    /// it does NOT load when `bootstrap_with_host_plugins` is invoked
+    /// with `host_plugins.require_signed = true`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profile_runtime_bootstrap_honours_host_require_signed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _key = ScopedEnvKey::set("OCTOS_HOST_SIGN_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let octos_home = tmp.path().join("octos-home");
+        let data_dir = octos_home.join("profiles").join("sigtest").join("data");
+        let skills_dir = data_dir.join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Plant an unsigned per-profile skill — manifest omits sha256.
+        let plugin_dir = skills_dir.join("unsigned-skill");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "unsigned-skill",
+                "version": "1.0",
+                "tools": [{"name": "ut", "description": "d"}]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("unsigned-skill");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho unsigned").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile = fixture_profile("sigtest", "OCTOS_HOST_SIGN_KEY");
+        let host_plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+
+        let rt = ProfileRuntime::bootstrap_with_host_plugins(
+            &profile,
+            &data_dir,
+            Some(&octos_home),
+            BootstrapRole::Serve,
+            Some(&host_plugins),
+        )
+        .await
+        .expect("bootstrap should succeed (the rejection only suppresses the plugin)");
+
+        let specs = rt.tool_specs.specs();
+        let registered: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !registered.iter().any(|n| n == &"ut"),
+            "unsigned skill tool `ut` must NOT load when host strict policy is on; \
+             registered: {registered:?}"
+        );
+    }
+
     /// M11-F regression fix REG-2 follow-up (codex review): when the
     /// `ProfileRuntime` drops, the cron service must observe a
     /// shutdown signal so the self-armed timer task does not survive
@@ -1413,6 +1681,64 @@ mod tests {
         assert!(
             rt.hook_executor.is_none(),
             "hook_executor must be None when neither config nor plugins supply hooks",
+        );
+    }
+
+    /// NEW-07 regression: `ProfileRuntime::bootstrap` must populate
+    /// `pipeline_factory` so the WS / UI Protocol spawn-wiring site can
+    /// attach a fresh `run_pipeline` instance to every spawn-child
+    /// registry. Pre-fix the field did not exist and the WS path's
+    /// SpawnTool only carried a `send_file` child factory — so a child
+    /// agent declaring `allowed_tools=["run_pipeline"]` hit
+    /// `ensure_subagent_tools_available`'s missing-tool branch and the
+    /// spawn was rejected with
+    /// `required tool(s) not available on this host: run_pipeline`.
+    /// Round-7 soak (binary `5cfd85f3`) caught the regression on mini1
+    /// `deep_research`; this test pins it.
+    ///
+    /// We exercise the factory by:
+    ///   1. Bootstrapping a profile with a valid LLM env var.
+    ///   2. Asserting `pipeline_factory.is_some()`.
+    ///   3. Building a `ToolRegistry` with the factory's tool and the
+    ///      `octos_agent` builtins, then asserting the registry's
+    ///      `get("run_pipeline")` returns `Some` — the same predicate
+    ///      `ensure_subagent_tools_available` uses (see
+    ///      `crates/octos-agent/src/tools/spawn.rs::ensure_subagent_tools_available`).
+    #[tokio::test]
+    async fn profile_runtime_bootstrap_populates_pipeline_factory_for_spawn_children() {
+        let _key = ScopedEnvKey::set("OCTOS_NEW07_PIPELINE_FACTORY_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let profile = fixture_profile("new07", "OCTOS_NEW07_PIPELINE_FACTORY_KEY");
+        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("bootstrap should succeed");
+
+        let factory = rt
+            .pipeline_factory
+            .as_ref()
+            .expect("pipeline_factory must be Some after a successful bootstrap");
+        let pt = factory.create();
+        assert_eq!(
+            pt.name(),
+            "run_pipeline",
+            "factory must produce the `run_pipeline` tool by name",
+        );
+
+        // Mirror the gateway's `with_child_tool_factory` consumer: clone
+        // the `Arc` and hand the child a fresh registry that mounts the
+        // factory output. This is exactly what `ui_protocol.rs` does at
+        // spawn-tool wiring time (see the NEW-07 comment block in the
+        // SpawnTool wiring), so success here proves the
+        // `ensure_subagent_tools_available` preflight will pass for
+        // `allowed_tools=["run_pipeline"]`.
+        let mut child_registry = octos_agent::ToolRegistry::with_builtins(&data_dir);
+        child_registry.register_arc(factory.create());
+        assert!(
+            child_registry.get("run_pipeline").is_some(),
+            "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",
         );
     }
 }

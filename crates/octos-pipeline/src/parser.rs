@@ -58,6 +58,8 @@ impl<'a> DotParser<'a> {
             id,
             label: None,
             default_model: None,
+            max_total_tokens: None,
+            default_timeout_secs: None,
             nodes: HashMap::new(),
             edges: Vec::new(),
             subgraphs: Vec::new(),
@@ -494,6 +496,14 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
     if let Some(model) = attrs.get("default_model") {
         graph.default_model = Some(model.clone());
     }
+    if let Some(max_total_tokens) = attrs.get("max_total_tokens") {
+        graph.max_total_tokens = max_total_tokens.parse().ok();
+    }
+    // NEW-15: per-pipeline wall-clock default. Accepts a plain integer
+    // ("2400") or a suffixed duration ("40m", "2400s", "1h").
+    if let Some(timeout) = attrs.get("default_timeout_secs") {
+        graph.default_timeout_secs = parse_duration_secs(timeout);
+    }
 }
 
 /// Parse a duration string like "900s", "15m", "2h" into seconds.
@@ -572,6 +582,10 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         max_tasks: attrs.get("max_tasks").and_then(|s| s.parse().ok()),
         deadline_secs,
         deadline_action,
+        continue_on_error: attrs
+            .get("continue_on_error")
+            .and_then(|s| parse_bool(s))
+            .unwrap_or(false),
         checkpoints,
     }
 }
@@ -1100,6 +1114,74 @@ mod tests {
         "#;
         let graph = parse_dot(dot).unwrap();
         assert!(graph.nodes["n3"].checkpoints.is_empty());
+    }
+
+    #[test]
+    fn should_parse_run_level_token_budget() {
+        let dot = r#"
+            digraph test {
+                graph [max_total_tokens="1234"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.max_total_tokens, Some(1234));
+    }
+
+    /// NEW-15: the DOT graph attribute `default_timeout_secs` is parsed
+    /// into `PipelineGraph::default_timeout_secs` so `RunPipelineTool`
+    /// can use it as the per-pipeline fallback wall-clock cap when the
+    /// LLM does not supply `timeout_secs`.
+    #[test]
+    fn should_parse_graph_default_timeout_secs_plain_integer() {
+        let dot = r#"
+            digraph test {
+                graph [default_timeout_secs="2400"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.default_timeout_secs, Some(2400));
+    }
+
+    /// `default_timeout_secs` accepts suffixed durations (parity with
+    /// other duration attributes elsewhere in the parser).
+    #[test]
+    fn should_parse_graph_default_timeout_secs_suffixed_duration() {
+        let dot = r#"
+            digraph test {
+                graph [default_timeout_secs="40m"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.default_timeout_secs, Some(2400));
+    }
+
+    /// Backward-compat: when the DOT graph omits `default_timeout_secs`,
+    /// the field stays `None` so callers fall through to the hard-coded
+    /// 1800s default.
+    #[test]
+    fn should_leave_default_timeout_secs_none_when_attribute_absent() {
+        let dot = r#"
+            digraph test {
+                graph [label="no timeout here"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.default_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn should_parse_continue_on_error() {
+        let dot = r#"
+            digraph test {
+                n1 [prompt="a", continue_on_error="true"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.nodes["n1"].continue_on_error);
     }
 
     #[test]

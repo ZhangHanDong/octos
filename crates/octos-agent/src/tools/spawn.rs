@@ -15,12 +15,15 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::mcp_agent::{
-    DispatchRequest, DispatchResponse, McpAgentBackendConfig, SharedBackend,
-    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse,
+    McpAgentBackendConfig, SharedBackend, build_backend_from_config, build_dispatch_event_payload,
+    dispatch_with_metrics,
 };
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::file_state_cache::FileStateCache;
 use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
+use crate::prompt_context::PromptContextManager;
+use crate::role_template::RoleTemplate;
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
 use crate::task_supervisor::TaskSupervisor;
@@ -36,6 +39,20 @@ use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResu
 /// [`SpawnTool::with_mcp_agent_backend`] for runtimes that expose a
 /// different entry point.
 pub const DEFAULT_MCP_AGENT_TOOL_NAME: &str = "run_task";
+
+/// Metadata passed to the parent runtime when a spawned child needs its own
+/// caller-owned prompt context manager.
+#[derive(Clone, Debug)]
+pub struct ChildPromptContextRequest {
+    pub parent_session_key: Option<String>,
+    pub child_session_key: Option<String>,
+    pub task_id: Option<String>,
+    pub worker_id: String,
+    pub task_label: String,
+}
+
+pub type ChildPromptContextManagerFactory =
+    Arc<dyn Fn(ChildPromptContextRequest) -> Option<Arc<dyn PromptContextManager>> + Send + Sync>;
 
 /// Guard C (issue #607): maximum nesting depth for `spawn`-within-`spawn`
 /// invocations before [`SpawnTool::execute_with_context`] refuses further
@@ -114,6 +131,32 @@ pub struct BackgroundResultPayload {
     /// `read_task_output` against it). `None` for legacy callers and
     /// tests that do not register tasks with the supervisor.
     pub task_id: Option<String>,
+    /// Originating `tool_call_id` (the spawn_only tool invocation that
+    /// produced this background task). Surfaced on the wire as
+    /// [`octos_core::ui_protocol::TurnSpawnCompleteEvent::tool_call_id`]
+    /// so the client can flip the in-flight chip from spinner to
+    /// checkmark directly off the envelope, without a race against a
+    /// `task/updated` watcher that builds `task_id → tool_call_id`
+    /// post-hoc. `None` for legacy callers and tests that do not track
+    /// the originating call.
+    pub tool_call_id: Option<String>,
+    /// Issue #960 fix (M10 Phase 4 plumbing): the originating user
+    /// message's `client_message_id` (cmid) — the same value the
+    /// supervisor records as
+    /// [`crate::task_supervisor::BackgroundTask::originating_client_message_id`]
+    /// and that the M8.9 recovery path threads onto its synthetic turn.
+    /// Surfaces on the wire as
+    /// [`octos_core::ui_protocol::TurnSpawnCompleteEvent::response_to_client_message_id`]
+    /// so the SPA reducer can anchor the new assistant bubble to the
+    /// parent user prompt instead of falling back to thread-map heuristics
+    /// (the bundle's `subSpawnComplete` handler bails when that lookup
+    /// misses — issue #960 root cause). For gateway-style channels the
+    /// reporter binds the real per-user `cmid`; for the WS standalone-turn
+    /// path the reporter binds the originating `TurnId` (a UUID) and the
+    /// SPA already keys its thread-map on that same value, so the wire
+    /// identity round-trips correctly in both shapes. `None` for legacy
+    /// callers and tests that do not track origination.
+    pub originating_client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +433,10 @@ pub struct SpawnTool {
     plugin_dirs: Vec<PathBuf>,
     /// Extra environment variables for plugin processes.
     plugin_extra_env: Vec<(String, String)>,
+    /// Section B (codex review P1.1): inherit the parent's strict-signing
+    /// policy so subagents enforce the same integrity gate when loading
+    /// plugin tools. Defaults to `false` (legacy permissive path).
+    plugin_require_signed: bool,
     /// Additional per-child tools that cannot live in octos-agent builtins.
     child_tool_factories: Vec<ChildToolFactory>,
     /// Shared task supervisor so background subagents show up in task tracking.
@@ -426,6 +473,18 @@ pub struct SpawnTool {
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
     parent_subagent_summary_generator: Option<Arc<AgentSummaryGenerator>>,
+    /// Caller-owned context-manager factory for child agents. AppUI/session
+    /// runtimes use this to fork the parent context ledger before a subagent
+    /// starts, so child prompts are compacted and normalized by the same
+    /// durable context path as top-level turns.
+    child_prompt_context_manager_factory: Option<ChildPromptContextManagerFactory>,
+    /// #714: pre-dispatch policy gate for the `agent_mcp` spawn branch.
+    /// Without one, `dispatch_with_metrics` is reached unconditionally —
+    /// the same bypass the swarm side closed via
+    /// `octos_swarm::SwarmBuilder::with_dispatch_policy` in #710 / #713.
+    /// `None` keeps the pre-fix behaviour for callers that opted out
+    /// (e.g. legacy tests not exercising the gate).
+    dispatch_policy: Option<crate::dispatch_policy::DispatchPolicy>,
 }
 
 impl SpawnTool {
@@ -451,6 +510,7 @@ impl SpawnTool {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            plugin_require_signed: false,
             child_tool_factories: Vec::new(),
             task_supervisor: None,
             session_key: None,
@@ -462,6 +522,8 @@ impl SpawnTool {
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
+            child_prompt_context_manager_factory: None,
+            dispatch_policy: None,
         }
     }
 
@@ -490,6 +552,7 @@ impl SpawnTool {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            plugin_require_signed: false,
             child_tool_factories: Vec::new(),
             task_supervisor: None,
             session_key: None,
@@ -501,6 +564,8 @@ impl SpawnTool {
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
+            child_prompt_context_manager_factory: None,
+            dispatch_policy: None,
         }
     }
 
@@ -559,6 +624,14 @@ impl SpawnTool {
         self
     }
 
+    /// Section B (codex review P1.1): inherit the parent's strict-signing
+    /// policy. When `true`, subagent plugin loads honour the same
+    /// `plugins.require_signed` gate as the parent.
+    pub fn with_plugin_require_signed(mut self, require_signed: bool) -> Self {
+        self.plugin_require_signed = require_signed;
+        self
+    }
+
     /// Add a factory for tools that must be instantiated per child worker.
     pub fn with_child_tool_factory(mut self, factory: ChildToolFactory) -> Self {
         self.child_tool_factories.push(factory);
@@ -611,6 +684,19 @@ impl SpawnTool {
         Ok(self.with_mcp_agent_backend(backend, tool_name))
     }
 
+    /// #714: wire a pre-dispatch policy gate for the `agent_mcp` spawn
+    /// branch. Mirrors
+    /// [`octos_swarm::SwarmBuilder::with_dispatch_policy`] so both
+    /// dispatch surfaces fail closed on the same shape of gates
+    /// ([`ToolPolicy`], env denylist / allowlist, approval,
+    /// `require_sandboxed`). Without one, the agent_mcp branch reaches
+    /// [`crate::tools::mcp_agent::dispatch_with_metrics`] directly —
+    /// the bypass #714 closes.
+    pub fn with_dispatch_policy(mut self, policy: crate::dispatch_policy::DispatchPolicy) -> Self {
+        self.dispatch_policy = Some(policy);
+        self
+    }
+
     /// Attach a cost / provenance accountant (M7.4). Every successful
     /// MCP sub-agent dispatch routed through this tool records an
     /// attribution on the accountant's ledger. If the accountant carries
@@ -652,6 +738,15 @@ impl SpawnTool {
         self
     }
 
+    /// Attach a runtime-owned context manager factory for spawned children.
+    pub fn with_child_prompt_context_manager_factory(
+        mut self,
+        factory: ChildPromptContextManagerFactory,
+    ) -> Self {
+        self.child_prompt_context_manager_factory = Some(factory);
+        self
+    }
+
     /// M8 Runtime Parity W2.B1 introspection helper — used by tests
     /// and the parity audit harness to assert that a SpawnTool was
     /// fully wired with parent caches.
@@ -690,7 +785,78 @@ impl SpawnTool {
             .clone()
             .unwrap_or_else(|| DEFAULT_MCP_AGENT_TOOL_NAME.to_string());
 
-        let request = DispatchRequest { tool_name, task };
+        // #714: the public `dispatch_to_mcp_agent` helper is a thin
+        // wrapper around `dispatch_with_metrics`. Apply the same policy
+        // gate the main `execute` agent_mcp branch uses so a configured
+        // policy cannot be bypassed by routing through this helper. The
+        // gate inspects the dispatch payload (tool_name + task) before
+        // any backend round-trip, so denials never touch the network
+        // and never increment the dispatch metric. On denial we
+        // synthesise a `RemoteError` response carrying the gate reason
+        // so the existing harness-event + dispatch-event pipeline
+        // surfaces the failure with the same shape as a backend error.
+        if let Some(policy) = self.dispatch_policy.as_ref() {
+            if let Err(denial) = crate::dispatch_policy::enforce_dispatch_gates(
+                policy,
+                backend.as_ref(),
+                crate::dispatch_policy::DispatchTarget {
+                    dispatch_id: task_id,
+                    tool_name: &tool_name,
+                    task: &task,
+                },
+            )
+            .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    outcome = %denial.last_dispatch_outcome,
+                    reason = %denial.reason,
+                    "rejecting direct MCP dispatch by DispatchPolicy gate"
+                );
+                let denied_response = DispatchResponse {
+                    outcome: DispatchOutcome::RemoteError,
+                    output: String::new(),
+                    files_to_send: Vec::new(),
+                    error: Some(format!(
+                        "dispatch rejected by policy ({}): {}",
+                        denial.last_dispatch_outcome, denial.reason
+                    )),
+                    context_contract: None,
+                };
+                let payload = build_dispatch_event_payload(
+                    session_id,
+                    task_id,
+                    workflow,
+                    phase,
+                    backend.as_ref(),
+                    &denied_response,
+                );
+                let event = HarnessEvent {
+                    schema: crate::harness_events::HARNESS_EVENT_SCHEMA_V1.to_string(),
+                    payload,
+                };
+                event.validate().map_err(|error| {
+                    eyre::eyre!("policy-denied dispatch event failed validation: {error}")
+                })?;
+                return Ok((denied_response, event));
+            }
+        }
+
+        let request = DispatchRequest::new(tool_name, task).with_context_contract(
+            // #1021 / M17-C — populate backend_kind/agent_id/risk so the
+            // evidence ledger can identify this unmanaged dispatch
+            // without parsing free-form text. Direct MCP dispatch never
+            // forks the Octos prompt context manager, so we tag it
+            // `risk: medium` (external transport, no managed context).
+            DispatchContextContract::external_unmanaged(
+                "direct_mcp_dispatch_has_no_octos_context_manager_payload",
+            )
+            .with_parent_session_key(Some(session_id.to_string()))
+            .with_child_session_key(Some(task_id.to_string()))
+            .with_backend_kind("mcp")
+            .with_agent_id(task_id.to_string())
+            .with_risk("medium"),
+        );
         let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
         let payload = build_dispatch_event_payload(
             session_id,
@@ -791,6 +957,9 @@ struct Input {
     /// These are added after the parent's worker prompt, never replacing it.
     #[serde(default, alias = "system_prompt")]
     additional_instructions: Option<String>,
+    /// Canonical M14-C backend role template to apply to this child.
+    #[serde(default)]
+    role: Option<String>,
     /// Optional structured workflow metadata from the session runtime.
     #[serde(default)]
     workflow: Option<WorkflowMetadata>,
@@ -890,6 +1059,37 @@ fn apply_agent_definition(
     }
 
     Ok(())
+}
+
+fn append_role_instructions(existing: Option<String>, role_prefix: &str) -> Option<String> {
+    if role_prefix.trim().is_empty() {
+        return existing;
+    }
+    Some(match existing {
+        Some(existing) if !existing.trim().is_empty() => format!("{role_prefix}\n\n{existing}"),
+        _ => role_prefix.to_owned(),
+    })
+}
+
+fn apply_role_template(input: &mut Input) -> Result<Option<&'static RoleTemplate>> {
+    let Some(role) = input
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+    else {
+        return Ok(None);
+    };
+    let template = RoleTemplate::for_name(role)
+        .ok_or_else(|| eyre::eyre!("spawn: unknown role template '{role}'"))?;
+
+    if input.allowed_tools.is_empty() {
+        input.allowed_tools = template.allowed_tools_vec();
+    }
+    input.additional_instructions =
+        append_role_instructions(input.additional_instructions.take(), template.prompt_prefix);
+    input.role = Some(template.name.to_owned());
+    Ok(Some(template))
 }
 
 fn should_deliver_output_files(files: &[PathBuf]) -> bool {
@@ -1665,6 +1865,11 @@ impl Tool for SpawnTool {
                     "items": { "type": "string" },
                     "description": "Tool names the subagent may use. Empty = all builtins."
                 },
+                "role": {
+                    "type": "string",
+                    "enum": ["reviewer", "implementer", "test_worker", "explorer"],
+                    "description": "Backend-owned M14-C role template. When set, the server resolves tool budget, sandbox, approval, model preference, and prompt prefix from the runtime template."
+                },
                 "context": {
                     "type": "string",
                     "description": "Extra context prepended to the task prompt."
@@ -1774,6 +1979,7 @@ impl Tool for SpawnTool {
         // wins" semantics. Unknown ids are a hard error — silently ignoring
         // them would let a typo erase the manifest's safety envelope.
         apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
+        let role_template = apply_role_template(&mut input)?;
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
@@ -1827,10 +2033,53 @@ impl Tool for SpawnTool {
             let dispatch_payload = serde_json::json!({
                 "task": task_desc,
                 "label": label,
+                "role": input.role,
                 "allowed_tools": allowed_tools,
                 "workflow": workflow.clone(),
                 "additional_instructions": input.additional_instructions,
             });
+
+            // #714: pre-dispatch policy gate. Runs **before** any
+            // budget reservation or backend dispatch so a denial
+            // short-circuits the whole pipeline (no reservation taken,
+            // no backend touched) — the same ordering the swarm
+            // dispatcher uses in `octos_swarm::dispatch_with_budget`.
+            // Without a configured policy this is a noop and the
+            // existing path is unchanged. With one, the gate enforces
+            // `tool_policy`, env denylist / allowlist, `require_approval`,
+            // and `require_sandboxed` so the agent_mcp branch can no
+            // longer bypass the constraints the operator wired into
+            // `octos serve`.
+            if let Some(policy) = self.dispatch_policy.as_ref() {
+                if let Err(denial) = crate::dispatch_policy::enforce_dispatch_gates(
+                    policy,
+                    backend.as_ref(),
+                    crate::dispatch_policy::DispatchTarget {
+                        dispatch_id: &task_id_for_event,
+                        tool_name: &tool_name,
+                        task: &dispatch_payload,
+                    },
+                )
+                .await
+                {
+                    warn!(
+                        task_id = %task_id_for_event,
+                        outcome = %denial.last_dispatch_outcome,
+                        reason = %denial.reason,
+                        "rejecting MCP sub-agent dispatch by DispatchPolicy gate"
+                    );
+                    let message = format!(
+                        "Status: FAILED\nDispatch rejected by policy ({outcome}): {reason}",
+                        outcome = denial.last_dispatch_outcome,
+                        reason = denial.reason,
+                    );
+                    return Ok(ToolResult {
+                        output: message,
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
 
             // Pre-dispatch budget reservation (F-003). Absent a
             // configured accountant the reservation short-circuits to
@@ -1890,10 +2139,23 @@ impl Tool for SpawnTool {
             };
 
             let (response, event) = {
-                let request = DispatchRequest {
-                    tool_name,
-                    task: dispatch_payload,
-                };
+                let request = DispatchRequest::new(tool_name, dispatch_payload)
+                    .with_context_contract(
+                        // #1021 / M17-C — backend_kind/agent_id/risk
+                        // identify this unmanaged dispatch in the
+                        // evidence ledger. Same medium-risk tagging as
+                        // the direct dispatch path: external MCP
+                        // transport that never forks the Octos prompt
+                        // context manager.
+                        DispatchContextContract::external_unmanaged(
+                            "mcp_agent_backend_does_not_consume_octos_prompt_context_manager",
+                        )
+                        .with_parent_session_key(self.session_key.clone())
+                        .with_child_session_key(Some(task_id_for_event.clone()))
+                        .with_backend_kind("mcp")
+                        .with_agent_id(task_id_for_event.clone())
+                        .with_risk("medium"),
+                    );
                 let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
                 let payload = build_dispatch_event_payload(
                     session_key_for_event.clone(),
@@ -2026,29 +2288,6 @@ impl Tool for SpawnTool {
             // `commit` above consumed it successfully, or Drop refunds.
             drop(reservation);
 
-            let mut files_to_send = response.files_to_send.clone();
-            // Workflow contract families always gate outputs through the
-            // workspace contract. The dispatch response is advisory; the
-            // final delivery path remains owned by the runtime.
-            if let Some(workflow_meta) = workflow.as_ref() {
-                if workflow_uses_contract_terminal_delivery(workflow_meta) {
-                    match resolve_contract_terminal_files(
-                        self.working_dir.as_path(),
-                        Some(workflow_meta),
-                    ) {
-                        Ok(Some(contract_files)) => files_to_send = contract_files,
-                        Ok(None) => {}
-                        Err(error) => {
-                            return Ok(ToolResult {
-                                output: format!("Status: FAILED\n{error}"),
-                                success: false,
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
-            }
-
             // Review A F-004: for the agent_mcp dispatch path the child
             // session runs inside the remote backend and never touches the
             // parent's ValidatorRunner. Before, the parent trusted the
@@ -2058,6 +2297,23 @@ impl Tool for SpawnTool {
             // here, against the parent's workspace root, restores the
             // invariant: any required validator failure demotes the
             // response to a typed failure before it leaves the tool.
+            //
+            // octos #997 (round-4 fix): run both the session-scope and
+            // project-scope validator blocks BEFORE
+            // `resolve_contract_terminal_files`. With
+            // `terminal_output.required_artifact_kind = "presentation"`
+            // (real `slides_delivery` shape),
+            // `resolve_contract_terminal_files` calls
+            // `inspect_workspace_contract_at_root` which reads the project
+            // ledger at
+            // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`.
+            // If validators run AFTER that gate, the gate returns
+            // `ready = false` (empty ledger) and the agent_mcp branch
+            // early-returns at `Err(error) => return Ok(...)` before
+            // either validator block executes. Re-ordering ensures the
+            // project ledger is populated first, so the contract gate
+            // inside `resolve_contract_terminal_files` sees the real
+            // `Pass` rows.
             let mut mcp_success = success;
             let mut mcp_output_override: Option<String> = None;
             if mcp_success {
@@ -2073,6 +2329,7 @@ impl Tool for SpawnTool {
                             &policy.validation.validators,
                             "spawn-agent-mcp",
                             crate::validators::ValidatorPhase::Completion,
+                            None,
                         )
                         .await
                         {
@@ -2080,6 +2337,65 @@ impl Tool for SpawnTool {
                             mcp_output_override = Some(format!(
                                 "Status: FAILED\nremote_agent_mcp: completion validator rejected child artifact: {reason}"
                             ));
+                        }
+                    }
+                }
+            }
+
+            // octos #997 (round-3 fix): the session-scope validator block above
+            // runs against `self.working_dir` (the session root) and writes the
+            // session ledger only. The project-scope contract gate
+            // (`inspect_workspace_contract`) reads
+            // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`. Without
+            // this run, an `agent_mcp` slides dispatch that produces a valid
+            // PPTX would leave the project ledger empty and a downstream
+            // contract gate would surface `ready = false`. Mirror the sync
+            // (`:2312`) and background (`:2680`) spawn fixes so the agent_mcp
+            // branch closes the same bypass.
+            if mcp_success {
+                let expected_kind = workflow.as_ref().and_then(workflow_contract_project_kind);
+                let registry_for_validators = ToolRegistry::with_builtins(&self.working_dir);
+                let report = crate::workspace_contract::run_project_root_validators(
+                    &registry_for_validators,
+                    &self.working_dir,
+                    expected_kind,
+                    &response.files_to_send,
+                )
+                .await;
+                if let Some(reason) = report.first_failure_reason() {
+                    mcp_success = false;
+                    mcp_output_override = Some(format!(
+                        "Status: FAILED\nremote_agent_mcp: project-scope validator rejected child artifact: {reason}"
+                    ));
+                }
+            }
+
+            // Workflow contract families always gate outputs through the
+            // workspace contract. The dispatch response is advisory; the
+            // final delivery path remains owned by the runtime.
+            //
+            // Runs LAST so the validator blocks above have already written
+            // the session + project ledgers; `inspect_workspace_contract_at_root`
+            // (inside `resolve_contract_terminal_files`) reads those ledgers
+            // to decide `ready`. Skipped on validator failure — empty
+            // `files_to_send` is correct for a failed result.
+            let mut files_to_send = response.files_to_send.clone();
+            if mcp_success {
+                if let Some(workflow_meta) = workflow.as_ref() {
+                    if workflow_uses_contract_terminal_delivery(workflow_meta) {
+                        match resolve_contract_terminal_files(
+                            self.working_dir.as_path(),
+                            Some(workflow_meta),
+                        ) {
+                            Ok(Some(contract_files)) => files_to_send = contract_files,
+                            Ok(None) => {}
+                            Err(error) => {
+                                return Ok(ToolResult {
+                                    output: format!("Status: FAILED\n{error}"),
+                                    success: false,
+                                    ..Default::default()
+                                });
+                            }
                         }
                     }
                 }
@@ -2134,12 +2450,20 @@ impl Tool for SpawnTool {
             // Sync mode: run subagent inline and return the result directly
             let mut tools = ToolRegistry::with_builtins(&self.working_dir);
             // Load plugin tools so subagents can use fm_tts, etc.
+            // Section B (codex review P1.1): honour the parent's
+            // require_signed policy so unsigned plugins are rejected here
+            // when strict mode is on.
             if !self.plugin_dirs.is_empty() {
-                let _ = crate::plugins::PluginLoader::load_into_with_work_dir(
+                let _ = crate::plugins::PluginLoader::load_into_with_options(
                     &mut tools,
                     &self.plugin_dirs,
                     &self.plugin_extra_env,
-                    Some(&self.working_dir),
+                    crate::plugins::PluginLoadOptions {
+                        work_dir: Some(&self.working_dir),
+                        synthesis_config: None,
+                        require_signed: self.plugin_require_signed,
+                        verified_cache_dir: None,
+                    },
                 );
             }
             for factory in &self.child_tool_factories {
@@ -2161,11 +2485,32 @@ impl Tool for SpawnTool {
                 // own spawn tool calls see the higher value and the
                 // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
                 .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
+            // Phase 2-D of the SessionScope migration: propagate the
+            // parent's scope into the child Agent so the child's tools
+            // (shell, read_file, write_file, edit_file, plugin tool,
+            // pipeline workers) all see the same filesystem contract.
+            // The child runs in a sub-session of the same parent — for
+            // now it shares the parent's workspace; a future enhancement
+            // can carve out per-child subdirs if isolation is required.
+            if let Some(scope) = ctx.session_scope.as_ref() {
+                worker = worker.with_session_scope(scope.clone());
+            }
             // Keep an Arc handle to the child's tool registry so we can run
             // declared validators against it after `run_task` returns.
             let child_tools_handle = worker.tool_registry().clone();
             if let Some(ref config) = self.worker_config {
                 worker = worker.with_config(config.clone());
+            }
+            if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
+                if let Some(manager) = factory(ChildPromptContextRequest {
+                    parent_session_key: self.session_key.clone(),
+                    child_session_key: None,
+                    task_id: None,
+                    worker_id: worker.id.to_string(),
+                    task_label: label.clone(),
+                }) {
+                    worker = worker.with_prompt_context_manager(manager);
+                }
             }
 
             // M8 Runtime Parity W2.B1: inherit parent caches so the child
@@ -2251,6 +2596,7 @@ impl Tool for SpawnTool {
                                     &policy.validation.validators,
                                     "spawn",
                                     crate::validators::ValidatorPhase::Completion,
+                                    None,
                                 )
                                 .await
                                 {
@@ -2265,6 +2611,37 @@ impl Tool for SpawnTool {
                             }
                         }
                     }
+
+                    // octos #997 (round-2 fix): in addition to the session-scope
+                    // validator run above, ALSO run each project-scope policy
+                    // at its OWN project root. The session run writes its
+                    // outcome to `<session>/.octos/validator_outcomes.jsonl`,
+                    // but `inspect_workspace_contract` reads from
+                    // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`
+                    // — so without this run a real valid deck whose project
+                    // policy declares a hard-required validator (octos #997:
+                    // `slides.mofa_slides.pptx_magic_bytes`) would surface as
+                    // `ready = false`. Scope the iteration to the workflow's
+                    // expected kind when available so a slides spawn does not
+                    // run the sites validator chain.
+                    if success {
+                        let expected_kind =
+                            workflow.as_ref().and_then(workflow_contract_project_kind);
+                        let report = crate::workspace_contract::run_project_root_validators(
+                            child_tools_handle.as_ref(),
+                            &self.working_dir,
+                            expected_kind,
+                            &r.files_to_send,
+                        )
+                        .await;
+                        if let Some(reason) = report.first_failure_reason() {
+                            success = false;
+                            output = format!(
+                                "Subagent failed: project-scope validator rejected child artifact: {reason}"
+                            );
+                        }
+                    }
+
                     Ok(ToolResult {
                         output,
                         success,
@@ -2303,6 +2680,24 @@ impl Tool for SpawnTool {
                     .and_then(|supervisor| supervisor.get_task(task_id))
                     .and_then(|task| task.child_session_key)
             });
+            if let (Some(supervisor), Some(task_id), Some(template)) = (
+                self.task_supervisor.as_ref(),
+                tracked_task_id.as_ref(),
+                role_template,
+            ) {
+                supervisor.set_m13b_projection(
+                    task_id,
+                    Some("model".to_owned()),
+                    Some(template.name.to_owned()),
+                    Some(label.chars().take(160).collect()),
+                    Some(0),
+                    Some(template.runtime_policy_stamp(
+                        "model",
+                        &input.backend,
+                        input.model.as_deref(),
+                    )),
+                );
+            }
             let llm = sub_llm;
             let memory = self.memory.clone();
             let working_dir = self.working_dir.clone();
@@ -2316,6 +2711,7 @@ impl Tool for SpawnTool {
             let task_label = label.clone();
             let plugin_dirs = self.plugin_dirs.clone();
             let plugin_extra_env = self.plugin_extra_env.clone();
+            let plugin_require_signed = self.plugin_require_signed;
             let child_tool_factories = self.child_tool_factories.clone();
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
@@ -2336,6 +2732,19 @@ impl Tool for SpawnTool {
             // which after fast-follow-up turns is the WRONG turn's
             // thread_id (cf. live mini3 trace, 2026-04-29).
             let originating_thread_id = ctx.reporter.thread_id().map(str::to_string);
+            // Snapshot the originating LLM `tool_call_id` (carried on
+            // `ToolContext.tool_id`) so the late-arriving terminal payload
+            // surfaces it on `TurnSpawnCompleteEvent.tool_call_id`. The
+            // client uses this to flip the in-flight chip from spinner to
+            // checkmark without a race against a `task/updated` watcher.
+            // Empty when the caller invoked the tool from a non-LLM
+            // context (synthetic harness, recovery path); in that case
+            // the field stays `None` on the wire.
+            let originating_tool_call_id = if ctx.tool_id.is_empty() {
+                None
+            } else {
+                Some(ctx.tool_id.clone())
+            };
             // M8 Runtime Parity W2.B1: capture parent caches into the
             // detached background closure so the bg child Agent gets the
             // same FileStateCache + Router + SummaryGenerator as the sync
@@ -2345,11 +2754,46 @@ impl Tool for SpawnTool {
             let parent_file_state_cache = self.parent_file_state_cache.clone();
             let parent_subagent_output_router = self.parent_subagent_output_router.clone();
             let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
+            // Issue #1125: invoke the child prompt-context factory
+            // SYNCHRONOUSLY here (before any `await`) so the fork captures
+            // the parent transcript as it stood at spawn dispatch time.
+            //
+            // The previous wiring deferred this call into the detached
+            // `tokio::spawn` below, AFTER awaiting
+            // `dispatch_child_session_lifecycle`. If the parent recorded
+            // another user turn during that await window, the factory
+            // (which locks the live parent `ContextManager`) would fork a
+            // POST-spawn snapshot — leaking messages that were not part
+            // of the spawning turn into the background child's context.
+            //
+            // Fork-at-dispatch produces a `ContextManager` snapshot pinned
+            // to the pre-spawn parent generation; the detached task just
+            // installs the pre-baked manager on the child Agent without
+            // touching the parent lock.
+            let prebuilt_child_prompt_context_manager = self
+                .child_prompt_context_manager_factory
+                .as_ref()
+                .and_then(|factory| {
+                    factory(ChildPromptContextRequest {
+                        parent_session_key: self.session_key.clone(),
+                        child_session_key: tracked_child_session_key.clone(),
+                        task_id: tracked_task_id.clone(),
+                        worker_id: worker_id.to_string(),
+                        task_label: label.clone(),
+                    })
+                });
             // Guard C (issue #607): snapshot the caller's spawn depth so
             // the detached child Agent dispatched below sees
             // `parent_depth + 1` and the [`MAX_SPAWN_DEPTH`] gate fires
             // after a bounded number of nests.
             let child_spawn_depth = ctx.spawn_depth.saturating_add(1);
+            // Phase 2-D of the SessionScope migration: snapshot the
+            // parent's scope before crossing into the detached
+            // `tokio::spawn` task. The background child shares the
+            // parent workspace — same contract as the sync branch above
+            // — so subprocesses spawned by the child's shell tool see
+            // the same CWD the foreground would.
+            let child_session_scope = ctx.session_scope.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -2433,18 +2877,23 @@ impl Tool for SpawnTool {
                     }
                     _ => None,
                 };
-                let harness_event_sink_path = harness_event_sink
-                    .as_ref()
-                    .map(|sink| sink.path().display().to_string());
+                let harness_event_sink_path = harness_event_sink.as_ref().map(|sink| sink.uri());
 
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
                 // Load plugin tools so subagents can use fm_tts, etc.
+                // Section B (codex review P1.1): inherit the parent's
+                // require_signed gate.
                 if !plugin_dirs.is_empty() {
-                    let _ = crate::plugins::PluginLoader::load_into_with_work_dir(
+                    let _ = crate::plugins::PluginLoader::load_into_with_options(
                         &mut tools,
                         &plugin_dirs,
                         &plugin_extra_env,
-                        Some(&working_dir),
+                        crate::plugins::PluginLoadOptions {
+                            work_dir: Some(&working_dir),
+                            synthesis_config: None,
+                            require_signed: plugin_require_signed,
+                            verified_cache_dir: None,
+                        },
                     );
                 }
                 for factory in &child_tool_factories {
@@ -2469,6 +2918,13 @@ impl Tool for SpawnTool {
                     // nesting depth + 1 so the detached child sees the
                     // higher value when its own spawn calls run.
                     .with_spawn_depth(child_spawn_depth);
+                // Phase 2-D: inherit the parent's SessionScope so the
+                // detached child sees the same filesystem contract as
+                // the sync spawn path (see `child_session_scope`
+                // snapshot at dispatch time).
+                if let Some(scope) = child_session_scope.as_ref() {
+                    worker = worker.with_session_scope(scope.clone());
+                }
                 // Keep an Arc to the child's tool registry for the
                 // post-`run_task` validator invocation below.
                 let child_tools_handle = worker.tool_registry().clone();
@@ -2501,6 +2957,16 @@ impl Tool for SpawnTool {
                     profile_id: ctx.profile_id.clone(),
                 }) {
                     worker = worker.with_hook_context(ctx);
+                }
+                // Issue #1125: install the pre-spawn-snapshot child
+                // prompt-context manager that we forked synchronously at
+                // dispatch time (see `prebuilt_child_prompt_context_manager`
+                // above). The factory was invoked BEFORE this `tokio::spawn`
+                // entered any await so the fork is pinned to the parent
+                // generation at SpawnTool dispatch — post-spawn user
+                // messages on the parent cannot leak into this child.
+                if let Some(manager) = prebuilt_child_prompt_context_manager {
+                    worker = worker.with_prompt_context_manager(manager);
                 }
 
                 // Review A F-004: propagate the parent's declarative
@@ -2581,6 +3047,7 @@ impl Tool for SpawnTool {
                             &policy.validation.validators,
                             "spawn",
                             crate::validators::ValidatorPhase::Completion,
+                            None,
                         )
                         .await
                         {
@@ -2588,6 +3055,41 @@ impl Tool for SpawnTool {
                         }
                     }
                 }
+
+                // octos #997 (round-2 fix): also run each project-scope
+                // policy AT its OWN project root. The session-scope run above
+                // writes to `<session>/.octos/validator_outcomes.jsonl`, but
+                // `inspect_workspace_contract` reads from
+                // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`.
+                // Without this run a real valid deck whose project policy
+                // declares a hard-required validator (octos #997:
+                // `slides.mofa_slides.pptx_magic_bytes`) would surface as
+                // `ready = false` because the persisted outcome is missing
+                // from the path `inspect_workspace_contract` reads.
+                if contract_failure.is_none()
+                    && matches!(&result, Ok(task_result) if task_result.success)
+                {
+                    let expected_kind = workflow_metadata
+                        .as_ref()
+                        .and_then(workflow_contract_project_kind);
+                    let bg_files_to_send: &[PathBuf] = match &result {
+                        Ok(task_result) => &task_result.files_to_send,
+                        Err(_) => &[],
+                    };
+                    let report = crate::workspace_contract::run_project_root_validators(
+                        child_tools_handle.as_ref(),
+                        &working_dir,
+                        expected_kind,
+                        bg_files_to_send,
+                    )
+                    .await;
+                    if let Some(reason) = report.first_failure_reason() {
+                        contract_failure = Some(format!(
+                            "project-scope validator rejected child artifact: {reason}"
+                        ));
+                    }
+                }
+
                 if contract_failure.is_none() {
                     contract_failure = match &result {
                         Ok(task_result) if task_result.success => {
@@ -2971,6 +3473,14 @@ impl Tool for SpawnTool {
                         envelope_media: vec![],
                         originating_thread_id: originating_thread_id.clone(),
                         task_id: tracked_task_id.clone(),
+                        // Issue #960: same value as `originating_thread_id`
+                        // — the reporter's `thread_id()` is the user's
+                        // `client_message_id` on the gateway/cmid-bound
+                        // path and the `TurnId` UUID on the WS path; the
+                        // SPA reducer's thread-map keys on whichever shape
+                        // its parent prompt row carries.
+                        originating_client_message_id: originating_thread_id.clone(),
+                        tool_call_id: originating_tool_call_id.clone(),
                     },
                 )
                 .await
@@ -3031,6 +3541,48 @@ mod tests {
     use super::*;
     use crate::{HookConfig, HookEvent};
 
+    #[test]
+    fn role_template_selection_applies_prompt_and_tool_budget() {
+        let mut input: Input = serde_json::from_value(serde_json::json!({
+            "task": "review this diff",
+            "role": crate::ROLE_REVIEWER,
+            "additional_instructions": "Focus on API behavior."
+        }))
+        .expect("input parses");
+
+        let template = apply_role_template(&mut input)
+            .expect("role template resolves")
+            .expect("template");
+
+        assert_eq!(template.name, crate::ROLE_REVIEWER);
+        assert_eq!(
+            input.allowed_tools,
+            template.allowed_tools_vec(),
+            "empty allowed_tools should resolve from the backend-owned role template"
+        );
+        let instructions = input
+            .additional_instructions
+            .as_deref()
+            .expect("instructions");
+        assert!(
+            instructions.starts_with(template.prompt_prefix),
+            "role prompt prefix must be prepended by the runtime factory"
+        );
+        assert!(instructions.contains("Focus on API behavior."));
+    }
+
+    #[test]
+    fn role_template_selection_rejects_unknown_role() {
+        let mut input: Input = serde_json::from_value(serde_json::json!({
+            "task": "do something",
+            "role": "planner"
+        }))
+        .expect("input parses");
+
+        let error = apply_role_template(&mut input).expect_err("unknown role is rejected");
+        assert!(error.to_string().contains("unknown role template"));
+    }
+
     #[cfg(unix)]
     fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
         HookConfig {
@@ -3044,6 +3596,8 @@ mod tests {
             ],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }
     }
 
@@ -3060,6 +3614,8 @@ mod tests {
             ],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }
     }
 
@@ -3085,6 +3641,7 @@ mod tests {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            plugin_require_signed: false,
             child_tool_factories: Vec::new(),
             task_supervisor: None,
             session_key: None,
@@ -3096,6 +3653,8 @@ mod tests {
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
+            child_prompt_context_manager_factory: None,
+            dispatch_policy: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -3153,6 +3712,14 @@ mod tests {
         }
     }
 
+    #[ignore = "Pre-migration test: the SpawnOnlyFiles-source MagicBytes validator \
+                (post-#997 round-3) rejects no-files-emitted tasks at the project-scope \
+                gate, so this test's `ShellThenEndProvider`-driven shell tool (which \
+                doesn't emit `files_to_send`) can no longer simulate a successful \
+                slides spawn — the deck-on-disk fallback the old Glob validator \
+                provided is gone by design. Re-enable by replacing `ShellThenEndProvider` \
+                with a stub plugin tool that returns the staged deck path in \
+                `tool_result.files_to_send`."]
     #[tokio::test]
     async fn test_background_spawn_uses_contract_selected_slides_artifact_for_persistence() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
@@ -3168,7 +3735,16 @@ mod tests {
         std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
         std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        // octos #997 (round-2): real PPTX magic bytes ONLY. The spawn loop
+        // itself runs the slides-kind project-scope validator at the project
+        // root after `run_task` succeeds — that production wiring writes the
+        // Pass row into `slides/demo/.octos/validator_outcomes.jsonl`, which
+        // the contract-gated terminal delivery step then reads. Pre-round-2
+        // this fixture manually seeded the Pass via `ledger.append(...)`,
+        // masking the gap codex flagged. No manual seeding here.
+        let mut pptx = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx.extend_from_slice(b"final");
+        std::fs::write(repo_root.join("output/deck.pptx"), pptx).unwrap();
         std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
 
         let supervisor = Arc::new(TaskSupervisor::new());
@@ -3762,10 +4338,39 @@ PY
         std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
         std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        // octos #997: real PPTX magic bytes so the slides-kind project-scope
+        // `MagicBytes` validator does not block delivery on a fake-bytes deck.
+        let mut pptx_final = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_final.extend_from_slice(b"final");
+        std::fs::write(repo_root.join("output/deck.pptx"), pptx_final).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(repo_root.join("output/deck-draft.pptx"), "draft").unwrap();
+        let mut pptx_draft = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_draft.extend_from_slice(b"draft");
+        std::fs::write(repo_root.join("output/deck-draft.pptx"), pptx_draft).unwrap();
         std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+        // octos #997 (round-2): exercise the production project-root
+        // validator helper so `inspect_workspace_contract_at_root` sees a
+        // real `Pass` row in the project ledger. Pre-round-2 this fixture
+        // manually `ledger.append(...)`ed a Pass — codex flagged that as
+        // masking the gap (the validator was declared but never RUN at the
+        // project root in production).
+        {
+            let registry = std::sync::Arc::new(crate::ToolRegistry::new());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime for fixture validator run");
+            let files_to_send = vec![repo_root.join("output/deck.pptx")];
+            runtime.block_on(async {
+                let _ = crate::workspace_contract::run_project_root_validators(
+                    &registry,
+                    temp.path(),
+                    Some(crate::WorkspaceProjectKind::Slides),
+                    &files_to_send,
+                )
+                .await;
+            });
+        }
 
         let workflow = WorkflowMetadata {
             workflow_kind: "slides".to_string(),
@@ -3977,6 +4582,8 @@ PY
             envelope_media: vec![],
             originating_thread_id: None,
             task_id: None,
+            originating_client_message_id: None,
+            tool_call_id: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);
@@ -4296,7 +4903,7 @@ PY
         apply_agent_definition(&mut input, &registry).expect("apply");
 
         // Research-worker manifest lists deep_search + web_fetch + web_search.
-        for expected in ["deep_search", "web_fetch", "web_search"] {
+        for expected in ["search", "web_fetch", "web_search"] {
             assert!(
                 input.allowed_tools.contains(&expected.to_string()),
                 "manifest tool {expected} did not flow into allowed_tools"
@@ -4728,5 +5335,291 @@ PY
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2-D: SessionScope propagation tests for SpawnTool.
+    //
+    // The migrated spawn tool reads `ctx.session_scope` and threads it
+    // onto the child Agent via `Agent::with_session_scope`. The child
+    // Agent's execution loop then plants the same scope onto every
+    // child `ToolContext` (see `agent/execution.rs`). These tests
+    // exercise that path end-to-end by mounting a recording tool on the
+    // child registry and asserting on what `execute_with_context` sees.
+    // -----------------------------------------------------------------------
+
+    /// Test-only tool that records the `session_scope.workspace()` it
+    /// observes on its `ToolContext`. Used by the Phase 2-D propagation
+    /// tests to capture what the child Agent's execution loop hands to
+    /// migrated tools. Lives only inside `#[cfg(test)]`.
+    struct ScopeRecordingTool {
+        observed: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ScopeRecordingTool {
+        fn name(&self) -> &str {
+            "scope_probe"
+        }
+
+        fn description(&self) -> &str {
+            "test-only tool that records the session_scope it observes"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+            self.execute_with_context(&super::super::ToolContext::zero(), args)
+                .await
+        }
+
+        async fn execute_with_context(
+            &self,
+            ctx: &super::super::ToolContext,
+            _args: &serde_json::Value,
+        ) -> Result<ToolResult> {
+            let observed = ctx
+                .session_scope
+                .as_ref()
+                .map(|scope| scope.workspace().to_path_buf());
+            *self.observed.lock().unwrap_or_else(|e| e.into_inner()) = observed;
+            Ok(ToolResult {
+                output: "ok".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Mock provider that calls `scope_probe` once and then ends — drives
+    /// the child Agent through exactly one tool execution so the
+    /// recording tool sees the migrated `ToolContext`.
+    struct ScopeProbeProvider;
+
+    #[async_trait]
+    impl LlmProvider for ScopeProbeProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            // First call → invoke scope_probe; second call (after the
+            // probe's tool_result lands) → end the turn.
+            let probe_already_run = messages
+                .iter()
+                .any(|msg| matches!(msg.role, octos_core::MessageRole::Tool));
+            if probe_already_run {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("done".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            } else {
+                Ok(octos_llm::ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call_scope_probe".into(),
+                        name: "scope_probe".into(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_propagates_scope_to_sub_agent() {
+        // When the parent `ToolContext` carries a `SessionScope`, the
+        // sync-mode sub-agent's tools must see the same scope on their
+        // own `ToolContext`. Without this, a session's filesystem
+        // contract is forgotten the moment work is delegated to a
+        // sub-agent.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
+            .expect("scope construction");
+
+        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed_for_factory = observed.clone();
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(ScopeProbeProvider),
+            Arc::new(create_test_store().await),
+            scope_dir.path().to_path_buf(),
+            in_tx,
+        )
+        .with_child_tool_factory(Arc::new(move || {
+            Arc::new(ScopeRecordingTool {
+                observed: observed_for_factory.clone(),
+            })
+        }));
+
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "probe the scope",
+                    "mode": "sync",
+                    "allowed_tools": ["scope_probe"]
+                }),
+            )
+            .await
+            .expect("spawn returns Ok");
+        assert!(
+            result.success,
+            "expected sync spawn success: {}",
+            result.output
+        );
+
+        let captured = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let captured = captured.expect(
+            "scope_probe must observe a SessionScope on its ToolContext — \
+             without Phase 2-D propagation the child Agent runs scope-less",
+        );
+        let canonical_expected =
+            std::fs::canonicalize(scope_dir.path()).expect("canonicalise scope dir");
+        let canonical_observed =
+            std::fs::canonicalize(&captured).expect("canonicalise observed workspace");
+        assert_eq!(
+            canonical_observed, canonical_expected,
+            "child Agent's session_scope.workspace() must match the parent's"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_sub_agent_inherits_workspace_cwd() {
+        // The sync-mode child Agent's `working_dir` (passed via
+        // `TaskContext`) and the scope's workspace agree when the
+        // SpawnTool was constructed with `working_dir == scope.workspace()`.
+        // This is the production wiring (`runtime/session.rs` builds
+        // `SpawnTool::new(... working_dir == scope.workspace())`), and
+        // it's the property the Phase 2-D contract relies on: the child
+        // workspace CWD == the parent's scoped workspace, so any shell
+        // tool the child invokes runs with the right CWD even without
+        // the scope plumb.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
+            .expect("scope construction");
+
+        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed_for_factory = observed.clone();
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        // SpawnTool's working_dir matches scope.workspace() — this is
+        // the production case.
+        let tool = SpawnTool::new(
+            Arc::new(ScopeProbeProvider),
+            Arc::new(create_test_store().await),
+            scope_dir.path().to_path_buf(),
+            in_tx,
+        )
+        .with_child_tool_factory(Arc::new(move || {
+            Arc::new(ScopeRecordingTool {
+                observed: observed_for_factory.clone(),
+            })
+        }));
+
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "probe",
+                    "mode": "sync",
+                    "allowed_tools": ["scope_probe"]
+                }),
+            )
+            .await
+            .expect("spawn ok");
+        assert!(result.success);
+
+        let captured = observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("scope_probe ran");
+        let canonical_workspace = std::fs::canonicalize(&captured).expect("canonicalise");
+        let canonical_spawn_cwd =
+            std::fs::canonicalize(scope_dir.path()).expect("canonicalise spawn cwd");
+        assert_eq!(
+            canonical_workspace, canonical_spawn_cwd,
+            "child workspace must equal the spawn cwd when SpawnTool::new \
+             was given `scope.workspace()` as its `working_dir`"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_falls_back_to_legacy_cwd_when_no_scope() {
+        // No scope on the parent context — the child Agent must keep
+        // its pre-Phase-2D behaviour byte-for-byte: `session_scope ==
+        // None`. The recording tool sees no scope. The legacy
+        // `working_dir` continues to drive every other code path
+        // (`ToolRegistry::with_builtins`, `TaskContext`).
+        let working = tempfile::tempdir().unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed_for_factory = observed.clone();
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(ScopeProbeProvider),
+            Arc::new(create_test_store().await),
+            working.path().to_path_buf(),
+            in_tx,
+        )
+        .with_child_tool_factory(Arc::new(move || {
+            Arc::new(ScopeRecordingTool {
+                observed: observed_for_factory.clone(),
+            })
+        }));
+
+        let ctx = super::super::ToolContext::zero();
+        assert!(
+            ctx.session_scope.is_none(),
+            "precondition: parent ctx has no scope"
+        );
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "probe",
+                    "mode": "sync",
+                    "allowed_tools": ["scope_probe"]
+                }),
+            )
+            .await
+            .expect("spawn ok");
+        assert!(result.success);
+
+        let captured = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            captured.is_none(),
+            "without a parent scope the child Agent must NOT synthesise one; observed={:?}",
+            captured
+        );
     }
 }

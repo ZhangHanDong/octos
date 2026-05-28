@@ -31,19 +31,22 @@ const SESSION_PROMPTS_DIR: &str = "session_prompts";
 /// ```text
 /// slides/<slug>/
 ///   history/       — optional manual exports (git is the primary history)
-///   output/        — generated PPTX files
 ///   assets/        — images, logos, branding
 ///   memory.md      — project-level memory
 ///   changelog.md   — edit history
 ///   script.js      — slide generation script template
 /// ```
+///
+/// `output/` is NOT scaffolded — generated decks land under
+/// `<workspace>/skill-output/slides/<slug>/output/` via the host's
+/// plugin work-dir rebind (the canonical Octos plugin output path).
+/// The previous empty `<project>/output/` was a ghost folder the
+/// project-scope validator never found anything in.
 pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> Result<PathBuf, String> {
     let slug = slugify(project_name);
     let project_dir = data_dir.join("slides").join(&slug);
     std::fs::create_dir_all(project_dir.join("history"))
         .map_err(|e| format!("create slides history dir failed: {e}"))?;
-    std::fs::create_dir_all(project_dir.join("output"))
-        .map_err(|e| format!("create slides output dir failed: {e}"))?;
     std::fs::create_dir_all(project_dir.join("assets"))
         .map_err(|e| format!("create slides assets dir failed: {e}"))?;
 
@@ -91,8 +94,11 @@ module.exports = [];
             .map_err(|e| format!("write slides script.js failed: {e}"))?;
     }
 
-    write_workspace_policy(&project_dir, &slides_delivery::workspace_policy())
-        .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
+    write_workspace_policy(
+        &project_dir,
+        &slides_delivery::workspace_policy_for_slug(Some(&slug)),
+    )
+    .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
 
     initialize_and_commit(
         &project_dir,
@@ -120,6 +126,19 @@ pub fn slides_creation_reply(project_name: &str) -> String {
     )
 }
 
+/// Embedded slides system prompt. Compiled into the binary at build time --
+/// there is intentionally no runtime override path. The slides workflow is
+/// opinionated (mofa_slides + script.js + style toml convention) and should
+/// not drift per deployment; updates ship via the normal Rust build path so
+/// every host runs an identical contract.
+///
+/// Placeholders substituted at render time:
+///   - `{project_name}` -- the topic name from `/new slides <name>`
+///   - `{slug}` -- the slugified form used as the workspace dir name
+///   - `{delete_cached_png_instruction}` -- platform-specific shell snippet
+///     for clearing cached slide PNGs (cmd.exe on Windows, sh on Unix)
+const SLIDES_PROMPT_TEMPLATE: &str = include_str!("prompts/slides_default.txt");
+
 /// Generate the slides-specific system prompt for a session.
 fn slides_system_prompt(project_name: &str) -> String {
     let slug = slugify(project_name);
@@ -132,103 +151,13 @@ fn slides_system_prompt(project_name: &str) -> String {
             "  shell(\"rm -f slides/{slug}/output/imgs/slide-NN.png\") for each changed slide N"
         )
     };
-    format!(
-        r#"You are a slides designer for the "{project_name}" project.
-Project dir: slides/{slug}/
-
-ON FIRST MESSAGE:
-1. glob("styles/*.toml") — list available style templates with their [meta].description
-2. Ask the user: topic, style (pick template or describe custom), slide count, any branding/images
-
-WORKFLOW (follow in order):
-1. STYLE — if user picks a template, use it. If custom, create styles/{{name}}.toml first.
-2. DESIGN — write slides/{slug}/script.js. Show outline to user. Wait for confirmation.
-3. GENERATE — on user confirmation ("生成"/"generate"/"go"), call mofa_slides.
-4. DELIVER — after successful generation, confirm the deck was delivered to the chat.
-
-RULES:
-- ALWAYS use mofa_slides TOOL. NEVER shell to run mofa. NEVER.
-- In slides sessions, `mofa_slides` is already active. Call it directly. Do not call `activate_tools(["mofa_slides"])`.
-- BEFORE calling mofa_slides: run shell("node --check slides/{slug}/script.js") to validate syntax. Fix any errors before proceeding.
-- ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
-- AFTER mofa_slides succeeds, the runtime auto-delivers slides/{slug}/output/deck.pptx to the chat. Do not call send_file for the same deck unless delivery actually failed. Do not ask the user whether you should send it.
-- Deliver exactly one final PPTX deck artifact. Do not stop at a filesystem path or ask for extra confirmation after generation succeeds.
-- NEVER pass slides array inline. ALWAYS use the input file.
-- On failure: report error, do NOT retry via shell.
-- If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
-- Read slides/{slug}/memory.md before each response for context.
-- Workspace policy lives at slides/{slug}/.octos-workspace.toml.
-- Runtime owns workspace contract enforcement: git snapshots, required source files, and required output artifacts.
-- Treat the workspace contract as authoritative for ready/not-ready state. Do NOT invent alternate completion criteria.
-- Runtime-owned revision history lives in local git. Do NOT create ad hoc versioned JS filenames as the main history mechanism.
-
-PROMPT-OWNED GUIDANCE:
-- Maintain a version header at the top of slides/{slug}/script.js:
-  // version: v{{NNN}}_{{desc}}
-  // updated_at: YYYY-MM-DD
-  // change_summary: <one line>
-- When you intentionally record a human-readable revision, keep the script.js version header and changelog.md aligned.
-- After edits: update memory.md.
-- If the user asks for change history, inspect it with shell("git -C slides/{slug} log --oneline -- script.js changelog.md memory.md").
-
-STYLE TOML — create at styles/{{name}}.toml when user wants a custom style:
-```toml
-[meta]
-name = "{{name}}"
-display_name = "Display Name"
-description = "One-line description"
-category = "custom"
-tags = ["custom"]
-
-[variants]
-default = "normal"
-
-[variants.normal]
-prompt = """
-Create a slide image. 1920×1080, 16:9 landscape.
-BACKGROUND: <hex colors, gradients>
-TYPOGRAPHY: <fonts, weights, sizes, hex colors>
-LAYOUT: <margins in px, alignment>
-ELEMENTS: <decorations, shapes — specific>
-Text must be PIXEL-PERFECT and EXACTLY as specified.
-"""
-
-[variants.cover]
-prompt = """
-Create a cover slide. 1920×1080, 16:9.
-<dramatic title layout, same palette>
-"""
-
-[variants.data]
-prompt = """
-Create a data slide. 1920×1080, 16:9.
-<tables, charts layout, same palette>
-"""
-```
-Prompts are Gemini image-gen instructions — use hex colors, px margins, font names. Be concrete.
-Custom styles persist in styles/ and appear as templates for future projects.
-
-INCREMENTAL UPDATES:
-- script.js is the SINGLE SOURCE OF TRUTH — never recreate, always edit
-- To update slides: read → edit changed slides only → delete their cached PNGs → regenerate
-{delete_cached_png_instruction}
-  (slide-01.png = slides[0], slide-02.png = slides[1], etc.)
-- Skipping PNG deletion causes mofa to reuse stale images
-- New slides need no PNG deletion (no cache yet)
-
-TASK STATUS CHECK:
-When user asks about progress ("做完了吗", "done?", "status"):
-  use check_background_tasks({{"include_completed": true}}) to inspect the current session's execution state
-  use check_workspace_contract({{"project": "slides/{slug}"}}) to inspect deliverable truth
-  task state tells you what happened in execution
-  workspace state tells you what is true about the deliverable
-  treat the workspace contract as the definition of ready/not-ready
-  count generated slides from the contract's preview artifact matches
-Report: X previews present, PPTX ready/not ready, generation running/verifying/delivering/completed/failed based on supervisor state, and list any failed contract checks or missing artifacts.
-
-Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file, check_background_tasks, check_workspace_contract
-"#
-    )
+    SLIDES_PROMPT_TEMPLATE
+        .replace("{project_name}", project_name)
+        .replace("{slug}", &slug)
+        .replace(
+            "{delete_cached_png_instruction}",
+            &delete_cached_png_instruction,
+        )
 }
 
 /// Write a session-specific system prompt override file.
@@ -651,6 +580,217 @@ pub fn read_site_project_metadata(project_dir: &Path) -> Option<SiteProjectMetad
     serde_json::from_str(&raw).ok()
 }
 
+/// Reason a metadata `build_output_dir` was rejected by
+/// [`validated_build_output_dir`]. Issue #996 — the LLM may rewrite
+/// `mofa-site-session.json` (the metadata source) via `edit_file`, so
+/// every consumer that joins the value onto `project_dir` must route
+/// through the validator to keep the preview confined to the site
+/// scaffold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildOutputDirError {
+    /// The metadata field was empty or whitespace-only.
+    Empty,
+    /// The path was absolute (e.g. `/etc/passwd`).
+    Absolute,
+    /// The path contained a `..` component, before or after normalisation.
+    ParentEscape,
+    /// The value did not match a per-template scaffold output dir
+    /// (`dist`, `out`, or `docs`).
+    NotAllowListed,
+    /// The value was on the global allow-list but did NOT match the
+    /// expected output dir for `metadata.template`. The closed contract
+    /// is per-template, not global — `astro-site` ↦ `dist` only, etc.
+    /// Pinned by codex's NEEDS-FOLLOWUP on the original fix: a global
+    /// allow-list lets `astro-site + docs` slip through. Issue #996.
+    TemplateMismatch,
+    /// `metadata.template` did not match any in-tree SiteTemplate
+    /// variant (`astro-site`, `nextjs-app`, `react-vite`,
+    /// `quarto-lesson`). Pinned by codex round-2 BLOCKING #2 (issue
+    /// #996 follow-up): the previous `SiteTemplate::from_slug`
+    /// fallback to `Docs` was default-allow — a phantom template
+    /// paired with `build_output_dir: "docs"` slipped past the
+    /// per-template-equality gate. The validator now uses
+    /// `from_slug_strict` and surfaces this variant on miss.
+    UnknownTemplate(String),
+    /// Canonicalising `project_dir.join(value)` failed or resolved
+    /// outside `project_dir` (e.g. through a symlink).
+    OutsideProject,
+}
+
+impl std::fmt::Display for BuildOutputDirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "build_output_dir is empty"),
+            Self::Absolute => write!(f, "build_output_dir must be a relative path"),
+            Self::ParentEscape => {
+                write!(f, "build_output_dir must not contain `..` segments")
+            }
+            Self::NotAllowListed => write!(
+                f,
+                "build_output_dir is not an allow-listed template output (dist, out, docs)"
+            ),
+            Self::TemplateMismatch => write!(
+                f,
+                "build_output_dir does not match the expected output for this template"
+            ),
+            Self::UnknownTemplate(slug) => write!(
+                f,
+                "metadata.template `{slug}` is not a known site template (must be one of: astro-site, nextjs-app, react-vite, quarto-lesson)"
+            ),
+            Self::OutsideProject => {
+                write!(f, "build_output_dir resolves outside the project directory")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BuildOutputDirError {}
+
+/// Per-template scaffold output directories. The values come from
+/// [`crate::workflow_runtime::workflow_families::SiteTemplate::output_dir`]
+/// — keep the two lists in sync. Updating an existing template's
+/// output dir requires updating both.
+///
+/// NOTE: this constant is the *global* allow-list and is kept as a
+/// defence-in-depth gate. The authoritative check is per-template
+/// equality against
+/// [`crate::workflow_runtime::workflow_families::SiteTemplate::output_dir`]
+/// — see [`validated_build_output_dir_form`] for the strict-equality
+/// pass.
+const ALLOWED_BUILD_OUTPUT_DIRS: &[&str] = &["dist", "out", "docs"];
+
+/// Validate the structural form of `metadata.build_output_dir`
+/// without touching disk. Returns the joined `project_dir.join(value)`
+/// on success — caller may further enforce canonical-descendant via
+/// [`canonical_descendant_check`] once the output dir exists on disk.
+///
+/// Per-template equality: the value must equal
+/// `SiteTemplate::from_slug(metadata.template).output_dir()`. This
+/// closes the codex-flagged "astro-site + docs" gap where a global
+/// allow-list let cross-template values slip through. Issue #996
+/// follow-up.
+fn validated_build_output_dir_form(
+    metadata: &SiteProjectMetadata,
+    project_dir: &Path,
+) -> Result<PathBuf, BuildOutputDirError> {
+    let raw = metadata.build_output_dir.trim();
+    if raw.is_empty() {
+        return Err(BuildOutputDirError::Empty);
+    }
+
+    let value_path = Path::new(raw);
+    if value_path.is_absolute() {
+        return Err(BuildOutputDirError::Absolute);
+    }
+
+    // Reject ParentDir components anywhere in the value — even if
+    // normalisation would collapse to a safe path, we don't want to
+    // allow the LLM to construct paths like `dist/../../../etc`.
+    for component in value_path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return Err(BuildOutputDirError::ParentEscape),
+            // Absolute prefixes (Windows drive letters etc.) and the
+            // root component were already excluded by `is_absolute`,
+            // but treat any unexpected component as an escape too.
+            _ => return Err(BuildOutputDirError::Absolute),
+        }
+    }
+
+    if !ALLOWED_BUILD_OUTPUT_DIRS.contains(&raw) {
+        return Err(BuildOutputDirError::NotAllowListed);
+    }
+
+    // Per-template equality: the codex review's NEEDS-FOLLOWUP. The
+    // closed contract is per template, not global — `astro-site` MUST
+    // resolve to `dist`, never `docs`, and so on. Without this gate a
+    // malicious `mofa-site-session.json` could keep `template:
+    // "astro-site"` (which controls the build command) while pointing
+    // `build_output_dir` at `docs` (which controls what the preview
+    // serves), enabling cross-template surface mismatches.
+    //
+    // Codex round-2 BLOCKING #2: use `from_slug_strict` (not the
+    // lossy `from_slug`) — an unknown template slug like
+    // `"phantom-template"` previously coerced to `SiteTemplate::Docs`
+    // and let `build_output_dir: "docs"` validate. The strict variant
+    // returns `None` on miss so we surface `UnknownTemplate` and the
+    // handler can map it to HTTP 400.
+    let template_slug = metadata.template.trim();
+    let template =
+        crate::workflow_runtime::workflow_families::SiteTemplate::from_slug_strict(template_slug)
+            .ok_or_else(|| BuildOutputDirError::UnknownTemplate(template_slug.to_string()))?;
+    if raw != template.output_dir() {
+        return Err(BuildOutputDirError::TemplateMismatch);
+    }
+
+    Ok(project_dir.join(value_path))
+}
+
+/// Validate the `build_output_dir` field of a site metadata record
+/// before joining it onto `project_dir`. Returns the joined path on
+/// success; if `project_dir` and the joined output dir both exist on
+/// disk, the result is canonicalised and confirmed to be a strict
+/// descendant of `project_dir`.
+///
+/// Security: the metadata file (`mofa-site-session.json`) is writable
+/// by the LLM via `edit_file`, so the field is **untrusted on read**
+/// even though the scaffold populates it from a closed allow-list. We
+/// enforce the allow-list (`dist` / `out` / `docs`) AND structural
+/// checks (no absolute paths, no `..` components, canonical-descendant
+/// of `project_dir`) as defence-in-depth. See issue #996.
+///
+/// Two-phase validation rationale:
+/// - Form checks (allow-list, no `..`, not absolute, not empty) are
+///   total — they always run.
+/// - Canonical-descendant only runs when both sides exist, because the
+///   site build flow creates the output dir lazily on first preview.
+///   When the dir is missing we accept the joined path so the build
+///   can produce it, then the caller (preview handler) MUST re-check
+///   the resolved asset path via the canonical check below.
+pub fn validated_build_output_dir(
+    metadata: &SiteProjectMetadata,
+    project_dir: &Path,
+) -> Result<PathBuf, BuildOutputDirError> {
+    let joined = validated_build_output_dir_form(metadata, project_dir)?;
+
+    let canonical_root = match std::fs::canonicalize(project_dir) {
+        Ok(p) => p,
+        Err(_) => {
+            // project_dir not yet realised; form-check is the strongest
+            // we can offer. Return the joined raw path.
+            return Ok(joined);
+        }
+    };
+    let canonical_joined = match std::fs::canonicalize(&joined) {
+        Ok(p) => p,
+        Err(_) => {
+            // output dir does not exist yet — form checks already
+            // ruled out escape via `..` or absolute paths, and the
+            // value is allow-listed. Return the joined path; the
+            // canonical-descendant check happens once the build
+            // populates the directory.
+            return Ok(canonical_root.join(Path::new(metadata.build_output_dir.trim())));
+        }
+    };
+
+    canonical_descendant_check(&canonical_root, &canonical_joined)?;
+    Ok(canonical_joined)
+}
+
+/// Enforce that `candidate` is a strict descendant of `root`. Both
+/// inputs are expected to be canonicalised paths. Used as the second
+/// phase of build_output_dir validation after the output dir exists
+/// on disk.
+pub fn canonical_descendant_check(
+    root: &Path,
+    candidate: &Path,
+) -> Result<(), BuildOutputDirError> {
+    if candidate == root || !candidate.starts_with(root) {
+        return Err(BuildOutputDirError::OutsideProject);
+    }
+    Ok(())
+}
+
 fn write_site_support_files(
     project_dir: &Path,
     metadata: &SiteProjectMetadata,
@@ -879,7 +1019,10 @@ mod tests {
         let project_dir = scaffold_slides_project(tmp.path(), "test-deck").unwrap();
 
         assert!(project_dir.join("history").is_dir());
-        assert!(project_dir.join("output").is_dir());
+        // `output/` is no longer scaffolded — decks land under
+        // `<workspace>/skill-output/slides/<slug>/output/` via the
+        // host's plugin work-dir rebind.
+        assert!(!project_dir.join("output").exists());
         assert!(project_dir.join("assets").is_dir());
         assert!(project_dir.join("memory.md").is_file());
         assert!(project_dir.join("changelog.md").is_file());
@@ -952,6 +1095,21 @@ mod tests {
         assert!(reply.unwrap().contains("untitled"));
         // Scaffolding happens in session_actor, not here
         assert!(!tmp.path().join("slides/untitled/script.js").is_file());
+    }
+
+    #[test]
+    fn slides_prompt_directs_llm_to_disable_auto_layout_by_default() {
+        // mofa-slides leaves `auto_layout` with no `default` declared in its
+        // manifest schema; the plugin's silent fallback is "editable text
+        // mode" which replaces generated image content with flat-color text
+        // boxes. The slides-design workflow almost never wants that — make
+        // the system prompt direct the LLM to pass `auto_layout: false`
+        // unless the user explicitly opts in.
+        let prompt = slides_system_prompt("Deck");
+        assert!(
+            prompt.contains("auto_layout: false"),
+            "slides prompt must instruct the LLM to pass auto_layout: false"
+        );
     }
 
     #[test]

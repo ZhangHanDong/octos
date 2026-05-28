@@ -272,6 +272,7 @@ mod tests {
             plugin_prompt_fragments: vec![],
             no_retry: false,
             sandbox_config: octos_agent::SandboxConfig::default(),
+            host_plugins: Default::default(),
         };
 
         let factory = builder.build("botfather--researcher").await.unwrap();
@@ -287,7 +288,7 @@ mod tests {
             "child bot should expose normal-mode web_search"
         );
         assert!(
-            registry.get("deep_search").is_some(),
+            registry.get("search").is_some(),
             "child bot should expose bundled deep_search skill"
         );
         assert!(

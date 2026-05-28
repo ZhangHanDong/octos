@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-FEATURES="${FEATURES:-api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot}"
-SKILL_CRATES="${SKILL_CRATES:--p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard -p skill-evolve}"
+FEATURES="${FEATURES:-api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3}"
+SKILL_CRATES="${SKILL_CRATES:--p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p skill-evolve}"
 
 usage() {
   cat <<'EOF'
@@ -54,6 +54,9 @@ run_swarm_app() {
 }
 
 run_hosted_fast() {
+  python3 scripts/lint-tool-descriptions.py --self-test
+  python3 scripts/lint-tool-descriptions.py
+
   cargo fmt --all -- --check
   cargo clippy --workspace -- -D warnings
   cargo test --workspace
@@ -63,6 +66,7 @@ run_hosted_fast() {
   cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
   cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
   cargo test -p octos-agent --test activate_tools_regression -- --nocapture
+  cargo test -p octos-bus --test file_handle_resolve_tool_path -- --nocapture
 }
 
 run_workspace_all_features() {

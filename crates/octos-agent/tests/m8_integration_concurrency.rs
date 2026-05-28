@@ -190,7 +190,7 @@ fn mcp_unknown_concurrency_value_falls_back_to_exclusive() {
     // Typos must not silently downgrade enforcement. Unknown values
     // resolve to the safe-side default.
     let config: McpServerConfig =
-        serde_json::from_str(r#"{"command": "/bin/true", "concurrency_class": "invalid"}"#)
+        serde_json::from_str(r#"{"command": "/bin/true", "concurrency_class": "exlusive"}"#)
             .unwrap();
     assert_eq!(
         config.resolved_concurrency_class(),

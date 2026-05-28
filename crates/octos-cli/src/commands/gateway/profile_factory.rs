@@ -240,6 +240,16 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
                 AdaptiveRouter::new(providers, &costs, adaptive_config)
                     .with_adaptive_config(mode, qos_ranking),
             );
+            // Wave-4c: surface AutoEscalationConfig from config.json so
+            // operators can disable the latency feedback loop on the
+            // gateway-side too. `qos_catalog::build_adaptive_provider_chain`
+            // does the equivalent for the serve / ProfileRuntime path;
+            // this is the same wiring for `commands::gateway`.
+            if let Some(ar) = routing_config {
+                router.set_auto_escalation_config(octos_llm::AutoEscalationConfig::from(
+                    &ar.auto_escalation,
+                ));
+            }
             adaptive_router_ref = Some(router.clone());
             router
         } else {
@@ -496,6 +506,11 @@ pub(super) struct ProfileActorFactoryBuilder {
     /// M8 fix-first item 8 (gap 2): shared SubAgentOutputRouter cloned
     /// into every ActorFactory built by this builder.
     pub(super) subagent_output_router: Arc<octos_agent::SubAgentOutputRouter>,
+    /// Section B (codex review round-4): host-level plugin policy, OR'd
+    /// with the profile's own `plugins.require_signed` so a host config
+    /// can mandate strict signing even when individual profile JSONs omit
+    /// the flag. Mirrors `ProfileRuntime::bootstrap_with_host_plugins`.
+    pub(super) host_plugins: crate::config::PluginsConfig,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -506,7 +521,15 @@ impl ProfileActorFactoryBuilder {
             .ok_or_else(|| eyre::eyre!("target profile '{profile_id}' not found"))?;
         let effective_profile =
             crate::profiles::resolve_effective_profile(&self.profile_store, &profile)?;
-        let profile_config = crate::profiles::config_from_profile(&effective_profile, None, None);
+        let mut profile_config =
+            crate::profiles::config_from_profile(&effective_profile, None, None);
+        // Section B (codex review round-4): OR-merge the host's
+        // `plugins.require_signed` onto the profile-derived flag so a
+        // child profile that omits the new `plugins` block still honours
+        // the host-level strict-signing policy.
+        if self.host_plugins.require_signed {
+            profile_config.plugins.require_signed = true;
+        }
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
@@ -600,6 +623,13 @@ impl ProfileActorFactoryBuilder {
                     octos_agent::PluginLoadOptions {
                         work_dir: Some(&plugin_work_dir),
                         synthesis_config,
+                        // Section B: opt-in strict signature enforcement.
+                        // Honours `plugins.require_signed` from the
+                        // profile-derived config; default is `false`
+                        // (backward compatible — unsigned plugins still
+                        // load with a warning).
+                        require_signed: profile_config.plugins.require_signed,
+                        verified_cache_dir: None,
                     },
                 ) {
                     Ok(result) => {
@@ -726,7 +756,7 @@ impl ProfileActorFactoryBuilder {
 
             tools.set_base_tools([
                 "run_pipeline",
-                "deep_search",
+                "search",
                 "deep_crawl",
                 "web_search",
                 "web_fetch",
@@ -778,6 +808,12 @@ impl ProfileActorFactoryBuilder {
                 plugin_dirs: Vec<PathBuf>,
                 router: Option<Arc<ProviderRouter>>,
                 octos_home: PathBuf,
+                plugin_require_signed: bool,
+                /// NEW-06 fix: forwarded to every worker `Agent` via
+                /// `RunPipelineTool::with_embedder` so pipeline-spawned
+                /// agents inherit hybrid scored + filtered memory
+                /// recall instead of the cwd-only unfiltered fallback.
+                embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
             }
 
             impl crate::session_actor::PipelineToolFactory for ChildPipelineToolFactory {
@@ -790,13 +826,24 @@ impl ProfileActorFactoryBuilder {
                     )
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
+                    .with_plugin_require_signed(self.plugin_require_signed)
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref router) = self.router {
                         pt = pt.with_provider_router(router.clone());
                     }
+                    if let Some(ref embedder) = self.embedder {
+                        pt = pt.with_embedder(embedder.clone());
+                    }
                     Arc::new(pt)
                 }
             }
+
+            // NEW-06 fix: the parent ActorFactory's session agent gets
+            // its embedder from `create_embedder(profile_config)`; mirror
+            // that here so child-profile pipeline workers run on the
+            // same contamination-safe hybrid memory path.
+            let child_pipeline_embedder = create_embedder(&profile_config)
+                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
 
             pipeline_factory = Some(Arc::new(ChildPipelineToolFactory {
                 llm: llm.clone(),
@@ -806,6 +853,10 @@ impl ProfileActorFactoryBuilder {
                 plugin_dirs: plugin_dirs.clone(),
                 router: provider_router.clone(),
                 octos_home: self.project_dir.clone(),
+                // Section B (codex review follow-up): propagate the
+                // profile's strict-signing policy.
+                plugin_require_signed: profile_config.plugins.require_signed,
+                embedder: child_pipeline_embedder,
             })
                 as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
 
@@ -867,9 +918,23 @@ impl ProfileActorFactoryBuilder {
             pending_messages: self.pending_messages.clone(),
             queue_mode: self.queue_mode,
             adaptive_router,
+            // RFC-3 (#1292): thread per-profile topic→lane overrides
+            // through to the ActorFactory so the SessionActor's
+            // agent_task spawn can build the lane context off
+            // `profile.config.lane_routing`. None = built-in defaults.
+            lane_routing: effective_profile.config.lane_routing.clone(),
             memory_store: Some(self.memory_store.clone()),
+            // Codex round-2 MAJOR 3 (PR #1327 review): expose the
+            // profile_id so `ActorFactory::spawn` can build a per-
+            // session SessionScope (multi-tenant) and attach the
+            // canonicalised skill_read_zones to gateway-spawned actors.
+            profile_id: Some(profile_id.to_string()),
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
+            // Section B (codex review P1.1): propagate the profile's
+            // strict-signing policy to SpawnTool subagents so unsigned
+            // plugins are also rejected under spawn.
+            plugin_require_signed: profile_config.plugins.require_signed,
             llm_strong,
             task_query_store: self.task_query_store.clone(),
             subagent_output_router: self.subagent_output_router.clone(),

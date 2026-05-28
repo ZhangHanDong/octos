@@ -9,7 +9,7 @@ mod llm_call;
 mod loop_compaction;
 mod loop_runner;
 pub mod loop_state;
-mod memory;
+pub mod memory;
 mod message_repair;
 pub mod realtime;
 mod streaming;
@@ -19,13 +19,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use octos_core::{AgentId, Message, TokenUsage};
+use octos_core::{AgentId, Message, SessionScope, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
 use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
+use crate::prompt_context::PromptContextManager;
 use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 
@@ -116,6 +117,17 @@ pub struct ConversationResponse {
     /// actor pulls these into the SSE `done` event so the W1.G4 cost panel
     /// can render real per-node attribution. Empty when no tool opted in.
     pub tool_results: Vec<(String, serde_json::Value)>,
+    /// Marks `content` as a synthesized acknowledgement fabricated by the
+    /// spawn_only branch in `loop_runner::process_message_inner` (the
+    /// "Background work started for `<tool>`. The final result will be
+    /// delivered automatically when it is ready." string). When `true`,
+    /// the API persist site tags the corresponding wire envelope with
+    /// `MessagePersistedSource::Background` so dual-negotiated clients
+    /// (those carrying `event.spawn_complete.v1`) suppress it via the
+    /// existing capability filter — collapsing the legacy
+    /// "two bubbles per turn" shape into a single preamble row.
+    /// Defaults to `false`; only set in the spawn_only synthesis path.
+    pub synthesized_from_spawn_only: bool,
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
@@ -255,6 +267,25 @@ pub struct Agent {
     /// `None` keeps legacy behaviour — callers that don't track the sandbox
     /// config (chat, gateway, tests) get the previous default.
     pub(super) sandbox_config: Option<crate::sandbox::SandboxConfig>,
+    /// Optional caller-owned prompt context manager. When present, the agent
+    /// loop asks it to prepare the final model-visible prompt before each LLM
+    /// call. This lets AppUI/session runtimes route mid-turn prompt compaction
+    /// through their durable context ledger without making `octos-agent`
+    /// depend on the CLI crate.
+    pub(super) prompt_context_manager: Option<Arc<dyn PromptContextManager>>,
+    /// Phase 1 of the [`SessionScope`] migration (PR #1198 follow-up):
+    /// the single filesystem contract for this session, constructed at
+    /// the host entry point (`chat.rs` solo, `runtime/session.rs`
+    /// multi-tenant). Threaded onto every per-tool
+    /// [`crate::tools::ToolContext`] so the same scope is visible to
+    /// tools and to pipeline workers via
+    /// [`octos_pipeline::PipelineHostContext::from_tool_context`].
+    ///
+    /// `None` keeps pre-Phase-1 behaviour byte-for-byte — no consumer
+    /// reads the field yet. Phase 2 PRs will migrate file tools,
+    /// pipeline workers, plugins, and shell to derive their CWD and
+    /// path validation from this scope.
+    pub(super) session_scope: Option<Arc<SessionScope>>,
 }
 
 impl Agent {
@@ -297,6 +328,8 @@ impl Agent {
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
+            prompt_context_manager: None,
+            session_scope: None,
         }
     }
 
@@ -340,6 +373,8 @@ impl Agent {
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
+            prompt_context_manager: None,
+            session_scope: None,
         }
     }
 
@@ -404,6 +439,18 @@ impl Agent {
         }
         self.config = config;
         self
+    }
+
+    /// Attach a caller-owned prompt context manager. Optional; absent keeps
+    /// the legacy agent-local compaction path.
+    pub fn with_prompt_context_manager(mut self, manager: Arc<dyn PromptContextManager>) -> Self {
+        self.prompt_context_manager = Some(manager);
+        self
+    }
+
+    /// Access the attached prompt context manager, if any.
+    pub fn prompt_context_manager(&self) -> Option<Arc<dyn PromptContextManager>> {
+        self.prompt_context_manager.clone()
     }
 
     /// Set the progress reporter.
@@ -520,6 +567,27 @@ impl Agent {
     /// Access the recorded parent session key, if any.
     pub fn parent_session_key(&self) -> Option<&str> {
         self.parent_session_key.as_deref()
+    }
+
+    /// Attach the session's [`SessionScope`] (Phase 1 of the migration
+    /// landed by PR #1198). Threaded into every per-tool
+    /// [`crate::tools::ToolContext`] so the same scope is visible to
+    /// the foreground branch, the spawn_only background branch, and —
+    /// via [`octos_pipeline::PipelineHostContext::from_tool_context`] —
+    /// to pipeline workers.
+    ///
+    /// Phase 1 is additive: no consumer reads the field yet. Setting
+    /// `None` (the default) preserves pre-Phase-1 behaviour byte-for-
+    /// byte; setting `Some(scope)` makes the value visible to the
+    /// downstream consumers that will come online in Phase 2.
+    pub fn with_session_scope(mut self, scope: Arc<SessionScope>) -> Self {
+        self.session_scope = Some(scope);
+        self
+    }
+
+    /// Access the configured session scope, if any.
+    pub fn session_scope(&self) -> Option<&Arc<SessionScope>> {
+        self.session_scope.as_ref()
     }
 
     /// Guard C (issue #607): record this agent's spawn nesting depth so
@@ -972,5 +1040,36 @@ mod profile_integration_tests {
             agent.profile().is_none(),
             "agents built without a profile envelope return None",
         );
+    }
+
+    #[tokio::test]
+    async fn agent_without_session_scope_returns_none_by_default() {
+        // Phase 1 of the SessionScope migration: agents built without
+        // an explicit scope keep the legacy pre-Phase-1 behaviour. The
+        // accessor reports `None`; downstream consumers (Phase 2) must
+        // treat that as "no contract, fall back to today's path".
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent = agent_default(tmp.path()).await;
+        assert!(
+            agent.session_scope().is_none(),
+            "agents built without a SessionScope return None for the accessor",
+        );
+    }
+
+    #[tokio::test]
+    async fn with_session_scope_populates_field_for_solo_cwd() {
+        // Phase 1 wiring contract: once the host entry point calls
+        // `with_session_scope(...)`, the field is present and the
+        // accessor returns the scope's `workspace()` == the user's cwd
+        // for solo mode. No downstream consumer reads it yet — the test
+        // exists so a regression in the plumbing fails loudly.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let scope = Arc::new(SessionScope::solo(cwd.clone(), vec![]).expect("solo scope"));
+        let agent = agent_default(tmp.path()).await.with_session_scope(scope);
+        let recorded = agent
+            .session_scope()
+            .expect("scope is wired into the agent");
+        assert_eq!(recorded.workspace(), cwd.as_path());
     }
 }

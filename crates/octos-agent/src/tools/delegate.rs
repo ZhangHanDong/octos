@@ -36,6 +36,7 @@ use octos_memory::EpisodeStore;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use super::spawn::{ChildPromptContextManagerFactory, ChildPromptContextRequest};
 use super::{Tool, ToolContext, ToolPolicy, ToolRegistry, ToolResult};
 use crate::compaction::CompactionRunner;
 use crate::harness_errors::HarnessError;
@@ -255,6 +256,8 @@ pub struct DelegateTool {
     harness_event_sink: Option<String>,
     /// Agent config inherited by child workers.
     worker_config: Option<AgentConfig>,
+    /// Caller-owned context-manager factory for delegated child agents.
+    child_prompt_context_manager_factory: Option<ChildPromptContextManagerFactory>,
 }
 
 impl DelegateTool {
@@ -273,6 +276,7 @@ impl DelegateTool {
             parent_task_id: None,
             harness_event_sink: None,
             worker_config: None,
+            child_prompt_context_manager_factory: None,
         }
     }
 
@@ -318,6 +322,15 @@ impl DelegateTool {
         self
     }
 
+    /// Attach a runtime-owned context manager factory for delegated children.
+    pub fn with_child_prompt_context_manager_factory(
+        mut self,
+        factory: ChildPromptContextManagerFactory,
+    ) -> Self {
+        self.child_prompt_context_manager_factory = Some(factory);
+        self
+    }
+
     /// Owned budget of this tool. Useful for tests that need to assert the
     /// child tool was constructed with the expected incremented level.
     pub fn depth_budget(&self) -> DepthBudget {
@@ -341,6 +354,7 @@ impl DelegateTool {
             parent_task_id: self.parent_task_id.clone(),
             harness_event_sink: self.harness_event_sink.clone(),
             worker_config: self.worker_config.clone(),
+            child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
         })
     }
 }
@@ -573,6 +587,7 @@ impl Tool for DelegateTool {
             // still reaches grandchildren even if only the ToolContext set it.
             harness_event_sink: effective_sink.map(|s| s.to_string()),
             worker_config: self.worker_config.clone(),
+            child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
         };
         tools.register_arc(Arc::new(child_delegate));
 
@@ -605,6 +620,7 @@ impl Tool for DelegateTool {
 
         // Step 5: run the child synchronously.
         let worker_id = AgentId::new(format!("delegate-{child_num}"));
+        let worker_id_for_context = worker_id.to_string();
         let mut worker = Agent::new(worker_id, self.llm.clone(), tools, self.memory.clone());
         // Keep an Arc handle to the child's tool registry so we can run
         // declared validators against it after `run_task` returns. `Agent::new`
@@ -616,6 +632,35 @@ impl Tool for DelegateTool {
         }
         if let Some(ref prompt) = self.worker_prompt {
             worker = worker.with_system_prompt(prompt.clone());
+        }
+        if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
+            // #1132: forward the supervisor-derived `child_session_key`
+            // (`parent#child-<task_id>`) so the persisted context
+            // ledger matches the key recorded in the task ledger.
+            // Audit/resume paths follow `BackgroundTask.child_session_key`,
+            // so synthesising a different key here (PR #1126 passed
+            // `None`, which made the session_actor factory mint a
+            // `parent#spawn-delegate-N` key) silently divorced the
+            // child's forked context from the task it backed.
+            //
+            // Fallback: when no TaskSupervisor is wired (standalone /
+            // legacy tests), keep `None` so the factory mints its own
+            // unique key — there's no registered BackgroundTask to
+            // read a key from.
+            let supervisor_child_session_key = self
+                .task_supervisor
+                .as_ref()
+                .and_then(|supervisor| supervisor.get_task(&child_task_id))
+                .and_then(|task| task.child_session_key);
+            if let Some(manager) = factory(ChildPromptContextRequest {
+                parent_session_key: self.session_key.clone(),
+                child_session_key: supervisor_child_session_key,
+                task_id: Some(child_task_id.clone()),
+                worker_id: worker_id_for_context,
+                task_label: label.clone(),
+            }) {
+                worker = worker.with_prompt_context_manager(manager);
+            }
         }
 
         // Review A F-004: propagate the parent's declarative compaction policy
@@ -673,6 +718,7 @@ impl Tool for DelegateTool {
                             &policy.validation.validators,
                             "delegate",
                             ValidatorPhase::Completion,
+                            None,
                         )
                         .await
                         .err()

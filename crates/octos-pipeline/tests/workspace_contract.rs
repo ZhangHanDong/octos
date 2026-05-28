@@ -155,6 +155,7 @@ fn base_config(dir: &TempDir, memory: Arc<EpisodeStore>, ctx: PipelineContext) -
         working_dir: dir.path().to_path_buf(),
         provider_policy: None,
         plugin_dirs: vec![],
+        plugin_require_signed: false,
         status_bridge: None,
         shutdown: Arc::new(AtomicBool::new(false)),
         max_parallel_workers: 4,
@@ -163,6 +164,8 @@ fn base_config(dir: &TempDir, memory: Arc<EpisodeStore>, ctx: PipelineContext) -
         hook_executor: None,
         workspace_context: ctx,
         host_context: octos_pipeline::host_context::PipelineHostContext::default(),
+        embedder: None,
+        catalog_dir: None,
     }
 }
 
@@ -210,6 +213,7 @@ fn policy_with_required_validator(required_file_path: &str) -> WorkspacePolicy {
     policy.validation.validators = vec![Validator {
         id: "required-artifact".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {

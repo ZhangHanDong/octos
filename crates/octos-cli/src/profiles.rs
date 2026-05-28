@@ -54,6 +54,12 @@ pub struct ProfileConfig {
     /// First-class structured LLM selection contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProfileConfig>,
+    /// Coding review specialist template. When omitted, `/review`
+    /// uses the server's built-in default specialists. Operators may
+    /// configure this per profile to change the native reviewer fanout
+    /// without changing code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewConfig>,
     /// Search provider contract for product-level search behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
@@ -116,6 +122,52 @@ pub struct ProfileConfig {
     /// tokens with persistent cooldowns and rotation strategies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_pool: Option<CredentialPoolConfig>,
+    /// Plugin loader policy. Mirrors the top-level `plugins` block in
+    /// `config.json` so per-profile gateways can opt into strict signature
+    /// enforcement independently of the host-level setting. Default
+    /// (`PluginsConfig::default()`) preserves backward compatibility —
+    /// unsigned plugins still load with a warning.
+    #[serde(default)]
+    pub plugins: crate::config::PluginsConfig,
+    /// RFC-3 (#1292) — per-topic model lane routing. When set, the
+    /// session-actor and the WS turn handler resolve the session's
+    /// `topic()` to a [`octos_llm::Lane`] using these overrides on
+    /// top of the built-in defaults, then scope the LLM chat call
+    /// inside [`octos_llm::with_lane_context`] so the
+    /// [`octos_llm::AdaptiveRouter`] narrows its candidate set to
+    /// the lane's `(provider, model)` list before scoring.
+    ///
+    /// Absent / `None` ⇒ pre-RFC-3 behavior: the router uses the
+    /// profile-default provider chain unchanged. The built-in lane
+    /// defaults still apply for topic prefixes (`slides`, `code`,
+    /// `research`, etc.) — the per-profile field only carries
+    /// **overrides**.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
+}
+
+/// Profile-owned review workflow configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// Native model-backed specialists to launch for AppUI `review/start`.
+    ///
+    /// Empty means "use the built-in default template".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_specialists: Vec<ReviewSpecialistConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSpecialistConfig {
+    /// Stable suffix used to build the child agent id.
+    pub agent_key: String,
+    /// Human-facing agent name rendered in AppUI traces.
+    pub nickname: String,
+    /// Machine-readable review role.
+    pub role: String,
+    /// Focus text injected into the specialist prompt.
+    pub focus: String,
 }
 
 /// Search configuration persisted in the profile contract.
@@ -377,6 +429,8 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub llm: PatchField<LlmProfileConfig>,
     #[serde(default)]
+    pub review: PatchField<ReviewConfig>,
+    #[serde(default)]
     pub search: PatchField<SearchConfig>,
     #[serde(default)]
     pub deep_crawl: PatchField<DeepCrawlConfig>,
@@ -586,6 +640,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.llm = None,
             PatchField::Value(llm) => self.llm = Some(llm),
+        }
+        match patch.review {
+            PatchField::Absent => {}
+            PatchField::Clear => self.review = None,
+            PatchField::Value(review) => self.review = Some(review),
         }
         match patch.search {
             PatchField::Absent => {}
@@ -855,6 +914,20 @@ pub enum ChannelCredentials {
         #[serde(default = "default_wechat_base_url")]
         base_url: String,
     },
+    Line {
+        #[serde(default = "default_line_secret_env")]
+        channel_secret_env: String,
+        #[serde(default = "default_line_token_env")]
+        channel_access_token_env: String,
+        #[serde(default)]
+        allowed_senders: String,
+        #[serde(default)]
+        webhook_port: Option<u16>,
+        #[serde(default)]
+        require_mention: bool,
+        #[serde(default)]
+        bot_user_id: String,
+    },
 }
 
 fn default_telegram_env() -> String {
@@ -922,6 +995,12 @@ fn default_wechat_token_env() -> String {
 }
 fn default_wechat_base_url() -> String {
     "https://ilinkai.weixin.qq.com".into()
+}
+fn default_line_secret_env() -> String {
+    "LINE_CHANNEL_SECRET".into()
+}
+fn default_line_token_env() -> String {
+    "LINE_CHANNEL_ACCESS_TOKEN".into()
 }
 
 /// Gateway-specific settings.
@@ -1022,8 +1101,11 @@ impl ProfileStore {
         }
 
         let path = self.profile_path(&normalized.id);
+        let mut serialized =
+            serde_json::to_value(&normalized).wrap_err("failed to serialize profile")?;
+        preserve_local_owner_metadata(&path, &mut serialized);
         let content =
-            serde_json::to_string_pretty(&normalized).wrap_err("failed to serialize profile")?;
+            serde_json::to_string_pretty(&serialized).wrap_err("failed to serialize profile")?;
 
         // Atomic write: write to temp file, then rename to avoid partial writes
         // if the process is interrupted or concurrent saves race.
@@ -1228,6 +1310,28 @@ impl ProfileStore {
     }
 }
 
+fn preserve_local_owner_metadata(path: &Path, serialized: &mut serde_json::Value) {
+    let Some(object) = serialized.as_object_mut() else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(existing)) =
+        serde_json::from_str::<serde_json::Value>(&content)
+    else {
+        return;
+    };
+    for key in ["username", "email"] {
+        if object.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = existing.get(key).filter(|value| value.is_string()) {
+            object.insert(key.to_owned(), value.clone());
+        }
+    }
+}
+
 /// Resolve the effective config for a profile. If it's a sub-account,
 /// LLM provider fields are inherited from the parent.
 pub fn resolve_effective_profile(
@@ -1249,6 +1353,9 @@ pub fn resolve_effective_profile(
 
     // Inherit the LLM contract from parent.
     ec.llm = pc.llm.clone();
+    if ec.review.is_none() {
+        ec.review = pc.review.clone();
+    }
     if ec.search.is_none() {
         ec.search = pc.search.clone();
     }
@@ -1361,8 +1468,11 @@ pub(crate) fn config_from_profile(
                     entry["settings"]["bridge_url"] = serde_json::json!(url);
                 }
             }
-            // Override Feishu webhook_port if auto-assigned
-            if let ChannelCredentials::Feishu { .. } = ch {
+            // Override webhook_port if auto-assigned (Feishu webhook / LINE)
+            if matches!(
+                ch,
+                ChannelCredentials::Feishu { .. } | ChannelCredentials::Line { .. }
+            ) {
                 if let Some(port) = feishu_port_override {
                     entry["settings"]["webhook_port"] = serde_json::json!(port);
                 }
@@ -1409,6 +1519,7 @@ pub(crate) fn config_from_profile(
                 .as_ref()
                 .and_then(|route| route.api_key_env.clone())
         }),
+        env_vars: profile.config.env_vars.clone(),
         api_type: primary.and_then(|selection| {
             selection
                 .route
@@ -1475,6 +1586,12 @@ pub(crate) fn config_from_profile(
         credential_pool: None,
         content_routing: profile.config.content_routing.clone(),
         appui: Default::default(),
+        // Carry the profile-declared plugin loader policy through to the
+        // flattened `Config` so callers reading
+        // `config.plugins.require_signed` see the same value the profile
+        // JSON declared. Defaults to permissive when the profile omits
+        // the field.
+        plugins: profile.config.plugins.clone(),
     }
 }
 
@@ -1635,6 +1752,36 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "base_url": base_url,
             }
         }),
+        ChannelCredentials::Line {
+            channel_secret_env,
+            channel_access_token_env,
+            allowed_senders,
+            webhook_port,
+            require_mention,
+            bot_user_id,
+        } => {
+            let senders: Vec<&str> = allowed_senders
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut settings = serde_json::json!({
+                "channel_secret_env": channel_secret_env,
+                "channel_access_token_env": channel_access_token_env,
+                "require_mention": require_mention,
+            });
+            if let Some(port) = webhook_port {
+                settings["webhook_port"] = serde_json::json!(port);
+            }
+            if !bot_user_id.is_empty() {
+                settings["bot_user_id"] = serde_json::json!(bot_user_id);
+            }
+            serde_json::json!({
+                "type": "line",
+                "allowed_senders": senders,
+                "settings": settings,
+            })
+        }
     }
 }
 
@@ -1651,8 +1798,8 @@ pub enum ProfileChange {
 
 /// Compare two profiles and classify the nature of changes.
 ///
-/// Restart-required: llm, search, deep_crawl, apps, channels, env_vars,
-///   email, hooks, credential_pool.
+/// Restart-required: llm, review, search, deep_crawl, apps, channels,
+///   env_vars, email, hooks, credential_pool.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -1667,6 +1814,9 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
 
     if oc.llm != nc.llm {
         restart_fields.push("llm".into());
+    }
+    if oc.review != nc.review {
+        restart_fields.push("review".into());
     }
     if oc.search != nc.search {
         restart_fields.push("search".into());
@@ -1694,6 +1844,13 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     }
     if oc.credential_pool != nc.credential_pool {
         restart_fields.push("credential_pool".into());
+    }
+    // Section B (codex review round-6): plugin loader policy changes
+    // (e.g. flipping `plugins.require_signed`) only take effect during
+    // bootstrap, so a toggle must trigger a gateway restart to flush
+    // the stale plugin registry and apply the new gate.
+    if oc.plugins != nc.plugins {
+        restart_fields.push("plugins".into());
     }
 
     if !restart_fields.is_empty() {
@@ -1726,6 +1883,31 @@ pub fn feishu_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
         }
     }
     None
+}
+
+/// Check if a profile has a LINE channel and return its webhook port configuration.
+///
+/// Returns:
+/// - `Some(Some(port))` — LINE channel exists with explicit webhook port
+/// - `Some(None)` — LINE channel exists but needs an auto-assigned port
+/// - `None` — no LINE channel
+pub fn line_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
+    for ch in &profile.config.channels {
+        if let ChannelCredentials::Line { webhook_port, .. } = ch {
+            return Some(*webhook_port);
+        }
+    }
+    None
+}
+
+/// Webhook port needed by any profile channel that listens for HTTP webhooks.
+pub fn profile_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
+    match (feishu_webhook_port(profile), line_webhook_port(profile)) {
+        (Some(f), Some(l)) => Some(f.or(l)),
+        (Some(f), None) => Some(f),
+        (None, Some(l)) => Some(l),
+        (None, None) => None,
+    }
 }
 
 /// Get the API channel port from a profile, if one is configured.
@@ -1832,6 +2014,44 @@ mod tests {
 
         assert!(store.delete("test").unwrap());
         assert!(store.get("test").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_save_preserves_local_owner_metadata_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+        let mut profile = UserProfile {
+            id: "ada".into(),
+            name: "Ada Lovelace".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.save(&profile).unwrap();
+        let path = store.profile_path("ada");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("username".into(), serde_json::json!("ada"));
+        raw.as_object_mut()
+            .unwrap()
+            .insert("email".into(), serde_json::json!("ada@example.com"));
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        profile.name = "Ada Byron".into();
+        store.save(&profile).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["username"], serde_json::json!("ada"));
+        assert_eq!(saved["email"], serde_json::json!("ada@example.com"));
+        assert_eq!(saved["name"], serde_json::json!("Ada Byron"));
     }
 
     #[test]
@@ -2117,6 +2337,27 @@ mod tests {
                 .and_then(|slides| slides.default_theme.as_deref()),
             Some("crew")
         );
+    }
+
+    #[test]
+    fn test_profile_config_patch_replaces_review_contract() {
+        let mut config = ProfileConfig::default();
+
+        config.apply_patch(ProfileConfigPatch {
+            review: PatchField::Value(ReviewConfig {
+                native_specialists: vec![ReviewSpecialistConfig {
+                    agent_key: "reviewer-ux".into(),
+                    nickname: "Noether".into(),
+                    role: "ux_review".into(),
+                    focus: "TUI UX and tmux evidence".into(),
+                }],
+            }),
+            ..Default::default()
+        });
+
+        let review = config.review.as_ref().expect("review config set");
+        assert_eq!(review.native_specialists.len(), 1);
+        assert_eq!(review.native_specialists[0].agent_key, "reviewer-ux");
     }
 
     #[test]
@@ -2437,6 +2678,14 @@ mod tests {
                         default_theme: Some("crew".into()),
                     }),
                 }),
+                review: Some(ReviewConfig {
+                    native_specialists: vec![ReviewSpecialistConfig {
+                        agent_key: "reviewer-api".into(),
+                        nickname: "Ada Lovelace".into(),
+                        role: "api_contract_review".into(),
+                        focus: "API".into(),
+                    }],
+                }),
                 ..Default::default()
             },
             created_at: Utc::now(),
@@ -2463,9 +2712,18 @@ mod tests {
                 default_theme: Some("ocean".into()),
             }),
         });
+        changed.config.review = Some(ReviewConfig {
+            native_specialists: vec![ReviewSpecialistConfig {
+                agent_key: "reviewer-ux".into(),
+                nickname: "Noether".into(),
+                role: "ux_review".into(),
+                focus: "TUI UX".into(),
+            }],
+        });
 
         match diff_profiles(&base, &changed) {
             ProfileChange::RestartRequired(fields) => {
+                assert!(fields.contains(&"review".into()));
                 assert!(fields.contains(&"search".into()));
                 assert!(fields.contains(&"deep_crawl".into()));
                 assert!(fields.contains(&"apps".into()));

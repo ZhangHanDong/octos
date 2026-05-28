@@ -1,6 +1,6 @@
 {
   "name": "voice",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "octos",
   "description": "OminiX voice skill: ASR, preset-voice TTS with emotion/speed control, and model management via local Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm instead.",
   "timeout_secs": 600,
@@ -27,6 +27,7 @@
     {
       "name": "voice_synthesize",
       "description": "Synthesize speech from text. Uses Qwen3-TTS when ominix-api is running (high quality, emotion/style control, speed adjustment). Falls back to macOS built-in Say command when ominix-api is unavailable. Produces a WAV/MP3 audio file. After generating, use send_file to deliver the audio to the user. NOTE: This tool only supports preset voices. For voice cloning or custom voice profiles, use mofa-fm (fm_tts).",
+      "spawn_only": true,
       "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
@@ -117,5 +118,8 @@
         "required": ["model_type"]
       }
     }
-  ]
+  ],
+  "discovery": {
+    "summary": "On-device ASR + preset-voice TTS (Qwen3 on Apple Silicon) with emotion/speed control and model lifecycle. Voice cloning lives in sibling skill mofa-fm."
+  }
 }

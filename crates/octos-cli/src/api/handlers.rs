@@ -6,65 +6,38 @@ use std::sync::{Arc, Mutex, OnceLock};
 use axum::Extension;
 use axum::Json;
 use axum::extract::State;
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use futures::stream::StreamExt;
 use octos_agent::inspect_workspace_contract;
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{MAIN_PROFILE_ID, Message, SessionKey};
-use octos_llm::pricing::model_pricing;
+#[cfg(test)]
+use octos_core::Message;
+use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use super::auth_handlers::ADMIN_PROFILE_ID;
-use super::events::ChannelReporter;
-use super::metrics::MetricsReporter;
+use super::auth_handlers::{ADMIN_PROFILE_ID, is_authorized_for_profile};
 use super::router::AuthIdentity;
-use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
+use crate::project_templates::{
+    BuildOutputDirError, SiteProjectMetadata, read_site_project_metadata,
+    validated_build_output_dir,
+};
 
-/// POST /api/chat -- send a message, get a response (sync JSON only).
+/// Legacy `POST /api/chat` retired.
 ///
-/// M9-α-5/α-6 (ADR PR #830): the SSE branch was deleted; `stream: true`
-/// now returns `410 Gone` and clients must use `/api/ui-protocol/ws`.
-/// `media` / `attach_only` / `client_message_id` are accepted for
-/// wire-compat with older clients but unused in the surviving sync
-/// path. The legacy `/api/ws` handler (`ws_standalone_agent`) reads
-/// the same struct and still consumes them.
-#[derive(Deserialize)]
-pub struct ChatRequest {
-    pub message: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub topic: Option<String>,
-    #[serde(default)]
-    pub stream: bool,
-    /// File paths from prior `/api/upload` call.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub media: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub attach_only: bool,
-    /// Web-generated correlation id. Used by the WS lifecycle handlers
-    /// downstream of `/api/ui-protocol/ws`. Pre-α-5/α-6 the streaming
-    /// HTTP path also threaded this through; that path is gone.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub client_message_id: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ChatResponse {
-    pub content: String,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-}
+/// Transport history:
+/// - M9-α-5/α-6 (ADR PR #830): the SSE branch was deleted; `stream: true`
+///   returned `410 Gone` and clients had to use `/api/ui-protocol/ws`.
+/// - Cleanup follow-up to PR #908: the surviving sync JSON path was
+///   retired once the last callers (the `coding_multi_session`
+///   integration test, three e2e specs, and
+///   `scripts/validate-m4-1a-live.sh`) migrated to the WS path.
+///
+/// The sole chat transport is now `/api/ui-protocol/ws`.
 
 #[derive(Serialize)]
 pub(crate) struct ContentFileEntry {
@@ -92,9 +65,6 @@ fn resolve_scoped_download_path(
     resolve_scoped_file_handle(base_dir, request_path)
         .or_else(|| resolve_legacy_file_request(base_dir, request_path))
 }
-
-/// Maximum message length (1MB).
-const MAX_MESSAGE_LEN: usize = 1_048_576;
 
 fn request_host(headers: &HeaderMap) -> Option<String> {
     let raw = headers
@@ -157,6 +127,47 @@ pub(crate) fn routed_profile_id_from_headers(
         .and_then(|candidate| resolve_profile_id_candidate(state, candidate))
 }
 
+/// #995 follow-up — authorization-aware wrapper around
+/// [`routed_profile_id_from_headers`].
+///
+/// On TRUSTED hops (loopback by default, or
+/// `OCTOS_TRUSTED_PROXY_CIDRS`-matched addresses) the strip middleware
+/// preserves the operator-set `X-Profile-Id`, so authenticated requests
+/// can still smuggle a victim-profile id past the routing layer. This
+/// helper closes that gap: when both a header-resolved profile id AND
+/// an authenticated identity are present, the identity MUST be
+/// authorized for the target profile. Admin tokens (`AuthIdentity::Admin`)
+/// and admin-role user sessions short-circuit to `Ok`; owner→sub-account
+/// is also permitted via the parent_id check in
+/// [`super::auth_handlers::is_authorized_for_profile`]. Mismatch is a
+/// hard `403`.
+///
+/// Unauthenticated requests pass through unchanged — the call site is
+/// responsible for its own downstream authorization (e.g. webhook
+/// proxies or public preview routes).
+#[allow(clippy::result_large_err)]
+pub(crate) fn authorized_routed_profile_id_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<Option<String>, Response> {
+    let Some(profile_id) = routed_profile_id_from_headers(state, headers) else {
+        return Ok(None);
+    };
+    if let Some(identity) = identity {
+        if !super::auth_handlers::is_authorized_for_profile(state, identity, &profile_id) {
+            tracing::warn!(
+                target: "octos::api::auth",
+                identity = ?identity,
+                requested_profile = %profile_id,
+                "routed_profile_id denied — authenticated identity not authorized for the requested profile (#995 follow-up)"
+            );
+            return Err((StatusCode::FORBIDDEN, "forbidden").into_response());
+        }
+    }
+    Ok(Some(profile_id))
+}
+
 /// Resolve API port for a specific profile, or fall back to first available.
 /// Profile is identified by X-Profile-Id header (set by Caddy from subdomain).
 async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(String, u16)> {
@@ -173,23 +184,68 @@ async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(Stri
     pm.first_api_port().await
 }
 
-fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String {
-    routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
-}
-
-fn standalone_api_session_key_candidates(
+/// #995 follow-up — authorization-aware wrapper around
+/// [`resolve_api_port`]. Returns `Err(403)` when the header-resolved
+/// profile is not one the authenticated identity is authorized for.
+///
+/// The header authorization check runs FIRST — even if no
+/// `process_manager` is wired (standalone mode) the call site still
+/// needs to authorize a cross-tenant `X-Profile-Id`, because the
+/// authorization gate is the only thing keeping a forged header from
+/// reaching the standalone path's storage helpers downstream.
+///
+/// Falls back to the gateway's first available port when no header
+/// resolved to a profile, matching the legacy `resolve_api_port`
+/// contract — that fallback never touches a tenant-scoped route, so
+/// there is no header to authorize.
+#[allow(clippy::result_large_err)]
+async fn resolve_api_port_authorized(
     state: &AppState,
     headers: &HeaderMap,
-    session_id: &str,
-) -> Vec<SessionKey> {
-    let profile_id = api_profile_id_from_headers(state, headers);
-    let mut candidates = vec![
-        SessionKey::with_profile(&profile_id, "api", session_id),
-        SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id),
-        SessionKey::new("api", session_id),
-    ];
-    candidates.dedup_by(|left, right| left.0 == right.0);
-    candidates
+    identity: Option<&AuthIdentity>,
+) -> Result<Option<(String, u16)>, Response> {
+    let authorized_profile_id =
+        authorized_routed_profile_id_from_headers(state, headers, identity)?;
+
+    let pm = match state.process_manager.as_ref() {
+        Some(pm) => pm,
+        None => return Ok(None),
+    };
+
+    if let Some(profile_id) = authorized_profile_id {
+        if let Some(port) = pm.api_port(&profile_id).await {
+            return Ok(Some((profile_id, port)));
+        }
+        tracing::warn!(profile = profile_id, "no API port for requested profile");
+    }
+
+    Ok(pm.first_api_port().await)
+}
+
+/// #995 follow-up round 3 — authorization-aware profile resolver for
+/// the API channel. Returns `Err(403)` when the header resolves to a
+/// profile the identity is not authorized for; falls back to
+/// `MAIN_PROFILE_ID` when no header is present (matching the legacy
+/// `api_profile_id_from_headers` contract, retired in this round).
+///
+/// The raw (unauthorized) variant was deleted because the only
+/// remaining caller — the standalone candidate walk in
+/// [`standalone_api_session_key_candidates_with_topic`] — is now
+/// reachable on a trusted hop AND must therefore reject cross-tenant
+/// headers up-front. Codex round-2 review called out the raw variant
+/// as bypass-prone for exactly this reason; the function now exists
+/// only in its `_authorized` form so future call sites can't
+/// reintroduce the same bug.
+#[allow(clippy::result_large_err)]
+fn api_profile_id_from_headers_authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<String, Response> {
+    Ok(
+        authorized_routed_profile_id_from_headers(state, headers, identity)?
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_string()),
+    )
 }
 
 /// Returns `true` when `session_id` is a bare SPA id whose raw form is
@@ -211,7 +267,8 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
     !session_id.contains(':') && !session_id.contains('#')
 }
 
-/// Topic-aware sibling of [`standalone_api_session_key_candidates`].
+/// Topic-aware, auth-aware candidate resolver shared by REST
+/// `/messages`, `session/title.set`, and `session/delete`.
 ///
 /// Returns the candidate `SessionKey`s the REST `/messages` and similar
 /// read paths should try, in fallback order. The fallback set is split
@@ -249,14 +306,28 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
 /// The dedup pass collapses duplicates when the topic is empty (in
 /// which case the bare-key and raw-id forms coincide with their
 /// no-topic counterparts).
+///
+/// **#995 follow-up round 3 — authorization is REQUIRED**. This helper
+/// now uses [`api_profile_id_from_headers_authorized`] internally, so
+/// a cross-tenant `X-Profile-Id` on a trusted hop produces an `Err`
+/// `Response` (403) instead of resolving to the victim profile id.
+/// Every caller already authorized via
+/// [`authorized_routed_profile_id_from_headers`] at the handler
+/// entry, so this is defense-in-depth: if a future caller is added
+/// that forgets to gate up-front, the candidate walk itself rejects
+/// the cross-tenant header rather than building candidates against
+/// the victim profile. Codex round-2 review specifically called out
+/// the standalone `session_messages` path as bypass-prone for exactly
+/// this reason.
+#[allow(clippy::result_large_err)]
 fn standalone_api_session_key_candidates_with_topic(
     state: &AppState,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     session_id: &str,
     topic: Option<&str>,
-) -> Vec<SessionKey> {
-    let profile_id = api_profile_id_from_headers(state, headers);
+) -> Result<Vec<SessionKey>, Response> {
+    let profile_id = api_profile_id_from_headers_authorized(state, headers, identity)?;
     let topic = topic.unwrap_or_default();
 
     // Always probe the resolved profile's own canonical key first.
@@ -306,212 +377,23 @@ fn standalone_api_session_key_candidates_with_topic(
         }
     }
     candidates.dedup_by(|left, right| left.0 == right.0);
-    candidates
+    Ok(candidates)
 }
 
 fn encode_api_session_path_id(id: &str) -> String {
     octos_bus::session::encode_path_component(id)
 }
 
-pub async fn chat(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<ChatRequest>,
-) -> Response {
-    // M9-α-5/α-6 (ADR PR #830 / audit issue #845): SSE chat is gone.
-    // `POST /api/chat` only supports the sync JSON path now — every
-    // streaming caller has migrated to `/api/ui-protocol/ws`. Fail
-    // closed when `stream=true` is requested so a stale client surfaces
-    // a clear error instead of a half-broken response.
-    if req.stream {
-        return (
-            StatusCode::GONE,
-            "POST /api/chat?stream=true was removed in M9-α-5/α-6 — \
-             use the WebSocket UI Protocol (/api/ui-protocol/ws) instead.",
-        )
-            .into_response();
-    }
-
-    match chat_sync(state, headers, req).await {
-        Ok(json) => json.into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
-    }
-}
-
-/// Persist a `Message` to the canonical per-user `<topic>.jsonl` and
-/// invalidate the `SessionManager` LRU cache for the key.
-///
-/// This is the unified write path for the standalone `octos serve` /chat
-/// handlers. Mirrors `ApiChannel::persist_to_session` in the gateway path
-/// — both funnel through `octos_bus::persist_message_through_canonical_path`
-/// so the storage layer is the single ordering point.
-///
-/// Returns the committed per-session sequence number so callers (e.g. the
-/// streaming handler) can correlate it back to the optimistic bubble.
-async fn persist_chat_message_through_canonical(
-    sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
-    key: &SessionKey,
-    message: Message,
-) -> eyre::Result<usize> {
-    let data_dir = {
-        let manager = sessions.lock().await;
-        manager.data_dir()
-    };
-
-    let result = octos_bus::persist_message_through_canonical_path(&data_dir, key, message).await;
-
-    // Drop any stale `SessionManager` cache entry so a follow-up read
-    // (duplicate-detection, `?source=full`) consults disk instead of
-    // returning a pre-write empty `Session`.
-    {
-        let mut manager = sessions.lock().await;
-        manager.invalidate_cache(key);
-    }
-
-    result
-}
-
-async fn chat_sync(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    req: ChatRequest,
-) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    if req.message.len() > MAX_MESSAGE_LEN {
-        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
-        ));
-    }
-
-    let profile_id = api_profile_id_from_headers(&state, &headers);
-    let session_key = standalone_api_session_key_with_topic(
-        &state,
-        &headers,
-        req.session_id.as_deref().unwrap_or("default"),
-        req.topic.as_deref(),
-    );
-
-    tracing::info!(
-        profile_id = %profile_id,
-        session = req.session_id.as_deref().unwrap_or("default"),
-        msg_len = req.message.len(),
-        "chat: processing message"
-    );
-
-    // M11-F: every read path resolves through `state.profiles` +
-    // `state.session_cache`. An unregistered profile is a configuration
-    // bug, not a runtime fallback — `octos serve` bootstraps every
-    // profile in `ProfileStore::list()` at startup, so if a profile id
-    // arrives at `/api/chat` that the catalog doesn't know about, it
-    // means the request routed against a profile that failed (or never
-    // had) bootstrap. Fail closed with 503 rather than silently fall
-    // through to a server-wide agent (which M11-F removed).
-    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "No LLM provider configured for profile '{profile_id}'. \
-                 Set up the profile with an API key in the dashboard.",
-            ),
-        ));
-    };
-    chat_sync_via_session_runtime(state, profile_runtime, session_key, req).await
-}
-
-/// `/api/chat` dispatcher: resolves the per-session
-/// [`crate::runtime::SessionRuntime`] from the cache (constructing it
-/// on first use), runs the agent against the session-bound workspace,
-/// and persists the response through the canonical per-user JSONL.
-///
-/// M11-F: the only `/api/chat` path. The legacy server-wide
-/// `state.agent` fallback was removed; unregistered profile → 503 in
-/// the caller.
-async fn chat_sync_via_session_runtime(
-    state: Arc<AppState>,
-    profile_runtime: Arc<crate::runtime::ProfileRuntime>,
-    session_key: SessionKey,
-    req: ChatRequest,
-) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    // Acquire (or build on first use) the per-session runtime.
-    //
-    // M11-F regression fix REG-6: when no client cwd is supplied,
-    // forward `state.appui_default_session_cwd` (mirrored from
-    // `config.appui.default_session_cwd`) as the workspace hint. The
-    // pre-M11-F serve path wired this into the server-wide agent via
-    // `agent.with_workspace_root(default_cwd)`; we now thread the
-    // same operator default through the per-session bootstrap. When
-    // the operator sets nothing, this is `None` and the bootstrap
-    // falls back to the canonical
-    // `<profile_data_dir>/users/<encoded session base>/workspace`
-    // layout — preserving the M11 fix for the
-    // `"workspace policy not found"` failure on yangmi voice clone.
-    let workspace_hint = state.appui_default_session_cwd.clone();
-    let session_runtime = state
-        .session_cache
-        .get_or_init(&profile_runtime, session_key.clone(), workspace_hint)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                error = %e,
-                profile_id = %profile_runtime.profile_id,
-                session = %session_key,
-                "chat: SessionRuntime::bootstrap failed",
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to bootstrap session runtime: {e}"),
-            )
-        })?;
-
-    let history: Vec<Message> = {
-        let mut sess = session_runtime.sessions.lock().await;
-        let session = sess.get_or_create(&session_key).await;
-        session.get_history(50).to_vec()
-    };
-
-    let response = session_runtime
-        .agent
-        .process_message(&req.message, &history, vec![])
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "chat: LLM processing failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    tracing::info!(
-        input_tokens = response.token_usage.input_tokens,
-        output_tokens = response.token_usage.output_tokens,
-        profile_id = %profile_runtime.profile_id,
-        session = %session_key,
-        "chat: response generated via SessionRuntime",
-    );
-
-    for msg in &response.messages {
-        let _ = persist_chat_message_through_canonical(
-            &session_runtime.sessions,
-            &session_key,
-            msg.clone(),
-        )
-        .await;
-    }
-
-    Ok(Json(ChatResponse {
-        content: response.content,
-        input_tokens: response.token_usage.input_tokens,
-        output_tokens: response.token_usage.output_tokens,
-    }))
-}
-
-/// GET /api/sessions -- list sessions.
+/// Result entry shape for the WS `session/list` RPC method (formerly the
+/// body of `GET /api/sessions`, retired in M12 Phase D-5).
 #[derive(Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
     pub message_count: usize,
     /// Display title (auto-derived from first user message; manual rename via
-    /// PATCH /api/sessions/:id/title preserves across new messages). None
-    /// for legacy sessions persisted before the title field existed; the
-    /// client should fall back to deriving a title from message content.
+    /// the WS `session/title.set` RPC method preserves across new messages).
+    /// None for legacy sessions persisted before the title field existed;
+    /// the client should fall back to deriving a title from message content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }
@@ -525,25 +407,78 @@ fn is_internal_session_topic(topic: &str) -> bool {
     topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+// Helper for `ui_protocol::handle_session_list` (M12 Phase D-5).
+// The REST route `GET /api/sessions` was retired; this function survives
+// as the implementation backing the WS `session/list` RPC method.
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+
+    // #995 follow-up — Layer-2 authorization for the routed profile.
+    // Pre-fix this prefix went straight to `routed_profile_id_from_headers`,
+    // so a trusted-hop request with `X-Profile-Id: <victim>` listed the
+    // victim's sessions even when authenticated as another tenant.
+    let profile_id = match api_profile_id_from_headers_authorized(&state, &headers, identity_ref) {
+        Ok(pid) => pid,
+        Err(response) => return response,
+    };
+
+    // M11-F per-profile SessionManager listing. Mirrors the
+    // `session_messages` fix in commit 10cc9378d (`fix(api): route
+    // session_messages through per-profile SessionManager`): the
+    // WS turn handler (`run_standalone_turn`) writes session history
+    // through `SessionRuntime.sessions` which opens against the
+    // profile's own `data_dir` (`<profile>/data/sessions/...`). The
+    // process-wide `state.sessions` walk below opens against the
+    // top-level home (`<home>/sessions/`) and never sees those
+    // per-profile JSONLs — so for an authenticated tenant request
+    // (e.g. dspfac listing its own chat history on
+    // `https://dspfac.octos.ominix.io/chat`), the legacy walk
+    // returns 0 sessions and the chat sidebar renders empty.
+    //
+    // The fix opens a transient `SessionManager` against the
+    // resolved profile_data_dir and walks the bare on-disk ids the
+    // SPA actually uses — no prefix strip, because the per-profile
+    // sessions/ directory is itself the tenant boundary, so on-disk
+    // ids are already chat-bare. The process-wide walk below remains
+    // as an admin / legacy fallback (still strips `<profile>:api:`
+    // for legacy entries).
+    if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await {
+        let profile_sessions = list_profile_sessions(&profile_data_dir);
+        let existing: std::collections::HashSet<String> =
+            all.iter().map(|s| s.id.clone()).collect();
+        all.extend(
+            profile_sessions
+                .into_iter()
+                .filter(|s| !existing.contains(&s.id)),
+        );
+    }
 
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
-        let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
+        let prefix = format!("{profile_id}:api:");
         // Use `list_top_level_sessions` (skips `child-*` and `*.tasks` at the
         // directory walk) so a user dir with tens of thousands of spawn
         // children does not turn this listing into an O(N) hang. The
         // `is_internal_api_session_id` belt-and-suspenders check is kept for
         // legacy entries that might slip through (e.g. flat layout files
         // pre-dating the encoder rules).
+        let existing: std::collections::HashSet<String> =
+            all.iter().map(|s| s.id.clone()).collect();
         all.extend(
             sess.list_top_level_sessions_with_title()
                 .into_iter()
                 .filter_map(|(id, count, title)| {
                     let chat_id = id.strip_prefix(&prefix)?;
                     if is_internal_api_session_id(chat_id) {
+                        return None;
+                    }
+                    if existing.contains(chat_id) {
                         return None;
                     }
                     Some(SessionInfo {
@@ -556,12 +491,19 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
     }
 
     // Also fetch from gateway if available.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — routed_profile_id used to walk the per-profile
+    // gateway is authorized above; the `resolve_api_port_authorized`
+    // call re-checks header authorization belt-and-suspenders.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let proxy_resp = super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
         if proxy_resp.status().is_success() {
             if let Ok(body) = axum::body::to_bytes(proxy_resp.into_body(), 10 * 1024 * 1024).await {
                 if let Ok(gateway_sessions) = serde_json::from_slice::<Vec<SessionInfo>>(&body) {
-                    // Merge, dedup by id (standalone wins)
+                    // Merge, dedup by id (per-profile / standalone wins).
                     let existing: std::collections::HashSet<String> =
                         all.iter().map(|s| s.id.clone()).collect();
                     all.extend(gateway_sessions.into_iter().filter(|s| {
@@ -583,9 +525,54 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
     Json(all).into_response()
 }
 
-/// GET /api/sessions/:id/messages -- get session history.
+/// List top-level sessions persisted under a per-profile data_dir.
 ///
-/// Query params: `?limit=100&offset=0`
+/// Mirrors [`read_profile_session_messages`] (the `session_messages`
+/// fix in commit `10cc9378d`): opens a transient `SessionManager`
+/// against the resolved profile_data_dir and walks
+/// `list_top_level_sessions_with_title()`. The on-disk session ids are
+/// already chat-bare (the SPA-supplied `web-<N>` / `slides-<N>` form),
+/// so we emit them as-is without stripping a `<profile>:api:` prefix —
+/// that prefix only applies to the process-wide `state.sessions` store
+/// which opens against the top-level home.
+///
+/// Internal runtime topics (`child-*` and `*.tasks` sidecars) are
+/// already filtered at the `list_top_level_sessions` directory walk;
+/// the `is_internal_api_session_id` check belt-and-suspenders any
+/// legacy flat-layout entries.
+///
+/// The per-profile sessions/ directory IS the tenant boundary — only
+/// that profile's JSONLs live there — so no further authorization gate
+/// is needed inside this helper. The caller (`list_sessions`) handles
+/// header/identity authorization via [`resolve_profile_data_dir`]
+/// before invoking us.
+fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo> {
+    let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
+        return Vec::new();
+    };
+    mgr.list_top_level_sessions_with_title()
+        .into_iter()
+        .filter_map(|(id, count, title)| {
+            if is_internal_api_session_id(&id) {
+                return None;
+            }
+            Some(SessionInfo {
+                id,
+                message_count: count,
+                title,
+            })
+        })
+        .collect()
+}
+
+// Helper for `ui_protocol::handle_session_messages_page` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/messages` was retired; this
+// function survives as the implementation backing the WS
+// `session/messages_page` RPC method.
+///
+/// Backing impl for the WS `session/messages_page` RPC method. Pagination
+/// shape (`limit`/`offset`/`since_seq`) carried over from the legacy REST
+/// route into `SessionMessagesPageParams`.
 #[derive(Deserialize)]
 pub struct PaginationParams {
     #[serde(default = "default_page_limit")]
@@ -615,16 +602,6 @@ fn default_page_limit() -> usize {
     100
 }
 
-fn standalone_api_session_key_with_topic(
-    state: &AppState,
-    headers: &HeaderMap,
-    session_id: &str,
-    topic: Option<&str>,
-) -> SessionKey {
-    let profile_id = api_profile_id_from_headers(state, headers);
-    SessionKey::with_profile_topic(&profile_id, "api", session_id, topic.unwrap_or_default())
-}
-
 fn append_topic_query(path: &mut String, topic: Option<&str>) {
     if let Some(topic) = topic.filter(|value| !value.is_empty()) {
         path.push_str(if path.contains('?') {
@@ -633,23 +610,6 @@ fn append_topic_query(path: &mut String, topic: Option<&str>) {
             "?topic="
         });
         path.push_str(&octos_bus::session::encode_path_component(topic));
-    }
-}
-
-// `append_since_seq_query` previously served the deleted
-// `/api/sessions/{id}/events/stream` proxy. Kept here (and tested below)
-// because future WS-lifecycle replays may re-introduce a `since_seq`
-// query string when re-implementing the corresponding gateway-mode
-// proxy step.
-#[allow(dead_code)]
-fn append_since_seq_query(path: &mut String, since_seq: Option<usize>) {
-    if let Some(since_seq) = since_seq {
-        path.push_str(if path.contains('?') {
-            "&since_seq="
-        } else {
-            "?since_seq="
-        });
-        path.push_str(&since_seq.to_string());
     }
 }
 
@@ -684,11 +644,66 @@ pub async fn session_messages(
 ) -> Response {
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
 
     // source=full: always proxy to gateway, which owns the canonical JSONL history.
     let use_full = params.source.as_deref() == Some("full");
 
-    // Try standalone store first in local mode.
+    // #995 follow-up round 3 — Layer-2 authorization gate BEFORE any
+    // standalone-store candidate walk. Pre-fix, the standalone path at
+    // lines 587-620 built candidate `SessionKey`s using the raw
+    // `api_profile_id_from_headers` (which trusts whatever
+    // `X-Profile-Id` the request carries on a trusted hop) and returned
+    // messages from those candidates before ever hitting the gateway
+    // gate at the bottom of this function. The result: an authenticated
+    // non-admin user on a loopback hop could read another tenant's
+    // session messages by forging `X-Profile-Id`. Codex round-2 quote:
+    // "Passing `identity` only affects fallback breadth; it does not
+    // reject cross-tenant headers." This call rejects cross-tenant
+    // headers up-front; admin / owner / self continue past it.
+    if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
+    {
+        return response;
+    }
+
+    // M11-F per-profile SessionManager lookup. The WS turn handler
+    // (`run_standalone_turn`) writes session history through
+    // `SessionRuntime.sessions` which opens against the profile's own
+    // `data_dir` (`<profile>/data/sessions/...`). The process-wide
+    // `state.sessions` below opens against the top-level home and
+    // never sees profile-scoped JSONLs — so for an authenticated
+    // tenant request (e.g. dspfac asking for its own slides session),
+    // the legacy `state.sessions` walk returns 0 messages and the
+    // left chat panel renders empty after a hard refresh. Live mini3
+    // regression 2026-05-18 for session
+    // `slides-1779130130502-th18yr#slides untitled-deck-th18yr`
+    // (38 lines on disk under `profiles/dspfac/data/sessions/`,
+    // 0 candidates matched at the process-wide layer).
+    //
+    // Open a transient `SessionManager` against the resolved profile's
+    // data_dir and walk the bare-key candidates the SPA actually uses
+    // (`<session_id>` and `<session_id>#<topic>`). The candidate
+    // helper's admin/main gate is irrelevant here because the disk
+    // scope IS the tenant boundary (the request's profile_data_dir
+    // resolves only sessions belonging to that profile).
+    if !use_full {
+        if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await
+        {
+            if let Some(history) = read_profile_session_messages(
+                &profile_data_dir,
+                &id,
+                params.topic.as_deref(),
+                limit,
+                offset,
+            )
+            .await
+            {
+                return Json(history).into_response();
+            }
+        }
+    }
+
+    // Try the process-wide standalone store next (legacy + admin fallback).
     if !use_full {
         if let Some(sessions) = &state.sessions {
             let fetch_count = match offset.checked_add(limit) {
@@ -723,14 +738,16 @@ pub async fn session_messages(
             // unlocks the unprofiled fallbacks even when the request
             // resolved to a hosted profile (admin already has read-all
             // privileges, so this is no privilege escalation).
-            let identity_ref = identity.as_ref().map(|ext| &ext.0);
-            let candidate_keys = standalone_api_session_key_candidates_with_topic(
+            let candidate_keys = match standalone_api_session_key_candidates_with_topic(
                 &state,
                 &headers,
                 identity_ref,
                 &id,
                 params.topic.as_deref(),
-            );
+            ) {
+                Ok(keys) => keys,
+                Err(response) => return response,
+            };
             let mut sess = sessions.lock().await;
             let mut chosen: Option<&SessionKey> = None;
             for key in &candidate_keys {
@@ -764,7 +781,13 @@ pub async fn session_messages(
     } // !use_full
 
     // Proxy to gateway.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — authorize routed profile against identity
+    // before walking the gateway.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = session_messages_proxy_path(
             &id,
             limit,
@@ -796,15 +819,28 @@ pub struct MessageInfo {
     pub thread_id: Option<String>,
 }
 
-/// GET /api/sessions/:id/status -- check if session has an active task.
+// Helper for `ui_protocol::handle_session_status_get` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/status` was retired; this
+// function survives as the implementation backing the WS
+// `session/status.get` RPC method.
+/// Backing impl for the WS `session/status.get` RPC method.
 pub async fn session_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
-    // Proxy to gateway (session actors live there)
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // Proxy to gateway (session actors live there).
+    // #995 follow-up — authorize routed profile against identity
+    // before walking the gateway. Pre-fix the gateway routing read the
+    // raw header.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let encoded_id = encode_api_session_path_id(&id);
         let mut path = format!("/sessions/{encoded_id}/status");
         append_topic_query(&mut path, params.topic.as_deref());
@@ -818,15 +854,26 @@ pub async fn session_status(
     .into_response()
 }
 
-/// GET /api/sessions/:id/tasks -- list background tasks for a session.
+// Helper for `ui_protocol::handle_session_tasks_list` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/tasks` was retired; this
+// function survives as the implementation backing the WS
+// `session/tasks.list` RPC method.
+/// Backing impl for the WS `session/tasks.list` RPC method.
 pub async fn session_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
-    // Proxy to gateway (task supervisor lives there)
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // Proxy to gateway (task supervisor lives there).
+    // #995 follow-up — authorize routed profile against identity.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let encoded_id = encode_api_session_path_id(&id);
         let mut path = format!("/sessions/{encoded_id}/tasks");
         append_topic_query(&mut path, params.topic.as_deref());
@@ -852,10 +899,19 @@ pub async fn session_tasks(
 pub async fn cancel_task(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
 ) -> Response {
-    // Gateway-mode: forward to the gateway process that owns the supervisor.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // Gateway-mode: forward to the gateway process that owns the
+    // supervisor. #995 follow-up — authorize routed profile against
+    // identity before forwarding (a forged header could otherwise
+    // cancel a victim's task on a TRUSTED hop).
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!("/tasks/{}/cancel", encode_api_session_path_id(&task_id));
         return super::webhook_proxy::api_post_proxy_json(
             &state,
@@ -926,12 +982,21 @@ pub struct RestartFromNodeRequest {
 pub async fn restart_task_from_node(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
     body: Option<Json<RestartFromNodeRequest>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
 
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — authorize routed profile against identity. A
+    // forged header could otherwise relaunch a victim's task on a
+    // TRUSTED hop.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!(
             "/tasks/{}/restart-from-node",
             encode_api_session_path_id(&task_id)
@@ -1035,18 +1100,39 @@ fn collect_session_files(
     }
 }
 
+// Helper for `ui_protocol::handle_session_files_list` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/files` was retired; this
+// function survives as the implementation backing the WS
+// `session/files.list` RPC method.
+/// Backing impl for the WS `session/files.list` RPC method.
 pub async fn session_files(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+
+    // Issue #999 — gateway-mode tenant-leak guard. Pre-fix the
+    // `state.sessions.is_some()` branch short-circuited to
+    // `sess.data_dir()` (the gateway/standalone top-level) BEFORE
+    // checking the host-routed profile. An authenticated non-admin
+    // user on a TRUSTED hop with a cross-tenant `X-Profile-Id` (or a
+    // host-routed cross-tenant subdomain) walked straight into the
+    // victim profile's workspace listing. Layer-2 authorization runs
+    // up-front now, mirroring `session_messages` (#1002): a forged
+    // cross-tenant header is `403` regardless of which side of the
+    // sessions / no-sessions branch resolves the data_dir below.
+    if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
+    {
+        return response;
+    }
+
     let data_dir = if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         sess.data_dir()
     } else {
-        let identity = identity.as_ref().map(|ext| &ext.0);
-        match resolve_profile_data_dir(&state, &headers, identity).await {
+        match resolve_profile_data_dir(&state, &headers, identity_ref).await {
             Ok(data_dir) => data_dir,
             Err(response) => return response,
         }
@@ -1068,18 +1154,37 @@ pub async fn session_files(
     Json(files).into_response()
 }
 
+// Helper for `ui_protocol::handle_session_workspace_get` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/workspace-contract` was retired;
+// this function survives as the implementation backing the WS
+// `session/workspace.get` RPC method.
+/// Backing impl for the WS `session/workspace.get` RPC method.
 pub async fn session_workspace_contract(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+
+    // Issue #999 — gateway-mode tenant-leak guard. Same shape as the
+    // companion `session_files` handler above: pre-fix the
+    // `state.sessions.is_some()` branch short-circuited to
+    // `sess.data_dir()` BEFORE checking the host-routed profile, so a
+    // cross-tenant header on a TRUSTED hop exposed the victim
+    // profile's workspace-contract statuses. The Layer-2 gate runs
+    // up-front; `state.sessions.data_dir()` only resolves when the
+    // routed profile is authorized (admin / owner / self).
+    if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
+    {
+        return response;
+    }
+
     let data_dir = if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         sess.data_dir()
     } else {
-        let identity = identity.as_ref().map(|ext| &ext.0);
-        match resolve_profile_data_dir(&state, &headers, identity).await {
+        match resolve_profile_data_dir(&state, &headers, identity_ref).await {
             Ok(data_dir) => data_dir,
             Err(response) => return response,
         }
@@ -1139,19 +1244,24 @@ fn should_resolve_file_access_from_profile(
         || identity.is_some()
 }
 
-/// PATCH /api/sessions/:id/title — set a manual title for a session.
-///
-/// Body: `{ "title": "New display title" }`. The title persists across new
-/// messages (auto-derivation from first user message no longer overrides it).
-/// Empty body or missing field returns 400.
+// Helper for `ui_protocol::handle_session_title_set` (M12 Phase D-5).
+// The REST route `PATCH /api/sessions/{id}/title` was retired; this
+// function survives as the implementation backing the WS
+// `session/title.set` RPC method.
+/// Backing request shape for the WS `session/title.set` RPC method
+/// (formerly the body of `PATCH /api/sessions/{id}/title`). The title
+/// persists across new messages — auto-derivation from the first user
+/// message no longer overrides it once a manual title is set.
 #[derive(Deserialize)]
 pub struct UpdateTitleRequest {
     pub title: String,
 }
 
+/// Backing impl for the WS `session/title.set` RPC method.
 pub async fn update_session_title(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<UpdateTitleRequest>,
 ) -> Response {
@@ -1164,27 +1274,71 @@ pub async fn update_session_title(
     }
 
     let mut updated = false;
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // #995 follow-up — authorize routed profile against identity
+    // before using it as `SessionManager` routing context. Pre-fix the
+    // raw header value flowed straight into `resolve_sessions_for_lookup`
+    // and the gateway proxy below, letting a forged
+    // `X-Profile-Id: <victim>` rename a victim's sessions on a TRUSTED
+    // hop.
+    let routed_profile_id =
+        match authorized_routed_profile_id_from_headers(&state, &headers, identity_ref) {
+            Ok(pid) => pid,
+            Err(response) => return response,
+        };
+    let candidates = match standalone_api_session_key_candidates_with_topic(
+        &state,
+        &headers,
+        identity_ref,
+        &id,
+        None,
+    ) {
+        Ok(keys) => keys,
+        Err(response) => return response,
+    };
 
-    if let Some(sessions) = &state.sessions {
+    // #924 BLOCK 3: each candidate `SessionKey` may belong to a
+    // different profile (the candidate set includes the resolved
+    // tenant profile, `_main`, and bare-channel/raw-id forms). Route
+    // each candidate through `resolve_sessions_for_lookup` so the
+    // profile's own `SessionRuntime.sessions` is locked — turn
+    // persistence writes there, so the title update MUST land in the
+    // same store. The legacy code locked only `state.sessions`, which
+    // did not contain profile-scoped runtime sessions and returned
+    // `NOT_FOUND` for raw `web-*` ids under profile auth.
+    for key in candidates {
+        let Some(sessions) = super::ui_protocol::resolve_sessions_for_lookup(
+            &state,
+            None,
+            routed_profile_id.as_deref(),
+            &key,
+        )
+        .await
+        else {
+            continue;
+        };
         let mut sess = sessions.lock().await;
-        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
-            if sess.load(&key).await.is_some() {
-                if let Err(e) = sess.update_title(&key, title.clone()).await {
-                    tracing::error!(
-                        session_key = %key,
-                        error = %e,
-                        "update_title in standalone store failed"
-                    );
-                } else {
-                    updated = true;
-                }
+        if sess.load(&key).await.is_some() {
+            if let Err(e) = sess.update_title(&key, title.clone()).await {
+                tracing::error!(
+                    session_key = %key,
+                    error = %e,
+                    "update_title in profile-scoped store failed"
+                );
+            } else {
+                updated = true;
             }
         }
     }
 
     // Proxy to gateway too, since the session may live in the per-profile
     // SessionManager rather than the serve-process store.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — same `resolve_api_port_authorized` gate.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
         let body_json = serde_json::json!({ "title": title }).to_string();
         let _ = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
@@ -1201,31 +1355,74 @@ pub async fn update_session_title(
     }
 }
 
-/// DELETE /api/sessions/:id -- delete a session.
+// Helper for `ui_protocol::handle_session_delete` (M12 Phase D-5).
+// The REST route `DELETE /api/sessions/{id}` was retired; this
+// function survives as the implementation backing the WS
+// `session/delete` RPC method.
+/// Backing impl for the WS `session/delete` RPC method.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    // Clear from the standalone store if available.
-    if let Some(sessions) = &state.sessions {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // #995 follow-up — authorize routed profile against identity
+    // before using it as `SessionManager` routing context. Pre-fix a
+    // forged `X-Profile-Id: <victim>` would delete victim's sessions
+    // on a TRUSTED hop.
+    let routed_profile_id =
+        match authorized_routed_profile_id_from_headers(&state, &headers, identity_ref) {
+            Ok(pid) => pid,
+            Err(response) => return response,
+        };
+    let candidates = match standalone_api_session_key_candidates_with_topic(
+        &state,
+        &headers,
+        identity_ref,
+        &id,
+        None,
+    ) {
+        Ok(keys) => keys,
+        Err(response) => return response,
+    };
+
+    // #924 BLOCK 3: route each candidate through the profile-aware
+    // SessionManager resolver — turn persistence writes to the
+    // profile's `SessionRuntime.sessions`, so deletes MUST hit the
+    // same store. The legacy code locked only `state.sessions`, which
+    // did not contain profile-scoped runtime sessions.
+    for key in candidates {
+        let Some(sessions) = super::ui_protocol::resolve_sessions_for_lookup(
+            &state,
+            None,
+            routed_profile_id.as_deref(),
+            &key,
+        )
+        .await
+        else {
+            continue;
+        };
         let mut sess = sessions.lock().await;
-        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
-            if sess.load(&key).await.is_some() {
-                if let Err(e) = sess.clear(&key).await {
-                    tracing::error!(
-                        session_key = %key,
-                        error = %e,
-                        "delete session from standalone store failed"
-                    );
-                }
+        if sess.load(&key).await.is_some() {
+            if let Err(e) = sess.clear(&key).await {
+                tracing::error!(
+                    session_key = %key,
+                    error = %e,
+                    "delete session from profile-scoped store failed"
+                );
             }
         }
     }
 
     // Also proxy delete to gateway — sessions may live in the gateway's
     // SessionManager (per-profile data dir), not just the serve process's store.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — same `resolve_api_port_authorized` gate.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!("/sessions/{}", encode_api_session_path_id(&id));
         let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
     }
@@ -1233,7 +1430,7 @@ pub async fn delete_session(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// POST /api/upload -- upload files, returns paths for use in /api/chat media field.
+/// POST /api/upload -- upload files, returns paths for use as turn-input media handles.
 ///
 /// Accepts multipart/form-data with one or more `file` fields.
 /// Returns JSON array of server-side upload handles.
@@ -1571,12 +1768,99 @@ async fn serve_file_impl(data_dir: &std::path::Path, filename: &str) -> Response
     (StatusCode::OK, headers, data).into_response()
 }
 
+/// Open a fresh `SessionManager` against the resolved profile's data dir
+/// and try the SPA-bare key candidates the WS turn handler actually
+/// writes under. Returns the requested message page if a candidate has
+/// non-empty history; `None` otherwise (caller falls back to the
+/// process-wide `state.sessions` block).
+///
+/// The bare-key candidate (`<id>` and `<id>#<topic>`) is tried
+/// unconditionally inside the per-profile scope because the on-disk
+/// scope IS the tenant boundary — `profile_data_dir/sessions/` only
+/// contains that profile's JSONLs. The admin / main-profile gating in
+/// [`standalone_api_session_key_candidates_with_topic`] is for the
+/// process-wide `state.sessions`, where bare keys could theoretically
+/// match a JSONL written by a different tenant.
+async fn read_profile_session_messages(
+    profile_data_dir: &std::path::Path,
+    session_id: &str,
+    topic: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Option<Vec<MessageInfo>> {
+    let fetch_count = offset.checked_add(limit)?;
+    let topic = topic.unwrap_or_default();
+    let mut mgr = octos_bus::SessionManager::open(profile_data_dir).ok()?;
+    let mut candidates: Vec<SessionKey> = Vec::with_capacity(2);
+    if is_safe_bare_session_id(session_id) {
+        if topic.is_empty() {
+            candidates.push(SessionKey(session_id.to_string()));
+        } else {
+            candidates.push(SessionKey(format!("{session_id}#{topic}")));
+            candidates.push(SessionKey(session_id.to_string()));
+        }
+    }
+    for key in &candidates {
+        let session = mgr.get_or_create(key).await;
+        if session.get_history(1).is_empty() {
+            continue;
+        }
+        let messages: Vec<MessageInfo> = session
+            .get_history(fetch_count)
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|m| MessageInfo {
+                role: m.role.to_string(),
+                content: m.content.clone(),
+                timestamp: m.timestamp.to_rfc3339(),
+                thread_id: m.thread_id.clone(),
+            })
+            .collect();
+        return Some(messages);
+    }
+    None
+}
+
+/// Reject bare `session_id`s that could escape the `users/<id>/workspace`
+/// subtree once joined as a raw path component.
+///
+/// The other candidates in [`api_session_workspace_dirs`] percent-encode
+/// the id via [`octos_bus::session::encode_path_component`], so traversal
+/// bytes (`/`, `\`, `..`, NUL, control chars) are neutralized. The
+/// SPA-bare candidate, however, joins the id verbatim so it lines up with
+/// what SPA writers (`slides-…`, `web-…`, `site-…`) put on disk — which
+/// means a request-supplied id like `../escape`, `/abs`, or `foo/bar`
+/// would land outside the intended profile subtree.
+///
+/// We allow only the alphanumeric + `-` + `_` + `#` alphabet that the SPA
+/// actually uses (`#` separates the optional topic suffix). Anything else
+/// — including `/`, `\`, `:`, `.`, NUL, and any non-ASCII byte — causes
+/// the bare candidate to be skipped. The encoded candidates still cover
+/// the request, so callers don't lose any legitimate lookup capability;
+/// they just don't get the unsafe raw-join shortcut.
+///
+/// Codex P1 follow-up to #1069.
+fn is_bare_path_safe_session_id(session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    // Reject `.` / `..` outright — even surrounded by safe chars, a literal
+    // path component of `..` is unambiguous traversal once joined.
+    if session_id == "." || session_id == ".." {
+        return false;
+    }
+    session_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'#')
+}
+
 fn api_session_workspace_dirs(
     data_dir: &std::path::Path,
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
     let profile_id = infer_profile_id_from_data_dir(data_dir);
-    let mut dirs = Vec::with_capacity(3);
+    let mut dirs = Vec::with_capacity(4);
     let mut seen = HashSet::new();
 
     for key in [
@@ -1588,6 +1872,29 @@ fn api_session_workspace_dirs(
         let path = data_dir.join("users").join(encoded_base).join("workspace");
         if seen.insert(path.clone()) {
             dirs.push(path);
+        }
+    }
+
+    // SPA-created sessions (slides-/web-/site- session_ids) write their
+    // workspace under the BARE session_id, without the `<channel>:` prefix
+    // that gets percent-encoded by `encode_path_component`. The three
+    // channel-prefixed encodings above don't match those on-disk paths,
+    // so the listing endpoint returned an empty set and the SlidesChat
+    // scaffold-wait loop timed out with "slides scaffold did not appear"
+    // (live mini3 regression 2026-05-18 for session
+    // `slides-1779125959003-ugtbaa`, even though the scaffold itself
+    // succeeded server-side and the 3 expected files were on disk).
+    //
+    // SECURITY: the bare candidate joins `session_id` verbatim, so a
+    // request-supplied id containing `/`, `\`, `..`, or NUL would escape
+    // the intended `users/<id>/workspace` subtree (codex P1 review of
+    // #1069). Gate this candidate behind a strict allowlist; the other
+    // three (percent-encoded) candidates still cover any caller, they
+    // just don't pick up the SPA-bare on-disk shape.
+    if is_bare_path_safe_session_id(session_id) {
+        let bare_path = data_dir.join("users").join(session_id).join("workspace");
+        if seen.insert(bare_path.clone()) {
+            dirs.push(bare_path);
         }
     }
 
@@ -1614,6 +1921,65 @@ fn infer_profile_id_from_data_dir(data_dir: &std::path::Path) -> String {
         .to_string()
 }
 
+/// Decision: which profile id should the request resolve to, given the
+/// header-derived candidate (post-middleware — already stripped if the
+/// connection was untrusted), an identity-derived id, and the auth
+/// identity for an authorization check?
+///
+/// **Auth bypass fix (#995)**: the legacy precedence
+/// `header.or(identity)` let an authenticated request set
+/// `X-Profile-Id: <victim>` and read the victim's data dir. The current
+/// precedence is identity-first; if a header is *also* present (i.e.
+/// from a trusted proxy after the strip middleware ran), it must name
+/// a profile the identity is authorized to act on — otherwise we
+/// return `403`, never silently override.
+///
+/// - Unauthenticated request + header: legacy hint, pass through.
+/// - Authenticated + header MATCHES identity scope: use that profile
+///   (lets per-tenant Caddy ingress narrow admin auth to a tenant).
+/// - Authenticated + header is unauthorized: `403`.
+/// - Authenticated + no header: use identity's own profile.
+/// - Neither header nor identity: `BAD_REQUEST`.
+//
+// `clippy::result_large_err` is consistent with `resolve_profile_data_dir`
+// and the rest of this handler module — boxing the response just for this
+// helper would diverge from the surrounding style.
+#[allow(clippy::result_large_err)]
+pub(crate) fn decide_resolved_profile_id(
+    state: &AppState,
+    identity: Option<&AuthIdentity>,
+    header_profile_id: Option<&str>,
+    identity_profile_id: Option<&str>,
+) -> Result<String, Response> {
+    match (identity, header_profile_id) {
+        (Some(identity), Some(pid)) => {
+            if super::auth_handlers::is_authorized_for_profile(state, identity, pid) {
+                return Ok(pid.to_string());
+            }
+            tracing::warn!(
+                target: "octos::api::auth",
+                identity = ?identity,
+                requested_profile = %pid,
+                "X-Profile-Id denied — authenticated identity not authorized for the requested profile"
+            );
+            Err((StatusCode::FORBIDDEN, "forbidden").into_response())
+        }
+        (Some(_), None) => identity_profile_id.map(str::to_string).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing X-Profile-Id and no authenticated profile context",
+            )
+                .into_response()
+        }),
+        (None, Some(pid)) => Ok(pid.to_string()),
+        (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            "missing X-Profile-Id and no authenticated profile context",
+        )
+            .into_response()),
+    }
+}
+
 async fn resolve_profile_data_dir(
     state: &AppState,
     headers: &HeaderMap,
@@ -1628,26 +1994,25 @@ async fn resolve_profile_data_dir(
                 None => None,
             };
 
-            if let Some(pid) = header_profile_id.as_deref().or(identity_profile_id) {
-                match ps.get(pid) {
-                    Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
-                    Ok(None) => {
-                        return Err((StatusCode::NOT_FOUND, "profile not found").into_response());
-                    }
-                    Err(error) => {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("profile lookup failed: {error}"),
-                        )
-                            .into_response());
-                    }
+            let pid = decide_resolved_profile_id(
+                state,
+                identity,
+                header_profile_id.as_deref(),
+                identity_profile_id,
+            )?;
+            match ps.get(&pid) {
+                Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
+                Ok(None) => {
+                    return Err((StatusCode::NOT_FOUND, "profile not found").into_response());
+                }
+                Err(error) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("profile lookup failed: {error}"),
+                    )
+                        .into_response());
                 }
             }
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "missing X-Profile-Id and no authenticated profile context",
-            )
-                .into_response());
         }
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no profile store").into_response());
     }
@@ -1848,11 +2213,18 @@ fn preview_content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Resolve the build output directory for a site preview.
+///
+/// Issue #996: the metadata file is LLM-writable via `edit_file`, so
+/// the `build_output_dir` field is **untrusted on read** — we route
+/// every read through [`validated_build_output_dir`]. Callers must
+/// surface the typed error to the user (e.g. as a 4xx-equivalent
+/// preview page), not silently fall back to the raw join.
 fn output_dir_for_site(
     project_dir: &std::path::Path,
     metadata: &SiteProjectMetadata,
-) -> std::path::PathBuf {
-    project_dir.join(&metadata.build_output_dir)
+) -> Result<std::path::PathBuf, BuildOutputDirError> {
+    validated_build_output_dir(metadata, project_dir)
 }
 
 fn newest_tree_mtime(
@@ -1969,10 +2341,44 @@ fn run_build_command(command: &mut std::process::Command, label: &str) -> Result
     }
 }
 
+/// Categorised reason `ensure_site_build_output` rejected a preview
+/// build. Codex BLOCKING #2 (issue #996 follow-up): the caller maps
+/// `InvalidMetadata` to HTTP 400 with a scrubbed body and the build/
+/// missing-artifact variants to HTTP 5xx with the project path
+/// stripped out — previously every error returned 200 with a "Build
+/// Failed" page and leaked the full project path in the body.
+///
+/// `pub` (re-exported only via the `#[doc(hidden)]` `testing` module
+/// in `crate::api`) so the build_output_dir test suite can directly
+/// induce each variant and assert the HTTP status mapping via
+/// [`preview_build_error_response`].
+#[derive(Debug)]
+pub enum SiteBuildError {
+    /// The LLM-controlled metadata failed validation (allow-list,
+    /// per-template equality, `..` escape, etc.). 4xx surface.
+    InvalidMetadata(BuildOutputDirError),
+    /// The template slug is not one we know how to build (post
+    /// metadata-validation; the validator already rejects unknown
+    /// templates via the `TemplateMismatch` path because their
+    /// `output_dir()` defaults to `docs`, but keep this branch for
+    /// defence-in-depth). 4xx surface.
+    UnsupportedTemplate,
+    /// The build tool (npm / quarto) exited non-zero. 5xx surface,
+    /// scrubbed body.
+    BuildCommandFailed,
+    /// The build claimed to succeed but the expected output dir was
+    /// not created. 5xx surface, scrubbed body.
+    OutputArtifactMissing,
+    /// Post-build re-validation tripped — typically a symlink that
+    /// the build step left behind. 4xx surface (it's a contract
+    /// violation by the build step, not a server hiccup).
+    PostBuildValidation(BuildOutputDirError),
+}
+
 fn ensure_site_build_output(
     project_dir: &std::path::Path,
     metadata: &SiteProjectMetadata,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<std::path::PathBuf, SiteBuildError> {
     fn site_build_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
         static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
         LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1992,7 +2398,10 @@ fn ensure_site_build_output(
 
     let build_lock = site_build_lock(project_dir);
     let _build_guard = build_lock.lock().unwrap();
-    let output_dir = output_dir_for_site(project_dir, metadata);
+    // Validate the LLM-controlled metadata field before we trust it
+    // to derive the build output path. Issue #996.
+    let output_dir =
+        output_dir_for_site(project_dir, metadata).map_err(SiteBuildError::InvalidMetadata)?;
     if !site_build_needed(project_dir, &output_dir) {
         return Ok(output_dir);
     }
@@ -2001,31 +2410,34 @@ fn ensure_site_build_output(
         "quarto-lesson" => {
             let mut render = std::process::Command::new("quarto");
             render.current_dir(project_dir).arg("render");
-            run_build_command(&mut render, "quarto render")?;
+            run_build_command(&mut render, "quarto render")
+                .map_err(|_| SiteBuildError::BuildCommandFailed)?;
         }
         "astro-site" | "nextjs-app" | "react-vite" => {
             if !project_dir.join("node_modules").exists() {
                 let mut install = std::process::Command::new("npm");
                 install.current_dir(project_dir).arg("install");
                 apply_site_build_env(&mut install, project_dir);
-                run_build_command(&mut install, "npm install")?;
+                run_build_command(&mut install, "npm install")
+                    .map_err(|_| SiteBuildError::BuildCommandFailed)?;
             }
             let mut build = std::process::Command::new("npm");
             build.current_dir(project_dir).arg("run").arg("build");
             apply_site_build_env(&mut build, project_dir);
-            run_build_command(&mut build, "npm run build")?;
+            run_build_command(&mut build, "npm run build")
+                .map_err(|_| SiteBuildError::BuildCommandFailed)?;
         }
-        other => return Err(format!("unsupported site template: {other}")),
+        _ => return Err(SiteBuildError::UnsupportedTemplate),
     }
 
     if !output_dir.exists() {
-        return Err(format!(
-            "site build completed but {} was not created",
-            output_dir.display()
-        ));
+        return Err(SiteBuildError::OutputArtifactMissing);
     }
 
-    Ok(output_dir)
+    // Re-validate now that the output dir exists on disk — this
+    // re-runs the canonical-descendant check and catches symlinks
+    // that the build step might have left behind.
+    output_dir_for_site(project_dir, metadata).map_err(SiteBuildError::PostBuildValidation)
 }
 
 fn safe_preview_join(root: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
@@ -2107,13 +2519,41 @@ fn resolve_preview_asset_path(
     Some(canonical_resolved)
 }
 
-async fn serve_preview_file(path: std::path::PathBuf) -> Response {
-    let data = match tokio::fs::read(&path).await {
+/// Serve a preview file with TOCTOU-safe semantics. Codex round-1
+/// BLOCKING #1: the previous body called `tokio::fs::read`, which
+/// follows symlinks — an attacker who could swap `<output_dir>` (or
+/// any ancestor) for a symlink between the canonical-descendant
+/// check in [`resolve_preview_asset_path`] and the read here would
+/// escape the project dir even though the validator passed.
+///
+/// Codex round-2 BLOCKING #1: the round-1 fix used a
+/// `symlink_metadata` ancestor walk + final `O_NOFOLLOW` open. That
+/// left a multi-syscall TOCTOU window — an attacker could swap an
+/// ancestor between the stat and the open. The replacement routes
+/// through [`crate::api::preview::serve_preview_no_follow`], which
+/// walks every component with `rustix::fs::openat` so each step is
+/// anchored to a parent fd that already passed `O_NOFOLLOW`.
+///
+/// The validation chain rooted here is:
+///   `project_dir` (caller-trusted scaffold)
+///     → `output_dir` component (allow-listed per-template)
+///     → asset-relative path (resolved by `resolve_preview_asset_path`).
+/// We pass `project_dir`, not `output_dir`, as the walk root so
+/// every component — including the `output_dir` name itself — is
+/// re-validated by the `openat` walk on each request. The previous
+/// shape passed `output_dir` and the walk only re-checked the
+/// asset-relative segment, missing the swap-`output_dir`-itself
+/// variant.
+async fn serve_preview_file(project_dir: &std::path::Path, path: std::path::PathBuf) -> Response {
+    let project_root = project_dir.to_path_buf();
+    let leaf_for_headers = path.clone();
+    let data = match crate::api::preview::serve_preview_no_follow(project_root, path).await {
         Ok(data) => data,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let cache_control = if path.extension().and_then(|ext| ext.to_str()) == Some("html") {
+    let cache_control = if leaf_for_headers.extension().and_then(|ext| ext.to_str()) == Some("html")
+    {
         "no-cache, no-store, must-revalidate"
     } else {
         "public, max-age=30"
@@ -2124,7 +2564,7 @@ async fn serve_preview_file(path: std::path::PathBuf) -> Response {
         [
             (
                 axum::http::header::CONTENT_TYPE,
-                preview_content_type(&path),
+                preview_content_type(&leaf_for_headers),
             ),
             (axum::http::header::CACHE_CONTROL, cache_control),
         ],
@@ -2155,13 +2595,14 @@ async fn serve_site_preview_impl(
     };
 
     let Some(metadata) = read_site_project_metadata(&project_dir) else {
+        // Codex BLOCKING #2: don't leak `project_dir` in the error
+        // body. The session/slug names came from the URL so are
+        // safe to echo; the on-disk path is not.
         return site_preview_html(
             StatusCode::NOT_FOUND,
             "Missing Site Metadata",
             &format!(
-                "The project exists at `{}` but `{}` is missing or invalid.",
-                project_dir.display(),
-                "mofa-site-session.json",
+                "The scaffold for `{session_id}` / `{site_slug}` is missing or its `mofa-site-session.json` is invalid.",
             ),
         );
     };
@@ -2174,49 +2615,120 @@ async fn serve_site_preview_impl(
 
     let output_dir = match build_task.await {
         Ok(Ok(output_dir)) => output_dir,
-        Ok(Err(error)) => {
+        Ok(Err(error)) => return preview_build_error_response(&metadata.template, error),
+        Err(_join_error) => {
+            // Worker panicked — server-internal, no useful detail
+            // for the client.
             return site_preview_html(
-                StatusCode::OK,
-                "Preview Build Failed",
-                &format!(
-                    "Octos could not build the preview for `{}`.\n\n{}",
-                    metadata.template, error
-                ),
-            );
-        }
-        Err(error) => {
-            return site_preview_html(
-                StatusCode::OK,
-                "Preview Build Failed",
-                &format!("The preview worker crashed: {error}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Preview Worker Crashed",
+                "The preview build worker crashed. Please retry; if this persists check server logs.",
             );
         }
     };
 
     let Some(path) = resolve_preview_asset_path(&output_dir, &request_path) else {
+        // Codex BLOCKING #2: drop `output_dir.display()` — that's
+        // the project path. The request path is user-supplied so
+        // safe to echo.
         return site_preview_html(
             StatusCode::NOT_FOUND,
             "Preview Asset Missing",
             &format!(
-                "The built preview exists, but `{}` was not found under `{}`.",
-                request_path,
-                output_dir.display(),
+                "The built preview exists, but no asset was found for `{}`.",
+                if request_path.is_empty() {
+                    "/"
+                } else {
+                    request_path.as_str()
+                },
             ),
         );
     };
 
-    serve_preview_file(path).await
+    // Codex round-2 BLOCKING #1: pass `project_dir` (not
+    // `output_dir`) as the symlink-safe walk root, so the openat
+    // chain re-validates `output_dir`'s component name on every
+    // request as well. The round-1 wiring passed `output_dir`, which
+    // meant a swap of the `output_dir` directory name itself between
+    // build and serve was only caught by the canonical-descendant
+    // check inside the helper — and that check is vulnerable to the
+    // same TOCTOU shape it's supposed to fix.
+    serve_preview_file(&project_dir, path).await
+}
+
+/// Map a `SiteBuildError` to a scrubbed HTTP response. Codex
+/// BLOCKING #2: validation failures are 4xx (the LLM messed up the
+/// metadata, not the server), build failures are 5xx, neither leaks
+/// the project path in the response body.
+///
+/// `pub` (re-exported only via the `#[doc(hidden)]` `testing` module
+/// in `crate::api`) so the build_output_dir test suite can assert
+/// the status-code mapping at the handler layer without spinning up
+/// the full Axum router. Codex round-2 follow-up.
+pub fn preview_build_error_response(template: &str, error: SiteBuildError) -> Response {
+    match error {
+        SiteBuildError::InvalidMetadata(reason) => site_preview_html(
+            StatusCode::BAD_REQUEST,
+            "Preview Build Rejected",
+            &format!(
+                "Octos rejected the preview build for template `{template}`: {reason}.\n\nThe `mofa-site-session.json` metadata is invalid. Restore the original `build_output_dir` value (or scaffold the site again) and reload.",
+            ),
+        ),
+        SiteBuildError::UnsupportedTemplate => site_preview_html(
+            StatusCode::BAD_REQUEST,
+            "Preview Build Rejected",
+            &format!("Unsupported site template `{template}`."),
+        ),
+        SiteBuildError::PostBuildValidation(reason) => site_preview_html(
+            StatusCode::BAD_REQUEST,
+            "Preview Build Rejected",
+            &format!(
+                "Octos rejected the preview build for template `{template}` after the build step: {reason}.\n\nThe build artifact left an unsafe output directory. Re-scaffold or clean the build cache.",
+            ),
+        ),
+        SiteBuildError::BuildCommandFailed => site_preview_html(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Preview Build Failed",
+            &format!(
+                "The build tool failed for template `{template}`. Check server logs for the full build output.",
+            ),
+        ),
+        SiteBuildError::OutputArtifactMissing => site_preview_html(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Preview Build Failed",
+            "Preview build artifact missing — the build claimed success but produced no output.",
+        ),
+    }
 }
 
 /// GET /api/site-preview/{session_id}/{site_slug} — serve the preview root for a site session.
+///
+/// Codex review of PR #1001 (issue #994 follow-up): this route is a
+/// parallel preview surface to `/api/preview/{profile_id}/...` (which
+/// PR #1001 hardened by moving onto `chat_api` + asserting ownership).
+/// Unlike that route, `/api/site-preview/*` has no `profile_id` URL
+/// segment, and the legacy implementation derived the profile via
+/// [`resolve_profile_data_dir`] which preferred the `X-Profile-Id`
+/// header over the authenticated identity. With a valid bearer token
+/// plus a spoofed `X-Profile-Id`, an authenticated tenant A could read
+/// tenant B's preview through this side door.
+///
+/// Fix: route via [`resolve_site_preview_data_dir`] which mirrors the
+/// `/api/my/*` flow:
+///   1. authenticated identity required (401 if missing),
+///   2. host-routed profile (subdomain) is honored only when the
+///      identity is authorized for it (`is_authorized_for_profile`),
+///   3. otherwise the profile id is derived directly from the
+///      identity (`User { id }` or the admin profile),
+///   4. `X-Profile-Id` is NEVER trusted for profile routing on this
+///      route. The header is ignored.
 pub async fn serve_site_preview_root(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path((session_id, site_slug)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    let identity = identity.as_ref().map(|ext| &ext.0);
-    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+    let data_dir = match resolve_site_preview_data_dir(&state, &headers, identity.as_ref()) {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
@@ -2224,6 +2736,8 @@ pub async fn serve_site_preview_root(
 }
 
 /// GET /api/site-preview/{session_id}/{site_slug}/{*path} — serve built preview assets.
+///
+/// See [`serve_site_preview_root`] for the security model.
 pub async fn serve_site_preview_path(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2234,33 +2748,156 @@ pub async fn serve_site_preview_path(
         String,
     )>,
 ) -> Response {
-    let identity = identity.as_ref().map(|ext| &ext.0);
-    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+    let data_dir = match resolve_site_preview_data_dir(&state, &headers, identity.as_ref()) {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
     serve_site_preview_impl(data_dir, session_id, site_slug, request_path).await
 }
 
-/// GET /api/preview/{profile_id}/{session_id}/{site_slug} — public preview root for site iframes.
-pub async fn serve_public_site_preview_root(
+/// Identity-first profile-data-dir resolver for `/api/site-preview/*`.
+///
+/// Codex flagged the legacy [`resolve_profile_data_dir`] path as
+/// unsafe for routes that lack an authoritative `profile_id` URL
+/// segment: it falls back to `X-Profile-Id` and treats the header as
+/// trusted, so an authed tenant A spoofing `X-Profile-Id: tenant-b`
+/// reads tenant B's preview. This helper deliberately ignores the
+/// header for profile routing and instead:
+///
+/// 1. Requires an `AuthIdentity` (the route is wrapped in
+///    `user_auth_middleware`, so reaching here with `None` is a
+///    routing bug — fail closed with 401).
+/// 2. If the request's host resolves to a tenant profile via the
+///    subdomain (e.g. `tenant-a.api.ominix.io`), honor it only when
+///    [`is_authorized_for_profile`] passes for the authenticated
+///    identity — otherwise 403 (mirrors `/api/my/*` host-scoping).
+/// 3. Otherwise, use the identity's own profile id: regular users
+///    map to their own user id, admin token maps to the admin
+///    profile.
+/// 4. Resolve the data dir from the now-authoritative profile id.
+#[allow(clippy::result_large_err)] // matches sibling `resolve_profile_data_dir_by_id`
+fn resolve_site_preview_data_dir(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&Extension<AuthIdentity>>,
+) -> Result<std::path::PathBuf, Response> {
+    let Some(Extension(identity)) = identity else {
+        tracing::warn!(
+            "site-preview route reached without AuthIdentity — routing bug? failing closed"
+        );
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    };
+
+    // Host-routed profile takes precedence (e.g. tenant subdomain),
+    // but ONLY when the authenticated identity is allowed to see
+    // that profile. Otherwise 403 — never silently fall through to
+    // another profile.
+    if let Some(host) = request_host(headers) {
+        if !is_local_request_host(&host) {
+            if let Some(candidate) = host.split('.').next() {
+                if let Some(host_profile_id) = resolve_profile_id_candidate(state, candidate) {
+                    if !is_authorized_for_profile(state, identity, &host_profile_id) {
+                        tracing::warn!(
+                            identity = ?identity,
+                            host_profile_id = %host_profile_id,
+                            "site-preview host-scope denied — identity not authorized for the tenant subdomain"
+                        );
+                        return Err(StatusCode::FORBIDDEN.into_response());
+                    }
+                    return resolve_profile_data_dir_by_id(state, &host_profile_id);
+                }
+            }
+        }
+    }
+
+    // No host-routed profile: derive purely from the authenticated
+    // identity. Crucially we do NOT read `X-Profile-Id` for profile
+    // routing — that's the codex-flagged side door.
+    let identity_profile_id = match identity {
+        AuthIdentity::Admin => ADMIN_PROFILE_ID,
+        AuthIdentity::User { id, .. } => id.as_str(),
+    };
+
+    // Defence in depth: if the caller DID send `X-Profile-Id`, treat
+    // any value that doesn't match the authenticated identity's
+    // profile (and that the identity isn't otherwise authorized for)
+    // as an explicit cross-tenant spoofing attempt → 403. This makes
+    // the rejection signal unambiguous in logs and tests, mirroring
+    // the response shape `/api/preview/{profile_id}/*` returns when
+    // identity does not own the route's profile_id segment.
+    if let Some(header_value) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
+        let trimmed = header_value.trim();
+        if !trimmed.is_empty()
+            && let Some(spoofed) = resolve_profile_id_candidate(state, trimmed)
+            && !is_authorized_for_profile(state, identity, &spoofed)
+        {
+            tracing::warn!(
+                identity = ?identity,
+                spoofed_profile_id = %spoofed,
+                "site-preview denied — X-Profile-Id requests a profile the identity is not authorized for (codex follow-up to PR #1001 / issue #994)"
+            );
+            return Err(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+
+    resolve_profile_data_dir_by_id(state, identity_profile_id)
+}
+
+/// GET /api/preview/{profile_id}/{session_id}/{site_slug} —
+/// auth-and-ownership-gated preview root for site iframes.
+///
+/// Issue #994 (P0 sev2 cross-tenant data read): prior to this commit
+/// the route lived on the unauthenticated public router branch and
+/// resolved both `profile_id` and `session_id` purely from the URL
+/// tuple. The tuple is moderately guessable (subdomain + short
+/// timestamp + small slug allow-list), so any caller who could guess
+/// it could read another tenant's built site.
+///
+/// The fix:
+/// 1. Route now requires user auth (`user_auth_middleware` in
+///    `router.rs`). An unauthenticated request is rejected at the
+///    middleware with `401 Unauthorized` before the handler runs.
+/// 2. Handler asserts the authenticated identity is authorized for
+///    the route's `profile_id` via [`is_authorized_for_profile`].
+///    Cross-tenant mismatch → `403 Forbidden`.
+/// 3. Handler verifies the route's `session_id` resolves to a
+///    workspace under the profile's data directory. A session that
+///    does not exist in that tree (e.g. crafted / harvested) → `403
+///    Forbidden` (NOT 404 — we never disclose whether the slot is
+///    empty vs forbidden).
+///
+/// Interaction with issue #995: when the X-Profile-Id strip lands,
+/// the authenticated identity's profile becomes authoritative and
+/// the route's `profile_id` segment is only trusted after
+/// `is_authorized_for_profile` confirms the match. The order is
+/// important — never use the route segment to look up data before
+/// the ownership check passes.
+pub async fn serve_owned_site_preview_root(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path((profile_id, session_id, site_slug)): axum::extract::Path<(
         String,
         String,
         String,
     )>,
 ) -> Response {
-    let data_dir = match resolve_profile_data_dir_by_id(&state, &profile_id) {
-        Ok(data_dir) => data_dir,
-        Err(response) => return response,
-    };
-    serve_site_preview_impl(data_dir, session_id, site_slug, String::new()).await
+    serve_owned_site_preview(
+        state,
+        identity,
+        profile_id,
+        session_id,
+        site_slug,
+        String::new(),
+    )
+    .await
 }
 
-/// GET /api/preview/{profile_id}/{session_id}/{site_slug}/{*path} — public preview assets.
-pub async fn serve_public_site_preview_path(
+/// GET /api/preview/{profile_id}/{session_id}/{site_slug}/{*path} —
+/// auth-and-ownership-gated preview assets. See
+/// [`serve_owned_site_preview_root`] for the security model.
+pub async fn serve_owned_site_preview_path(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path((profile_id, session_id, site_slug, request_path)): axum::extract::Path<(
         String,
         String,
@@ -2268,10 +2905,85 @@ pub async fn serve_public_site_preview_path(
         String,
     )>,
 ) -> Response {
+    serve_owned_site_preview(
+        state,
+        identity,
+        profile_id,
+        session_id,
+        site_slug,
+        request_path,
+    )
+    .await
+}
+
+/// Shared implementation for [`serve_owned_site_preview_root`] and
+/// [`serve_owned_site_preview_path`]. Performs the auth + profile +
+/// session-ownership checks then delegates to the existing
+/// `serve_site_preview_impl` for the build / serve path.
+async fn serve_owned_site_preview(
+    state: Arc<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    profile_id: String,
+    session_id: String,
+    site_slug: String,
+    request_path: String,
+) -> Response {
+    // 1. Auth identity must be present. The router wraps this route in
+    //    `user_auth_middleware`, which rejects unauthenticated
+    //    requests with 401 before the handler runs — so reaching here
+    //    with `identity = None` is a routing bug, not user error. Fail
+    //    closed with 401 just in case.
+    let Some(Extension(identity)) = identity else {
+        tracing::warn!(
+            profile_id = %profile_id,
+            "preview route reached without AuthIdentity — routing bug? failing closed"
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    // 2. The authenticated identity must be authorized for the route's
+    //    `profile_id`. Admin (token or admin-role user) is authorized
+    //    for any profile; a regular user is authorized for their own
+    //    profile and any sub-accounts they own. Cross-tenant => 403.
+    if !is_authorized_for_profile(&state, &identity, &profile_id) {
+        tracing::warn!(
+            identity = ?identity,
+            route_profile_id = %profile_id,
+            "preview route denied — identity not authorized for route's profile_id (issue #994)"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // 3. Now that ownership is confirmed, resolve the data directory
+    //    by the (authoritative) route profile_id. A non-existent
+    //    profile is a 404 (the profile literally does not exist) but
+    //    `is_authorized_for_profile` already passed for sub-account
+    //    paths, so this is mostly a sanity check.
     let data_dir = match resolve_profile_data_dir_by_id(&state, &profile_id) {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
+
+    // 4. Session ownership: the route's `session_id` must resolve to
+    //    a workspace under this profile's data directory. We mirror
+    //    the search `serve_site_preview_impl` performs below, but
+    //    return 403 (not 404) when no candidate exists so the
+    //    response is indistinguishable from the cross-tenant denial.
+    let session_owned = api_session_workspace_dirs(&data_dir, &session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("sites").join(&site_slug))
+        .any(|candidate| candidate.exists());
+    if !session_owned {
+        tracing::warn!(
+            identity = ?identity,
+            route_profile_id = %profile_id,
+            session_id = %session_id,
+            site_slug = %site_slug,
+            "preview route denied — session/site does not exist under profile's data dir (issue #994)"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     serve_site_preview_impl(data_dir, session_id, site_slug, request_path).await
 }
 
@@ -2588,7 +3300,9 @@ fn categorize(filename: &str) -> String {
     }
 }
 
-/// GET /api/status -- server status.
+/// Result shape for the WS `system/status.get` RPC method (formerly the
+/// body of `GET /api/status`, retired in M12 Phase D-5). The `/health`
+/// endpoint remains REST as the public liveness probe.
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub version: String,
@@ -2604,6 +3318,9 @@ pub struct StatusResponse {
     pub base_domain: String,
 }
 
+// Helper for `ui_protocol::handle_system_status_get` (M12 Phase D-5).
+// The REST route `GET /api/status` was retired; this function survives
+// as the implementation backing the WS `system/status.get` RPC method.
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = chrono::Utc::now() - state.started_at;
     // M11-F: surface a profile-aware status. The legacy server-wide
@@ -2663,497 +3380,317 @@ pub async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket endpoint
-// ---------------------------------------------------------------------------
+// ───────────────────────────────────────────────────────────────────────────
+//  Issue #1001 follow-up: signed-URL preview endpoint.
+//
+//  PR #1001 required `Authorization: Bearer ...` on
+//  `/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}`. The SPA's
+//  `<iframe src=/api/preview/...>` cannot inject headers, so the iframe
+//  401-loops after PR #1001 landed.
+//
+//  Codex design: mint a 256-bit random token via
+//  `POST /api/my/preview/sign`, store a server-side grant
+//  `{issuer_bearer, identity_snapshot, profile_id, session_id, site_slug,
+//  expires_at}` in `AppState.preview_tokens`, and serve the preview via
+//  PUBLIC route `GET /api/preview-signed/{token}/{*path}`. The token IS the
+//  auth credential.
+//
+//  Revocation: `serve_signed_preview` re-resolves the issuer bearer on
+//  every request — logout / session-delete invalidate naturally because
+//  `resolve_identity` will return `None` for a revoked bearer. Daemon
+//  restart drops the in-memory `PreviewTokens` cache, invalidating every
+//  outstanding grant.
+//
+//  See `crates/octos-cli/src/api/preview_tokens.rs` for full design
+//  rationale on the token-cache module itself.
+// ───────────────────────────────────────────────────────────────────────────
 
-/// Client → Server message protocol over WebSocket.
+/// Body for `POST /api/my/preview/sign`.
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WsClientMsg {
-    /// Send a chat message (equivalent to POST /api/chat).
-    Send {
-        content: String,
-        #[serde(default)]
-        media: Vec<String>,
-        #[serde(default)]
-        session: Option<String>,
-    },
-    /// Abort the current streaming response.
-    Abort,
+pub struct SignPreviewRequest {
+    pub profile_id: String,
+    pub session_id: String,
+    pub site_slug: String,
 }
 
-/// GET /api/ws?session={session_id}&token={token} — WebSocket endpoint.
+/// `POST /api/my/preview/sign` — mint an opaque signed-preview token.
 ///
-/// Provides bidirectional real-time communication as an alternative to the
-/// SSE-based streaming flow. Server→Client events use the same JSON format
-/// as SSE events. Client→Server commands: `send` and `abort`.
-pub async fn ws_handler(
+/// Flow:
+/// 1. Auth middleware has already populated `Extension<AuthIdentity>` — if
+///    it's missing the router routed an unauthenticated request into this
+///    handler, which is a routing bug. Fail closed with 401.
+/// 2. Extract the bearer that the auth middleware accepted (we re-validate
+///    it on every `serve_signed_preview` call, so we need to store the
+///    same string here). Falling back to query `?token=` matches
+///    `extract_token` in `router.rs`.
+/// 3. Identity must be authorized for the requested `profile_id`. Codex
+///    design: this is the same `is_authorized_for_profile` gate the
+///    `/api/preview/...` route uses, so the signing surface is no looser
+///    than the route it bridges to.
+/// 4. Validate that `<data_dir>/users/<encoded_session_key>/workspace/sites/<slug>`
+///    exists. Without this check, a caller who legitimately owns
+///    `profile_id` could mint a token for a nonexistent session — not a
+///    security boundary (the serve handler would 404 anyway), but it lets
+///    the SPA surface a useful error at the sign step rather than the
+///    serve step.
+/// 5. Issue the token via `state.preview_tokens.issue(...)`.
+pub async fn sign_preview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    ws: WebSocketUpgrade,
+    identity: Option<Extension<AuthIdentity>>,
+    Json(req): Json<SignPreviewRequest>,
 ) -> Response {
-    // Extract session_id from query params.
-    // (Auth is already handled by the user_auth_middleware layer.)
-    ws.on_upgrade(move |socket| ws_connection(socket, state, headers))
-}
+    // (1) Auth identity must be present (routing-bug guard).
+    let Some(Extension(identity)) = identity else {
+        tracing::warn!(
+            "POST /api/my/preview/sign reached without AuthIdentity — routing bug? failing closed"
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
 
-/// Handle an established WebSocket connection.
-async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap) {
-    let (ws_tx, mut ws_rx) = socket.split();
-    let ws_tx = Arc::new(tokio::sync::Mutex::new(ws_tx));
+    // (2) Extract the bearer string. Mirrors the precedence
+    // `router.rs::extract_token` uses: Authorization header first, then
+    // `?token=`/`?_token=` query param. We need this verbatim so we can
+    // re-validate it via `resolve_identity` later.
+    let Some(bearer) = extract_bearer_from_request(&headers) else {
+        tracing::warn!("sign_preview: no bearer token on request");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
 
-    // Track the abort handle for the current streaming task so clients can
-    // cancel in-flight requests.
-    let abort_handle: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let text = match msg {
-            WsMessage::Text(t) => t,
-            WsMessage::Close(_) => break,
-            // Respond to pings with pongs (axum handles this automatically in
-            // most cases, but be explicit).
-            WsMessage::Ping(_) => continue,
-            _ => continue,
-        };
-
-        let client_msg: WsClientMsg = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                let err = serde_json::json!({"type": "error", "message": format!("invalid message: {e}")});
-                let _ = send_ws(&ws_tx, &err.to_string()).await;
-                continue;
-            }
-        };
-
-        match client_msg {
-            WsClientMsg::Send {
-                content,
-                media,
-                session,
-            } => {
-                if content.len() > MAX_MESSAGE_LEN {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
-                    });
-                    let _ = send_ws(&ws_tx, &err.to_string()).await;
-                    continue;
-                }
-
-                let session_id = session.unwrap_or_else(|| "default".into());
-
-                // If a gateway is running, proxy through it (same as chat handler).
-                if let Some((profile_id, port)) = resolve_api_port(&state, &headers).await {
-                    let ws_tx2 = ws_tx.clone();
-                    let _abort_ref = abort_handle.clone();
-                    let http_client = state.http_client.clone();
-                    let handle = tokio::spawn(async move {
-                        ws_proxy_to_gateway(
-                            ws_tx2,
-                            &http_client,
-                            port,
-                            Some(&profile_id),
-                            &content,
-                            Some(&session_id),
-                            &media,
-                        )
-                        .await;
-                    });
-                    *abort_handle.lock().await = Some(handle.abort_handle());
-                } else {
-                    // M11-F: standalone (non-gateway) mode now routes through
-                    // the per-profile `ProfileRuntime` + per-session
-                    // `SessionRuntime` cache instead of the deleted
-                    // `state.agent` legacy field. We resolve the profile id
-                    // from the request headers (matching what `chat_sync`
-                    // does), pull the `ProfileRuntime` out of `state.profiles`,
-                    // and ask the cache for the per-session view.
-                    let profile_id = api_profile_id_from_headers(&state, &headers);
-                    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
-                        let err = serde_json::json!({
-                            "type": "error",
-                            "message": format!(
-                                "No LLM provider configured for profile '{profile_id}'. \
-                                 Set up the profile with an API key in the dashboard.",
-                            ),
-                        });
-                        let _ = send_ws(&ws_tx, &err.to_string()).await;
-                        continue;
-                    };
-                    let session_key =
-                        SessionKey::with_profile(&profile_runtime.profile_id, "api", &session_id);
-                    // M11-F regression fix REG-6: forward
-                    // `config.appui.default_session_cwd` (mirrored on
-                    // `AppState::appui_default_session_cwd`) as the
-                    // workspace hint when no client cwd is available.
-                    // Pre-M11-F serve.rs wired this into the server-wide
-                    // agent via `agent.with_workspace_root(default_cwd)`;
-                    // M11-F's deletion of that helper left the standalone
-                    // WS chat path falling back to the canonical
-                    // `<data_dir>/users/<encoded base>/workspace` instead
-                    // of the operator-configured directory (e.g.
-                    // octos-app uses this for the per-machine coding
-                    // workspace).
-                    let workspace_hint = state.appui_default_session_cwd.clone();
-                    let session_runtime = match state
-                        .session_cache
-                        .get_or_init(&profile_runtime, session_key.clone(), workspace_hint)
-                        .await
-                    {
-                        Ok(rt) => rt,
-                        Err(error) => {
-                            let err = serde_json::json!({
-                                "type": "error",
-                                "message": format!(
-                                    "failed to bootstrap session runtime: {error}"
-                                ),
-                            });
-                            let _ = send_ws(&ws_tx, &err.to_string()).await;
-                            continue;
-                        }
-                    };
-                    let ws_tx2 = ws_tx.clone();
-                    let _abort_ref = abort_handle.clone();
-                    let handle = tokio::spawn(async move {
-                        ws_standalone_agent(ws_tx2, session_runtime, &session_id, &content, media)
-                            .await;
-                    });
-                    *abort_handle.lock().await = Some(handle.abort_handle());
-                }
-            }
-            WsClientMsg::Abort => {
-                if let Some(handle) = abort_handle.lock().await.take() {
-                    handle.abort();
-                    let msg = serde_json::json!({"type": "error", "message": "aborted"});
-                    let _ = send_ws(&ws_tx, &msg.to_string()).await;
-                }
-            }
-        }
+    // (3) Identity must own the requested profile.
+    if !is_authorized_for_profile(&state, &identity, &req.profile_id) {
+        tracing::warn!(
+            identity = ?identity,
+            requested_profile = %req.profile_id,
+            "sign_preview denied — identity not authorized for requested profile"
+        );
+        return StatusCode::FORBIDDEN.into_response();
     }
-}
 
-/// Proxy a WebSocket chat request to the gateway's internal API channel and
-/// stream SSE events back as WebSocket text frames.
-async fn ws_proxy_to_gateway(
-    ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
-    http_client: &reqwest::Client,
-    port: u16,
-    profile_id: Option<&str>,
-    message: &str,
-    session_id: Option<&str>,
-    media: &[String],
-) {
-    use futures::StreamExt;
+    // (4) Resolve the data dir and confirm the site exists. Errors map
+    //     to the same status codes as the existing preview route so the
+    //     SPA can render a meaningful message.
+    let data_dir = match resolve_profile_data_dir_by_id(&state, &req.profile_id) {
+        Ok(d) => d,
+        Err(response) => return response,
+    };
+    let site_exists = api_session_workspace_dirs(&data_dir, &req.session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("sites").join(&req.site_slug))
+        .any(|candidate| candidate.exists());
+    if !site_exists {
+        tracing::warn!(
+            identity = ?identity,
+            profile_id = %req.profile_id,
+            session_id = %req.session_id,
+            site_slug = %req.site_slug,
+            "sign_preview: site does not exist under profile's data dir"
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
-    let url = format!("http://127.0.0.1:{port}/chat");
-    let body = serde_json::json!({
-        "message": message,
-        "session_id": session_id,
-        "media": media,
-        "target_profile_id": profile_id,
-    });
-
-    let resp = match http_client
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
+    // (5) Mint the token. Codex GAP 8: distinguish OS-level entropy
+    //     failures (503) from rate-limit refusals (429) so the SPA can
+    //     differentiate "retry the daemon" from "you're holding too
+    //     many previews open already".
+    use crate::api::preview_tokens::IssueError;
+    match state
+        .preview_tokens
+        .issue(
+            bearer,
+            identity,
+            req.profile_id,
+            req.session_id,
+            req.site_slug,
+        )
         .await
     {
-        Ok(r) => r,
-        Err(e) => {
-            let err = serde_json::json!({"type": "error", "message": format!("gateway proxy failed: {e}")});
-            let _ = send_ws(&ws_tx, &err.to_string()).await;
-            return;
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(IssueError::Random(err)) => {
+            tracing::error!(error = %err, "sign_preview: getrandom failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "token mint failed").into_response()
         }
-    };
-
-    if !resp.status().is_success() {
-        let err_body = resp.text().await.unwrap_or_default();
-        let err = serde_json::json!({"type": "error", "message": err_body});
-        let _ = send_ws(&ws_tx, &err.to_string()).await;
-        return;
-    }
-
-    // Stream SSE events from the gateway response and forward as WS text frames.
-    // The gateway sends `text/event-stream` with `data: {...}\n\n` lines.
-    let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        let bytes = match chunk {
-            Ok(b) => b,
-            Err(_) => break,
-        };
-        let text = match std::str::from_utf8(&bytes) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        buffer.push_str(text);
-
-        // Parse SSE frames: lines starting with "data:" separated by blank lines.
-        while let Some(pos) = buffer.find("\n\n") {
-            let frame = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
-
-            for line in frame.lines() {
-                let data = if let Some(d) = line.strip_prefix("data:") {
-                    d.trim()
-                } else if let Some(d) = line.strip_prefix("data: ") {
-                    d.trim()
-                } else {
-                    continue;
-                };
-                if data.is_empty() {
-                    continue;
-                }
-                if send_ws(&ws_tx, data).await.is_err() {
-                    return;
-                }
-            }
+        // #1009: every 429 carries a `Retry-After: 60` header. 60 s is
+        // the SPA's re-sign cadence (TTL - 60 s = 9 min - 60 s tail
+        // window) so a well-behaved client will naturally re-attempt
+        // around that boundary, but slow clients also get an explicit
+        // hint per RFC 9110. The hint covers all three rate-limit
+        // variants (#1007 per-identity, GAP 8 per-bearer, #1008
+        // global-with-no-evictable) so the SPA can render a uniform
+        // backoff toast without branching on the error string.
+        Err(IssueError::PerBearerLimitReached) => {
+            tracing::warn!("sign_preview: per-bearer cap reached (codex GAP 8 backpressure)");
+            preview_rate_limit_response(
+                "too many outstanding preview tokens for this session — wait for expiry or close some iframes",
+            )
+        }
+        Err(IssueError::PerIdentityLimitReached) => {
+            tracing::warn!(
+                "sign_preview: per-identity cap reached (#1007 cross-bearer backpressure)"
+            );
+            preview_rate_limit_response(
+                "too many outstanding preview tokens for this account — wait for expiry or close some iframes",
+            )
+        }
+        Err(IssueError::GlobalLimitReached) => {
+            tracing::error!(
+                "sign_preview: GLOBAL preview-token cap reached — possible DoS or runaway client"
+            );
+            preview_rate_limit_response("preview-token cache is full; daemon is rate-limiting")
         }
     }
 }
 
-/// Run the standalone agent for a WebSocket request and stream events back.
+/// Build the HTTP 429 response for a preview-token rate-limit refusal.
 ///
-/// M11-F: takes a `SessionRuntime` (sourced from `state.session_cache`)
-/// instead of the deleted server-wide `state.agent`. The runtime carries
-/// the per-session workspace-bound tool registry, the profile's LLM, the
-/// agent's config/system-prompt snapshot, and the per-session
-/// `SessionManager`.
-async fn ws_standalone_agent(
-    ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
-    session_runtime: Arc<crate::runtime::SessionRuntime>,
-    session_id: &str,
-    message: &str,
-    media: Vec<String>,
-) {
-    let profile_id = session_runtime.profile.profile_id.clone();
-    let session_key = SessionKey::with_profile(&profile_id, "api", session_id);
-    let sessions = session_runtime.sessions.clone();
-
-    let history: Vec<Message> = {
-        let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&session_key).await;
-        session.get_history(50).to_vec()
-    };
-
-    // Create per-request channel and reporter
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
-        Arc::new(ChannelReporter::new(tx.clone())),
-    ));
-
-    let base_agent = session_runtime.agent.clone();
-    let mut request_agent = octos_agent::Agent::new_shared(
-        octos_core::AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
-        base_agent.llm_provider(),
-        base_agent.tool_registry().clone(),
-        base_agent.memory_store(),
-    )
-    .with_config(base_agent.agent_config())
-    .with_system_prompt(base_agent.system_prompt_snapshot())
-    .with_reporter(reporter);
-    // M11-F regression fix REG-3: forward the profile-scope hook
-    // executor onto the per-request rebuilt agent so the standalone
-    // WS chat path observes the same `before_tool_call` /
-    // `after_tool_call` / LLM hooks as the cached `SessionRuntime`'s
-    // agent. Without this, every WS message would bypass the hook
-    // pipeline because `base_agent`'s `hooks` field is not carried
-    // forward by the `Agent::new_shared` constructor.
-    if let Some(hooks) = base_agent.hooks() {
-        request_agent = request_agent.with_hooks(hooks);
-    }
-    // M11-F regression fix REG-1 follow-up (codex review): wire the
-    // `activate_tools` back-reference on this rebuilt agent so the
-    // deferred non-core tool groups (`group:admin`, `group:sessions`,
-    // `group:web`, `group:runtime`, `group:media`) are actually
-    // activatable. `Agent::new_shared` does not re-execute the wiring,
-    // so without this the LLM observes the deferred groups via
-    // `tools.specs()` but `activate_tools` itself is a no-op stub.
-    // Gateway wires the equivalent at `session_actor.rs:2500`.
-    request_agent.wire_activate_tools();
-
-    let message = message.to_string();
-    let session_id = session_id.to_string();
-    let session_key2 = SessionKey::with_profile(&profile_id, "api", &session_id);
-
-    // Spawn the agent task
-    tokio::spawn(async move {
-        let result = request_agent
-            .process_message(&message, &history, media)
-            .await;
-
-        match result {
-            Ok(response) => {
-                // Save conversation messages to the canonical per-user JSONL.
-                // Mirrors `chat_sync` and `chat_streaming`; closes the
-                // standalone-serve split-brain by routing through the same
-                // helper the gateway-side `ApiChannel` uses. Capture the
-                // committed seq of the final assistant message so the
-                // WebSocket-bridged `done` event can thread it back to the
-                // web client (M8.10-A).
-                let assistant_committed_seq: Option<u64> = {
-                    let mut last_assistant_seq: Option<u64> = None;
-                    for msg in &response.messages {
-                        let is_assistant = msg.role == octos_core::MessageRole::Assistant;
-                        match persist_chat_message_through_canonical(
-                            &sessions,
-                            &session_key2,
-                            msg.clone(),
-                        )
-                        .await
-                        {
-                            Ok(seq) if is_assistant => {
-                                last_assistant_seq = u64::try_from(seq).ok();
-                            }
-                            Ok(_) => {}
-                            Err(_) => {}
-                        }
-                    }
-                    last_assistant_seq
-                };
-
-                let provider_metadata = response.provider_metadata.clone();
-                let model_id = provider_metadata
-                    .as_ref()
-                    .map(|meta| meta.model.clone())
-                    .or_else(|| {
-                        let provider = request_agent.llm_provider();
-                        let model = provider.model_id();
-                        if model.is_empty() {
-                            None
-                        } else {
-                            Some(model.to_string())
-                        }
-                    });
-                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
-                    pricing.cost(
-                        response.token_usage.input_tokens,
-                        response.token_usage.output_tokens,
-                    )
-                });
-                let mut done = serde_json::json!({
-                    "type": "done",
-                    "content": response.content,
-                    "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
-                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": model_id,
-                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
-                    "tokens_in": response.token_usage.input_tokens,
-                    "tokens_out": response.token_usage.output_tokens,
-                    "session_cost": session_cost,
-                });
-                if let Some(seq) = assistant_committed_seq {
-                    done["committed_seq"] = serde_json::Value::from(seq);
-                }
-                // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
-                // tool results' structured side-channel into the SSE done
-                // event so the dashboard CostBreakdown panel can render
-                // real per-node attribution from `run_pipeline` runs.
-                let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
-                for (_tool_call_id, meta) in &response.tool_results {
-                    if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
-                        all_node_costs.extend(arr.iter().cloned());
-                    }
-                }
-                if !all_node_costs.is_empty() {
-                    done["node_costs"] = serde_json::Value::Array(all_node_costs);
-                }
-                let _ = tx.send(done.to_string());
-            }
-            Err(e) => {
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": e.to_string(),
-                });
-                let _ = tx.send(err.to_string());
-            }
-        }
-    });
-
-    // Forward channel events to WebSocket
-    while let Some(data) = rx.recv().await {
-        if send_ws(&ws_tx, &data).await.is_err() {
-            break;
-        }
-    }
+/// #1009 follow-up: every preview-token 429 must include a
+/// `Retry-After: 60` header so SPAs and clients have a uniform backoff
+/// hint regardless of which cap (per-bearer / per-identity / global)
+/// tripped. 60 s is chosen to match the SPA's existing re-sign cadence
+/// (TTL - 60 s) — a polite client should naturally re-issue near the
+/// same boundary, and an aggressive client gets a hard backoff hint.
+///
+/// We hand-build the response (rather than the
+/// `(StatusCode, &'static str).into_response()` shortcut used
+/// elsewhere) so we can attach the header before returning.
+fn preview_rate_limit_response(body: &'static str) -> Response {
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("60"),
+    );
+    resp
 }
 
-/// Send a text message through the WebSocket sink.
-async fn send_ws(
-    ws_tx: &Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
-    data: &str,
-) -> Result<(), ()> {
-    use futures::SinkExt;
-    let mut tx = ws_tx.lock().await;
-    tx.send(WsMessage::text(data)).await.map_err(|_| ())
+/// `GET /api/preview-signed/{token}/{*path}` — serve a previewed asset
+/// using the opaque token as the auth credential.
+///
+/// The route lives on the PUBLIC branch (no `user_auth_middleware`)
+/// because the iframe cannot inject `Authorization`. The token IS the
+/// credential — codex's design re-validates it three ways here:
+///   1. Token must resolve to a non-expired grant in the in-memory cache.
+///      Unknown / expired => 404 (don't leak whether the token ever
+///      existed).
+///   2. The `issuer_bearer` recorded at sign time must still resolve to
+///      an `AuthIdentity` — `resolve_identity` returns `None` for
+///      revoked sessions, deleted users, or daemon restart. Refusal =>
+///      403 (the token IS known, but its bearer is no longer valid).
+///   3. The re-resolved identity must still be authorized for the
+///      grant's `profile_id`. Refusal => 403 (defense in depth — closes
+///      the corner case where a user's role changes between sign and
+///      serve).
+///
+/// Response carries `Referrer-Policy: no-referrer` per codex's design so
+/// outbound links from the previewed site cannot leak the signed URL
+/// (which contains the token) to third parties via the Referer header.
+pub async fn serve_signed_preview(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((token, request_path)): axum::extract::Path<(String, String)>,
+) -> Response {
+    serve_signed_preview_impl(state, token, request_path).await
+}
+
+/// Variant of `serve_signed_preview` for routes WITHOUT a `{*path}`
+/// segment (e.g. `GET /api/preview-signed/{token}/`). Hands the empty
+/// string as the request path so the underlying preview impl serves the
+/// `index.html` root.
+pub async fn serve_signed_preview_root(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    serve_signed_preview_impl(state, token, String::new()).await
+}
+
+async fn serve_signed_preview_impl(
+    state: Arc<AppState>,
+    token: String,
+    request_path: String,
+) -> Response {
+    // (1) Consume the token. Unknown or expired => 404.
+    let Some(grant) = state.preview_tokens.consume(&token).await else {
+        // 404 (NOT 401) — codex design: don't leak whether the token
+        // ever existed.
+        tracing::debug!("serve_signed_preview: token unknown or expired");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // (2) Re-resolve the issuer bearer. If the user logged out or the
+    // session was deleted, `resolve_identity` returns None.
+    let Some(identity) = super::router::resolve_identity_public(&state, &grant.issuer_bearer).await
+    else {
+        tracing::warn!(
+            profile_id = %grant.profile_id,
+            "serve_signed_preview: issuer bearer no longer resolves to an identity (logout / session-delete?)"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    };
+
+    // (3) Defense in depth: even if the bearer still resolves, re-check
+    // the identity-vs-profile authorisation. Closes the corner case
+    // where the user's role changes between sign and serve.
+    if !is_authorized_for_profile(&state, &identity, &grant.profile_id) {
+        tracing::warn!(
+            identity = ?identity,
+            grant_profile = %grant.profile_id,
+            "serve_signed_preview: identity no longer authorized for grant's profile"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // (4) Resolve the profile's data dir and delegate to the same
+    // symlink-safe serve path that `/api/preview/...` and
+    // `/api/site-preview/...` use. PR #1000's `serve_preview_no_follow`
+    // is invoked inside `serve_site_preview_impl`; we must NOT inline a
+    // fresh serve path here or we re-introduce the traversal bug.
+    let data_dir = match resolve_profile_data_dir_by_id(&state, &grant.profile_id) {
+        Ok(d) => d,
+        Err(response) => return response,
+    };
+
+    let mut resp =
+        serve_site_preview_impl(data_dir, grant.session_id, grant.site_slug, request_path).await;
+
+    // (5) Codex design: set `Referrer-Policy: no-referrer` so a click on
+    // any outbound link from the previewed site cannot leak the signed
+    // URL (which contains the token) to third parties via Referer.
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    resp
+}
+
+/// Extract a bearer token from the request headers OR the URL query
+/// string. Mirrors `crate::api::router::extract_token` but takes a
+/// `&HeaderMap` so the sign_preview handler can call it from a typed
+/// extractor signature without re-receiving the raw axum Request.
+///
+/// NOTE: The query-string branch is omitted here because `/api/my/preview/sign`
+/// is POST-only and clients should send the bearer via the
+/// `Authorization` header — query-string fallback is a holdover for
+/// EventSource and `<img src=...>` which neither apply to the sign
+/// surface. If a future client needs it we'll revisit; keeping the
+/// surface narrow at sign time reduces the bearer's exposure in access
+/// logs.
+fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn chat_request_deserialize() {
-        let json = r#"{"message": "hello"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.message, "hello");
-        assert!(req.session_id.is_none());
-        assert!(!req.stream);
-    }
-
-    #[test]
-    fn chat_request_with_session() {
-        let json = r#"{"message": "hi", "session_id": "s1"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.message, "hi");
-        assert_eq!(req.session_id.as_deref(), Some("s1"));
-    }
-
-    #[test]
-    fn chat_request_with_stream() {
-        let json = r#"{"message": "hi", "stream": true}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert!(req.stream);
-    }
-
-    /// FA-12f follow-up: the outer `ChatRequest` (served at `/api/chat`) must
-    /// accept `client_message_id` so it survives proxy forwarding to the
-    /// gateway. The prior fix patched only the gateway-internal struct; the
-    /// outer struct silently dropped the field and overflow replies arrived
-    /// with `response_to_client_message_id: null`, breaking web-side
-    /// correlation under `/queue speculative`.
-    #[test]
-    fn chat_request_accepts_client_message_id() {
-        let json = r#"{"message": "hi", "client_message_id": "client-bravo-xyz"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.client_message_id.as_deref(), Some("client-bravo-xyz"));
-    }
-
-    #[test]
-    fn chat_request_client_message_id_defaults_to_none() {
-        let json = r#"{"message": "hi"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert!(req.client_message_id.is_none());
-    }
-
-    #[test]
-    fn chat_response_serialize() {
-        let resp = ChatResponse {
-            content: "world".into(),
-            input_tokens: 10,
-            output_tokens: 5,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["content"], "world");
-        assert_eq!(json["input_tokens"], 10);
-        assert_eq!(json["output_tokens"], 5);
-    }
+    // Legacy `POST /api/chat` REST tests (chat_request_*, chat_response_*)
+    // were retired with the handler in the cleanup follow-up to PR #908.
+    // Wire-level chat coverage now lives in
+    // `api::ui_protocol::tests` (turn/start, turn/completed, etc.) and
+    // the `coding_multi_session` integration test (per-session workspace
+    // isolation).
 
     #[test]
     fn session_info_serialize() {
@@ -3284,7 +3821,7 @@ mod tests {
         let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
         let dirs = api_session_workspace_dirs(base, "slides-123");
 
-        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs.len(), 4);
         assert_eq!(
             dirs[0],
             base.join("users")
@@ -3302,6 +3839,340 @@ mod tests {
             base.join("users")
                 .join("api%3Aslides-123")
                 .join("workspace")
+        );
+        // SPA-created slides/web sessions live under the BARE session_id
+        // on disk — the listing endpoint must look there too. Without
+        // this fourth candidate, slides-scaffold-wait times out with
+        // "slides scaffold did not appear" even when the deck dir +
+        // scaffold files all exist (mini3 regression 2026-05-18).
+        assert_eq!(
+            dirs[3],
+            base.join("users").join("slides-123").join("workspace")
+        );
+    }
+
+    #[test]
+    fn api_session_workspace_dirs_rejects_path_traversal_session_ids() {
+        // Codex P1 follow-up to #1069. The bare-id candidate joins
+        // `session_id` verbatim into `users/<id>/workspace`, so request-
+        // supplied ids that contain `/`, `..`, an absolute path, or
+        // Windows-style `\` must NOT round-trip through this candidate.
+        // The other (percent-encoded) candidates still appear, but the
+        // bare one is dropped, keeping the lookup inside the profile
+        // data dir.
+        let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
+
+        for bad_id in ["foo/bar", "../escape", "/abs", "foo\\bar", "..", ".", ""] {
+            let dirs = api_session_workspace_dirs(base, bad_id);
+            let users_dir = base.join("users");
+            // The bare candidate must NOT be present — it's the only
+            // one that joins `bad_id` verbatim. Every other candidate
+            // percent-encodes via `encode_path_component`, so traversal
+            // bytes turn into `%XX` sequences and stay inside `users/`.
+            let bare = users_dir.join(bad_id).join("workspace");
+            assert!(
+                !dirs.iter().any(|d| d == &bare),
+                "session_id {bad_id:?} unexpectedly kept the bare-join candidate {bare:?}"
+            );
+            // Defence-in-depth: walk every returned dir and assert no
+            // literal `..` or `.` component leaked through.
+            for dir in &dirs {
+                assert!(
+                    dir.starts_with(&users_dir),
+                    "session_id {bad_id:?} produced dir {dir:?} that escapes {users_dir:?}"
+                );
+                for component in dir
+                    .strip_prefix(&users_dir)
+                    .expect("starts_with checked above")
+                    .components()
+                {
+                    let s = component
+                        .as_os_str()
+                        .to_str()
+                        .expect("ASCII path component");
+                    assert_ne!(
+                        s, "..",
+                        "session_id {bad_id:?} surfaced a literal `..` component in {dir:?}"
+                    );
+                    assert_ne!(
+                        s, ".",
+                        "session_id {bad_id:?} surfaced a literal `.` component in {dir:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_bare_path_safe_session_id_allows_spa_shapes_only() {
+        // Canonical SPA shapes — must pass so live workspaces keep
+        // resolving.
+        assert!(is_bare_path_safe_session_id("slides-1779125959003-ugtbaa"));
+        assert!(is_bare_path_safe_session_id("web-7c9e"));
+        assert!(is_bare_path_safe_session_id("site-abc_42"));
+        assert!(is_bare_path_safe_session_id(
+            "slides-1779125959003-ugtbaa#deck-foo"
+        ));
+
+        // Path-traversal / unsafe shapes must be rejected.
+        assert!(!is_bare_path_safe_session_id("foo/bar"));
+        assert!(!is_bare_path_safe_session_id("../escape"));
+        assert!(!is_bare_path_safe_session_id("/abs"));
+        assert!(!is_bare_path_safe_session_id("foo\\bar"));
+        assert!(!is_bare_path_safe_session_id(".."));
+        assert!(!is_bare_path_safe_session_id("."));
+        assert!(!is_bare_path_safe_session_id(""));
+        // Colon would let an attacker inject a channel-prefix shape
+        // through the raw-join candidate; reject it for consistency
+        // with `is_safe_bare_session_id`.
+        assert!(!is_bare_path_safe_session_id("api:web-7c9e"));
+        // NUL and control bytes must be rejected.
+        assert!(!is_bare_path_safe_session_id("foo\0bar"));
+        assert!(!is_bare_path_safe_session_id("foo\nbar"));
+        // Non-ASCII bytes (could decompose into traversal on some FS).
+        assert!(!is_bare_path_safe_session_id("café"));
+    }
+
+    #[tokio::test]
+    async fn read_profile_session_messages_returns_bare_key_history() {
+        // Reproduces the mini3 slides regression 2026-05-18: the WS
+        // turn handler persists slides history under the SPA-bare key
+        // `slides-<id>#<topic>` in `profile_data_dir/sessions/`, but
+        // the legacy process-wide store walk at `state.sessions`
+        // never sees it because it opens against a different
+        // `data_dir`. The per-profile helper must find the JSONL by
+        // walking the bare candidate directly.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+        let sessions_dir = profile_data_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Persist a session under the bare-form key the SPA actually
+        // uses for slides. Round-trip through `SessionManager` so the
+        // file layout matches production exactly.
+        let bare_key =
+            SessionKey("slides-1779130130502-th18yr#slides untitled-deck-th18yr".to_string());
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            mgr.add_message(&bare_key, octos_core::Message::user("hello"))
+                .await
+                .unwrap();
+            // PR F (M8.10 thread-binding): assistant persists require a
+            // caller-supplied thread_id.
+            let mut assistant = octos_core::Message::assistant("hi back");
+            assistant.thread_id = Some("turn-1".to_string());
+            mgr.add_message(&bare_key, assistant).await.unwrap();
+        }
+
+        let messages = read_profile_session_messages(
+            profile_data_dir,
+            "slides-1779130130502-th18yr",
+            Some("slides untitled-deck-th18yr"),
+            10,
+            0,
+        )
+        .await
+        .expect("should find bare-key history under profile_data_dir");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "hi back");
+    }
+
+    /// Reproduces the dspfac mini regression 2026-05-19: the WS turn
+    /// handler writes session history under the SPA-bare key
+    /// `web-<N>` in `profile_data_dir/sessions/`, but the legacy
+    /// process-wide store walk at `state.sessions` never sees it
+    /// because it opens against a different `data_dir`. The
+    /// per-profile helper must enumerate those JSONLs directly so the
+    /// sidebar listing on `https://dspfac.octos.ominix.io/chat`
+    /// renders past chats instead of an empty pane.
+    #[tokio::test]
+    async fn list_profile_sessions_returns_bare_web_session_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+
+        // Persist three sessions under the per-profile data dir using
+        // the on-disk keys the SPA writes via the WS turn handler:
+        //   • `web-101` — canonical chat (bare key)
+        //   • `web-202` — second canonical chat (bare key)
+        //   • `web-303#child-task-1` — internal child fanout (MUST be
+        //     filtered by `is_internal_api_session_id`)
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            mgr.add_message(
+                &SessionKey("web-101".to_string()),
+                octos_core::Message::user("hi from 101"),
+            )
+            .await
+            .unwrap();
+            let mut a1 = octos_core::Message::assistant("hello from 101");
+            a1.thread_id = Some("turn-101".to_string());
+            mgr.add_message(&SessionKey("web-101".to_string()), a1)
+                .await
+                .unwrap();
+
+            mgr.add_message(
+                &SessionKey("web-202".to_string()),
+                octos_core::Message::user("hi from 202"),
+            )
+            .await
+            .unwrap();
+
+            // Child fanout that must NOT show up in the sidebar.
+            mgr.add_message(
+                &SessionKey("web-303#child-task-1".to_string()),
+                octos_core::Message::user("child task body"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut sessions = list_profile_sessions(profile_data_dir);
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+
+        // Two top-level web chats should be enumerated; the child
+        // fanout must be filtered out.
+        assert_eq!(
+            sessions.len(),
+            2,
+            "expected exactly two top-level web chats; got {ids:?}"
+        );
+        assert_eq!(sessions[0].id, "web-101");
+        // message_count is the JSONL line count returned by
+        // `list_top_level_sessions_with_title`: 1 meta line + N
+        // message lines. web-101 has 2 messages → 3 lines. This
+        // matches the contract the existing process-wide walk emits.
+        assert_eq!(sessions[0].message_count, 3);
+        assert_eq!(sessions[1].id, "web-202");
+        // web-202 has 1 message → 2 lines (1 meta + 1 user).
+        assert_eq!(sessions[1].message_count, 2);
+
+        // Explicit confirmation that the child fanout did not leak.
+        assert!(
+            !sessions.iter().any(|s| s.id.starts_with("web-303")),
+            "child-* fanouts must be filtered: {ids:?}"
+        );
+    }
+
+    /// Empty / missing profile data_dir returns an empty list rather
+    /// than panicking — the caller (`list_sessions`) falls back to
+    /// the process-wide `state.sessions` walk in that case.
+    #[tokio::test]
+    async fn list_profile_sessions_returns_empty_when_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = list_profile_sessions(tmp.path());
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            sessions.is_empty(),
+            "missing sessions/ dir must yield empty list; got {ids:?}"
+        );
+    }
+
+    /// Non-admin / profile-scoped probe: a request that resolves to
+    /// a specific profile data_dir (the way Caddy /
+    /// `resolve_profile_data_dir` would route a dspfac chat
+    /// request) MUST surface the seeded `web-<N>` session via
+    /// `list_profile_sessions`. This is the regression test for the
+    /// user-visible bug (`/chat` sidebar empty on
+    /// `dspfac.octos.ominix.io`) and is MANDATORY per
+    /// `feedback_admin_token_masks_bugs` — the bug was hidden for a
+    /// week because the previous test harness only used admin auth,
+    /// which walks a different code path (the process-wide
+    /// `state.sessions` store at `<home>/sessions/`).
+    ///
+    /// We test the helper directly because the bug is in *which
+    /// directory we open*, not in *which identity is allowed to call
+    /// us*. The handler-level path (`list_sessions` →
+    /// `resolve_profile_data_dir`) requires wiring a
+    /// `process_manager` with a registered API port for the
+    /// synthetic profile, which the public `ProcessManager` surface
+    /// doesn't expose for tests. The sibling
+    /// `list_sessions_admin_legacy_path_still_emits_session`
+    /// confirms the handler's legacy path still works end-to-end.
+    #[tokio::test]
+    async fn list_profile_sessions_handles_non_admin_profile_scope() {
+        // Seed a synthetic profile data_dir as if `dspfac` had
+        // written several web chats through the WS turn handler.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            mgr.add_message(
+                &SessionKey("web-1779100000001-aa".to_string()),
+                octos_core::Message::user("dspfac chat 1"),
+            )
+            .await
+            .unwrap();
+            mgr.add_message(
+                &SessionKey("web-1779100000002-bb".to_string()),
+                octos_core::Message::user("dspfac chat 2"),
+            )
+            .await
+            .unwrap();
+        }
+
+        // The helper does not consult the request identity — it
+        // operates on the resolved profile_data_dir directly. The
+        // tenant boundary is the on-disk scope, not an identity
+        // check inside the helper. This mirrors the production
+        // call site, where `resolve_profile_data_dir` runs the
+        // identity check FIRST and only hands us a path the
+        // request is authorized to read.
+        let sessions = list_profile_sessions(profile_data_dir);
+        assert_eq!(sessions.len(), 2, "expected dspfac's two web chats");
+        let ids: std::collections::HashSet<_> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains("web-1779100000001-aa"));
+        assert!(ids.contains("web-1779100000002-bb"));
+    }
+
+    /// Bonus: admin scope still works through the legacy process-wide
+    /// `state.sessions` path. Confirms the new per-profile branch did
+    /// not regress the admin / legacy fallback. We exercise
+    /// `list_sessions` directly with admin identity and a populated
+    /// `state.sessions` to assert the standalone walk still emits the
+    /// stripped chat id.
+    #[tokio::test]
+    async fn list_sessions_admin_legacy_path_still_emits_session() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist a profiled-key session under the process-wide store
+        // (legacy / admin path) — `_main:api:web-legacy-1` is the
+        // canonical shape that `list_sessions` strips the prefix from.
+        let key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "web-legacy-1");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&key, Message::user("legacy admin chat"))
+                .await
+                .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(AuthIdentity::Admin)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let list: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            list.iter().any(|s| s.id == "web-legacy-1"),
+            "admin legacy path must still surface profiled sessions: {ids:?}"
         );
     }
 
@@ -3524,7 +4395,8 @@ mod tests {
             Some(&AuthIdentity::Admin),
             "telegram:123",
             None,
-        );
+        )
+        .expect("admin identity is always authorized");
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         assert!(
             !keys.iter().any(|k| *k == "telegram:123"),
@@ -3648,7 +4520,8 @@ mod tests {
         // is returned.
         let candidates = standalone_api_session_key_candidates_with_topic(
             &state, &headers, None, "web-7c9e", None,
-        );
+        )
+        .expect("unauthenticated → no header authorization check required");
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         // Profiled key must come first so existing chat-history reads keep
         // hitting the canonical write target before walking fallbacks.
@@ -3977,7 +4850,7 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new()).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -4035,7 +4908,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new()).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4079,6 +4952,7 @@ mod tests {
         let response = delete_session(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path("web-topic#research".to_string()),
         )
         .await;
@@ -4126,164 +5000,16 @@ mod tests {
     }
 
     #[test]
-    fn append_since_seq_query_uses_question_mark_for_clean_path() {
-        let mut path = "/sessions/slides-123/events/stream".to_string();
-        append_since_seq_query(&mut path, Some(8));
-        assert_eq!(path, "/sessions/slides-123/events/stream?since_seq=8");
-    }
-
-    #[test]
-    fn append_since_seq_query_uses_ampersand_when_query_exists() {
-        let mut path = "/sessions/slides-123/events/stream?topic=slides".to_string();
-        append_since_seq_query(&mut path, Some(8));
-        assert_eq!(
-            path,
-            "/sessions/slides-123/events/stream?topic=slides&since_seq=8"
-        );
-    }
-
-    #[test]
     fn default_page_limit_is_100() {
         assert_eq!(default_page_limit(), 100);
     }
 
-    #[test]
-    fn max_message_len_is_1mb() {
-        assert_eq!(MAX_MESSAGE_LEN, 1_048_576);
-    }
-
-    #[test]
-    fn ws_client_msg_send_deserialize() {
-        let json = r#"{"type": "send", "content": "hello"}"#;
-        let msg: WsClientMsg = serde_json::from_str(json).unwrap();
-        match msg {
-            WsClientMsg::Send {
-                content,
-                media,
-                session,
-            } => {
-                assert_eq!(content, "hello");
-                assert!(media.is_empty());
-                assert!(session.is_none());
-            }
-            _ => panic!("expected Send"),
-        }
-    }
-
-    #[test]
-    fn ws_client_msg_send_with_session_and_media() {
-        let json = r#"{"type": "send", "content": "hi", "session": "s1", "media": ["/tmp/a.png"]}"#;
-        let msg: WsClientMsg = serde_json::from_str(json).unwrap();
-        match msg {
-            WsClientMsg::Send {
-                content,
-                media,
-                session,
-            } => {
-                assert_eq!(content, "hi");
-                assert_eq!(session.as_deref(), Some("s1"));
-                assert_eq!(media, vec!["/tmp/a.png"]);
-            }
-            _ => panic!("expected Send"),
-        }
-    }
-
-    #[test]
-    fn ws_client_msg_abort_deserialize() {
-        let json = r#"{"type": "abort"}"#;
-        let msg: WsClientMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, WsClientMsg::Abort));
-    }
-
-    #[test]
-    fn ws_client_msg_invalid_type() {
-        let json = r#"{"type": "unknown"}"#;
-        let result = serde_json::from_str::<WsClientMsg>(json);
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn chat_sync_writes_to_canonical_per_user_topic_jsonl() {
-        // Regression for the standalone `octos serve` /chat handlers writing
-        // to the legacy flat layout instead of the canonical per-user JSONL.
-        //
-        // Pre-fix, `chat_sync`/`chat_streaming`/the websocket handler all
-        // called `SessionManager::add_message_with_seq` directly. That writes
-        // to `<data_dir>/sessions/<encoded_full_key>.jsonl` (legacy flat),
-        // not the canonical per-user `<topic>.jsonl`. A standalone deployment
-        // without a gateway-side `ApiChannel` therefore split-brained — the
-        // actor wrote to one path, handlers wrote to another, replays missed
-        // half the history.
-        //
-        // Post-fix, every `/chat` write must funnel through
-        // `persist_chat_message_through_canonical` — a wrapper around
-        // `octos_bus::persist_message_through_canonical_path` that also
-        // invalidates the `SessionManager` LRU cache (mirroring what
-        // `ApiChannel::persist_to_session` does). The contract: messages
-        // committed via this helper land in the canonical per-user JSONL
-        // and never touch the legacy flat directory.
-        let data_dir = tempfile::tempdir().unwrap();
-        let sessions = Arc::new(tokio::sync::Mutex::new(
-            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
-        ));
-        let session_id = "web-canonical-handlers";
-        let topic = "research";
-        let key = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic);
-
-        // Drive a write through the helper the production handlers now use.
-        let seq = persist_chat_message_through_canonical(
-            &sessions,
-            &key,
-            Message::user("please summarise the q1 numbers"),
-        )
-        .await
-        .expect("canonical persist");
-        assert_eq!(seq, 0);
-
-        // Canonical per-user `<encoded_topic>.jsonl` must exist and carry
-        // the user message.
-        let encoded_base = octos_bus::session::encode_path_component(&format!(
-            "{MAIN_PROFILE_ID}:api:{session_id}"
-        ));
-        let encoded_topic = octos_bus::session::encode_path_component(topic);
-        let canonical = data_dir
-            .path()
-            .join("users")
-            .join(&encoded_base)
-            .join("sessions")
-            .join(format!("{encoded_topic}.jsonl"));
-        assert!(
-            canonical.exists(),
-            "/chat handler write must land in canonical per-user JSONL ({}) — \
-             this is the unified file the SessionActor and the bus-side \
-             ApiChannel also write",
-            canonical.display()
-        );
-        let body = std::fs::read_to_string(&canonical).unwrap();
-        assert!(
-            body.contains("please summarise the q1 numbers"),
-            "canonical JSONL must contain the user message text"
-        );
-
-        // Legacy flat `sessions/<encoded_full_key>.jsonl` must NOT exist —
-        // that's the old split-brain location standalone /chat used to
-        // write to.
-        let sessions_dir = data_dir.path().join("sessions");
-        if sessions_dir.exists() {
-            for entry in std::fs::read_dir(&sessions_dir).unwrap().flatten() {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    panic!(
-                        "/chat handler must NOT write to the legacy flat \
-                         layout (sessions/{}.jsonl) — that is the split-brain \
-                         path the storage unification PR is closing",
-                        name
-                    );
-                }
-            }
-        }
-    }
+    // `max_message_len_is_1mb` + `chat_sync_writes_to_canonical_per_user_topic_jsonl`
+    // were retired with the legacy `POST /api/chat` handler in the
+    // cleanup follow-up to PR #908. The canonical-JSONL invariant is
+    // now covered end-to-end by the `coding_multi_session` integration
+    // test (which drives the same `octos_bus::persist_message_through_canonical_path`
+    // call site) and by the WS UI Protocol handler's own unit tests.
 
     // ────────── M7.9 / W2 cancel + restart-from-node API tests ──────────
 
@@ -4321,6 +5047,7 @@ mod tests {
         let response = cancel_task(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path(task_id.clone()),
         )
         .await;
@@ -4343,6 +5070,7 @@ mod tests {
         let response = cancel_task(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path("does-not-exist".to_string()),
         )
         .await;
@@ -4365,8 +5093,13 @@ mod tests {
             task_query_store: Some(store),
             ..AppState::empty_for_tests()
         });
-        let response =
-            cancel_task(State(state), HeaderMap::new(), axum::extract::Path(task_id)).await;
+        let response = cancel_task(
+            State(state),
+            HeaderMap::new(),
+            None,
+            axum::extract::Path(task_id),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
@@ -4376,6 +5109,7 @@ mod tests {
         let response = cancel_task(
             State(Arc::clone(&state)),
             HeaderMap::new(),
+            None,
             axum::extract::Path("any".to_string()),
         )
         .await;
@@ -4402,6 +5136,7 @@ mod tests {
         let response = restart_task_from_node(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path(task_id.clone()),
             Some(Json(RestartFromNodeRequest {
                 node_id: Some("design".into()),
@@ -4440,6 +5175,7 @@ mod tests {
         let response = restart_task_from_node(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path("nope".into()),
             Some(Json(RestartFromNodeRequest::default())),
         )
@@ -4458,6 +5194,7 @@ mod tests {
         let response = restart_task_from_node(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path(task_id),
             Some(Json(RestartFromNodeRequest::default())),
         )
@@ -4465,245 +5202,193 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
-    // ────────── M11-D `/api/chat` routes through `SessionRuntime` ──────────
+    // ────────── Legacy `POST /api/chat` REST tests retired ──────────
+    //
+    // The original M11-D block exercised `chat_sync` /
+    // `chat_sync_via_session_runtime` end-to-end via the
+    // `ChatRequest` shape. With the legacy REST entrypoint retired
+    // (cleanup follow-up to PR #908), the equivalent acceptance
+    // evidence now lives in:
+    //
+    //   * `crates/octos-cli/tests/coding_multi_session.rs`
+    //     — per-session `SessionRuntime::bootstrap` writes
+    //       `.octos-workspace.toml` AND multi-tenant tool registries
+    //       stay isolated when distinct `workspace_hint`s are pinned.
+    //   * `api::ui_protocol::tests` (`turn/start` happy path +
+    //     503-on-missing-profile-runtime) — WS handler hits the same
+    //     `SessionRuntimeCache::get_or_init` call site.
+    //
+    // The `appui_default_session_cwd` workspace-hint forwarding the
+    // M11-F regression-fix test asserted is now exercised directly
+    // through the WS turn dispatcher (`ui_protocol::run_standalone_turn`).
 
-    /// Minimal stub LLM that returns a fixed assistant reply. Used to drive
-    /// the M11-D `/api/chat` route through `SessionRuntime::bootstrap` +
-    /// `Agent::process_message` without hitting a real provider.
-    struct EchoLlm {
-        reply: String,
+    // ── #995 — `decide_resolved_profile_id` precedence + auth ──────────
+    //
+    // The legacy precedence was `header.or(identity)` (handlers.rs:1442
+    // before the fix), letting any authenticated request set
+    // `X-Profile-Id: <victim>` and walk into the victim's data dir. The
+    // current logic is identity-first; if a header is also present
+    // (i.e. coming from a trusted reverse proxy after the strip
+    // middleware ran) it must name a profile the identity is authorized
+    // for — otherwise we return `403`, never silently override.
+
+    use crate::api::auth_handlers::ADMIN_PROFILE_ID;
+    use crate::profiles::{ProfileStore, UserProfile};
+    use crate::user_store::UserRole;
+
+    fn make_profile(id: &str, parent_id: Option<&str>) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: parent_id.map(Into::into),
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
     }
 
-    #[async_trait::async_trait]
-    impl octos_llm::LlmProvider for EchoLlm {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> eyre::Result<octos_llm::ChatResponse> {
-            Ok(octos_llm::ChatResponse {
-                content: Some(self.reply.clone()),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: octos_llm::TokenUsage {
-                    input_tokens: 7,
-                    output_tokens: 11,
-                    ..Default::default()
-                },
-                provider_index: None,
-            })
+    /// Build a minimal `AppState` for `decide_resolved_profile_id` unit
+    /// tests with a profile_store containing the listed profiles.
+    fn state_with_profiles(profiles: &[(&str, Option<&str>)]) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open(dir.path()).unwrap();
+        for (id, parent) in profiles {
+            ps.save(&make_profile(id, *parent)).unwrap();
         }
-
-        fn model_id(&self) -> &str {
-            "m11d-echo"
-        }
-
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-
-        fn context_window(&self) -> u32 {
-            64_000
-        }
-    }
-
-    async fn make_m11d_profile(
-        data_dir: &std::path::Path,
-        reply: &str,
-    ) -> Arc<crate::runtime::ProfileRuntime> {
-        std::fs::create_dir_all(data_dir).unwrap();
-        let memory = Arc::new(octos_memory::EpisodeStore::open(data_dir).await.unwrap());
-        let memory_store = Arc::new(octos_memory::MemoryStore::open(data_dir).await.unwrap());
-        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(data_dir).await.unwrap());
-        let sandbox = octos_agent::SandboxConfig::default();
-        let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
-            data_dir,
-            octos_agent::create_sandbox(&sandbox),
-        );
-        Arc::new(crate::runtime::ProfileRuntime {
-            profile_id: MAIN_PROFILE_ID.to_string(),
-            data_dir: data_dir.to_path_buf(),
-            llm: Arc::new(EchoLlm {
-                reply: reply.to_string(),
-            }),
-            adaptive_router: None,
-            runtime_qos_catalog: None,
-            primary_model_id: "m11d-echo".to_string(),
-            provider_name: "stub".to_string(),
-            credentials: HashMap::new(),
-            skills_dir: None,
-            plugin_env_template: Vec::new(),
-            tool_policy: None,
-            default_sandbox: sandbox,
-            tool_specs: Arc::new(base_tools),
-            plugin_tool_names: Vec::new(),
-            plugin_dirs: Vec::new(),
-            plugin_prompt_fragments: Vec::new(),
-            plugin_hooks: Vec::new(),
-            system_prompt: "test-system-prompt".to_string(),
-            memory,
-            memory_store,
-            tool_config,
-            cron_service: None,
-            hook_executor: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn chat_routes_through_session_runtime_when_profile_registered() {
-        // Acceptance evidence (M11-D Part 3): a `/api/chat` request lands
-        // in `chat_sync_via_session_runtime` whenever the routed profile
-        // is registered in `state.profiles`. The route is the exact
-        // structural path the live yangmi flow takes — it implies
-        // `SessionRuntime::bootstrap` ran, which writes the per-session
-        // `.octos-workspace.toml` (closing the "workspace policy not
-        // found" failure mode without any hotfix file at the daemon
-        // cwd).
-        let data_dir = tempfile::tempdir().unwrap();
-        let profile_data_dir = data_dir.path().join("profile-data");
-        let profile_runtime = make_m11d_profile(&profile_data_dir, "yangmi reply ack").await;
-
-        let mut profiles = HashMap::new();
-        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
-        let state = Arc::new(AppState {
-            profiles,
+        let state = AppState {
+            profile_store: Some(Arc::new(ps)),
             ..AppState::empty_for_tests()
-        });
-
-        let req = ChatRequest {
-            message: "用 yangmi 语音说北京今天天气晴朗".to_string(),
-            session_id: Some("yangmi-trace-001".to_string()),
-            topic: None,
-            stream: false,
-            media: Vec::new(),
-            attach_only: false,
-            client_message_id: None,
         };
-
-        let response = chat_sync(state.clone(), HeaderMap::new(), req)
-            .await
-            .expect("chat_sync must succeed via SessionRuntime path");
-        assert_eq!(response.content, "yangmi reply ack");
-        assert_eq!(response.input_tokens, 7);
-        assert_eq!(response.output_tokens, 11);
-
-        // The session runtime was materialized into the cache — a second
-        // call for the same session reuses the same `Arc<SessionRuntime>`.
-        let cache_len = state.session_cache.len().await;
-        assert_eq!(cache_len, 1, "session cache must hold one entry");
-
-        // The per-session workspace policy bootstrap actually ran — i.e.
-        // the yangmi gap is closed at the structural level.
-        let encoded = octos_bus::session::encode_path_component(&format!(
-            "{MAIN_PROFILE_ID}:api:yangmi-trace-001"
-        ));
-        let policy_path = profile_data_dir
-            .join("users")
-            .join(&encoded)
-            .join("workspace")
-            .join(".octos-workspace.toml");
-        assert!(
-            policy_path.exists(),
-            "SessionRuntime::bootstrap must write the workspace policy at {} \
-             without any operator-side hotfix",
-            policy_path.display(),
-        );
+        (dir, state)
     }
 
-    #[tokio::test]
-    async fn chat_returns_503_when_routed_profile_not_registered() {
-        // M11-F: the legacy `state.agent` fallback was deleted; an
-        // unregistered profile is a configuration bug, not a runtime
-        // fallback. `octos serve` bootstraps every profile in
-        // `ProfileStore::list()` at startup, so a request that lands on
-        // a profile id missing from `state.profiles` must fail closed
-        // with 503 SERVICE UNAVAILABLE (and a body that names the
-        // offending profile so operators can investigate).
-        let state = Arc::new(AppState::empty_for_tests());
-        let req = ChatRequest {
-            message: "ping".to_string(),
-            session_id: Some("legacy".to_string()),
-            topic: None,
-            stream: false,
-            media: Vec::new(),
-            attach_only: false,
-            client_message_id: None,
+    #[test]
+    fn decide_uses_identity_when_no_header_present() {
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
         };
-
-        let result = chat_sync(state, HeaderMap::new(), req).await;
-        let (status, msg) = result
-            .err()
-            .expect("expected 503 when profile not registered");
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        // The error must name the missing profile so the operator log
-        // surfaces the misrouted-request shape (not an opaque "no
-        // provider" message that pre-M11-F's legacy path returned).
-        assert!(
-            msg.contains(MAIN_PROFILE_ID),
-            "503 message must name the unregistered profile (got: {msg})",
-        );
+        let pid = decide_resolved_profile_id(&state, Some(&identity), None, Some("alice")).unwrap();
+        assert_eq!(pid, "alice");
     }
 
-    /// M11-F regression fix REG-6: `chat_sync_via_session_runtime` must
-    /// forward `state.appui_default_session_cwd` as the session's
-    /// workspace hint when no client cwd is supplied. Pre-M11-F serve.rs
-    /// wired this into the server-wide agent via
-    /// `agent.with_workspace_root(default_cwd)` so every `/api/chat`
-    /// inherited it; M11-F's deletion of that helper left this
-    /// dispatcher path falling back to the canonical
-    /// `<data_dir>/users/.../workspace` instead of the operator setting.
-    #[tokio::test]
-    async fn chat_sync_forwards_appui_default_session_cwd_as_workspace_hint() {
-        let tmp = tempfile::tempdir().unwrap();
-        let profile_data_dir = tmp.path().join("profile-data");
-        let operator_cwd = tmp.path().join("operator-coding-workspace");
-        std::fs::create_dir_all(&operator_cwd).unwrap();
-        let profile_runtime = make_m11d_profile(&profile_data_dir, "ack").await;
+    #[test]
+    fn decide_uses_header_when_identity_is_authorized_admin() {
+        // Admin token can be narrowed to a specific tenant via X-Profile-Id
+        // when the request comes from the loopback Caddy ingress. This is
+        // the legitimate post-fix behaviour for hosted subdomains.
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let identity = AuthIdentity::Admin;
+        let pid = decide_resolved_profile_id(
+            &state,
+            Some(&identity),
+            Some("alice"),
+            Some(ADMIN_PROFILE_ID),
+        )
+        .unwrap();
+        assert_eq!(pid, "alice");
+    }
 
-        let mut profiles = HashMap::new();
-        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
-        let state = Arc::new(AppState {
-            profiles,
-            appui_default_session_cwd: Some(operator_cwd.clone()),
-            ..AppState::empty_for_tests()
-        });
-
-        let req = ChatRequest {
-            message: "anchor here".to_string(),
-            session_id: Some("reg6-trace".to_string()),
-            topic: None,
-            stream: false,
-            media: Vec::new(),
-            attach_only: false,
-            client_message_id: None,
+    #[test]
+    fn decide_uses_header_when_identity_owns_sub_account_named_in_header() {
+        let (_dir, state) = state_with_profiles(&[("owner", None), ("owner-sub", Some("owner"))]);
+        let identity = AuthIdentity::User {
+            id: "owner".into(),
+            role: UserRole::User,
         };
+        let pid =
+            decide_resolved_profile_id(&state, Some(&identity), Some("owner-sub"), Some("owner"))
+                .unwrap();
+        assert_eq!(pid, "owner-sub");
+    }
 
-        let _response = chat_sync(state.clone(), HeaderMap::new(), req)
-            .await
-            .expect("chat_sync should succeed");
+    #[test]
+    fn decide_rejects_header_when_authenticated_identity_unauthorized_for_it() {
+        // #995 pre-fix bypass: authenticated as alice, header says bob.
+        // Pre-fix: `header.or(identity)` returned "bob" silently.
+        // Post-fix: 403, no leak.
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
+        };
+        let err = decide_resolved_profile_id(&state, Some(&identity), Some("bob"), Some("alice"))
+            .expect_err("must reject cross-tenant header");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
 
-        // After the first call, the cached SessionRuntime must be
-        // anchored at the operator-configured cwd (not the canonical
-        // `<profile_data_dir>/users/.../workspace`).
-        let session_key =
-            octos_core::SessionKey::with_profile(MAIN_PROFILE_ID, "api", "reg6-trace");
-        let session_runtime = state
-            .session_cache
-            .get_or_init(&profile_runtime, session_key, None)
-            .await
-            .expect("cached SessionRuntime");
-        let expected =
-            std::fs::canonicalize(&operator_cwd).unwrap_or_else(|_| operator_cwd.clone());
-        let actual = std::fs::canonicalize(&session_runtime.workspace_root)
-            .unwrap_or_else(|_| session_runtime.workspace_root.clone());
-        assert_eq!(
-            actual,
-            expected,
-            "SessionRuntime.workspace_root must equal appui.default_session_cwd \
-             when forwarded by chat_sync_via_session_runtime (got {})",
-            session_runtime.workspace_root.display()
-        );
+    #[test]
+    fn decide_rejects_header_pointing_to_unrelated_sub_account() {
+        // Owner authenticated → cannot use header to act as another
+        // owner's sub-account (parent_id mismatch).
+        let (_dir, state) = state_with_profiles(&[
+            ("owner-a", None),
+            ("owner-b", None),
+            ("owner-b-sub", Some("owner-b")),
+        ]);
+        let identity = AuthIdentity::User {
+            id: "owner-a".into(),
+            role: UserRole::User,
+        };
+        let err = decide_resolved_profile_id(
+            &state,
+            Some(&identity),
+            Some("owner-b-sub"),
+            Some("owner-a"),
+        )
+        .expect_err("must reject foreign sub-account");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn decide_allows_user_with_admin_role_to_target_any_profile() {
+        // A user account flagged as `UserRole::Admin` is fully
+        // privileged — `is_authorized_for_profile` short-circuits to
+        // `true` in that branch. Codify the contract so a future
+        // refactor can't quietly break the admin path.
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::Admin,
+        };
+        let pid = decide_resolved_profile_id(&state, Some(&identity), Some("bob"), Some("alice"))
+            .unwrap();
+        assert_eq!(pid, "bob");
+    }
+
+    #[test]
+    fn decide_falls_back_to_header_when_unauthenticated() {
+        // Pre-auth callers (e.g. webhook proxies, public preview) still
+        // use the header as a hint. Their handlers do their own
+        // authorization downstream; the contract here is only
+        // "don't 403 just because no identity is present."
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let pid = decide_resolved_profile_id(&state, None, Some("alice"), None).unwrap();
+        assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn decide_returns_bad_request_when_no_signal_at_all() {
+        let (_dir, state) = state_with_profiles(&[]);
+        let err = decide_resolved_profile_id(&state, None, None, None)
+            .expect_err("no identity AND no header must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decide_returns_bad_request_when_authenticated_but_no_identity_profile_id_resolved() {
+        // Edge case: identity is `Some(_)` but the caller could not
+        // resolve a profile id for it (e.g. admin in a setup-wizard
+        // state where `ensure_admin_profile` hasn't run yet). We must
+        // not fall through to a stripped-empty header.
+        let (_dir, state) = state_with_profiles(&[]);
+        let identity = AuthIdentity::Admin;
+        let err = decide_resolved_profile_id(&state, Some(&identity), None, None)
+            .expect_err("must signal missing context");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 }

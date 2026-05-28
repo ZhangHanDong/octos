@@ -32,7 +32,7 @@ use eyre::Result;
 use metrics::counter;
 use octos_agent::harness_events::{HarnessEvent, HarnessSwarmDispatchEvent};
 use octos_agent::tools::mcp_agent::{
-    DispatchOutcome, DispatchRequest, McpAgentBackend, record_dispatch,
+    DispatchContextContract, DispatchOutcome, DispatchRequest, McpAgentBackend, record_dispatch,
 };
 use octos_agent::validators::{
     ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner,
@@ -44,13 +44,14 @@ use tracing::{debug, warn};
 
 use octos_agent::cost_ledger::{CostAccountant, CostAttributionEvent, project_cost_usd};
 
-use crate::gate::{DispatchPolicy, enforce_or_outcome};
+use crate::gate::enforce_or_outcome;
 use crate::ledger::{CostLedger, NoopCostLedger, SwarmCostAttribution};
 use crate::persistence::{DispatchRecord, DispatchStore};
 use crate::result::{
     AggregateArtifact, SubtaskOutcome, SubtaskStatus, SwarmOutcomeKind, SwarmResult,
 };
 use crate::topology::{ContractSpec, MAX_CONTRACTS_PER_DISPATCH, SwarmTopology};
+use octos_agent::DispatchPolicy;
 
 /// Maximum number of retry rounds the primitive performs before
 /// surfacing a partial result. Bounded per invariant 5 so a flaky
@@ -199,6 +200,22 @@ impl Swarm {
         persistence_dir: impl Into<PathBuf>,
     ) -> SwarmBuilder {
         SwarmBuilder::new(backend, persistence_dir.into())
+    }
+
+    /// Return the configured MCP backend.
+    ///
+    /// AppUI-owned product workflows use this to launch supervised MCP
+    /// specialists without exposing a generic UI-side scheduler.
+    pub fn backend(&self) -> Arc<dyn McpAgentBackend> {
+        self.backend.clone()
+    }
+
+    /// Return the configured pre-dispatch policy gate.
+    ///
+    /// Direct AppUI specialist runners use this when they intentionally
+    /// reuse the swarm backend without going through [`Self::dispatch`].
+    pub fn dispatch_policy(&self) -> Arc<DispatchPolicy> {
+        self.dispatch_policy.clone()
     }
 
     /// Dispatch a batch of contracts against the configured backend.
@@ -520,6 +537,13 @@ impl Swarm {
                 "{}/subtask/{}",
                 validator.invocation.repo_label, contract.contract_id
             ),
+            input_args: None,
+            tool_output: None,
+            // Swarm subtask invocations run AFTER their per-subtask
+            // workspace contract; the dispatcher has no spawn_only file
+            // list of its own to forward. Subtask-level validators that
+            // need a file source should stay on the glob path.
+            spawn_only_files: Vec::new(),
         };
 
         let outcomes = validator.runner.run_all(&invocation, &scoped).await;
@@ -827,11 +851,24 @@ async fn dispatch_once(
     contract: &ContractSpec,
     prior_attempts: u32,
 ) -> SubtaskOutcome {
-    let request = DispatchRequest {
-        tool_name: contract.tool_name.clone(),
-        task: contract.task.clone(),
-    };
-    let response = backend.dispatch(request).await;
+    // #1021 / M17-C — swarm dispatches go through external MCP backends
+    // that don't consume the Octos prompt context manager. Tag the
+    // contract with backend_kind/agent_id/risk so the evidence ledger
+    // can identify each unmanaged dispatch without parsing free-form
+    // text. The contract_id doubles as the agent_id here — swarm
+    // subtasks don't have a separate Octos task supervisor handle.
+    let context_contract =
+        DispatchContextContract::external_unmanaged("swarm_mcp_backend_context_payload_not_wired")
+            .with_child_session_key(Some(contract.contract_id.clone()))
+            .with_backend_kind("mcp")
+            .with_agent_id(contract.contract_id.clone())
+            .with_risk("medium");
+    let request = DispatchRequest::new(contract.tool_name.clone(), contract.task.clone())
+        .with_context_contract(context_contract.clone());
+    let response = backend
+        .dispatch(request)
+        .await
+        .with_context_contract(Some(context_contract));
     record_dispatch(backend.backend_label(), response.outcome);
 
     let status = SubtaskStatus::from_dispatch(response.outcome);
@@ -951,5 +988,70 @@ mod tests {
             max_retry_rounds: None,
         };
         assert_eq!(budget.effective_max_contracts(), MAX_CONTRACTS_PER_DISPATCH);
+    }
+
+    /// #1021 / M17-C — when the swarm dispatches a subtask through an
+    /// external MCP backend, the request's context contract must carry
+    /// the new diagnostic fields (`backend_kind: "mcp"`, an `agent_id`
+    /// matching the contract_id, and `risk: "medium"`). Without this
+    /// the evidence ledger could not identify each unmanaged dispatch
+    /// from a single line.
+    #[tokio::test]
+    async fn dispatch_once_populates_m17c_context_contract_fields() {
+        use crate::topology::ContractSpec;
+        use async_trait::async_trait;
+        use octos_agent::tools::mcp_agent::{DispatchOutcome, DispatchResponse};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct CapturingBackend {
+            last_request: Mutex<Option<DispatchRequest>>,
+        }
+
+        #[async_trait]
+        impl McpAgentBackend for CapturingBackend {
+            fn backend_label(&self) -> &'static str {
+                "local"
+            }
+            fn endpoint_label(&self) -> String {
+                "capture".to_string()
+            }
+            async fn dispatch(&self, request: DispatchRequest) -> DispatchResponse {
+                *self.last_request.lock().unwrap() = Some(request);
+                DispatchResponse {
+                    outcome: DispatchOutcome::Success,
+                    output: "ok".into(),
+                    files_to_send: Vec::new(),
+                    error: None,
+                    context_contract: None,
+                }
+            }
+        }
+
+        let backend = CapturingBackend::default();
+        let contract = ContractSpec {
+            contract_id: "swarm-subtask-42".into(),
+            tool_name: "run_task".into(),
+            task: serde_json::json!({ "contract_id": "swarm-subtask-42" }),
+            label: Some("c-42".into()),
+        };
+
+        let _ = dispatch_once(&backend, &contract, 0).await;
+
+        let captured = backend
+            .last_request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("backend must have recorded a request");
+        let cc = captured
+            .context_contract
+            .as_ref()
+            .expect("dispatch must attach a context contract");
+        assert_eq!(cc.mode, "external_context_unmanaged");
+        assert_eq!(cc.backend_kind.as_deref(), Some("mcp"));
+        assert_eq!(cc.agent_id.as_deref(), Some("swarm-subtask-42"));
+        assert_eq!(cc.risk.as_deref(), Some("medium"));
+        assert_eq!(cc.child_session_key.as_deref(), Some("swarm-subtask-42"));
     }
 }

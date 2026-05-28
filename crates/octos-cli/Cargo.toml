@@ -18,6 +18,12 @@ octos-llm = { workspace = true }
 octos-bus = { workspace = true }
 octos-pipeline = { workspace = true }
 octos-swarm = { workspace = true }
+# RFC-2 (issue #1291): `octos skills install` runs the manifest schema
+# validator at install time so the operator sees the error before the
+# agent loop ever loads the broken manifest. The validator lives in
+# `octos-plugin::manifest_validator` and is reached through the
+# top-level re-exports.
+octos-plugin = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
@@ -40,6 +46,14 @@ sha2 = { workspace = true }
 subtle = { workspace = true, optional = true }
 getrandom = "0.2"
 constant_time_eq = "0.3"
+# Issue #1010 — `extract_token` must percent-decode the `token=` query
+# param so a token containing `!`, `+`, `/`, `=`, `:` matches the value
+# stored on `AppState.auth_token` / the OTP session store. The
+# `Authorization: Bearer …` header path takes the bytes literally —
+# HTTP headers are NOT percent-encoded — so the WS path uses RFC 3986
+# percent-decode-only semantics (leaves `+` literal) to stay consistent
+# with REST.
+percent-encoding = "2"
 open = { workspace = true }
 zip = { workspace = true }
 quick-xml = { workspace = true }
@@ -47,6 +61,11 @@ image = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
 base64 = { workspace = true }
+# #1057: `onboarding/workspace_probe` parses `workspace_policy.toml` to
+# surface presence + parse errors during TUI onboarding. The probe re-uses
+# `octos_agent::workspace_policy::WorkspacePolicy` as the canonical schema
+# and only needs the `toml` deserializer entry point here.
+toml = { workspace = true }
 keyring = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
@@ -61,6 +80,22 @@ lettre = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW for the symlink-safe preview file serve in
+# `src/api/preview.rs`. Pinned by issue #996 BLOCKING #1: previously
+# `tokio::fs::read` followed symlinks between the canonical-descendant
+# check and the read, opening a TOCTOU window.
+libc = { workspace = true }
+# `rustix::fs::openat` for the component-by-component path walk in
+# `src/api/preview.rs::open_no_follow_walk`. Codex round-2 BLOCKING #1
+# (issue #996): the previous `symlink_metadata`-then-`open` ancestor
+# walk left a multi-syscall TOCTOU window — an attacker could swap
+# any ancestor for a symlink between the stat and the open. Rustix's
+# safe `openat` wrapper (workspace-wide `deny(unsafe_code)` rules out
+# raw `libc::openat`) anchors each step to a parent fd so the
+# relationship survives mid-walk swaps.
+rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
@@ -80,12 +115,19 @@ email = ["octos-bus/email"]
 feishu = ["octos-bus/feishu"]
 twilio = ["octos-bus/twilio"]
 wecom = ["octos-bus/wecom"]
+line = ["octos-bus/line"]
 matrix = ["octos-bus/matrix"]
 wecom-bot = ["octos-bus/wecom-bot"]
 qq-bot = ["octos-bus/qq-bot"]
 wechat = ["octos-bus/wechat"]
 git = ["octos-agent/git"]
 ast = ["octos-agent/ast"]
+# Mp3 decode for the AudioNonSilent workspace-contract validator (.mp3 files).
+# Without it, validators on .mp3 artifacts return "feature not enabled" — see
+# `crates/octos-agent/src/validators.rs`. Fleet builds that ship the podcast
+# / fm_tts skills should enable this so the contract layer accepts the mp3
+# outputs they produce.
+audio_mp3 = ["octos-agent/audio_mp3"]
 
 [lints]
 workspace = true
@@ -94,3 +136,12 @@ workspace = true
 tokio-test = { workspace = true }
 tower = { workspace = true }
 axum = { workspace = true }
+# Wave-4 B3.4 — enable `test-utils` for octos-llm so the gateway's
+# failover-surfacing tests can call `publish_failover_for_subscribers`.
+# Production builds don't see this; only `cargo test -p octos-cli`.
+octos-llm = { workspace = true, features = ["test-utils"] }
+
+[[test]]
+name = "build_output_dir_validation"
+path = "tests/build_output_dir_validation.rs"
+required-features = ["api"]

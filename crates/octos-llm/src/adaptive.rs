@@ -4,9 +4,10 @@
 //! per-provider latency (EMA + p95), error rates, and circuit breaker state.
 //! Supports probe/canary requests to keep metrics fresh for non-primary providers.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -19,6 +20,7 @@ use crate::config::ChatConfig;
 use crate::content_classifier::{ClassificationDecision, ContentClassifier};
 use crate::credential_pool::{CredentialPool, ErrorId, rotation_reason};
 use crate::provider::LlmProvider;
+use crate::responsiveness::ResponsivenessObserver;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 // ---------------------------------------------------------------------------
@@ -66,6 +68,122 @@ impl Default for AdaptiveConfig {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Auto-escalation: latency-driven Lane -> Hedge self-promotion
+// ---------------------------------------------------------------------------
+
+/// Tunables for the per-session auto-escalation state machine.
+///
+/// When sustained-latency degradation is detected on a given session the
+/// router self-promotes the global `AdaptiveMode` from `Lane` to `Hedge`
+/// (and falls back to `Lane`/`Off` when latency recovers). The thresholds
+/// match the legacy gateway-side `ResponsivenessObserver` defaults so
+/// behavior is identical for `octos gateway` after the refactor.
+#[derive(Debug, Clone)]
+pub struct AutoEscalationConfig {
+    /// Master switch. `false` disables all latency-tracking and mode flips.
+    pub enabled: bool,
+    /// Sliding window of recent turn latencies kept per session.
+    pub window_size: usize,
+    /// Number of warmup samples used to learn the baseline (median).
+    pub baseline_samples: usize,
+    /// Multiplier over baseline above which a single turn counts as "slow".
+    /// e.g. `3.0` ⇒ slow if `latency > baseline * 3`.
+    pub degradation_threshold: f64,
+    /// Consecutive slow turns required to escalate.
+    pub slow_trigger: u32,
+    /// Hard ceiling — turns longer than this always count as slow once a
+    /// baseline exists. Default 8000 ms, matches the FA-11/12 spec.
+    pub latency_ceiling_ms: u64,
+    /// Hysteresis fraction. After escalation, latency must drop below
+    /// `latency_ceiling_ms * recovery_factor` for `should_deactivate()` to
+    /// reset. Default `0.6` mirrors the existing single-fast-turn rule but
+    /// adds a soft ceiling so a single below-threshold turn that is still
+    /// noisy does not flap us back to Off.
+    pub recovery_factor: f64,
+}
+
+impl Default for AutoEscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_size: 5,
+            baseline_samples: 5,
+            degradation_threshold: 3.0,
+            slow_trigger: 3,
+            latency_ceiling_ms: 8_000,
+            recovery_factor: 0.6,
+        }
+    }
+}
+
+/// Decision returned from [`AdaptiveRouter::record_turn_latency`].
+///
+/// Callers that want to drive UI/queue-mode side effects (gateway "⚡"
+/// notification, `QueueMode::Speculative` flip) inspect this value;
+/// callers that just want the router's own mode-flip behavior can ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoEscalationDecision {
+    /// No change — feature disabled, still warming up, or threshold not met.
+    NoChange,
+    /// Latency window just crossed the degradation threshold. Router has
+    /// already flipped its mode to `Hedge`.
+    Escalated,
+    /// Latency window recovered. Router has already flipped back to
+    /// the previous mode (recorded at the time of escalation).
+    Deescalated,
+}
+
+/// Per-session auto-escalation state stored inside `AdaptiveRouter`.
+struct SessionAutoState {
+    observer: ResponsivenessObserver,
+    /// Last latency sample (ms). Used by `should_deactivate_with_ceiling`.
+    last_latency_ms: u64,
+    /// Mode the router was in when we escalated, so we can restore it on
+    /// recovery instead of dropping to `Off`. `None` while not escalated.
+    pre_escalation_mode: Option<AdaptiveMode>,
+}
+
+impl SessionAutoState {
+    fn new(cfg: &AutoEscalationConfig) -> Self {
+        Self {
+            observer: ResponsivenessObserver::with_params(
+                cfg.window_size.max(cfg.baseline_samples),
+                cfg.baseline_samples,
+                cfg.degradation_threshold,
+                cfg.slow_trigger,
+            ),
+            last_latency_ms: 0,
+            pre_escalation_mode: None,
+        }
+    }
+}
+
+/// Notification fired when [`AdaptiveRouter`] auto-escalates or
+/// de-escalates because of sustained latency on a session.
+///
+/// Wired by callers (gateway → "⚡ Detected slow responses…" message, web
+/// → telemetry only) via [`AdaptiveRouter::set_auto_escalation_callback`].
+#[derive(Debug, Clone)]
+pub struct AutoEscalationEvent {
+    /// The session id the router was driven by.
+    pub session_id: String,
+    /// Mode the router moved to (`Hedge` on escalate, restored mode on
+    /// deescalate).
+    pub new_mode: AdaptiveMode,
+    /// Mode the router was in before this flip.
+    pub previous_mode: AdaptiveMode,
+    /// Latest latency sample that produced the flip (ms).
+    pub latency_ms: u64,
+    /// `true` for escalations, `false` for recoveries.
+    pub escalated: bool,
+}
+
+/// Callback invoked when [`AdaptiveRouter`] auto-escalates or recovers.
+/// Held under `RwLock` so it can be swapped at runtime without restarting
+/// the router (mirrors `StatusCallback`).
+pub type AutoEscalationCallback = Arc<dyn Fn(&AutoEscalationEvent) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Per-provider metrics
@@ -527,6 +645,70 @@ pub struct AdaptiveStatus {
     pub provider_count: usize,
 }
 
+/// Wave4-A: per-router failover broadcast event. Pushed onto a
+/// `tokio::sync::broadcast::Sender<FailoverEvent>` whenever the
+/// adaptive router crosses from one lane to another inside `chat()` /
+/// `chat_stream()`. Subscribers (API layer, telemetry) consume events
+/// without blocking the router — the broadcast channel drops the
+/// oldest event on a slow consumer.
+///
+/// Identifiers use the `<provider_name>/<model_id>` shape so they line
+/// up with the `lane_scores` keys in `RouterStatusEvent`.
+///
+/// **Codex P1 (Wave4-A review)**: the AdaptiveRouter is *profile*-
+/// scoped — every session on the same profile shares the same router
+/// instance ([`ProfileRuntime`]). Without an originating identifier
+/// here, two concurrent sessions on the same profile would each
+/// re-emit one another's failovers as if it were their own. The
+/// optional `originating_session_id` / `originating_turn_id` fields
+/// let the API-layer forwarder filter to events whose context matches
+/// its own session — see
+/// [`with_router_context`] for the publisher-side hookup.
+#[derive(Debug, Clone)]
+pub struct FailoverEvent {
+    pub from_provider: String,
+    pub to_provider: String,
+    pub reason: String,
+    pub elapsed_ms: u64,
+    /// Originating session id (free-form `SessionKey` string), captured
+    /// via [`ROUTER_CONTEXT`] at publish time. `None` when chat() was
+    /// invoked outside a context-aware scope (CLI smoke tests, etc.).
+    pub originating_session_id: Option<String>,
+    /// Originating turn id (UUID v7 hex), captured via [`ROUTER_CONTEXT`]
+    /// at publish time.
+    pub originating_turn_id: Option<String>,
+}
+
+/// Wave4-A: per-task context the API layer pushes BEFORE calling
+/// `provider.chat()`. Read inside `AdaptiveRouter::publish_failover` to
+/// stamp the originating session onto every emitted `FailoverEvent`.
+///
+/// Subscribers filter on this so a session B subscriber doesn't surface
+/// session A's failover under session B. The context is `Cell`-style —
+/// fork-friendly with `with_router_context`.
+#[derive(Debug, Clone, Default)]
+pub struct RouterContext {
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+tokio::task_local! {
+    /// Wave4-A: see [`RouterContext`]. Default `RouterContext::default()`
+    /// when no scope wraps the chat() call (test paths, CLI smoke).
+    pub static ROUTER_CONTEXT: RouterContext;
+}
+
+/// Wave4-A: run `fut` with the given `RouterContext` accessible via
+/// [`ROUTER_CONTEXT`]. The API layer wraps `run_standalone_turn`'s
+/// chat() path with this so the originating session id reaches the
+/// router's failover publisher.
+pub async fn with_router_context<F, T>(ctx: RouterContext, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    ROUTER_CONTEXT.scope(ctx, fut).await
+}
+
 /// Adaptive provider router with metrics-driven selection.
 ///
 /// Drop-in replacement for `ProviderChain`. Tracks latency and error rates
@@ -573,6 +755,26 @@ pub struct AdaptiveRouter {
     /// Id of the credential currently in use per slot. Updated at acquire
     /// time so failure notifications can identify the right credential.
     current_credential_ids: Mutex<Vec<Option<String>>>,
+    /// Wave4-A: lock-free broadcast channel for failover events. Senders
+    /// publish into it from the `chat()` / `chat_stream()` failover loops;
+    /// API-layer subscribers consume in a separate tokio task. The channel
+    /// drops the oldest event under back-pressure (per
+    /// `tokio::sync::broadcast` semantics) so a slow subscriber can NEVER
+    /// stall the router's hot path. A capacity of 64 absorbs short bursts
+    /// without forcing immediate drops.
+    failover_tx: tokio::sync::broadcast::Sender<FailoverEvent>,
+    /// Tuning for the latency-driven auto-escalation state machine. Cloned
+    /// per-`record_turn_latency` call so threshold tweaks at runtime are
+    /// rare — the cost is one Mutex acquire we'd already have to take.
+    auto_escalation_config: RwLock<AutoEscalationConfig>,
+    /// Per-session escalation state. Keyed by session id so a single
+    /// degraded session does not poison metrics from other sessions and
+    /// flap the global mode unnecessarily.
+    auto_escalation_state: Mutex<HashMap<String, SessionAutoState>>,
+    /// Callback fired on escalate / deescalate. Wired by gateway to send
+    /// the "⚡ Detected slow responses…" chat message; wired by serve for
+    /// telemetry.
+    auto_escalation_callback: RwLock<Option<AutoEscalationCallback>>,
 }
 
 impl AdaptiveRouter {
@@ -613,6 +815,11 @@ impl AdaptiveRouter {
             })
             .collect();
         let slot_count = slots.len();
+        // Wave4-A: capacity 64 absorbs short failover bursts without
+        // dropping the oldest event. Slow subscribers fall behind and
+        // observe a `RecvError::Lagged` — they MUST NOT stall the
+        // router's hot path.
+        let (failover_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             slots,
             config,
@@ -630,6 +837,126 @@ impl AdaptiveRouter {
             decision_callback: RwLock::new(None),
             credential_pools: RwLock::new(vec![None; slot_count]),
             current_credential_ids: Mutex::new(vec![None; slot_count]),
+            failover_tx,
+            auto_escalation_config: RwLock::new(AutoEscalationConfig::default()),
+            auto_escalation_state: Mutex::new(HashMap::new()),
+            auto_escalation_callback: RwLock::new(None),
+        }
+    }
+
+    /// Wave4-A: subscribe to failover events. The subscriber receives a
+    /// `FailoverEvent` each time the router crosses a lane in
+    /// `chat()` / `chat_stream()`. The channel is `broadcast`-based, so
+    /// every active subscriber gets every event; slow consumers may
+    /// observe `RecvError::Lagged(n)` and MUST handle it (skip to head
+    /// of channel; consider re-reading `adaptive_status()` to recover).
+    pub fn subscribe_failover(&self) -> tokio::sync::broadcast::Receiver<FailoverEvent> {
+        self.failover_tx.subscribe()
+    }
+
+    /// Wave4-A: publish a `FailoverEvent` (internal). `send` returns
+    /// `Ok(receiver_count)` or `Err` when there are zero active
+    /// subscribers — both outcomes are non-fatal for the router, so we
+    /// ignore the result entirely.
+    ///
+    /// Reads [`ROUTER_CONTEXT`] (Codex P1): if the caller's task-local
+    /// scope provides a `RouterContext`, stamps its `session_id` /
+    /// `turn_id` onto the event so subscribers can filter to the
+    /// originating session. Falls back to `None` outside such scopes
+    /// (test paths / CLI smoke).
+    fn publish_failover(
+        &self,
+        from_provider: &str,
+        to_provider: &str,
+        reason: &str,
+        elapsed_ms: u64,
+    ) {
+        let (originating_session_id, originating_turn_id) = ROUTER_CONTEXT
+            .try_with(|ctx| (ctx.session_id.clone(), ctx.turn_id.clone()))
+            .unwrap_or_default();
+        let _ = self.failover_tx.send(FailoverEvent {
+            from_provider: from_provider.to_string(),
+            to_provider: to_provider.to_string(),
+            reason: reason.to_string(),
+            elapsed_ms,
+            originating_session_id,
+            originating_turn_id,
+        });
+    }
+
+    /// Wave-4 B3: synthesize and broadcast a `FailoverEvent` to all
+    /// `subscribe_failover()` listeners. Wraps the internal
+    /// `publish_failover` so out-of-band callers — gateway tests,
+    /// synthetic monitoring — can drive the failover stream without
+    /// going through the chat loop.
+    ///
+    /// **Gated behind `feature = "test-utils"`** so production builds
+    /// can never synthesize false failovers. Downstream crates that
+    /// need the helper in their integration tests enable the feature
+    /// via `[dev-dependencies] octos-llm = { features = ["test-utils"] }`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn publish_failover_for_subscribers(
+        &self,
+        from_provider: &str,
+        to_provider: &str,
+        reason: &str,
+        elapsed_ms: u64,
+    ) {
+        self.publish_failover(from_provider, to_provider, reason, elapsed_ms);
+    }
+
+    /// Wave4-A: snapshot per-lane scores keyed by
+    /// `"<provider_name>/<model_id>"`. Returned as a `BTreeMap` so the
+    /// caller can hand it straight to the UI protocol layer without
+    /// re-sorting.
+    pub fn lane_scores(&self) -> std::collections::BTreeMap<String, f64> {
+        self.slots
+            .iter()
+            .map(|s| {
+                (
+                    format!("{}/{}", s.provider.provider_name(), s.provider.model_id()),
+                    self.score(s),
+                )
+            })
+            .collect()
+    }
+
+    /// Wave4-A: snapshot per-lane circuit-breaker state keyed by the same
+    /// `"<provider_name>/<model_id>"` shape as [`lane_scores`]. Values
+    /// are the string rendering — `"closed"`, `"open"`, or `"half_open"`
+    /// — so the wire shape stays stable across enum changes.
+    ///
+    /// We don't have a tri-state breaker yet (today it's
+    /// `consecutive_failures` past `failure_threshold`); `"half_open"`
+    /// is reserved for when one lands.
+    pub fn breaker_states(&self) -> std::collections::BTreeMap<String, String> {
+        self.slots
+            .iter()
+            .map(|s| {
+                let key = format!("{}/{}", s.provider.provider_name(), s.provider.model_id());
+                let state = if s.metrics.is_circuit_open(self.config.failure_threshold) {
+                    "open"
+                } else {
+                    "closed"
+                };
+                (key, state.to_string())
+            })
+            .collect()
+    }
+
+    /// Wave4-A: friendly accessor for the currently-selected lane in the
+    /// `"<provider_name>/<model_id>"` form expected by
+    /// `RouterStatusEvent::provider_name`. Falls back to `"unknown"`
+    /// when `last_selected` is out of range (cold-start race).
+    pub fn current_lane_key(&self) -> String {
+        let idx = self.last_selected.load(Ordering::Relaxed) as usize;
+        match self.slots.get(idx) {
+            Some(slot) => format!(
+                "{}/{}",
+                slot.provider.provider_name(),
+                slot.provider.model_id()
+            ),
+            None => "unknown".to_string(),
         }
     }
 
@@ -772,6 +1099,225 @@ impl AdaptiveRouter {
         if let Some(cb) = self.status_callback.read().unwrap().as_ref() {
             cb(message);
         }
+    }
+
+    /// Replace the auto-escalation tunables at runtime. Subsequent
+    /// `record_turn_latency` calls observe the new config; existing
+    /// per-session state retains its already-built window.
+    pub fn set_auto_escalation_config(&self, cfg: AutoEscalationConfig) {
+        *self.auto_escalation_config.write().unwrap() = cfg;
+    }
+
+    /// Snapshot the current auto-escalation tunables (clone).
+    pub fn auto_escalation_config(&self) -> AutoEscalationConfig {
+        self.auto_escalation_config.read().unwrap().clone()
+    }
+
+    /// Install a callback invoked when the router auto-escalates or
+    /// recovers. `None` clears it. Wired by gateway to send the
+    /// "⚡ Detected slow responses…" notification; wired by serve to feed
+    /// telemetry.
+    pub fn set_auto_escalation_callback(&self, cb: Option<AutoEscalationCallback>) {
+        *self.auto_escalation_callback.write().unwrap() = cb;
+    }
+
+    /// Record a turn's end-to-end LLM latency for a session and let the
+    /// router decide whether to self-promote (`Lane`/`Off` → `Hedge`) or
+    /// recover. Returns the decision so callers can drive gateway-only
+    /// side effects (queue mode flip, "⚡" chat message).
+    ///
+    /// Concurrency: holds the per-router `auto_escalation_state` mutex
+    /// for the duration of one record + check. The mutex is short-lived
+    /// — this is not on the hot per-token path, only the once-per-turn
+    /// boundary.
+    ///
+    /// When the feature is disabled via [`AutoEscalationConfig::enabled`]
+    /// `false` the router is a no-op and returns
+    /// [`AutoEscalationDecision::NoChange`].
+    pub fn record_turn_latency(
+        &self,
+        session_id: &str,
+        latency: Duration,
+    ) -> AutoEscalationDecision {
+        let cfg = self.auto_escalation_config.read().unwrap().clone();
+        if !cfg.enabled {
+            return AutoEscalationDecision::NoChange;
+        }
+        let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+        let (decision, event) = {
+            let mut state_map = self
+                .auto_escalation_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let state = state_map
+                .entry(session_id.to_string())
+                .or_insert_with(|| SessionAutoState::new(&cfg));
+            state.last_latency_ms = latency_ms;
+            // Use the ceiling-aware record so absolute-latency excursions
+            // (e.g. 8s+) count as slow even when the per-session baseline
+            // would otherwise normalize them.
+            state
+                .observer
+                .record_with_ceiling(latency, Some(cfg.latency_ceiling_ms));
+            let current_mode = self.mode();
+
+            // Escalate when the observer says so AND we're not already
+            // in Hedge mode. The observer's `should_activate` already
+            // gates on internal `active` so we don't double-fire.
+            let trigger_escalate = state.observer.should_activate();
+            let trigger_deescalate = state.observer.should_deactivate()
+                && Self::below_recovery_ceiling(latency_ms, &cfg);
+
+            if trigger_escalate && current_mode != AdaptiveMode::Hedge {
+                state.observer.set_active(true);
+                state.pre_escalation_mode = Some(current_mode);
+                self.set_mode(AdaptiveMode::Hedge);
+                warn!(
+                    session = session_id,
+                    latency_ms,
+                    previous_mode = %current_mode,
+                    "auto-escalation: promoting AdaptiveMode → Hedge on sustained latency"
+                );
+                let event = AutoEscalationEvent {
+                    session_id: session_id.to_string(),
+                    new_mode: AdaptiveMode::Hedge,
+                    previous_mode: current_mode,
+                    latency_ms,
+                    escalated: true,
+                };
+                (AutoEscalationDecision::Escalated, Some(event))
+            } else if trigger_deescalate {
+                // Operator-override guard: if the router is no longer in
+                // Hedge mode (a `/adaptive off|lane` was issued by the
+                // user/operator since we escalated), drop our cached
+                // `pre_escalation_mode` without overriding their choice.
+                // Otherwise restore to the mode we saw at escalation
+                // time.
+                state.observer.set_active(false);
+                let stashed = state.pre_escalation_mode.take();
+                if current_mode != AdaptiveMode::Hedge {
+                    info!(
+                        session = session_id,
+                        latency_ms,
+                        current_mode = %current_mode,
+                        "auto-escalation: latency recovered but router was manually moved off Hedge — leaving the operator-chosen mode in place"
+                    );
+                    (AutoEscalationDecision::Deescalated, None)
+                } else {
+                    let restore = stashed.unwrap_or(AdaptiveMode::Off);
+                    self.set_mode(restore);
+                    info!(
+                        session = session_id,
+                        latency_ms,
+                        restored_mode = %restore,
+                        "auto-escalation: latency recovered, restoring mode"
+                    );
+                    let event = AutoEscalationEvent {
+                        session_id: session_id.to_string(),
+                        new_mode: restore,
+                        previous_mode: AdaptiveMode::Hedge,
+                        latency_ms,
+                        escalated: false,
+                    };
+                    (AutoEscalationDecision::Deescalated, Some(event))
+                }
+            } else {
+                (AutoEscalationDecision::NoChange, None)
+            }
+        };
+        if let Some(event) = event {
+            if let Some(cb) = self.auto_escalation_callback.read().unwrap().as_ref() {
+                cb(&event);
+            }
+        }
+        decision
+    }
+
+    fn below_recovery_ceiling(latency_ms: u64, cfg: &AutoEscalationConfig) -> bool {
+        // Latency must be below `latency_ceiling_ms * recovery_factor` for
+        // recovery to fire. This is hysteresis on top of `should_deactivate`
+        // so a single fast turn at the noisy edge of the ceiling doesn't
+        // immediately flap us back to the pre-escalation mode.
+        let ceiling = (cfg.latency_ceiling_ms as f64 * cfg.recovery_factor) as u64;
+        if ceiling == 0 {
+            return true;
+        }
+        latency_ms <= ceiling
+    }
+
+    /// Latency baseline learned for `session_id`, if any. Exposed so
+    /// gateway-side code (the speculative-overflow "patience" computation
+    /// in `session_actor.rs`) can read the same baseline the router used
+    /// to decide on escalation, instead of carrying its own observer.
+    pub fn session_latency_baseline(&self, session_id: &str) -> Option<Duration> {
+        let state_map = self
+            .auto_escalation_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state_map
+            .get(session_id)
+            .and_then(|state| state.observer.baseline())
+    }
+
+    /// Number of latency samples recorded for `session_id`. Mirrors
+    /// `ResponsivenessObserver::sample_count` for the per-session entry.
+    pub fn session_latency_samples(&self, session_id: &str) -> usize {
+        let state_map = self
+            .auto_escalation_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state_map
+            .get(session_id)
+            .map(|state| state.observer.sample_count())
+            .unwrap_or(0)
+    }
+
+    /// Drop the per-session auto-escalation state. Callers should call
+    /// this when a session terminates so the router doesn't grow
+    /// unbounded under many short-lived sessions.
+    ///
+    /// Side effect: if the dropped session was the one that owned the
+    /// last escalation (i.e. its `pre_escalation_mode` was the only
+    /// record of "what the router was before Hedge"), the router is
+    /// restored to that pre-escalation mode so a session that exits
+    /// while still escalated does not leave the router stuck in Hedge
+    /// indefinitely.
+    pub fn forget_session(&self, session_id: &str) -> bool {
+        let dropped = {
+            let mut state_map = self
+                .auto_escalation_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state_map.remove(session_id)
+        };
+        let Some(state) = dropped else {
+            return false;
+        };
+        // If this session owned an active escalation AND no other
+        // session has its own active escalation, drop the router back
+        // to what we saw before promoting. Without this, an exit-while-
+        // escalated would leave the router stuck in Hedge.
+        if let Some(restore) = state.pre_escalation_mode {
+            if self.mode() == AdaptiveMode::Hedge && !self.any_session_escalated() {
+                self.set_mode(restore);
+                info!(
+                    session = session_id,
+                    restored_mode = %restore,
+                    "forget_session: session exited while escalated, restoring router mode"
+                );
+            }
+        }
+        true
+    }
+
+    fn any_session_escalated(&self) -> bool {
+        let state_map = self
+            .auto_escalation_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state_map
+            .values()
+            .any(|s| s.pre_escalation_mode.is_some() && s.observer.is_active())
     }
 
     /// Toggle QoS quality ranking at runtime (orthogonal to mode).
@@ -1201,17 +1747,137 @@ impl AdaptiveRouter {
         we * blended_err + wl * ranking_component + wp * norm_priority + wc * norm_cost
     }
 
+    /// RFC-3 (#1292) — when a per-turn [`crate::LaneContext`] is in
+    /// scope and resolves to a non-`General` lane with at least one
+    /// `(provider, model)` candidate that matches a router slot,
+    /// return the matching slot indices in candidate order.
+    ///
+    /// Returns `None` for:
+    /// - no `LANE_CONTEXT` active (outside a `with_lane_context`
+    ///   scope — test paths, gateway pre-RFC-3 sessions)
+    /// - lane is `General` or `None` (semantics: "no filter")
+    /// - candidate list is empty
+    /// - candidate list matches no provider in the chain
+    ///
+    /// All three "None" cases preserve the pre-RFC-3 behavior: every
+    /// slot remains eligible for selection. This is the backward
+    /// compat anchor — profiles that don't carry a topic resolve to
+    /// `General`, get `None` back, and never observe a behavior
+    /// change.
+    ///
+    /// **Codex P2 follow-up:** `provider_name()` for OpenAI-compatible
+    /// providers (DeepSeek / Moonshot / Wisemodel via
+    /// `OpenAIProvider::with_base_url`) is endpoint-tagged as
+    /// `name@endpoint` (e.g. `moonshot@autodl`). Lane defaults and
+    /// profile config use untagged family identifiers, so the
+    /// comparison normalizes via [`normalized_provider_name`] which
+    /// strips any `@suffix` before matching. Without this
+    /// normalization, `code:*` against a Wisemodel-backed profile
+    /// would produce zero matches and silently fall through.
+    fn lane_filtered_slot_indices(&self) -> Option<Vec<usize>> {
+        let ctx = crate::lane::current_lane_context();
+        let lane = ctx.lane?;
+        if lane == crate::Lane::General {
+            return None;
+        }
+        let candidates = ctx.candidates();
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut matched: Vec<usize> = Vec::new();
+        for (want_provider, want_model) in &candidates {
+            // Codex P2 follow-up #2: when a profile override
+            // specifies a tagged candidate like `moonshot@autodl`,
+            // honor the tag with an exact match so operators can
+            // pin to a specific endpoint. Untagged candidates
+            // (built-in defaults, plain family names) match against
+            // the normalized slot label so endpoint-tagged slots
+            // still light up. The decision is per-candidate, not
+            // per-slot: a tagged candidate only matches a tagged
+            // slot with the exact same label.
+            let want_is_tagged = want_provider.contains('@');
+            for (i, slot) in self.slots.iter().enumerate() {
+                let slot_name = slot.provider.provider_name();
+                let provider_matches = if want_is_tagged {
+                    slot_name == want_provider.as_str()
+                } else {
+                    normalized_provider_name(slot_name) == want_provider.as_str()
+                };
+                if provider_matches
+                    && slot.provider.model_id() == want_model
+                    && !matched.contains(&i)
+                {
+                    matched.push(i);
+                }
+            }
+        }
+        if matched.is_empty() {
+            // Candidates exist but none of them are in this chain.
+            // Fall through to default selection rather than starving
+            // the router. This matches the RFC-3 "lane defaults must
+            // not break existing profiles" requirement.
+            debug!(
+                lane = lane.as_str(),
+                "lane filter resolved zero matching slots; falling through to default selection"
+            );
+            return None;
+        }
+        debug!(
+            lane = lane.as_str(),
+            matched = matched.len(),
+            total = self.slots.len(),
+            "lane filter narrowed candidate slots"
+        );
+        Some(matched)
+    }
+
     /// Select provider index and whether this is a probe request.
     ///
     /// - Off / Hedge: priority order, skip circuit-broken only.
     ///   (Hedge mode uses this to pick the primary for racing.)
     /// - Lane: score-based selection across all providers.
+    ///
+    /// RFC-3 (#1292): when a per-turn lane is in scope, the eligible
+    /// set is narrowed to slots whose `(provider_name, model_id)` is
+    /// in the lane's candidate list. When the lane filter yields
+    /// zero matches we fall through to the full slot list so the
+    /// router never starves (see [`Self::lane_filtered_slot_indices`]).
     fn select_provider(&self) -> (usize, bool) {
         let mode = self.mode();
+        // RFC-3: lane-filtered eligible set, if any. None ⇒ no
+        // filter; behave identically to pre-RFC-3.
+        let lane_eligible = self.lane_filtered_slot_indices();
 
         // Off and Hedge both use priority order for the primary selection.
         // (Hedge picks the alternate separately in hedged_chat.)
         if mode != AdaptiveMode::Lane {
+            // RFC-3: when a lane filter is active, walk the lane's
+            // candidate list in declared order rather than the full
+            // priority order. The first non-circuit-broken match
+            // wins. Falls through to the full slot list if every
+            // lane candidate has a circuit-open breaker.
+            if let Some(ref eligible) = lane_eligible {
+                for &i in eligible {
+                    let slot = &self.slots[i];
+                    if !slot.metrics.is_circuit_open(self.config.failure_threshold) {
+                        let prev = self.last_selected.swap(i as u32, Ordering::Relaxed);
+                        if prev != i as u32 {
+                            info!(
+                                from = self
+                                    .slots
+                                    .get(prev as usize)
+                                    .map(|s| s.provider.provider_name())
+                                    .unwrap_or("?"),
+                                to = slot.provider.provider_name(),
+                                "provider failover (lane filter, lane changing disabled)"
+                            );
+                        }
+                        return (i, false);
+                    }
+                }
+                // All lane candidates circuit-broken → fall through
+                // to the wider priority walk below.
+            }
             for (i, slot) in self.slots.iter().enumerate() {
                 if !slot.metrics.is_circuit_open(self.config.failure_threshold) {
                     let prev = self.last_selected.swap(i as u32, Ordering::Relaxed);
@@ -1232,14 +1898,38 @@ impl AdaptiveRouter {
             // All circuit-broken — fall through to least-failed logic below
         }
 
-        // Score all non-circuit-broken providers
+        // Score all non-circuit-broken providers. RFC-3: if a lane
+        // filter is active and at least one matching slot is up, the
+        // scoring set is restricted to those slots. When the filter
+        // produces zero usable slots we fall back to the full chain.
         let mut scored: Vec<(usize, f64)> = self
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| !s.metrics.is_circuit_open(self.config.failure_threshold))
+            .filter(|(i, s)| {
+                if !s.metrics.is_circuit_open(self.config.failure_threshold) {
+                    match lane_eligible {
+                        Some(ref eligible) => eligible.contains(i),
+                        None => true,
+                    }
+                } else {
+                    false
+                }
+            })
             .map(|(i, s)| (i, self.score(s)))
             .collect();
+        // RFC-3 fall-through: if the lane filter excluded every
+        // remaining slot, redo without the lane filter so the router
+        // doesn't starve under transient lane outages.
+        if scored.is_empty() && lane_eligible.is_some() {
+            scored = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.metrics.is_circuit_open(self.config.failure_threshold))
+                .map(|(i, s)| (i, self.score(s)))
+                .collect();
+        }
 
         // If all circuit-broken, pick least-failed
         if scored.is_empty() {
@@ -1261,13 +1951,21 @@ impl AdaptiveRouter {
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let best_idx = scored[0].0;
 
-        // Probe: with some probability, redirect to a stale non-primary provider
+        // Probe: with some probability, redirect to a stale non-primary provider.
+        // RFC-3 (#1292) — codex P2: when a lane filter is active,
+        // restrict probe targets to the lane's eligible slots so a
+        // probe under `slides:*`/`code:*` can never route the user
+        // turn to an out-of-lane model.
         if self.slots.len() > 1 && self.should_probe() {
             // Find a stale provider that isn't the best
             for (i, slot) in self.slots.iter().enumerate() {
                 if i != best_idx
                     && slot.metrics.is_stale(self.config.probe_interval_secs)
                     && !slot.metrics.is_circuit_open(self.config.failure_threshold)
+                    && match lane_eligible {
+                        Some(ref eligible) => eligible.contains(&i),
+                        None => true,
+                    }
                 {
                     debug!(
                         probe_provider = slot.provider.provider_name(),
@@ -1323,15 +2021,32 @@ impl AdaptiveRouter {
         // Pick the cheapest alternate provider for hedging. When cost data is
         // available, always hedge with the lowest-cost provider. Falls back to
         // score-based selection when no cost data exists.
+        //
+        // RFC-3 (#1292) — codex P2: when a lane filter is active,
+        // confine hedge alternates to the lane's eligible slots so a
+        // race under `slides:*`/`code:*` can't be won by an
+        // out-of-lane model. When the filter excludes every
+        // alternate, the hedge skips (`None` return) and the caller
+        // falls back to the single-provider path against the
+        // primary — preserving lane integrity at the cost of
+        // hedging on that turn.
         let primary_name = self.slots[primary_idx].provider.provider_name();
+        let lane_eligible = self.lane_filtered_slot_indices();
         let candidates: Vec<(usize, &AdaptiveSlot)> = self
             .slots
             .iter()
             .enumerate()
             .filter(|(i, s)| {
-                *i != primary_idx
-                    && s.provider.provider_name() != primary_name
-                    && !s.metrics.is_circuit_open(self.config.failure_threshold)
+                if *i == primary_idx
+                    || s.provider.provider_name() == primary_name
+                    || s.metrics.is_circuit_open(self.config.failure_threshold)
+                {
+                    return false;
+                }
+                match lane_eligible {
+                    Some(ref eligible) => eligible.contains(i),
+                    None => true,
+                }
             })
             .collect();
         let alternate_idx = {
@@ -1561,6 +2276,10 @@ impl LlmProvider for AdaptiveRouter {
         }
 
         // ── Single-provider path (Off / Lane / fallthrough) ────────────
+        // Wave4-A: track wall time from the first attempt so the failover
+        // event's `elapsed_ms` reflects the user-visible latency before
+        // the lane change, not just the time spent in the failover loop.
+        let failover_started = Instant::now();
         match self.try_chat(start_idx, messages, tools, config).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
@@ -1575,16 +2294,12 @@ impl LlmProvider for AdaptiveRouter {
                 );
 
                 // Failover: try remaining providers in score order.
-                let mut scored: Vec<(usize, f64)> = self
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, s)| {
-                        *i != start_idx && !s.metrics.is_circuit_open(self.config.failure_threshold)
-                    })
-                    .map(|(i, s)| (i, self.score(s)))
-                    .collect();
-                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                // RFC-3 (#1292): when a lane filter is active, prefer
+                // the lane's remaining candidates. If every lane
+                // candidate is exhausted or excluded, fall back to the
+                // full unfiltered set so the router never starves.
+                let lane_eligible = self.lane_filtered_slot_indices();
+                let scored = build_failover_candidates(self, start_idx, lane_eligible.as_ref());
 
                 let mut last_error = e;
                 for (idx, _) in scored {
@@ -1592,6 +2307,28 @@ impl LlmProvider for AdaptiveRouter {
                         "Switching to {}...",
                         self.slots[idx].provider.provider_name()
                     ));
+                    // Wave4-A: publish per-attempt failover events. We
+                    // emit BEFORE the retry so a client can render the
+                    // transition even if the retry never succeeds.
+                    let from_key = format!(
+                        "{}/{}",
+                        self.slots[start_idx].provider.provider_name(),
+                        self.slots[start_idx].provider.model_id()
+                    );
+                    let to_key = format!(
+                        "{}/{}",
+                        self.slots[idx].provider.provider_name(),
+                        self.slots[idx].provider.model_id()
+                    );
+                    self.publish_failover(
+                        &from_key,
+                        &to_key,
+                        &format!("chat_error: {last_error}"),
+                        failover_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                     match self.try_chat(idx, messages, tools, config).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
@@ -1619,6 +2356,9 @@ impl LlmProvider for AdaptiveRouter {
         let _classifier_decision = self.classify_turn(messages);
         let (start_idx, _is_probe) = self.select_provider();
 
+        // Wave4-A: failover elapsed-time anchor — see equivalent comment
+        // in `chat()` above.
+        let failover_started = Instant::now();
         match self
             .try_chat_stream(start_idx, messages, tools, config)
             .await
@@ -1635,16 +2375,9 @@ impl LlmProvider for AdaptiveRouter {
                     "adaptive router failing over stream"
                 );
 
-                let mut scored: Vec<(usize, f64)> = self
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, s)| {
-                        *i != start_idx && !s.metrics.is_circuit_open(self.config.failure_threshold)
-                    })
-                    .map(|(i, s)| (i, self.score(s)))
-                    .collect();
-                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                // RFC-3 (#1292): same lane-aware failover as chat() above.
+                let lane_eligible = self.lane_filtered_slot_indices();
+                let scored = build_failover_candidates(self, start_idx, lane_eligible.as_ref());
 
                 let mut last_error = e;
                 for (idx, _) in scored {
@@ -1652,6 +2385,25 @@ impl LlmProvider for AdaptiveRouter {
                         "Switching to {}...",
                         self.slots[idx].provider.provider_name()
                     ));
+                    let from_key = format!(
+                        "{}/{}",
+                        self.slots[start_idx].provider.provider_name(),
+                        self.slots[start_idx].provider.model_id()
+                    );
+                    let to_key = format!(
+                        "{}/{}",
+                        self.slots[idx].provider.provider_name(),
+                        self.slots[idx].provider.model_id()
+                    );
+                    self.publish_failover(
+                        &from_key,
+                        &to_key,
+                        &format!("stream_error: {last_error}"),
+                        failover_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                     match self.try_chat_stream(idx, messages, tools, config).await {
                         Ok(stream) => return Ok(stream),
                         Err(e) => {
@@ -1716,6 +2468,68 @@ impl LlmProvider for AdaptiveRouter {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Normalize a `provider_name()` for RFC-3 (#1292) lane matching.
+///
+/// `OpenAIProvider::with_base_url` tags the provider label with the
+/// endpoint suffix when a non-canonical base URL is in play
+/// (`moonshot@autodl`, `deepseek@api`, etc. — see
+/// `openai.rs:with_base_url`). Lane defaults and profile config use
+/// untagged family identifiers (`moonshot`, `deepseek`,
+/// `wisemodel`), so this helper strips the `@suffix` before
+/// comparison. Anthropic / Gemini / native OpenAI return their bare
+/// name and pass through unchanged.
+fn normalized_provider_name(name: &str) -> &str {
+    name.split_once('@').map(|(p, _)| p).unwrap_or(name)
+}
+
+/// Build the score-ordered failover candidate list for a router after
+/// the primary slot has errored. RFC-3 (#1292) preference: when
+/// `lane_eligible` is `Some(_)`, only slots in that set are
+/// considered. If that lane-filtered set is empty (every candidate
+/// was either the primary or circuit-broken), the function silently
+/// falls back to the full slot list so the router doesn't starve on
+/// transient lane outages.
+///
+/// Shared between `chat()` and `chat_stream()` so both code paths
+/// retain consistent failover behavior under lane filtering.
+fn build_failover_candidates(
+    router: &AdaptiveRouter,
+    start_idx: usize,
+    lane_eligible: Option<&Vec<usize>>,
+) -> Vec<(usize, f64)> {
+    let circuit_threshold = router.config.failure_threshold;
+    let mut scored: Vec<(usize, f64)> = router
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            if *i == start_idx || s.metrics.is_circuit_open(circuit_threshold) {
+                return false;
+            }
+            match lane_eligible {
+                Some(eligible) => eligible.contains(i),
+                None => true,
+            }
+        })
+        .map(|(i, s)| (i, router.score(s)))
+        .collect();
+    if scored.is_empty() && lane_eligible.is_some() {
+        // RFC-3 fall-through: lane filter excluded every remaining
+        // slot; widen to the full set so failover still has somewhere
+        // to go. The starting slot has already errored, so the
+        // surviving candidates come from outside the lane.
+        scored = router
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != start_idx && !s.metrics.is_circuit_open(circuit_threshold))
+            .map(|(i, s)| (i, router.score(s)))
+            .collect();
+    }
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
 
 fn now_epoch_us() -> u64 {
     std::time::SystemTime::now()
@@ -3009,5 +3823,961 @@ mod tests {
             warm_good.metrics.error_rate,
             warm_fail.metrics.error_rate,
         );
+    }
+
+    // ── Auto-escalation tests ─────────────────────────────────────────────
+
+    /// Helper: build a 2-provider router with permissive defaults so we can
+    /// drive the auto-escalation state machine in isolation.
+    fn auto_escalation_router() -> AdaptiveRouter {
+        let providers: Vec<Arc<dyn LlmProvider>> = vec![
+            Arc::new(MockProvider {
+                name: "primary",
+                model: "m1",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            }),
+            Arc::new(MockProvider {
+                name: "fallback",
+                model: "m2",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            }),
+        ];
+        AdaptiveRouter::new(providers, &[], AdaptiveConfig::default())
+            .with_adaptive_config(AdaptiveMode::Lane, false)
+    }
+
+    // ------------------------------------------------------------------
+    // Wave4-A: failover broadcast channel tests.
+    // ------------------------------------------------------------------
+
+    /// Wave4-A: subscribers receive a `FailoverEvent` when the router
+    /// crosses a lane in `chat()`. The first provider fails forcing
+    /// a failover to the second.
+    #[tokio::test]
+    async fn failover_broadcast_publishes_event_on_lane_change() {
+        let config = AdaptiveConfig {
+            failure_threshold: 5,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "primary down",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        );
+
+        let mut rx = router.subscribe_failover();
+
+        let messages = vec![Message::user("hello")];
+        let tools: Vec<ToolSpec> = vec![];
+        let cfg = ChatConfig::default();
+        let _ = router.chat(&messages, &tools, &cfg).await.unwrap();
+
+        // Wave4-A: the failover loop SHOULD have published at least one
+        // event. Wait up to 100ms — broadcast::Sender::send is sync but
+        // the chat loop yields, so we give the scheduler one tick.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("broadcast channel receive timed out")
+            .expect("broadcast channel was closed without an event");
+        assert_eq!(event.from_provider, "primary/m1");
+        assert_eq!(event.to_provider, "fallback/m2");
+        assert!(
+            event.reason.contains("chat_error"),
+            "reason should describe the underlying chat error — got {}",
+            event.reason
+        );
+    }
+
+    /// Wave4-A: the broadcast channel MUST NOT block the router under
+    /// back-pressure. A slow subscriber falls behind and observes
+    /// `RecvError::Lagged` — but the router keeps publishing.
+    ///
+    /// We construct a 64-deep burst (channel capacity) and verify that
+    /// the router survives without blocking and a fresh subscriber can
+    /// still read events afterwards.
+    #[tokio::test]
+    async fn failover_broadcast_does_not_block_router_under_backpressure() {
+        let router = AdaptiveRouter::new(
+            vec![Arc::new(MockProvider {
+                name: "p1",
+                model: "m1",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            })],
+            &[],
+            AdaptiveConfig::default(),
+        );
+
+        // Subscribe but never drain — the channel capacity is 64, so the
+        // 65th publish will start dropping the oldest event.
+        let _stuck_rx = router.subscribe_failover();
+
+        // Publish 100 events directly (the public API doesn't accept
+        // direct publish; we go through the same internal entry point
+        // the failover loops use).
+        for i in 0..100 {
+            router.publish_failover("from/m1", "to/m2", "test-burst", i);
+        }
+
+        // A fresh subscriber sees nothing of the previous 100 events
+        // (broadcast::Receiver only sees events sent AFTER subscribe()),
+        // but the channel must still be usable.
+        let mut fresh_rx = router.subscribe_failover();
+        router.publish_failover("from/m1", "to/m2", "post-burst", 999);
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), fresh_rx.recv())
+            .await
+            .expect("fresh subscriber receive timed out")
+            .expect("fresh subscriber channel closed");
+        assert_eq!(event.elapsed_ms, 999);
+        assert_eq!(event.reason, "post-burst");
+    }
+
+    /// Wave4-A: `lane_scores()` returns one entry per slot keyed by
+    /// `"<provider_name>/<model_id>"` in BTreeMap order.
+    #[test]
+    fn lane_scores_returns_deterministic_per_slot_snapshot() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "zai",
+                    model: "glm-5-turbo",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "ollama",
+                    model: "llama3.2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig::default(),
+        );
+
+        let scores = router.lane_scores();
+        let keys: Vec<&String> = scores.keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                &"ollama/llama3.2".to_string(),
+                &"zai/glm-5-turbo".to_string(),
+            ],
+            "lane_scores keys must be sorted (BTreeMap order)"
+        );
+    }
+
+    /// Wave4-A: `breaker_states()` reports `"closed"` initially and
+    /// `"open"` once the consecutive-failure threshold trips.
+    #[tokio::test]
+    async fn breaker_states_reports_open_after_threshold() {
+        let config = AdaptiveConfig {
+            failure_threshold: 1,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "fail",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "always_down",
+                }),
+                Arc::new(MockProvider {
+                    name: "ok",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        );
+
+        // Initially closed.
+        let states = router.breaker_states();
+        assert_eq!(states.get("fail/m1").map(String::as_str), Some("closed"));
+        assert_eq!(states.get("ok/m2").map(String::as_str), Some("closed"));
+
+        // Trip primary's breaker.
+        let _ = router
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+
+        let states = router.breaker_states();
+        assert_eq!(
+            states.get("fail/m1").map(String::as_str),
+            Some("open"),
+            "primary breaker should be open after failure_threshold trips"
+        );
+    }
+
+    /// Wave4-A (Codex P1): the failover publisher reads `ROUTER_CONTEXT`
+    /// via task_local and stamps the originating session/turn id onto
+    /// every emitted `FailoverEvent`. Subscribers filter on this so
+    /// concurrent sessions on the same profile-scoped router don't
+    /// receive each other's failovers.
+    #[tokio::test]
+    async fn failover_event_carries_originating_session_from_router_context() {
+        let config = AdaptiveConfig {
+            failure_threshold: 5,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = Arc::new(AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "primary down",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        ));
+        let mut rx = router.subscribe_failover();
+
+        let router_clone = router.clone();
+        let ctx = RouterContext {
+            session_id: Some("local:session-A".into()),
+            turn_id: Some("turn-A".into()),
+        };
+        let messages = vec![Message::user("hello")];
+        let cfg = ChatConfig::default();
+        let _ = with_router_context(ctx, async move {
+            router_clone.chat(&messages, &[], &cfg).await.unwrap()
+        })
+        .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("failover event timed out")
+            .expect("broadcast channel closed");
+        assert_eq!(event.from_provider, "primary/m1");
+        assert_eq!(event.to_provider, "fallback/m2");
+        assert_eq!(
+            event.originating_session_id.as_deref(),
+            Some("local:session-A"),
+            "publisher must stamp originating session from ROUTER_CONTEXT"
+        );
+        assert_eq!(
+            event.originating_turn_id.as_deref(),
+            Some("turn-A"),
+            "publisher must stamp originating turn from ROUTER_CONTEXT"
+        );
+    }
+
+    /// Wave4-A (Codex P1): without a wrapping `ROUTER_CONTEXT` scope
+    /// (CLI smoke / test paths), the publisher falls back to `None` so
+    /// existing callers don't break.
+    #[tokio::test]
+    async fn failover_event_originating_id_is_none_outside_context_scope() {
+        let config = AdaptiveConfig {
+            failure_threshold: 5,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "primary down",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        );
+        let mut rx = router.subscribe_failover();
+
+        let _ = router
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("failover event timed out")
+            .expect("broadcast channel closed");
+        assert_eq!(
+            event.originating_session_id, None,
+            "outside ROUTER_CONTEXT scope, originating_session_id must be None"
+        );
+        assert_eq!(event.originating_turn_id, None);
+    }
+
+    // ── Auto-escalation tests (merged from #945) ──────────────────────────
+
+    /// Sustained slow turns on a single session promote the router to Hedge.
+    #[test]
+    fn auto_escalation_promotes_to_hedge_on_sustained_latency() {
+        let router = auto_escalation_router();
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+
+        // Warmup: 5 fast samples to establish baseline ~100ms.
+        for _ in 0..5 {
+            let decision = router.record_turn_latency("s1", Duration::from_millis(100));
+            assert_eq!(decision, AutoEscalationDecision::NoChange);
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+        // Three slow turns (4x baseline > 3x threshold) → escalate on the third.
+        for i in 0..3 {
+            let decision = router.record_turn_latency("s1", Duration::from_millis(400));
+            if i < 2 {
+                assert_eq!(
+                    decision,
+                    AutoEscalationDecision::NoChange,
+                    "did not expect escalation at turn {i}"
+                );
+            }
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+    }
+
+    /// Disabling the feature is a no-op even under sustained latency.
+    #[test]
+    fn auto_escalation_disabled_is_noop() {
+        let router = auto_escalation_router();
+        router.set_auto_escalation_config(AutoEscalationConfig {
+            enabled: false,
+            ..AutoEscalationConfig::default()
+        });
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Lane,
+            "router should not have escalated with auto_escalation disabled"
+        );
+    }
+
+    /// Two different sessions track independently — slow turns on session A
+    /// do not pollute session B's window.
+    #[test]
+    fn auto_escalation_state_is_session_scoped() {
+        let router = auto_escalation_router();
+        // Warm both.
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+            router.record_turn_latency("s2", Duration::from_millis(100));
+        }
+        // s1 takes 3 slow turns → escalate.
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // But s2's observer should still be at consecutive_slow=0.
+        // We verify indirectly: feed s2 ONE slow turn and confirm it does NOT
+        // re-trigger escalation (router is already Hedge so trigger_escalate
+        // is suppressed) — what we care about is that s2's baseline and slow
+        // count are independent. Check via the helper accessors.
+        let s1_baseline = router.session_latency_baseline("s1");
+        let s2_baseline = router.session_latency_baseline("s2");
+        assert!(s1_baseline.is_some());
+        assert!(s2_baseline.is_some());
+        assert_eq!(s2_baseline, Some(Duration::from_millis(100)));
+        // s2 sample count = 5 (warmup only, fully consumed by window).
+        // s1 sample count: window_size defaults to max(window_size,
+        // baseline_samples) = 5, so 5 warmup + 3 slow = 8 records but the
+        // observer's window caps at 5 (newest first). s2 stayed at 5.
+        assert_eq!(router.session_latency_samples("s2"), 5);
+        assert_eq!(router.session_latency_samples("s1"), 5);
+    }
+
+    /// Hysteresis: a single fast turn after escalation that is still above
+    /// `latency_ceiling_ms * recovery_factor` must NOT trigger recovery.
+    #[test]
+    fn auto_escalation_hysteresis_prevents_flapping() {
+        let router = auto_escalation_router();
+        router.set_auto_escalation_config(AutoEscalationConfig {
+            // Tighter ceiling so the regression test is precise: with
+            // ceiling=200, recovery_factor=0.6 → must be ≤120ms.
+            latency_ceiling_ms: 200,
+            recovery_factor: 0.6,
+            ..AutoEscalationConfig::default()
+        });
+        // Warm at 100ms, then escalate via 3x400ms.
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // One sample at 150ms (above ceiling*0.6=120ms but below baseline*3=300ms).
+        // observer.should_deactivate() WOULD fire, but ceiling check suppresses.
+        let decision = router.record_turn_latency("s1", Duration::from_millis(150));
+        assert_eq!(
+            decision,
+            AutoEscalationDecision::NoChange,
+            "expected hysteresis to suppress recovery at 150ms above ceiling*factor"
+        );
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // Now a sample below the recovery ceiling → recover.
+        let decision = router.record_turn_latency("s1", Duration::from_millis(50));
+        assert_eq!(decision, AutoEscalationDecision::Deescalated);
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+    }
+
+    /// Recovery restores the pre-escalation mode (not just Off).
+    #[test]
+    fn auto_escalation_restores_previous_mode() {
+        let router = auto_escalation_router();
+        // Start in Lane.
+        router.set_mode(AdaptiveMode::Lane);
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        router.record_turn_latency("s1", Duration::from_millis(50));
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Lane,
+            "router should restore the pre-escalation mode (Lane), not Off"
+        );
+    }
+
+    /// Callback fires on escalate AND deescalate with full event payload.
+    #[test]
+    fn auto_escalation_callback_fires_on_both_edges() {
+        let router = auto_escalation_router();
+        let captured: Arc<Mutex<Vec<AutoEscalationEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let recv = captured.clone();
+        router.set_auto_escalation_callback(Some(Arc::new(move |e| {
+            recv.lock().unwrap().push(e.clone());
+        })));
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        router.record_turn_latency("s1", Duration::from_millis(50));
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 2, "expected 2 callback fires (esc + de-esc)");
+        assert!(events[0].escalated);
+        assert_eq!(events[0].new_mode, AdaptiveMode::Hedge);
+        assert_eq!(events[0].previous_mode, AdaptiveMode::Lane);
+        assert!(!events[1].escalated);
+        assert_eq!(events[1].new_mode, AdaptiveMode::Lane);
+        assert_eq!(events[1].previous_mode, AdaptiveMode::Hedge);
+    }
+
+    /// 4-turn fake slow run still does NOT escalate (slow_trigger default = 3).
+    /// The single-sample boundary is exercised by `forget_session`.
+    #[test]
+    fn auto_escalation_forget_session_drops_state() {
+        let router = auto_escalation_router();
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        assert!(router.session_latency_baseline("s1").is_some());
+        assert!(router.forget_session("s1"));
+        assert!(router.session_latency_baseline("s1").is_none());
+        assert!(!router.forget_session("s1"));
+    }
+
+    /// Codex review P1.2: if a session exits while still escalated,
+    /// forget_session restores the router mode so we don't get stuck in
+    /// Hedge with no record of how to recover.
+    #[test]
+    fn auto_escalation_forget_session_restores_mode() {
+        let router = auto_escalation_router();
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // s1 exits while still escalated.
+        router.forget_session("s1");
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Lane,
+            "router should restore the pre-escalation mode when the escalating session is forgotten"
+        );
+    }
+
+    /// Codex review P1.3: if the operator manually moves the router off
+    /// Hedge (`/adaptive off|lane`) during an active escalation, a
+    /// subsequent fast turn must NOT override the operator's choice via
+    /// the cached pre_escalation_mode.
+    #[test]
+    fn auto_escalation_respects_operator_override() {
+        let router = auto_escalation_router();
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // Operator decides to force the router off (e.g. costs).
+        router.set_mode(AdaptiveMode::Off);
+        // A fast turn arrives — recovery would normally restore Lane.
+        router.record_turn_latency("s1", Duration::from_millis(50));
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Off,
+            "router should respect the operator's manual override and not restore the pre-escalation mode"
+        );
+    }
+
+    /// Codex review P1.4: a session whose baseline drifts up to e.g. 5s
+    /// will not normally consider 8s "slow" (8 < 5*3=15). The
+    /// `latency_ceiling_ms` config knob must still trigger escalation
+    /// when an absolute ceiling is exceeded.
+    #[test]
+    fn auto_escalation_latency_ceiling_triggers_escalation() {
+        let router = auto_escalation_router();
+        // Configure a tight ceiling: 1500ms.
+        router.set_auto_escalation_config(AutoEscalationConfig {
+            latency_ceiling_ms: 1_500,
+            recovery_factor: 0.6,
+            // Keep slow_trigger=3 so the test mirrors gateway defaults.
+            ..AutoEscalationConfig::default()
+        });
+        // Warm a high baseline at 1s so 3x baseline = 3s > 1.5s ceiling.
+        // The legacy baseline-only logic would NOT fire on 2s samples
+        // (2 < 3) — only the ceiling-aware path catches them.
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(1_000));
+        }
+        // 3 samples at 2s: each is below 3x baseline (3s) but above
+        // ceiling (1.5s) → must escalate.
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(2_000));
+        }
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Hedge,
+            "router should have escalated on the latency_ceiling_ms path"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // RFC-3 (#1292) — lane-aware provider selection
+    // ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_steers_chat_to_first_matching_candidate() {
+        // Build a 3-slot router so the lane filter has meaningful
+        // narrowing to do (priority order [primary, code, strong]).
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "openrouter",
+                    model: "gpt-4o-mini",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "deepseek",
+                    model: "deepseek-coder",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        // Default mode is Off → priority order; pre-lane this would
+        // pick `openrouter` (index 0).
+        let baseline = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(baseline.content.as_deref(), Some("from-openrouter"));
+
+        // Now scope a CodeCapable lane — the first lane candidate is
+        // `(anthropic, claude-sonnet-4-6)`, so the router should
+        // route to anthropic even though its priority is lowest.
+        let ctx = crate::LaneContext::for_topic(Some("code:refactor"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-anthropic"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_unknown_topic_preserves_default_behavior() {
+        // Built-in default for `chat:*` is `General` → no filter.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "wisemodel",
+                    model: "kimi-k2.6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let ctx = crate::LaneContext::for_topic(Some("chat:hello"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // General lane = no filter, so priority-0 (wisemodel) wins.
+        assert_eq!(resp.content.as_deref(), Some("from-wisemodel"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_zero_matches_falls_through_to_full_chain() {
+        // None of the registered providers match the InstructionStrong
+        // defaults — the filter must not starve the router.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "custom-provider",
+                    model: "custom-model",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "other-provider",
+                    model: "other-model",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let ctx = crate::LaneContext::for_topic(Some("slides:demo"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Zero lane matches → priority-0 wins (no starvation).
+        assert_eq!(resp.content.as_deref(), Some("from-custom-provider"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_circuit_breaker_open_on_first_lane_candidate_falls_through_to_second() {
+        // Lane has 2 candidates; the first is failing and trips its
+        // circuit, the second is healthy.
+        let router = AdaptiveRouter::new(
+            vec![
+                // Slot 0 — fast-chat lane's first candidate, failing.
+                Arc::new(MockProvider {
+                    name: "wisemodel",
+                    model: "kimi-k2.6",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "503 down",
+                }),
+                // Slot 1 — fast-chat lane's second candidate, healthy.
+                Arc::new(MockProvider {
+                    name: "deepseek",
+                    model: "deepseek-chat",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                // Slot 2 — outside any lane, low-priority backstop.
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        );
+        // Trip the circuit on slot 0 first via a non-lane call.
+        let _ = router.chat(&[], &[], &ChatConfig::default()).await;
+        assert!(router.slots[0].metrics.is_circuit_open(1));
+
+        // Now lane scope `FastChat` — the first candidate is
+        // circuit-open, so the router should advance to the second
+        // (`deepseek-chat`) rather than fall through to anthropic.
+        let mut cfg = crate::LaneRoutingConfig::default();
+        cfg.topic_lanes
+            .insert("loop".to_string(), crate::Lane::FastChat);
+        let ctx = crate::LaneContext::for_topic(Some("loop:test"), Some(&cfg));
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-deepseek"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_general_is_no_op() {
+        // A `General` lane has no candidates and must not change
+        // anything about how the router behaves vs. an absent scope.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let ctx = crate::LaneContext {
+            lane: Some(crate::Lane::General),
+            config: None,
+        };
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-primary"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_lane_filter_normalizes_endpoint_tagged_provider_names() {
+        // Codex P2 follow-up: profiles using OpenAI-compatible
+        // providers carry endpoint-tagged labels (e.g.
+        // `wisemodel@autodl`). The lane filter normalizes by
+        // stripping the `@suffix` before matching against lane
+        // candidate strings.
+        let router = AdaptiveRouter::new(
+            vec![
+                // Out-of-lane (untagged).
+                Arc::new(MockProvider {
+                    name: "openrouter",
+                    model: "gpt-4o-mini",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                // In-lane after `@` strip: `wisemodel@autodl` →
+                // `wisemodel` matches the FastChat default.
+                Arc::new(MockProvider {
+                    name: "wisemodel@autodl",
+                    model: "kimi-k2.6",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let mut cfg = crate::LaneRoutingConfig::default();
+        cfg.topic_lanes.insert("loop".into(), crate::Lane::FastChat);
+        let ctx = crate::LaneContext::for_topic(Some("loop:t"), Some(&cfg));
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Should pick the tagged wisemodel slot, not the
+        // out-of-lane openrouter slot.
+        assert_eq!(resp.content.as_deref(), Some("from-wisemodel@autodl"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_tagged_candidate_in_override_matches_only_tagged_slot() {
+        // Codex P2 follow-up #2: a profile override that names an
+        // endpoint-tagged label (e.g. `moonshot@autodl`) MUST pin to
+        // exactly that slot — the untagged `moonshot` slot or a
+        // differently-tagged `moonshot@other` slot should NOT
+        // satisfy the override.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "k2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "moonshot@autodl",
+                    model: "k2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        let mut cfg = crate::LaneRoutingConfig::default();
+        cfg.topic_lanes
+            .insert("loop".to_string(), crate::Lane::CodeCapable);
+        cfg.lane_models.insert(
+            crate::Lane::CodeCapable,
+            vec![("moonshot@autodl".to_string(), "k2".to_string())],
+        );
+        let ctx = crate::LaneContext::for_topic(Some("loop:test"), Some(&cfg));
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Tagged candidate MUST pick the tagged slot, not the
+        // untagged primary.
+        assert_eq!(resp.content.as_deref(), Some("from-moonshot@autodl"));
+    }
+
+    #[tokio::test]
+    async fn rfc3_hedge_confines_alternate_to_lane_when_filter_active() {
+        // Codex P2 follow-up: under `AdaptiveMode::Hedge`, the
+        // alternate hedge target must be in-lane. Build a chain
+        // where the lane candidate is a SLOW out-of-priority slot
+        // and a non-lane slot is fast: without the fix, hedge would
+        // race the fast non-lane slot and return its content; with
+        // the fix, hedge skips when no in-lane alternate is healthy
+        // and the single-provider path runs against the primary.
+        //
+        // Topology:
+        //   slot 0 primary = `anthropic / claude-sonnet-4-6` (in lane, fast)
+        //   slot 1 alt     = `openrouter / out-of-lane` (fast, NOT in lane)
+        // Expectation: hedge candidate set is empty (the only
+        // out-of-lane slot is filtered out), so hedge falls through
+        // and the response comes from the primary.
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "anthropic",
+                    model: "claude-sonnet-4-6",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "openrouter",
+                    model: "out-of-lane",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+        router.set_mode(AdaptiveMode::Hedge);
+
+        let ctx = crate::LaneContext::for_topic(Some("slides:demo"), None);
+        let resp = crate::with_lane_context(ctx, async {
+            router.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        // Lane filter excludes openrouter from the hedge alternate
+        // set, so the only hedge candidate is none → fall through
+        // to single-provider path against the primary (anthropic
+        // is in-lane).
+        assert_eq!(resp.content.as_deref(), Some("from-anthropic"));
     }
 }

@@ -83,13 +83,13 @@ fn derive_dashboard_auth_from_profile(
 
     Some((
         crate::otp::DashboardAuthConfig {
-            smtp: crate::otp::SmtpConfig {
+            smtp: Some(crate::otp::SmtpConfig {
                 host: host.to_string(),
                 port: email.smtp_port.unwrap_or(465),
                 username: username.to_string(),
                 password_env,
                 from_address: from_address.to_string(),
-            },
+            }),
             session_expiry_hours: 24,
             allow_self_registration: false,
             static_tokens: Vec::new(),
@@ -158,13 +158,15 @@ fn resolve_dashboard_auth_smtp_password(
     profile_store: &crate::profiles::ProfileStore,
     auth_config: &crate::otp::DashboardAuthConfig,
 ) -> Option<String> {
-    if std::env::var(&auth_config.smtp.password_env).is_ok() {
+    // No SMTP block on disk → nothing to resolve.
+    let smtp = auth_config.smtp.as_ref()?;
+    if std::env::var(&smtp.password_env).is_ok() {
         return None;
     }
 
     for profile in preferred_dashboard_auth_profiles(profile_store) {
         if let Some(email) = profile.config.email.as_ref() {
-            if profile_email_matches_dashboard_smtp(email, &auth_config.smtp) {
+            if profile_email_matches_dashboard_smtp(email, smtp) {
                 if let Some(secret) = resolve_profile_email_secret(email, &profile.config.env_vars)
                 {
                     tracing::info!(
@@ -179,20 +181,18 @@ fn resolve_dashboard_auth_smtp_password(
 
     let profiles_for_smtp = profile_store.list().unwrap_or_default();
     for profile in &profiles_for_smtp {
-        if let Some(password) = profile.config.env_vars.get(&auth_config.smtp.password_env) {
+        if let Some(password) = profile.config.env_vars.get(&smtp.password_env) {
             if password == crate::auth::keychain::KEYCHAIN_MARKER {
-                if let Ok(Some(secret)) =
-                    crate::auth::keychain::get_secret(&auth_config.smtp.password_env)
-                {
+                if let Ok(Some(secret)) = crate::auth::keychain::get_secret(&smtp.password_env) {
                     tracing::info!(
-                        var = %auth_config.smtp.password_env,
+                        var = %smtp.password_env,
                         "SMTP password resolved from keychain"
                     );
                     return Some(secret);
                 }
             } else if !password.is_empty() {
                 tracing::info!(
-                    var = %auth_config.smtp.password_env,
+                    var = %smtp.password_env,
                     profile = %profile.id,
                     "SMTP password resolved from profile env_vars"
                 );
@@ -217,6 +217,10 @@ pub struct ServeCommand {
     /// Use 0.0.0.0 to accept connections from all interfaces.
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
+
+    /// Run AppUI JSON-RPC over stdin/stdout instead of binding HTTP.
+    #[arg(long)]
+    pub stdio: bool,
 
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
@@ -294,6 +298,14 @@ impl ServeCommand {
             Config::load_with_path(&cwd, &data_dir)?
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
+        if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
+            .configure_supervisor_store(data_dir.join("supervisor"))
+        {
+            tracing::warn!(
+                %error,
+                "failed to configure durable agent supervisor store; continuing with in-process supervision only"
+            );
+        }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 
@@ -406,11 +418,16 @@ impl ServeCommand {
                 continue;
             }
             let profile_data_dir = profile_store.resolve_data_dir(profile);
-            match crate::runtime::ProfileRuntime::bootstrap(
+            // Section B (codex review round-3): thread the host's
+            // strict-signing policy so the per-profile plugin load honors
+            // `plugins.require_signed = true` from the top-level config
+            // even when individual profile JSONs omit the field.
+            match crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
                 profile,
                 &profile_data_dir,
                 Some(&data_dir),
                 crate::runtime::BootstrapRole::Serve,
+                Some(&config.plugins),
             )
             .await
             {
@@ -442,7 +459,12 @@ impl ServeCommand {
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(self.port, auth_token.clone()),
+                .with_serve_config(self.port, auth_token.clone())
+                // Section B (codex review round-5 P1.2): every spawned
+                // gateway inherits the host's strict-signing policy via
+                // an env var. `Config::from_file` OR-merges it onto the
+                // gateway's effective `plugins.require_signed`.
+                .with_host_plugins_require_signed(config.plugins.require_signed),
         );
         process_manager.set_self_ref();
 
@@ -558,6 +580,19 @@ impl ServeCommand {
         .await
         .wrap_err("failed to build swarm state")?;
 
+        // Issue #1001 follow-up: in-memory signed-preview token cache.
+        // Issue #1009: construct the cache first so we can spawn the
+        // background sweeper and own the resulting handle inside
+        // `AppState` — when the last `Arc<AppState>` is dropped the
+        // wrapper aborts the task instead of leaking it (the previous
+        // local-binding pattern relied on `process::exit(0)` and would
+        // strand the sweeper on any error-path drop).
+        let preview_tokens = Arc::new(crate::api::PreviewTokens::new());
+        let preview_sweeper = crate::api::PreviewSweeperHandle::spawn(
+            preview_tokens.clone(),
+            crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
+        );
+
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
@@ -629,7 +664,28 @@ impl ServeCommand {
             // `with_builtins_and_sandbox(serve_cwd)`. See
             // `api/ui_protocol.rs::session_tool_registry`.
             appui_default_session_cwd: config.appui.default_session_cwd.clone(),
+            // Issue #1001 follow-up: in-memory signed-preview token
+            // cache backs `POST /api/my/preview/sign` /
+            // `GET /api/preview-signed/...` so the SPA iframe can drop
+            // the `Authorization: Bearer ...` header that the closed
+            // `/api/preview/...` route now requires. Daemon restart
+            // invalidates every grant (see
+            // `crate::api::preview_tokens` for the design rationale).
+            preview_tokens,
+            // Issue #1009: owning sweeper handle. `Drop` aborts the
+            // tokio task when the last `Arc<AppState>` is released,
+            // replacing the previous `_preview_sweeper` local that
+            // leaked the task on any non-`process::exit(0)` shutdown
+            // path.
+            preview_sweeper: Some(preview_sweeper),
         });
+
+        if self.stdio {
+            crate::api::ui_protocol::stdio_connection(state).await?;
+            tracing::info!("stopping all gateway child processes");
+            let _ = process_manager.stop_all().await;
+            return Ok(());
+        }
 
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
@@ -1100,11 +1156,14 @@ mod tests {
 
         let (auth, password) = derive_dashboard_auth_from_profiles(&store)
             .expect("dashboard auth should derive from admin profile");
-        assert_eq!(auth.smtp.host, "smtp.example.com");
-        assert_eq!(auth.smtp.port, 587);
-        assert_eq!(auth.smtp.username, "admin@example.com");
-        assert_eq!(auth.smtp.password_env, "SMTP_PASSWORD");
-        assert_eq!(auth.smtp.from_address, "admin@example.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().host, "smtp.example.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().port, 587);
+        assert_eq!(auth.smtp.as_ref().unwrap().username, "admin@example.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().password_env, "SMTP_PASSWORD");
+        assert_eq!(
+            auth.smtp.as_ref().unwrap().from_address,
+            "admin@example.com"
+        );
         assert_eq!(password.as_deref(), Some("secret"));
     }
 
@@ -1143,13 +1202,13 @@ mod tests {
             .unwrap();
 
         let auth = crate::otp::DashboardAuthConfig {
-            smtp: crate::otp::SmtpConfig {
+            smtp: Some(crate::otp::SmtpConfig {
                 host: "smtp.example.com".into(),
                 port: 465,
                 username: "admin@example.com".into(),
                 password_env: "SMTP_PASSWORD".into(),
                 from_address: "admin@example.com".into(),
-            },
+            }),
             session_expiry_hours: 24,
             allow_self_registration: false,
             static_tokens: Vec::new(),
@@ -1224,9 +1283,9 @@ mod tests {
 
         let (auth, password) = derive_dashboard_auth_from_profiles(&store)
             .expect("dashboard auth should derive from usable profile");
-        assert_eq!(auth.smtp.host, "smtp.gmail.com");
-        assert_eq!(auth.smtp.username, "dspfac@gmail.com");
-        assert_eq!(auth.smtp.from_address, "dspfac@gmail.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().host, "smtp.gmail.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().username, "dspfac@gmail.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().from_address, "dspfac@gmail.com");
         assert_eq!(password.as_deref(), Some("app-password"));
     }
 
@@ -1269,13 +1328,13 @@ mod tests {
             .unwrap();
 
         let auth = crate::otp::DashboardAuthConfig {
-            smtp: crate::otp::SmtpConfig {
+            smtp: Some(crate::otp::SmtpConfig {
                 host: "smtp.gmail.com".into(),
                 port: 465,
                 username: "dspfac@gmail.com".into(),
                 password_env: "SMTP_PASSWORD".into(),
                 from_address: "dspfac@gmail.com".into(),
-            },
+            }),
             session_expiry_hours: 24,
             allow_self_registration: false,
             static_tokens: Vec::new(),

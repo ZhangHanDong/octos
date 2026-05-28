@@ -12,7 +12,7 @@ use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, HookExecutor, ToolRegistry,
     read_workspace_policy,
 };
-use octos_core::{AgentId, Message, MessageRole};
+use octos_core::{AgentId, Message, MessageRole, SessionScope};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
     RetryProvider,
@@ -258,11 +258,24 @@ impl ChatCommand {
             eprintln!("Bootstrapped {n} platform skills");
         }
 
-        // Load plugins (includes app-skills from .octos/skills/)
+        // Load plugins (includes app-skills from .octos/skills/).
+        // Section B (codex review P1.1): honour `plugins.require_signed`
+        // from the resolved Config so an operator who opts into strict
+        // signing has it enforced on `octos chat` too.
         let plugin_dirs = Config::plugin_dirs_from_project(&cwd.join(".octos"));
         let mut plugin_result = octos_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
-            match octos_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[]) {
+            match octos_agent::PluginLoader::load_into_with_options(
+                &mut tools,
+                &plugin_dirs,
+                &[],
+                octos_agent::PluginLoadOptions {
+                    work_dir: None,
+                    synthesis_config: None,
+                    require_signed: config.plugins.require_signed,
+                    verified_cache_dir: None,
+                },
+            ) {
                 Ok(result) => plugin_result = result,
                 Err(e) => eprintln!("Warning: plugin loading failed: {e}"),
             }
@@ -276,15 +289,32 @@ impl ChatCommand {
             }
         }
 
-        // Pipeline tool (DOT-based multi-step workflows, with plugin access)
-        let pipeline_tool = octos_pipeline::RunPipelineTool::new(
+        // Pipeline tool (DOT-based multi-step workflows, with plugin access).
+        // Section B (codex review follow-up): propagate
+        // `plugins.require_signed` so pipeline workers enforce the same
+        // gate as the main session.
+        //
+        // NEW-06 codex follow-up: also propagate the embedder so the
+        // pipeline-spawned worker `Agent` instances inherit the same
+        // hybrid scored + filtered episodic-memory recall the parent
+        // chat agent gets at the `agent = agent.with_embedder(..)` line
+        // below. Without this, `octos chat`'s pipeline workers fall back
+        // to the unfiltered cwd-only path in `EpisodeStore::find_relevant`
+        // and can pull in cross-domain episodes (the NEW-06 contamination
+        // root cause). Construction is extracted into
+        // [`build_run_pipeline_tool`] so the regression test in
+        // `octos-pipeline/tests/embedder_propagation.rs` can pin the
+        // wiring without instantiating the full chat command.
+        let pipeline_tool = build_run_pipeline_tool(
             llm.clone(),
             memory.clone(),
             cwd.clone(),
             data_dir.clone(),
-        )
-        .with_provider_policy(tools.provider_policy().cloned())
-        .with_plugin_dirs(plugin_dirs);
+            tools.provider_policy().cloned(),
+            plugin_dirs.clone(),
+            config.plugins.require_signed,
+            create_embedder(&config),
+        );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
             "run_pipeline",
@@ -400,6 +430,57 @@ impl ChatCommand {
             supervisor_for_summary,
         ));
 
+        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
+        // construct the single filesystem contract for this solo
+        // session and stash it on the agent. `cwd` may have come from
+        // `--cwd` (potentially relative) or from `current_dir()`
+        // (always absolute). Absolutize defensively so the
+        // `SessionScope::solo` invariant holds without panicking on
+        // user input. Phase 2 PRs will start reading this from tools,
+        // pipelines, and plugins; today it is wired through but unused.
+        //
+        // Codex review note (Phase-1 LOW): surface a hard error when
+        // `cwd` is relative AND `current_dir()` fails so the
+        // `SessionScope::solo` `expect` below can never fire on a
+        // relative path. Mirroring `current_dir()` failures up as
+        // `wrap_err` is consistent with the existing fallback at the
+        // top of `run_async` that constructed `cwd` the same way.
+        let absolute_cwd: PathBuf = if cwd.is_absolute() {
+            cwd.clone()
+        } else {
+            std::env::current_dir()
+                .wrap_err("failed to absolutize --cwd: current_dir() unavailable")?
+                .join(&cwd)
+        };
+        // PR-A: thread the per-profile plugin install directories
+        // through to the scope so `read_file` can reach the SKILL.md
+        // content the agent's system prompt auto-injects.
+        //
+        // Codex round-2 BLOCKER 2 (PR #1327 review): SKIP dirs that
+        // fail canonicalize (fail-closed). Keeping the raw path was a
+        // fail-open vulnerability — a later symlink replacement
+        // (`/tmp/missing -> /etc`) would canonicalise both sides to
+        // `/etc` and allow reads as `InSkillDir`. The shared helper in
+        // `octos-core` drops the entry and logs a warning per skip.
+        let canonical_skill_dirs: Vec<PathBuf> =
+            octos_core::canonicalize_skill_read_zones(&plugin_dirs);
+        let session_scope = {
+            let base = SessionScope::solo(absolute_cwd.clone(), Vec::new()).expect(
+                "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
+            );
+            let scope = base
+                .with_skill_read_zones(canonical_skill_dirs)
+                .unwrap_or_else(|err| {
+                    eprintln!(
+                        "Warning: with_skill_read_zones rejected one or more plugin_dirs: {err}; \
+                         continuing without skill_read_zones (read_file may not reach SKILL.md references)"
+                    );
+                    SessionScope::solo(absolute_cwd.clone(), Vec::new())
+                        .expect("absolutized cwd still valid")
+                });
+            Arc::new(scope)
+        };
+
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(reporter)
@@ -408,7 +489,8 @@ impl ChatCommand {
             .with_profile(profile_arc.clone())
             .with_file_state_cache(file_state_cache)
             .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator);
+            .with_subagent_summary_generator(subagent_summary_generator)
+            .with_session_scope(session_scope);
 
         // M8.3: if the profile declares a system_prompt_template, try to
         // read it relative to `~/.octos/profiles/<name>/`. The path is a
@@ -711,6 +793,39 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
     Some(Arc::new(e))
 }
 
+/// Build the [`octos_pipeline::RunPipelineTool`] used by the chat command,
+/// threading through the per-session policy / plugin dirs / signing gate /
+/// embedder.
+///
+/// NEW-06 codex follow-up — extracted into a stand-alone function so the
+/// regression test in `octos-pipeline/tests/embedder_propagation.rs` can
+/// pin the embedder propagation without instantiating the entire chat
+/// command (which depends on rustyline, hooks, profiles, MCP, etc.).
+///
+/// Keep the construction order byte-for-byte identical to the inline
+/// path it replaced — the policy/plugin builders rely on insertion order
+/// (`with_plugin_dirs` invalidates the plugin cache, etc.).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_run_pipeline_tool(
+    llm: Arc<dyn LlmProvider>,
+    memory: Arc<EpisodeStore>,
+    cwd: PathBuf,
+    data_dir: PathBuf,
+    provider_policy: Option<octos_agent::ToolPolicy>,
+    plugin_dirs: Vec<PathBuf>,
+    plugin_require_signed: bool,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+) -> octos_pipeline::RunPipelineTool {
+    let mut pipeline_tool = octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir)
+        .with_provider_policy(provider_policy)
+        .with_plugin_dirs(plugin_dirs)
+        .with_plugin_require_signed(plugin_require_signed);
+    if let Some(embedder) = embedder {
+        pipeline_tool = pipeline_tool.with_embedder(embedder);
+    }
+    pipeline_tool
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -751,6 +866,194 @@ mod tests {
             resolve_provider_policy(&config, "anthropic", "claude-sonnet-4-20250514").is_none()
         );
     }
+
+    #[test]
+    fn chat_constructs_solo_session_scope_with_user_cwd() {
+        // Phase 1 SessionScope migration (PR #1198 follow-up): the
+        // chat entry point constructs a solo [`SessionScope`] from the
+        // user-finalized `cwd` (or `current_dir()` fallback) and
+        // attaches it to the per-session agent via
+        // [`Agent::with_session_scope`]. This test mirrors the exact
+        // construction the entry point performs so a regression that
+        // drops the wiring (or accidentally rejects valid input by
+        // mistakenly making the constructor fail) fails the suite
+        // before it ships to fleet.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        // Mirror chat.rs's absolutize-then-build pattern. The entry
+        // point propagates `current_dir()` failures via `wrap_err?`;
+        // here in the test the cwd is already absolute (`tempdir`
+        // returns an absolute path) so the relative branch is never
+        // taken.
+        let absolute_cwd: PathBuf = if cwd.is_absolute() {
+            cwd.clone()
+        } else {
+            std::env::current_dir()
+                .expect("current_dir() in tests")
+                .join(&cwd)
+        };
+        let scope = SessionScope::solo(absolute_cwd, Vec::new())
+            .expect("solo SessionScope construction must succeed for an absolute cwd");
+        assert_eq!(scope.workspace(), cwd.as_path());
+        assert_eq!(scope.root(), cwd.as_path());
+        assert!(scope.shared_zones().is_empty());
+    }
+
+    #[test]
+    fn chat_solo_session_scope_does_not_panic_on_relative_cwd_input() {
+        // Defensive cover for chat.rs's absolutize branch — the
+        // `--cwd relative` case must not propagate a relative path
+        // into `SessionScope::solo`, which would `expect` on the
+        // `RootNotAbsolute` invariant. The chat entry point now
+        // bubbles `current_dir()` errors up via `wrap_err?` so the
+        // branch only ever produces an absolute path or returns Err
+        // before reaching the `SessionScope::solo` call site.
+        let relative = PathBuf::from("some-subdir");
+        let base = std::env::current_dir().expect("current_dir() in tests");
+        let absolute_cwd: PathBuf = if relative.is_absolute() {
+            relative.clone()
+        } else {
+            base.join(&relative)
+        };
+        assert!(
+            absolute_cwd.is_absolute(),
+            "current_dir().join(relative) must produce an absolute path"
+        );
+        SessionScope::solo(absolute_cwd, Vec::new())
+            .expect("SessionScope::solo accepts the absolutized path");
+    }
+
+    /// NEW-06 codex follow-up — when [`build_run_pipeline_tool`] is
+    /// given an embedder, the resulting [`octos_pipeline::RunPipelineTool`]
+    /// must carry it through so pipeline workers spawned from `octos chat`
+    /// inherit the contamination-safe hybrid memory recall path.
+    ///
+    /// Regression guard: if a future refactor drops the
+    /// `.with_embedder(...)` call on the chat construction path the
+    /// `embedder_for_test()` assertion below goes red.
+    #[tokio::test]
+    async fn build_run_pipeline_tool_propagates_embedder_when_present() {
+        use async_trait::async_trait;
+        use octos_llm::EmbeddingProvider;
+
+        struct StubEmbedder;
+        #[async_trait]
+        impl EmbeddingProvider for StubEmbedder {
+            async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![0.0]; texts.len()])
+            }
+            fn dimension(&self) -> usize {
+                1
+            }
+        }
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmProvider for MockLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("ok".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+            fn model_id(&self) -> &str {
+                "mock-1"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
+        let llm = Arc::new(MockLlm) as Arc<dyn LlmProvider>;
+        let embedder = Arc::new(StubEmbedder) as Arc<dyn EmbeddingProvider>;
+
+        let tool = build_run_pipeline_tool(
+            llm,
+            memory,
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            false,
+            Some(embedder),
+        );
+
+        assert!(
+            tool.embedder_for_test().is_some(),
+            "build_run_pipeline_tool must call `.with_embedder(..)` when \
+             the caller supplies one — otherwise `octos chat` pipeline \
+             workers fall back to the unfiltered cwd-only memory recall \
+             path and re-introduce the NEW-06 contamination."
+        );
+    }
+
+    /// NEW-06 codex follow-up — without an embedder argument the helper
+    /// produces a tool that matches pre-fix behaviour byte-for-byte
+    /// (`embedder_for_test()` returns `None`). Locks the legacy fall-through
+    /// for callers that don't have an embedder configured.
+    #[tokio::test]
+    async fn build_run_pipeline_tool_defaults_to_no_embedder() {
+        use async_trait::async_trait;
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmProvider for MockLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("ok".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+            fn model_id(&self) -> &str {
+                "mock-1"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
+        let llm = Arc::new(MockLlm) as Arc<dyn LlmProvider>;
+
+        let tool = build_run_pipeline_tool(
+            llm,
+            memory,
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            false,
+            None,
+        );
+
+        assert!(
+            tool.embedder_for_test().is_none(),
+            "build_run_pipeline_tool with `embedder = None` must not \
+             attach one — otherwise legacy callers that never configured \
+             an embedder would observe a behaviour change."
+        );
+    }
 }
 
 /// Create an LLM provider from name and config.
@@ -765,7 +1068,7 @@ pub(crate) fn create_provider(
 ) -> Result<Arc<dyn LlmProvider>> {
     let provider =
         create_provider_with_api_type(name, config, model, base_url, config.api_type.as_deref())?;
-    println!("{}: {}", "Model".green(), provider.model_id());
+    eprintln!("{}: {}", "Model".green(), provider.model_id());
     Ok(provider)
 }
 
