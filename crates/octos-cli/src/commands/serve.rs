@@ -246,6 +246,15 @@ pub struct ServeCommand {
     #[arg(long)]
     pub auth_token: Option<String>,
 
+    /// Enable the no-password "solo" login (`POST /api/auth/solo*`) for a
+    /// local single-user install. OFF by default. Only honoured for direct
+    /// loopback requests on a Local-mode host with profile/user stores, and
+    /// never when the request carries reverse-proxy headers. Also settable
+    /// via `OCTOS_SOLO_LOGIN=1`. Do NOT set on a host fronted by a reverse
+    /// proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
+    #[arg(long)]
+    pub solo: bool,
+
     /// Disable automatic retry on transient errors.
     #[arg(long)]
     pub no_retry: bool,
@@ -389,6 +398,14 @@ impl ServeCommand {
         // per-profile loop free of redundant disk writes.
         octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
         octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+        // Gap 4.1: bundle generic pipelines (deep_research) into the
+        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline`
+        // always discovers them even when the `mofa-research` skill carrying
+        // `deep_research.dot` has drifted off a profile. Per-profile
+        // `RunPipelineTool`s register that dir as the LOWEST-precedence
+        // search path via `with_octos_home` (bootstrap-dir == search-dir).
+        // Installed pipelines of the same name always win (no clobber).
+        octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
 
         // M11-D — build the per-profile runtime catalog. For every
         // enabled profile that has an active primary LLM selection,
@@ -634,6 +651,10 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
+            solo_login_enabled: self.solo
+                || std::env::var("OCTOS_SOLO_LOGIN")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
@@ -913,6 +934,16 @@ impl ServeCommand {
                 tracing::info!("monitor started (watchdog + health checks + alerts)");
             }
         }
+
+        // mini5 soak gap #1: drain queued master continuations
+        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
+        // even when NO ws/stdio client is connected. The per-connection
+        // `appui_continuation_tick` only runs inside a live handler loop, so a
+        // sub-agent finishing while the TUI is disconnected (or a continuation
+        // re-loaded after a serve restart) would otherwise sit undrained until
+        // a client reconnects. Shares the process-global active-turns registry
+        // with the per-connection ticks, so there is no double-run.
+        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
 
         let app = build_router(state);
         let addr = format!("{}:{}", self.host, self.port);

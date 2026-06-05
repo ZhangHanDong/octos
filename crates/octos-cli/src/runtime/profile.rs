@@ -174,6 +174,13 @@ pub struct ProfileRuntime {
     /// this value.
     pub default_sandbox: SandboxConfig,
 
+    /// Configured agent iteration budget (`config.max_iterations`) that
+    /// sessions — and the sub-agents they spawn — inherit. `None` falls back
+    /// to [`AgentConfig`]'s default. Captured here so the session runtime
+    /// honors the configured value instead of a hardcoded cap (which silently
+    /// starved spawned sub-agents doing multi-step work).
+    pub max_iterations: Option<u32>,
+
     /// The base [`ToolRegistry`] template — builtins + plugins +
     /// MCP agents + the LRU pin set — but **NOT** workspace-bound.
     /// Sessions clone this and call `with_workspace_root` to obtain
@@ -612,6 +619,16 @@ impl ProfileRuntime {
                 Ok(result) => plugin_result = result,
                 Err(e) => warn!(profile_id = %profile.id, error = %e, "plugin loading failed"),
             }
+            // SPEC-VENDOR-NODE-V1 HTTP tool discovery — hard-fail per @ymote's
+            // Finding 2 contract (see chat.rs for rationale).
+            octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "HTTP tool discovery failed during profile {} bootstrap",
+                        profile.id
+                    )
+                })?;
         }
 
         // Step 14: skill-declared MCP servers.
@@ -958,6 +975,7 @@ impl ProfileRuntime {
             plugin_env_template,
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
+            max_iterations: config.max_iterations,
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             plugin_dirs,

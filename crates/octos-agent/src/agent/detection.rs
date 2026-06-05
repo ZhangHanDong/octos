@@ -1,12 +1,33 @@
 //! Detection of repetitive output and retriable responses.
 
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use octos_core::ToolCall;
 use octos_llm::{ChatResponse, StopReason};
 use regex::Regex;
 
 use super::Agent;
+
+/// Process-global monotonic counter for synthesizing inline-`<invoke>`
+/// tool-call ids.
+///
+/// Models that emit tool calls as inline `<invoke name=...>` XML in assistant
+/// TEXT (rather than native structured `tool_calls`) carry no call id, so octos
+/// synthesizes one. Like the Gemini synthesizer (`call_gemini_`) and the
+/// agent's empty-id fallback (`call_synth_`), this id MUST be process-unique:
+/// it becomes `BackgroundTask::tool_call_id`, and the supervisor's synth-ack
+/// set (commit 9e972d8a), the `mark_descendants_failed` pipeline cascade, and
+/// the orphan-sweep liveness gate's tool_call_id-family exemption
+/// (fix/orphan-sweep-liveness-gate) all key on it. A per-response positional
+/// index reset every turn, so two first-position inline calls to the SAME tool
+/// (e.g. `run_pipeline`) in different turns both got
+/// `call_inline_0_run_pipeline` — colliding, which could match a stale
+/// synth-ack or let a live task's tcid falsely exempt a dead one from orphan
+/// reaping. A process-global monotonic counter never repeats within the
+/// process; the `call_inline_` prefix keeps it disjoint from the other two
+/// synthesized id spaces.
+static INLINE_TOOL_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 static INVOKE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<invoke\b(?P<attrs>[^>]*)>(?P<body>.*?)</invoke\s*>"#).unwrap()
@@ -99,7 +120,17 @@ impl Agent {
     }
 
     /// Check if an error looks like a transient server issue worth retrying.
+    ///
+    /// Codex round (PR #1355): typed `StreamError`s now flow through this
+    /// path. Downcast first so the variant's own retryability policy
+    /// drives the decision — string-matching the rendered message would
+    /// either over- or under-trigger (e.g. `MalformedArgs` carries a
+    /// "stream error" substring under some rendering but is explicitly
+    /// non-retryable so the model can self-correct on its next turn).
     pub(super) fn is_retryable_stream_error(err: &eyre::Report) -> bool {
+        if let Some(stream_err) = err.downcast_ref::<octos_llm::StreamError>() {
+            return stream_err.is_retryable();
+        }
         let msg = err.to_string().to_lowercase();
         msg.contains("overloaded")
             || msg.contains("temporarily")
@@ -122,13 +153,13 @@ fn extract_inline_invokes(content: &str) -> (String, Vec<ToolCall>) {
     for caps in INVOKE_TAG_RE.captures_iter(content) {
         let attrs = caps.name("attrs").map(|m| m.as_str()).unwrap_or("");
         let body = caps.name("body").map(|m| m.as_str()).unwrap_or("");
-        if let Some(call) = build_tool_call_from_invoke(attrs, body, calls.len()) {
+        if let Some(call) = build_tool_call_from_invoke(attrs, body) {
             calls.push(call);
         }
     }
     for caps in INVOKE_SELF_RE.captures_iter(content) {
         let attrs = caps.name("attrs").map(|m| m.as_str()).unwrap_or("");
-        if let Some(call) = build_tool_call_from_invoke(attrs, "", calls.len()) {
+        if let Some(call) = build_tool_call_from_invoke(attrs, "") {
             calls.push(call);
         }
     }
@@ -139,7 +170,7 @@ fn extract_inline_invokes(content: &str) -> (String, Vec<ToolCall>) {
     (cleaned, calls)
 }
 
-fn build_tool_call_from_invoke(attrs: &str, body: &str, idx: usize) -> Option<ToolCall> {
+fn build_tool_call_from_invoke(attrs: &str, body: &str) -> Option<ToolCall> {
     let attr_map = parse_attrs(attrs);
     let name = attr_map.get("name")?.trim();
     if name.is_empty() {
@@ -162,7 +193,11 @@ fn build_tool_call_from_invoke(attrs: &str, body: &str, idx: usize) -> Option<To
     };
 
     Some(ToolCall {
-        id: format!("call_inline_{}_{}", idx, sanitize_tool_name(name)),
+        id: format!(
+            "call_inline_{}_{}",
+            INLINE_TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed),
+            sanitize_tool_name(name)
+        ),
         name: name.to_string(),
         arguments,
         metadata: None,
@@ -328,6 +363,47 @@ mod tests {
         assert_eq!(r.content.as_deref(), Some("before  after"));
     }
 
+    /// Regression (codex round-4 / fix/orphan-sweep-liveness-gate): inline
+    /// `<invoke>` tool-call ids must be PROCESS-UNIQUE, not positional. The id
+    /// previously embedded the within-response index, so the FIRST inline call
+    /// to a given tool in any response was always `call_inline_0_<tool>`. Two
+    /// separate responses each calling `run_pipeline` first thus collided —
+    /// breaking the tool_call_id-uniqueness invariant the supervisor's
+    /// synth-ack set, the `mark_descendants_failed` pipeline cascade, and the
+    /// orphan-sweep tool_call_id-family exemption all rely on.
+    #[test]
+    fn inline_invoke_ids_are_unique_across_responses() {
+        let body = "<invoke name=\"run_pipeline\">{\"k\":\"deep_research\"}</invoke>";
+        let (_, calls1) = extract_inline_invokes(body);
+        let (_, calls2) = extract_inline_invokes(body);
+        assert_eq!(calls1.len(), 1);
+        assert_eq!(calls2.len(), 1);
+        assert!(
+            calls1[0].id.starts_with("call_inline_"),
+            "got {}",
+            calls1[0].id
+        );
+        assert!(
+            calls1[0].id.ends_with("_run_pipeline"),
+            "keeps the readable tool-name suffix: {}",
+            calls1[0].id
+        );
+        assert_ne!(
+            calls1[0].id, calls2[0].id,
+            "the same tool at position 0 in two responses must NOT collide",
+        );
+    }
+
+    /// Within a single response, multiple inline calls still get distinct ids
+    /// (the monotonic counter increments per call).
+    #[test]
+    fn inline_invoke_ids_distinct_within_one_response() {
+        let body = "<invoke name=\"a\">{}</invoke><invoke name=\"b\">{}</invoke>";
+        let (_, calls) = extract_inline_invokes(body);
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
     #[test]
     fn should_downgrade_empty_tooluse_to_endturn_after_normalization() {
         let mut r = make_response_with_stop(Some("plain text"), vec![], 10, StopReason::ToolUse);
@@ -375,5 +451,57 @@ mod tests {
     fn is_retryable_stream_error_non_retryable() {
         let err = eyre::eyre!("invalid json");
         assert!(!Agent::is_retryable_stream_error(&err));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Codex round (PR #1355): typed StreamError downcast — these tests
+    // pin the boundary contract. Without the downcast path, MalformedArgs
+    // would match the string "stream" fallback and get retried forever,
+    // hiding the diagnostic from the model.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_retryable_stream_error_idle_timeout_is_typed_retryable() {
+        let typed = octos_llm::StreamError::IdleTimeout { idle_secs: 180 };
+        let err = eyre::Report::new(typed);
+        assert!(
+            Agent::is_retryable_stream_error(&err),
+            "IdleTimeout must be retryable through the typed downcast"
+        );
+    }
+
+    #[test]
+    fn is_retryable_stream_error_malformed_args_is_typed_not_retryable() {
+        let typed = octos_llm::StreamError::MalformedArgs {
+            tool_id: "call_0".to_string(),
+            tool_name: "mofa_slides".to_string(),
+            error: "EOF while parsing a string at column 4123".to_string(),
+        };
+        let err = eyre::Report::new(typed);
+        // The rendered string contains "stream" / similar substrings under
+        // some formatters; the downcast path must short-circuit BEFORE the
+        // string match falls through.
+        assert!(
+            !Agent::is_retryable_stream_error(&err),
+            "MalformedArgs must be NOT retryable so the model sees the diagnostic"
+        );
+    }
+
+    #[test]
+    fn is_retryable_stream_error_incomplete_is_typed_retryable() {
+        let typed = octos_llm::StreamError::Incomplete {
+            detail: "stream ended without Done".to_string(),
+        };
+        let err = eyre::Report::new(typed);
+        assert!(Agent::is_retryable_stream_error(&err));
+    }
+
+    #[test]
+    fn is_retryable_stream_error_transport_is_typed_retryable() {
+        let typed = octos_llm::StreamError::Transport {
+            detail: "broken pipe".to_string(),
+        };
+        let err = eyre::Report::new(typed);
+        assert!(Agent::is_retryable_stream_error(&err));
     }
 }

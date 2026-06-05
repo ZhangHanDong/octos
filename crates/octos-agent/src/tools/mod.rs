@@ -353,6 +353,53 @@ tokio::task_local! {
     pub static TOOL_APPROVAL_CTX: Arc<dyn ToolApprovalRequester>;
 }
 
+/// Request emitted by the `ask_user_question` tool when it asks the user a
+/// structured multiple-choice question mid-turn (UPCR-2026-023).
+///
+/// Mirrors [`ToolApprovalRequest`]: a typed payload the
+/// [`UserQuestionRequester`] surfaces to the attached client, blocking the
+/// tool on a oneshot until the client answers. `questions` is already
+/// validated (1..=4 questions, 2..=4 options each); `title`/`body` are the
+/// mandatory generic fallback text a non-structured client renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestionRequest {
+    pub questions: Vec<octos_core::ui_protocol::UserQuestion>,
+    pub title: String,
+    pub body: String,
+}
+
+/// Outcome returned to the blocked `ask_user_question` tool after client
+/// handling (UPCR-2026-023). Mirrors [`ToolApprovalDecision`] but carries the
+/// structured per-question answers and distinguishes a cancelled turn from an
+/// unsupported client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserQuestionOutcome {
+    /// The client answered; one entry per question, in question order.
+    Answered(Vec<octos_core::ui_protocol::UserQuestionAnswer>),
+    /// The turn was interrupted / the pending question drained before an
+    /// answer arrived. The tool returns a cancelled result.
+    Cancelled,
+    /// No capable client was attached for this turn; the tool degrades to the
+    /// structured-metadata fallback (§4.4).
+    Unsupported,
+}
+
+/// Async user-question bridge provided by clients that negotiated
+/// `user_question.v1` (UPCR-2026-023). Mirrors [`ToolApprovalRequester`]:
+/// scoped per-turn via [`USER_QUESTION_CTX`] so the `ask_user_question` tool
+/// can block on a oneshot until `user_question/respond` resolves it.
+#[async_trait]
+pub trait UserQuestionRequester: Send + Sync {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome;
+}
+
+tokio::task_local! {
+    /// Optional task-local user-question bridge scoped around a turn by
+    /// interactive clients that negotiated `user_question.v1`. When unset the
+    /// `ask_user_question` tool degrades gracefully (no hard block).
+    pub static USER_QUESTION_CTX: Arc<dyn UserQuestionRequester>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TurnAttachmentContext {
     pub attachment_paths: Vec<String>,
@@ -394,7 +441,8 @@ pub enum ToolProgress {
 ///   serially in call order. A single error from an exclusive call cancels
 ///   the remaining peers so the LLM sees the cascade instead of continuing
 ///   to mutate state on a doomed path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConcurrencyClass {
     /// Read-only / side-effect-free. Can run in parallel with any other
     /// `Safe` tool call without observable interference.
@@ -536,6 +584,51 @@ pub trait Tool: Send + Sync {
     fn concurrency_class(&self) -> ConcurrencyClass {
         ConcurrencyClass::Safe
     }
+
+    /// Per-tool execution timeout (seconds) enforced at the registry dispatch
+    /// boundary (Gap 3.3). `None` (the default) means "use the registry's
+    /// global backstop" (`ToolRegistry::set_tool_timeout_secs`, default
+    /// 1800s). A tool that returns `Some(n)` caps its own foreground
+    /// execution at `n` seconds regardless of the registry default.
+    ///
+    /// This is the LAST line of defence against a hung foreground tool
+    /// wedging the session-actor turn forever: even direct registry callers
+    /// (e.g. the serve/API tool path, workspace-contract auto-send) that do
+    /// not run inside the agent loop's per-batch timeout get bounded here.
+    /// It composes with — and is independent of — the agent loop's
+    /// fast/long batch timeout in `agent::execution`, which fires first on
+    /// that path; this guard catches the unprotected direct-caller paths.
+    ///
+    /// `spawn_only` tools are intercepted and backgrounded BEFORE the
+    /// foreground dispatch path, so they never hit this timeout. Genuinely
+    /// long-running foreground tools (`web_fetch`, `web_search`, `browser`,
+    /// deep research/crawl) inherit the generous 1800s backstop by leaving
+    /// this `None`; the `shell` tool already clamps its own internal timeout
+    /// to [1, 600]s, well under the backstop, so it is not double-killed.
+    ///
+    /// Default: `None` (inherit the registry backstop). Keep any override
+    /// generous — this is a safety net, not a tuning knob for normal work.
+    fn execution_timeout_secs(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether this tool BLOCKS on human input (e.g. `ask_user_question`
+    /// awaits the [`USER_QUESTION_CTX`] requester until the client answers,
+    /// exactly as the approval gate blocks on [`TOOL_APPROVAL_CTX`]). Such a
+    /// tool must be EXEMPT from the dispatch-boundary timeout in
+    /// [`ToolRegistry::execute_with_context`]: a human may legitimately take
+    /// longer than any finite tool timeout, and firing the timeout would drop
+    /// the requester's receiver and leak the pending question/approval store
+    /// entry forever (Gap-3.3 interaction). The waiting future is instead
+    /// cancelled the right way — when the turn is interrupted the pending
+    /// store drains the entry and resolves the waiter as `Cancelled`.
+    ///
+    /// Returning `true` here makes the registry skip wrapping the call in the
+    /// dispatch timeout entirely (it still composes with the agent loop's
+    /// per-turn lifecycle and the turn-interrupt drain). Default: `false`.
+    fn blocks_on_human_input(&self) -> bool {
+        false
+    }
 }
 
 /// LRU-based tool lifecycle manager.
@@ -641,13 +734,16 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
+pub mod ask_user_question;
 pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
 pub mod diff_edit;
+pub mod dora_bridge;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;
+pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
@@ -683,6 +779,7 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use ask_user_question::AskUserQuestionTool;
 pub use coding_tools::{
     ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
     ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,
@@ -698,6 +795,7 @@ pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
+pub use http::HttpTool;
 pub use list_dir::ListDirTool;
 pub use manage_skills::ManageSkillsTool;
 pub use mcp_agent::{
@@ -869,6 +967,76 @@ fn resolve_for_scope(
     user_path: &str,
     for_write: bool,
 ) -> Result<PathBuf, &'static str> {
+    // Upload handles (`up/<base64>/<name>`) are opaque references to a file in
+    // the authenticated upload tmpdir — NOT workspace-relative paths. Without
+    // this short-circuit the join+classify logic below treats them as
+    // `<workspace>/up/<base64>/<name>` (lexically InWorkspace) and the file is
+    // never found, so every scoped (SPA web-/slides-/site-) session is unable
+    // to read ANY uploaded file. Decode via the unified resolver (which
+    // canonicalizes under the upload root, firmlink-safe), matching the legacy
+    // `resolve_path`.
+    //
+    // SECURITY: only trust this short-circuit when the resolver actually
+    // landed in the upload tmpdir (`ToolPathScope::UploadTmpdir`). A path that
+    // merely *starts with* `up/` but is not a valid handle (e.g.
+    // `up/link/secret.txt`) decode-fails and `resolve_tool_path` falls back to
+    // `ToolPathScope::Workspace`, returning the LEXICAL `<workspace>/up/...`
+    // form. Returning that here would skip the canonical ancestor-symlink guard
+    // in `classify_canonical_path` below — and `read_no_follow` only protects
+    // the leaf component, so a symlinked `workspace/up` would reopen a scoped
+    // read escape. Such paths therefore fall through to the normal resolver.
+    // Uploads are read sources, so writes to a resolved upload handle are
+    // refused. The `pf/` profile handle needs a profile root that
+    // `SessionScope` does not currently expose; tracked as a follow-up
+    // (issue #1367).
+    if user_path.starts_with("up/") {
+        // #1377 tenant isolation: in a multi-tenant (scoped) session, uploads
+        // are materialized into `<workspace>/uploads/` at turn start and read
+        // by that workspace path. Refuse global `up/` handle resolution here so
+        // a scoped session cannot reach the process-global upload tmpdir (and
+        // thus another tenant's uploads) by handle. Solo sessions (CLI
+        // `octos chat`) keep resolving handles for back-compat.
+        if scope.tenant_id().is_some()
+            && matches!(
+                octos_bus::file_handle::decode_file_handle(user_path),
+                Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+            )
+        {
+            return Err(
+                "Uploaded file not found; uploaded files are under uploads/ — \
+                 read with read_file(\"uploads/<name>\")",
+            );
+        }
+        match octos_bus::file_handle::resolve_tool_path(scope.workspace(), None, user_path) {
+            Ok(resolved)
+                if resolved.scope == octos_bus::file_handle::ToolPathScope::UploadTmpdir =>
+            {
+                return if for_write {
+                    Err("Writes to uploaded files are not permitted")
+                } else {
+                    Ok(resolved.absolute)
+                };
+            }
+            _ => {
+                // If the value DECODES as an upload handle it is unambiguously an
+                // upload reference: never fall through to the workspace resolver
+                // (which would let `write_file` create `<workspace>/up/<payload>/
+                // <name>`, or a read silently hit an unrelated workspace file with
+                // the same literal path). The temp file may have been deleted or
+                // no longer canonicalises under the upload root — report it as a
+                // missing upload rather than masking it as a workspace path.
+                if matches!(
+                    octos_bus::file_handle::decode_file_handle(user_path),
+                    Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+                ) {
+                    return Err("Uploaded file not found");
+                }
+                // A value that merely starts with `up/` but does NOT decode as a
+                // handle (e.g. a real workspace path) falls through to the scoped
+                // resolver, where the canonical containment guard still applies.
+            }
+        }
+    }
     let candidate = PathBuf::from(user_path);
     let absolute = if candidate.is_absolute() {
         candidate
@@ -909,6 +1077,54 @@ fn resolve_for_scope(
             }
         }
         PathClassification::OutOfScope => Err("Path outside session scope"),
+    }
+}
+
+/// Interim mitigation (#1378, superseded by #1377): `up/<base64>/<name>` is an
+/// opaque UPLOAD HANDLE, not a browsable directory — and uploaded files live in
+/// a tmpdir *outside* the session workspace, so `list_dir`/`glob` can never
+/// enumerate the `up/` namespace. They returned a bare "Directory not found",
+/// which was observed to make models (deepseek-chat in prod, and gemini-2.5-pro
+/// on replay) wrongly conclude the upload is missing and ask the user to
+/// re-upload — even after a successful `read_file` of the same handle.
+///
+/// Returns guidance to redirect the model when a directory-listing tool is
+/// pointed at the upload-handle namespace (`up` or `up/...`). Matches the EXACT
+/// spelling `read_file`/`resolve_for_scope` accept as a handle (`up/` prefix);
+/// it deliberately does NOT normalise `./up/...` or trim whitespace, because the
+/// read path doesn't either — guiding the model to `read_file("./up/...")` would
+/// just fail there too (codex #1378 round 6). This is a band-aid; the real fix
+/// (#1377) materialises uploads into `<workspace>/uploads/`.
+pub(crate) fn upload_handle_namespace_guidance(path: &str) -> Option<&'static str> {
+    if path == "up" || path.starts_with("up/") {
+        Some(
+            "`up/…` is an opaque upload handle, not a directory — uploaded files \
+             are NOT browsable via list_dir or glob. Read the file directly with \
+             read_file using the exact `up/…` handle from the attachment (you may \
+             already have its contents from a prior read).",
+        )
+    } else {
+        None
+    }
+}
+
+/// Whether a `list_dir`/`glob` failure for `path` should be replaced with
+/// upload guidance, given the session's `workspace_root`. Centralises the gate
+/// so the two tools cannot diverge (codex #1378): redirect iff `path` targets
+/// the `up/` namespace AND it either decodes as a real upload handle OR there is
+/// no real browsable `up/` directory in the workspace. Uses the path verbatim
+/// (no `./`/whitespace normalisation) so the redirect decision matches exactly
+/// what `read_file` would accept as a handle.
+pub(crate) fn upload_namespace_redirect(path: &str, workspace_root: &Path) -> Option<&'static str> {
+    let guidance = upload_handle_namespace_guidance(path)?;
+    let decodes_as_upload = matches!(
+        octos_bus::file_handle::decode_file_handle(path),
+        Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+    );
+    if decodes_as_upload || !workspace_root.join("up").is_dir() {
+        Some(guidance)
+    } else {
+        None
     }
 }
 
@@ -1433,6 +1649,230 @@ mod path_tests {
         // The lexical absolute form passes through unchanged
         // (canonicalisation is only used for classification).
         assert_eq!(resolved, skill_file);
+    }
+
+    /// Regression (issue #1367): a SCOPED session must resolve an
+    /// `up/<base64>/<name>` upload handle to the real file under the upload
+    /// tmpdir — NOT treat it as a workspace-relative `<workspace>/up/...`
+    /// path. Every SPA (web-/slides-/site-) session is scoped, so before this
+    /// fix uploaded attachments were unreadable ("File not found: up/...").
+    /// The pre-existing scope tests never exercised a handle — that gap is
+    /// what let the bug ship.
+    #[test]
+    fn scoped_session_resolves_upload_handle_to_tmpdir_not_workspace() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
+        let uploaded = upload_root.join(format!("u-{}-report.md", std::process::id()));
+        std::fs::write(&uploaded, b"# strategy insight report\n").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("report.md"))
+            .expect("encode upload handle");
+        assert!(
+            handle.starts_with("up/"),
+            "expected an up/ handle, got {handle}"
+        );
+
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+
+        // READ resolves to the real upload file (under the canonical upload
+        // root), NOT under the workspace.
+        let resolved = resolve_path_for_session_scope_read(&scope, &handle)
+            .expect("scoped session must resolve an up/ upload handle");
+        let canon_root = std::fs::canonicalize(&upload_root).unwrap_or(upload_root.clone());
+        assert!(
+            resolved.starts_with(&canon_root),
+            "resolved {} must be under the upload root {}, not joined onto the workspace",
+            resolved.display(),
+            canon_root.display()
+        );
+        assert!(
+            !resolved.starts_with(workspace.path()),
+            "must NOT resolve the upload handle under the workspace"
+        );
+
+        // Uploads are read sources — writes via the handle are refused.
+        assert!(
+            resolve_path_for_session_scope_write(&scope, &handle).is_err(),
+            "writes to an upload handle must be refused"
+        );
+
+        let _ = std::fs::remove_file(&uploaded);
+    }
+
+    /// SECURITY (codex #1367 P1): a path that merely *starts with* `up/` but
+    /// is NOT a valid upload handle must NOT bypass the canonical
+    /// ancestor-symlink guard. `up/secret.txt` ("secret.txt" isn't valid
+    /// base64 → decode fails → `resolve_tool_path` falls back to
+    /// `ToolPathScope::Workspace`, returning the LEXICAL `<workspace>/up/...`).
+    /// The short-circuit must reject the Workspace fallback and let the path
+    /// fall through to `classify_canonical_path`, which canonicalises through
+    /// the `up` symlink and refuses the escape — instead of leaking a lexical
+    /// path whose only protection (`O_NOFOLLOW`) guards the leaf, not the `up`
+    /// ancestor.
+    #[test]
+    #[cfg(unix)]
+    fn scoped_session_does_not_trust_non_handle_up_prefix_via_symlink() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let outside = tempfile::tempdir().expect("out-of-scope tmpdir");
+        std::fs::write(outside.path().join("secret.txt"), b"top secret\n").unwrap();
+        // workspace/up -> <outside>: an ancestor symlink escaping the scope.
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("up")).unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+
+        let resolved = resolve_path_for_session_scope_read(&scope, "up/secret.txt");
+        assert!(
+            resolved.is_err(),
+            "a non-handle up/ path through an ancestor symlink must be refused, got {resolved:?}"
+        );
+    }
+
+    /// codex #1367 round-4 P2: a value that DECODES as an upload handle but
+    /// whose temp file is gone (deleted / no longer canonicalises under the
+    /// upload root) must report a missing upload — NOT fall through to the
+    /// workspace resolver, which would let `write_file` create
+    /// `<workspace>/up/<payload>/<name>` or a read silently hit an unrelated
+    /// same-named workspace file.
+    #[test]
+    fn scoped_session_rejects_decoded_but_missing_upload_handle() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("m-{}-gone.md", std::process::id()));
+        std::fs::write(&uploaded, b"temp\n").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("gone.md"))
+            .expect("encode upload handle");
+        // Delete the upload so the handle still DECODES but no longer resolves.
+        std::fs::remove_file(&uploaded).unwrap();
+
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+
+        assert!(
+            resolve_path_for_session_scope_read(&scope, &handle).is_err(),
+            "a decoded-but-missing upload handle must error, not resolve to a workspace path"
+        );
+        assert!(
+            resolve_path_for_session_scope_write(&scope, &handle).is_err(),
+            "write to a missing upload handle must error"
+        );
+    }
+
+    /// #1377 tenant isolation: a multi-tenant (scoped) session must NOT resolve
+    /// a global `up/` upload handle — uploads are materialized into `uploads/`
+    /// and read by that workspace path. (Solo sessions keep resolving handles;
+    /// covered by `scoped_session_resolves_upload_handle_to_tmpdir_not_workspace`.)
+    #[test]
+    fn multi_tenant_session_refuses_global_up_handle_but_reads_uploads_dir() {
+        let data = tempfile::tempdir().expect("profile data dir");
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data.path().to_path_buf(),
+            "tenant-a".into(),
+            "web-x".into(),
+        )
+        .unwrap();
+        // Create the workspace so canonicalize is firmlink-consistent on macOS.
+        std::fs::create_dir_all(scope.workspace()).unwrap();
+
+        // A valid up/ handle (which a solo session WOULD resolve under the
+        // global tmpdir) is refused for a multi-tenant session.
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let uploaded = upload_root.join(format!("mt-{}-secret.md", std::process::id()));
+        std::fs::write(&uploaded, b"tenant secret\n").unwrap();
+        let handle =
+            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("secret.md")).unwrap();
+        let resolved = resolve_path_for_session_scope_read(&scope, &handle);
+        let _ = std::fs::remove_file(&uploaded);
+        assert!(
+            resolved.is_err(),
+            "a multi-tenant session must refuse a global up/ handle, got {resolved:?}"
+        );
+
+        // ...but the materialized workspace path resolves InWorkspace.
+        let ok = resolve_path_for_session_scope_read(&scope, "uploads/secret.md")
+            .expect("uploads/<name> must resolve in the workspace");
+        assert!(ok.starts_with(scope.workspace().join("uploads")));
+    }
+
+    /// Interim guard (#1378): the upload-handle namespace is detected for
+    /// directory-listing tools, and ONLY that namespace — a normal path or a
+    /// directory whose name merely starts with "up" must not be hijacked.
+    #[test]
+    fn upload_handle_namespace_guidance_matches_only_the_up_namespace() {
+        for p in ["up", "up/", "up/abc123/file.md"] {
+            assert!(
+                super::upload_handle_namespace_guidance(p).is_some(),
+                "expected guidance for upload-namespace path {p:?}"
+            );
+        }
+        // Verbatim match (codex round-6): `./up/...` and whitespace variants are
+        // NOT hijacked, because the read path doesn't accept those spellings as
+        // handles either — staying consistent avoids guiding to a failing read.
+        for p in [
+            "uploads/x",
+            "up2/x",
+            "upstream/x",
+            "report.md",
+            "slides/untitled/script.js",
+            "",
+            "/etc/passwd",
+            "./up/abc/file.md",
+            "  up/x  ",
+        ] {
+            assert!(
+                super::upload_handle_namespace_guidance(p).is_none(),
+                "must NOT hijack non-upload-namespace path {p:?}"
+            );
+        }
+        assert!(
+            super::upload_handle_namespace_guidance("up/x")
+                .unwrap()
+                .contains("read_file"),
+            "guidance should point the model at read_file"
+        );
+    }
+
+    /// The centralised gate (#1378): a bare valid handle redirects even beside a
+    /// real `up/` dir (decode precedence); a non-handle `up/...` beside a real
+    /// `up/` dir does NOT (normal workspace path); and `./`-prefixed spellings
+    /// are NOT redirected — the read path doesn't accept them either, so the
+    /// guard stays consistent rather than guiding to a failing read (round-6).
+    #[test]
+    fn upload_namespace_redirect_matches_readfile_acceptance() {
+        let ws = tempfile::tempdir().expect("ws");
+        std::fs::create_dir(ws.path().join("up")).unwrap(); // a REAL up/ dir
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
+            &octos_bus::file_handle::temp_upload_root().join("u-x-report.md"),
+            Some("report.md"),
+        )
+        .expect("encode handle");
+
+        // A bare valid handle decodes → redirect even though a real `up/` dir
+        // exists (decode precedence, consistent with read_file).
+        assert!(
+            super::upload_namespace_redirect(&handle, ws.path()).is_some(),
+            "the bare valid handle must redirect even beside a real up/ dir"
+        );
+        // `./`-prefixed: read_file would NOT treat this as a handle, so neither
+        // do we (no guiding the model to a read that fails).
+        assert!(
+            super::upload_namespace_redirect(&format!("./{handle}"), ws.path()).is_none(),
+            "a ./-prefixed handle must NOT redirect (matches read_file acceptance)"
+        );
+        // Non-handle `up/...` beside a real up/ dir → normal workspace path.
+        assert!(
+            super::upload_namespace_redirect("up/keep.txt", ws.path()).is_none(),
+            "non-handle up/ path beside a real up/ dir must NOT redirect"
+        );
+        assert!(
+            super::upload_namespace_redirect("up", ws.path()).is_none(),
+            "listing the real up/ dir itself must NOT redirect"
+        );
+        // No real up/ dir → any up-namespace path redirects.
+        let empty = tempfile::tempdir().expect("empty ws");
+        assert!(super::upload_namespace_redirect("up", empty.path()).is_some());
+        assert!(super::upload_namespace_redirect("up/x", empty.path()).is_some());
+        assert!(super::upload_namespace_redirect("uploads/x", empty.path()).is_none());
     }
 
     /// PR-A core invariant: write attempts inside a registered

@@ -26,7 +26,7 @@ use crate::prompt_context::PromptContextManager;
 use crate::role_template::RoleTemplate;
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
-use crate::task_supervisor::TaskSupervisor;
+use crate::task_supervisor::{TaskSupervisor, TaskTerminalGuard};
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
@@ -157,6 +157,15 @@ pub struct BackgroundResultPayload {
     /// identity round-trips correctly in both shapes. `None` for legacy
     /// callers and tests that do not track origination.
     pub originating_client_message_id: Option<String>,
+    /// C1 step 3: the terminal supervisor status (`Completed` / `Failed` /
+    /// `Cancelled`) for the spawn_only task that produced this completion.
+    /// Set at the same call sites that invoke `mark_completed` /
+    /// `mark_failed`, so the session actor can read an explicit status
+    /// instead of inferring success from the rendered `"✗"` / `"✅"` content
+    /// heuristic. Carried alongside `task_id` so the actor can attribute the
+    /// terminal state to a specific background task. `None` for legacy
+    /// callers and tests that do not track the terminal status.
+    pub terminal_status: Option<crate::task_supervisor::TaskStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2465,6 +2474,13 @@ impl Tool for SpawnTool {
                         verified_cache_dir: None,
                     },
                 );
+                // SPEC-VENDOR-NODE-V1 HTTP tool discovery — hard-fail per
+                // @ymote's Finding 2 contract. Subagents need the bridge tools
+                // the parent has; if discovery fails the spawn must error out
+                // rather than silently spawn a tool-blind subagent.
+                crate::plugins::register_http_skills_on_startup(&mut tools, &self.plugin_dirs)
+                    .await
+                    .map_err(|e| eyre::eyre!("subagent HTTP tool discovery failed: {e}"))?;
             }
             for factory in &self.child_tool_factories {
                 tools.register_arc(factory());
@@ -2698,6 +2714,25 @@ impl Tool for SpawnTool {
                     )),
                 );
             }
+            // codex round-5 (orphan-sweep liveness): arm the RAII terminal
+            // guard HERE, in the FOREGROUND, before the `tokio::spawn` below.
+            // `register_with_lineage` above already persisted a non-terminal
+            // `Spawned` row; arming the guard inside the spawned future left a
+            // window where a fast next-turn orphan-sweep could see the row
+            // non-terminal AND not-live and falsely reap a
+            // scheduled-but-not-yet-polled detached child. Constructing it
+            // synchronously within the spawning turn inserts the id into the
+            // process-global live-set before the turn returns (turns are
+            // serialized per session ⇒ this completes before any next-turn
+            // sweep). Moved into the future below so its Drop (clear live-set +
+            // drive an unfinished task to Failed) still fires at worker end.
+            let foreground_terminal_guard: Option<TaskTerminalGuard> =
+                match (self.task_supervisor.as_ref(), tracked_task_id.as_ref()) {
+                    (Some(supervisor), Some(task_id)) => {
+                        Some(TaskTerminalGuard::new(supervisor.clone(), task_id.clone()))
+                    }
+                    _ => None,
+                };
             let llm = sub_llm;
             let memory = self.memory.clone();
             let working_dir = self.working_dir.clone();
@@ -2796,6 +2831,18 @@ impl Tool for SpawnTool {
             let child_session_scope = ctx.session_scope.clone();
 
             tokio::spawn(async move {
+                // codex round-5: the terminal guard was armed in the
+                // FOREGROUND (before this spawn) so the task id entered the
+                // process-global live-set synchronously within the spawning
+                // turn — closing the window where a fast next-turn orphan-sweep
+                // could reap a scheduled-but-not-yet-polled detached child.
+                // Move it in here so its Drop — which clears the live-set and
+                // drives an unfinished task to Failed (so the TUI count
+                // decrements instead of hanging on "N running") — still fires
+                // when this worker future terminates. Idempotent on the normal
+                // terminal arms below; Drop no-ops once the body marked the
+                // task terminal itself.
+                let _terminal_guard = foreground_terminal_guard;
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
@@ -2895,6 +2942,24 @@ impl Tool for SpawnTool {
                             verified_cache_dir: None,
                         },
                     );
+                    // SPEC-VENDOR-NODE-V1 HTTP tool discovery — this is the
+                    // ASYNC spawn-background path (`tokio::spawn(async move
+                    // { ... })`); the enclosing block returns `()` so there is
+                    // no Err-propagation channel. The contract therefore
+                    // diverges from the sync subagent and boot paths: a
+                    // failed catalog fetch in a background subagent is logged
+                    // and the subagent runs with whatever static tools loaded.
+                    // Documented divergence from @ymote's Finding 2 contract;
+                    // the sync subagent path (line ~2470) still hard-fails.
+                    if let Err(e) =
+                        crate::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
+                            .await
+                    {
+                        warn!(
+                            error = %e,
+                            "subagent (background) HTTP tool discovery failed; continuing with static tools only"
+                        );
+                    }
                 }
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());
@@ -3401,6 +3466,17 @@ impl Tool for SpawnTool {
                     }
                 }
 
+                // C1 step 3: derive the terminal supervisor status from the
+                // SAME (&result, contract_failure) match the mark_* arms above
+                // used, so the BackgroundResultPayload carries an explicit
+                // outcome the session actor can read instead of inferring
+                // success from the rendered content string.
+                let terminal_status = match (&result, contract_failure.as_ref()) {
+                    (Ok(task_result), None) if task_result.success => {
+                        crate::task_supervisor::TaskStatus::Completed
+                    }
+                    _ => crate::task_supervisor::TaskStatus::Failed,
+                };
                 let content = match (&result, contract_failure.as_ref()) {
                     (Ok(_), Some(error)) => format!("Status: FAILED\nError: {error}"),
                     (Ok(r), None) => format!(
@@ -3481,6 +3557,7 @@ impl Tool for SpawnTool {
                         // its parent prompt row carries.
                         originating_client_message_id: originating_thread_id.clone(),
                         tool_call_id: originating_tool_call_id.clone(),
+                        terminal_status: Some(terminal_status),
                     },
                 )
                 .await
@@ -4584,6 +4661,7 @@ PY
             task_id: None,
             originating_client_message_id: None,
             tool_call_id: None,
+            terminal_status: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);

@@ -287,6 +287,20 @@ Current M9 sandbox-parity decision:
   It lets AppUI clients inspect the server-owned prompt context generation,
   transcript hash, checkpoint, compaction, and recovery state without
   reconstructing it from chat rows.
+- The additive structured mid-turn user-question surface (the
+  `user_question/respond` command, the `user_question/requested` notification,
+  the `questions[]` / `answers[]` payloads, and the new `question_id`
+  correlation id) is governed by proposed
+  [UPCR-2026-023](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_023_ASK_USER_QUESTION.md),
+  gated behind the `user_question.v1` feature flag. It is the codex/Claude
+  `AskUserQuestion` shape implemented as "approval + choices + free-text": the
+  agent tool blocks the turn at a deterministic tool boundary (mirroring
+  `approval/requested`), the server emits `user_question/requested`, the client
+  renders a single/multi-select picker plus a free-text "Other", and
+  `user_question/respond` resumes the waiting tool. A turn interrupt cancels
+  pending questions; a client lacking the capability receives the agent tool's
+  structured-metadata/generic-text fallback instead of a blocking question. See
+  [docs/design/ask-user-question-2026-06-03.md](../docs/design/ask-user-question-2026-06-03.md).
 
 ## 5. Identity Model
 
@@ -340,46 +354,139 @@ Client commands are JSON-RPC requests.
 
 Server notifications are JSON-RPC notifications.
 
-The logical command/event names are:
+The logical command/event names are listed below. The machine-readable
+source of truth for this catalog is `UI_PROTOCOL_COMMAND_METHODS` and
+`UI_PROTOCOL_NOTIFICATION_METHODS` in
+[crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1075)
+(plus the server-handled `APPUI_EXTRA_METHODS` slice in
+[crates/octos-cli/src/api/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-cli/src/api/ui_protocol.rs:1)).
+Per `SRV-036`/M18-E, this list MUST stay in sync with those constants — a
+method that is dispatched and advertised in `supported_methods` but not
+named here is a spec defect.
 
 Commands:
+
+Session, turn, and approval core:
+
+- `session/open`
+- `session/hydrate` (gate `state.session_hydrate.v1`, accepted `UPCR-2026-009`)
+- `turn/start`
+- `turn/interrupt`
+- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
+- `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
+- `approval/respond`
+- `approval/scopes/list` (approval-scope discovery; first-server slice)
+- `user_question/respond` (gate `user_question.v1`, proposed `UPCR-2026-023`)
+- `permission/profile/list`, `permission/profile/set`
+  (accepted `UPCR-2026-018`)
+- `diff/preview/get`
+
+Task and harness control:
+
+- `task/output/read`
+- `task/list` (capability-gated `harness.task_control.v1`, accepted `UPCR-2026-005`)
+- `task/cancel` (capability-gated `harness.task_control.v1`, accepted `UPCR-2026-005`)
+- `task/restart_from_node` (capability-gated `harness.task_control.v1`, accepted `UPCR-2026-005`)
+- `task/artifact/list`, `task/artifact/read`
+  (capability-gated, canonical aliases of `agent/artifact/*`; #965 / accepted `UPCR-2026-019`)
+
+Supervised review and M15 agent/goal/loop autonomy (capability-gated, accepted
+`UPCR-2026-019` / `UPCR-2026-021`):
+
+- `review/start`
+- `agent/list`, `agent/status/read`, `agent/output/read`,
+  `agent/artifact/list`, `agent/artifact/read`, `agent/interrupt`, `agent/close`
+- `session/goal/get`, `session/goal/set`, `session/goal/clear`
+- `loop/create`, `loop/list`, `loop/delete`, `loop/pause`, `loop/resume`,
+  `loop/fire_now`
+
+Router (Wave4-A):
+
+- `router/set_mode`, `router/get_metrics`
+
+M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
+
+- `session/list`, `session/snapshot`, `session/messages_page`,
+  `session/status.get`, `session/files.list`, `session/tasks.list`,
+  `session/workspace.get`, `session/title.set`, `session/delete`
+- `system/status.get`
+- `content/list`, `content/delete`, `content/bulk_delete`
+
+Runtime, auth, profile, and onboarding inspection (server-handled
+`APPUI_EXTRA_METHODS`):
 
 - `config/capabilities/list` (accepted `UPCR-2026-017`)
 - `client_hello` (accepted `UPCR-2026-016`)
 - `profile/local/create` (accepted `UPCR-2026-018`)
-- `session/open`
 - `session/status/read` (accepted `UPCR-2026-017`)
-- `turn/start`
-- `review/start` (capability-gated, accepted `UPCR-2026-019`)
-- `turn/interrupt`
-- `approval/respond`
-- `permission/profile/list`, `permission/profile/set`
-  (accepted `UPCR-2026-018`)
-- `diff/preview/get`
-- `task/output/read`
-- `task/list` (capability-gated, accepted `UPCR-2026-005`)
-- `task/cancel` (capability-gated, accepted `UPCR-2026-005`)
-- `task/restart_from_node` (capability-gated, accepted `UPCR-2026-005`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
-  (accepted `UPCR-2026-017`)
+  (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
+  stdio capability set and return typed `auth_unavailable` per § stdio policy)
 - `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
   `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
   `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `profile/skills/list`, `profile/skills/registry/search`,
+  `profile/skills/install`, `profile/skills/remove` (server-handled skills
+  management)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
+- `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
+  local-solo only; #1057)
 
 Notifications:
 
-- `turn/started`
-- `turn/completed`
-- `turn/error`
+Session (server-pushed open-state echo for reconnect/replay):
+
+- `session/open` (same method name as the §7 command; emitted as
+  `UiNotification::SessionOpened` and replayed from the durable ledger)
+
+Turn, message, and tool lifecycle:
+
+- `turn/started`, `turn/completed`, `turn/error`
 - `message/delta`
-- `tool/started`
-- `tool/progress`
-- `tool/completed`
-- `approval/requested`
+- `message/persisted` (accepted `UPCR-2026-012`)
+- `turn/spawn_complete` (gate `event.spawn_complete.v1`; M10 background-tool completion envelope)
+- `tool/started`, `tool/progress`, `tool/completed`
+
+Approval lifecycle:
+
+- `approval/requested`, `approval/auto_resolved`, `approval/decided`,
+  `approval/cancelled`
+
+Structured user-question lifecycle (gate `user_question.v1`, proposed
+`UPCR-2026-023`):
+
+- `user_question/requested`
+
+Task and progress:
+
 - `task/updated`
 - `task/output/delta`
+- `progress/updated`
 - `warning`
+- `protocol/replay_lossy`
+
+Projection and session bridging (accepted `UPCR-2026-014`):
+
+- `projection/envelope` — wire `params` carries the bare `Envelope`
+  fields FLATTENED with the routing keys `session_id` (bare base key) +
+  optional `topic`, so a multi-session client can route each envelope
+  (`feat(envelope-wire-routing)`); see § 14.1.
+- `file/attached`
+- `session/event`
+
+Router and queue (Wave4-A):
+
+- `router/status`, `router/failover`, `queue/state`
+
+M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
+
+- `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
+- `session/goal/updated`, `session/goal/cleared`
+- `loop/updated`, `loop/fired`, `loop/completed`
+
+M16 context lifecycle (gate `context.lifecycle.v1`):
+
+- `context/compaction_completed`, `context/normalization_reported`
 
 ## 7. Command Semantics
 
@@ -648,6 +755,30 @@ Optional params from accepted `UPCR-2026-001`:
   String registry with initial values `request`, `turn`, and `session`.
   Scope is advisory in v1alpha1 and must not silently create persistent allow
   rules.
+- `client_note`
+  Human-readable client note for audit/display. Servers must not require it.
+
+### `user_question/respond`
+
+Purpose:
+
+- answer a `user_question/requested` event
+
+Minimum params:
+
+- `session_id`
+- `question_id`
+- `answers`
+  Per-question answer list, one entry per question in the originating
+  `user_question/requested` event, in question order. Each entry carries:
+  - `selected_labels` — selected option label(s). Empty when the user supplied
+    only free text. For a single-select question this is 0 or 1 entries; for a
+    `multi_select` question it is 0..N. Labels must match the option labels from
+    the request.
+  - `free_text` — optional string from the free-text "Other" escape hatch.
+
+Optional params (governed by accepted `UPCR-2026-023`):
+
 - `client_note`
   Human-readable client note for audit/display. Servers must not require it.
 
@@ -1474,6 +1605,56 @@ Capability feature:
   Advertised through optional `supported_features` in `UiProtocolCapabilities`.
   The capability payload schema version is `2`.
 
+### `user_question/requested`
+
+Carries a structured multiple-choice question the agent is asking the user
+mid-turn. While this is unresolved, the turn remains paused at a deterministic
+boundary (the same blocking-tool boundary as `approval/requested`).
+
+Required fallback fields:
+
+- `session_id`
+- `question_id`
+- `turn_id`
+- `title`
+  Mandatory generic fallback text.
+- `body`
+  Mandatory generic fallback text.
+
+Structured field (governed by accepted `UPCR-2026-023`):
+
+- `questions`
+  An array of 1–4 questions. Each question carries:
+  - `header` — short label, ≤ 12 characters. An over-long header is
+    **truncated** to the limit (char-boundary safe, ellipsis-marked) server-side
+    rather than rejected, so a model that sends a descriptive header
+    ("Favorite Color") still gets a rendered picker (live-soak hardening
+    2026-06-04).
+  - `question` — the question text.
+  - `options` — an array of 2–4 options, each with `label` and `description`.
+  - `multi_select` — `bool`; when `true` the user may select more than one
+    option.
+  - `allow_free_text` — `bool`; the server forces this `true` so a free-text
+    "Other" escape hatch is always offered alongside the options.
+
+Compatibility rules:
+
+- Generic `title` and `body` remain mandatory fallback text for v1alpha1.
+- Unknown fields must fall back to generic rendering and remain actionable: a
+  client that does not understand `questions` renders `title`/`body` and the
+  user can still answer (for example via free text).
+- Clients that do not advertise the `user_question.v1` capability receive the
+  agent tool's structured-metadata / generic-text fallback instead of a blocking
+  question, so the turn never hard-blocks on a non-supporting client (the agent
+  tool degrades exactly like the existing `request_user_input` codex tool).
+
+Capability feature:
+
+- `user_question.v1`
+  Advertised through optional `supported_features` in `UiProtocolCapabilities`.
+  Clients request it through `X-Octos-Ui-Features` using comma or
+  space-separated feature tokens.
+
 ### `task/updated`
 
 Carries task lifecycle and summary updates that are useful to clients even before the full unified ledger exists.
@@ -1735,24 +1916,46 @@ Rules:
 
 ## 11. Relationship to REST
 
-During migration:
+The original migration-era split below has been **superseded by M12 Phase D**
+(`docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`, Accepted). The AppUI **data
+plane** is now the WS UI Protocol v1 (`/api/ui-protocol/ws`); the 13 auxiliary
+endpoints (`GET /api/sessions`, `/api/sessions/{id}/*`, `/api/status`,
+`/api/my/content*`) were migrated to the `auxiliary.rest_to_ws.v1` methods
+(§6 / §7) and retired from the REST router.
 
-- REST remains valid for snapshot hydrate
-- the protocol becomes the interactive source of truth
+After M12, REST survives only for four planes the WS protocol cannot or should
+not serve:
 
-Suggested split:
+- **AUTH / bootstrap** — `/api/auth/*`, `/api/register`, `/api/my/profile`.
+  The bearer token and `selected_profile` must be established over HTTP
+  *before* a WS handshake can authenticate (the WS bridge reads its credential
+  from the same store these calls populate). Keeping auth on a tiny, well-known
+  prefix is also what lets the 401-reaper scope to `/api/auth/*` only.
+- **BLOB / binary I/O** — `/api/upload`, `/api/site-files/upload`,
+  `/api/files`, `/api/files/{path}`, `/api/files/list`,
+  `/api/my/content/{id}/thumbnail`, `/api/my/content/{id}/body`,
+  `/api/site-preview/*`, `/api/preview/{profile}/{session}/{slug}/*`,
+  `/api/my/preview/sign`. Bodies exceed `MAX_TEXT_FRAME_BYTES` (1 MiB) and want
+  HTTP range/streaming/`<img src>`/browser-native caching.
+- **INFRA / OPS** — `/health`, `/metrics`, `/api/version`,
+  `/api/internal/frps-auth`, `/api/events/harness`. Non-AppUI consumers (load
+  balancers, Prometheus, the reverse proxy) require plain HTTP.
+- **ADMIN control plane** — `/api/admin/*` and the operator/config endpoints
+  consumed by the **admin dashboard** SPA (`dashboard/src/api.ts`), e.g.
+  `/api/my/test-provider`, `/api/my/provider-models`, `/api/my/test-search`,
+  `/api/my/model-limits`, `/api/my/soul`. These functionally overlap
+  `profile/llm/*` but serve the REST-based admin SPA, which is intentionally
+  outside the AppUI migration scope.
 
-- REST:
-  - session lists
-  - artifact/file lists
-  - compatibility hydrate
-- protocol:
-  - turn lifecycle
-  - approvals
-  - diff preview
-  - task output
-  - live progress
-  - resumable event flow
+Note: `POST /api/tasks/{task_id}/cancel` is **not** an AppUI duplicate of the
+WS `task/cancel` method — it backs the `octos-bus` API channel
+(`crates/octos-bus/src/api_channel.rs`) and is the channel/CLI task-cancel path.
+
+Original migration-era split (historical):
+
+- REST: session lists, artifact/file lists, compatibility hydrate
+- protocol: turn lifecycle, approvals, diff preview, task output, live
+  progress, resumable event flow
 
 ## 12. M8 Gate
 
@@ -1810,9 +2013,33 @@ Wire shape (JSON):
   "thread_id": "thread-1",
   "seq": 18,
   "client_message_id": "01900000-0000-7000-8000-000000000001",
-  "payload": { "type": "...", "data": { ... } }
+  "payload": { "type": "...", "data": { ... } },
+  "session_id": "local:demo",
+  "topic": "planning"
 }
 ```
+
+The `projection/envelope` notification's JSON-RPC `params` is the bare
+`Envelope` fields (`thread_id`, `seq`, `client_message_id?`, `payload`)
+FLATTENED with the routing keys `session_id` and optional `topic`. The
+routing keys let a multi-session client (e.g. the TUI, which holds
+several sessions on one connection) route each envelope to the correct
+session and topic-scoped pane. The bare `Envelope` keys remain at the
+top level, so a client that reads `thread_id`/`seq`/`payload` top-level
+and ignores unknown keys decodes the frame unchanged — the routing
+addition is backward-compatible. A decoder that receives an OLD frame
+lacking `session_id`/`topic` defaults `session_id` to the empty key and
+`topic` to absent, and falls back to its ambient connection context for
+routing.
+
+> History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
+> BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
+> only on the durable ledger's on-disk record. That left a multi-session
+> consumer with an unroutable empty `session_id`. The wire is now
+> un-stripped (`feat(envelope-wire-routing)`); the **disk** record shape
+> — a NESTED `{ session_id, topic, envelope }` object via the
+> `EnvelopeNotification` derive — is UNCHANGED, so post-restart
+> topic-scoped replay still routes (BLOCKER 4's actual invariant holds).
 
 Field contract:
 
@@ -1829,6 +2056,12 @@ Field contract:
   server emitting `client_message_id` on a non-`user_message` envelope
   is a wire contract violation.
 - `payload` (object, required) — Sealed tagged union; see § 14.2.
+- `session_id` (`string`, optional on the wire for backward-compat,
+  always emitted by current servers) — The bare base session key for
+  client-side routing. A multi-session client routes the envelope to
+  this session; the projection itself does not consult it.
+- `topic` (`string`, optional) — Topic suffix for topic-scoped routing.
+  Omitted when the envelope is not topic-scoped.
 
 Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
 in `octos-core::ui_protocol`. TS source: `Envelope` in

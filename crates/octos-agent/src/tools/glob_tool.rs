@@ -49,6 +49,53 @@ fn default_limit() -> usize {
     100
 }
 
+/// Directory NAMES whose subtrees are pruned during glob DESCENT.
+///
+/// mini5 soak motivation: a broad glob from an unscoped cwd (the home dir)
+/// recursed into `~/Library/...`, emitting thousands of per-entry WARN lines
+/// and running until the 1800s tool timeout fired. These trees are either
+/// system/OS storage (`Library`) or build/VCS noise every search tool
+/// (ripgrep, fd, the `ignore` crate) skips by default. Pruning them at
+/// descent keeps a broad scan fast without flooding logs.
+///
+/// Conservative invariant: this is a DESCENT filter only — it never affects a
+/// pattern that explicitly anchors AT one of these directories (the walker
+/// root is never pruned), and it never touches files at any other depth.
+const NOISY_SKIP_DIRS: &[&str] = &[
+    "Library",      // macOS user Library (huge, system-managed)
+    ".git",         // VCS internals
+    "node_modules", // JS dependency tree
+    "target",       // Rust build output
+];
+
+/// Whether a directory with this name should be pruned during glob descent.
+fn is_noisy_skip_dir(name: &str) -> bool {
+    NOISY_SKIP_DIRS.contains(&name)
+}
+
+/// Returns `true` if `dir_entry` is a directory that should be pruned from
+/// traversal: either it is a well-known noisy/system dir (and not the walker
+/// root itself), so we never descend into it. Used as a `WalkBuilder`
+/// `filter_entry` predicate (the closure returns `false` to prune).
+fn should_descend(dir_entry: &ignore::DirEntry, root: &std::path::Path) -> bool {
+    // Never prune the walker root — anchoring a pattern AT a noisy dir must
+    // still enumerate its contents.
+    if dir_entry.path() == root {
+        return true;
+    }
+    // Only directories are descent candidates; files always pass.
+    let is_dir = dir_entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+    if !is_dir {
+        return true;
+    }
+    let prune = dir_entry
+        .file_name()
+        .to_str()
+        .map(is_noisy_skip_dir)
+        .unwrap_or(false);
+    !prune
+}
+
 #[async_trait]
 impl Tool for GlobTool {
     fn name(&self) -> &str {
@@ -121,6 +168,26 @@ impl Tool for GlobTool {
         if ctx.session_scope.is_none() && !filesystem_scope.is_host() && pattern.starts_with('/') {
             return Ok(ToolResult {
                 output: "Absolute paths and '..' are not allowed in glob patterns".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        // Interim mitigation (#1378, superseded by #1377): redirect upload-handle
+        // / `up/` namespace patterns to read_file BEFORE globbing, so a decoded
+        // handle is never returned as a workspace match (consistent with
+        // read_file/list_dir which treat decoded `up/...` as uploads). A
+        // non-handle `up/...` beside a real `up/` dir returns None and globs
+        // normally; one with no real `up/` dir is redirected here rather than
+        // surfacing the misleading empty "No files found".
+        let ws_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|s| s.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
+        if let Some(guidance) = super::upload_namespace_redirect(&pattern, &ws_root) {
+            return Ok(ToolResult {
+                output: guidance.to_string(),
                 success: false,
                 ..Default::default()
             });
@@ -289,20 +356,31 @@ fn run_glob_scoped(scope: &SessionScope, pattern: String, limit: usize) -> Resul
     let glob_set = glob_set.expect("checked above");
 
     // Step 5: walk with follow_links(false) so symlinks aren't traversed.
+    // FIX 2: prune well-known noisy/system trees (`Library`, `.git`,
+    // `node_modules`, `target`) during DESCENT via `filter_entry` so a broad
+    // glob stays fast. The walker root is never pruned (anchoring AT such a
+    // dir still enumerates it).
+    let walk_root = root.clone();
     let walker = WalkBuilder::new(&root)
         .follow_links(false)
         .hidden(false)
         .git_ignore(false)
+        .filter_entry(move |e| should_descend(e, &walk_root))
         .build();
 
     for entry in walker {
         if files.len() >= limit {
+            // FIX 2: log ONCE on truncation (no silent unbounded scans).
+            tracing::info!(limit, "glob result truncated at limit");
             break;
         }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "glob walker entry error");
+                // FIX 2: an unreadable/permission-denied subtree must NOT
+                // emit a per-entry WARN (the mini5 log flood). Record at
+                // debug and skip silently.
+                tracing::debug!(error = %e, "glob walker entry skipped (unreadable)");
                 continue;
             }
         };
@@ -360,11 +438,21 @@ fn run_glob_scoped(scope: &SessionScope, pattern: String, limit: usize) -> Resul
 
 /// Legacy `base_dir + FilesystemScope` glob execution (pre-PR-B).
 ///
-/// Kept unchanged for callers without a `SessionScope`: `octos chat`
-/// uses this path. The `glob::glob` recursion model is acceptable here
-/// because the only containment guarantee these callers ever had was
-/// the lexical `..` / absolute rejection at the input boundary plus
-/// the `base_dir` anchor — that's still in force.
+/// Used by callers without a `SessionScope` (`octos chat`, and the
+/// unscoped `serve` factory path). The containment guarantee is the
+/// lexical `..` / absolute rejection at the input boundary plus the
+/// `base_dir` anchor — that's still in force.
+///
+/// FIX 2 (mini5 soak): this path previously used `glob::glob`, which (a)
+/// recursed into `~/Library/...` when the cwd was an unscoped home dir,
+/// emitting thousands of per-entry `glob entry error attempting to read`
+/// WARN lines, and (b) ran until the 1800s tool timeout fired. It now
+/// uses an `ignore::WalkBuilder` rooted at the pattern's non-glob prefix
+/// with `filter_entry` pruning of well-known noisy/system trees
+/// (`Library`, `.git`, `node_modules`, `target`) and debug-level (never
+/// WARN) handling of unreadable entries. Match semantics are preserved:
+/// `*` does not cross `/`, `**` does (globset `literal_separator(true)`),
+/// matched against the entry path relative to the walk root.
 fn run_glob_legacy(
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
@@ -372,35 +460,93 @@ fn run_glob_legacy(
     limit: usize,
 ) -> Result<Vec<String>> {
     let pattern_path = PathBuf::from(&pattern);
-    let full_pattern = if filesystem_scope.is_host() && pattern_path.is_absolute() {
-        pattern.clone()
+    let host_absolute = filesystem_scope.is_host() && pattern_path.is_absolute();
+
+    // Compute the walk root and the remaining glob pattern. Host-absolute
+    // patterns anchor at the absolute non-glob prefix; everything else
+    // anchors under `base_dir`.
+    let (prefix, remainder) = split_glob_prefix(&pattern);
+    let (root, glob_pattern): (PathBuf, String) = if host_absolute {
+        let prefix_path = if prefix.is_empty() {
+            PathBuf::from("/")
+        } else {
+            PathBuf::from(&prefix)
+        };
+        (prefix_path, remainder)
+    } else if prefix.is_empty() {
+        (base_dir.clone(), remainder)
     } else {
-        format!("{}/{}", base_dir.display(), pattern)
+        (base_dir.join(&prefix), remainder)
     };
 
     let mut files: Vec<String> = Vec::new();
 
-    let entries = match glob::glob(&full_pattern) {
-        Ok(p) => p,
-        Err(e) => return Err(eyre::eyre!("invalid glob pattern: {}", e)),
-    };
+    // Literal-only pattern (no metachars): treat the root as a single match
+    // if it is an existing file, mirroring `glob::glob` (which returns the
+    // literal path when it exists).
+    if glob_pattern.is_empty() {
+        if root.is_file() {
+            let display = root
+                .strip_prefix(&base_dir)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| root.clone());
+            files.push(display.display().to_string());
+        }
+        return Ok(files);
+    }
 
-    for entry in entries {
+    let glob = GlobBuilder::new(&glob_pattern)
+        .literal_separator(true)
+        .build()
+        .wrap_err_with(|| format!("invalid glob pattern: {}", glob_pattern))?;
+    let mut builder = GlobSetBuilder::new();
+    builder.add(glob);
+    let glob_set = builder.build().wrap_err("globset build failed")?;
+
+    let walk_root = root.clone();
+    let walker = WalkBuilder::new(&root)
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(false)
+        .filter_entry(move |e| should_descend(e, &walk_root))
+        .build();
+
+    for entry in walker {
         if files.len() >= limit {
+            // FIX 2: log ONCE on truncation (no silent unbounded scans).
+            tracing::info!(limit, "glob result truncated at limit");
             break;
         }
-        let path = match entry {
-            Ok(p) => p,
+        let entry = match entry {
+            Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "glob entry error");
+                // FIX 2: unreadable/permission-denied subtree — debug, never
+                // a per-entry WARN (the mini5 flood).
+                tracing::debug!(error = %e, "glob entry skipped (unreadable)");
                 continue;
             }
         };
+        let path = entry.path();
+
+        if path == root {
+            continue;
+        }
+        if path.is_dir() {
+            continue;
+        }
+
+        let rel = match path.strip_prefix(&root) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !glob_set.is_match(rel) {
+            continue;
+        }
 
         let display_path = path
             .strip_prefix(&base_dir)
             .map(|p| p.to_path_buf())
-            .unwrap_or(path);
+            .unwrap_or_else(|_| path.to_path_buf());
         files.push(display_path.display().to_string());
     }
 
@@ -411,6 +557,140 @@ fn run_glob_legacy(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn glob_on_upload_handle_namespace_returns_guidance() {
+        // #1378: glob('up/**') can never match (uploads live outside the
+        // workspace), so redirect to read_file instead of an empty "no
+        // matches" that reads as "the upload is gone".
+        let dir = tempfile::tempdir().unwrap();
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "up/**"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("opaque upload handle") && result.output.contains("read_file"),
+            "expected upload guidance, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn glob_does_not_hijack_a_real_workspace_up_directory() {
+        // codex #1378 P2: a repo with a genuine `up/` dir must glob normally —
+        // matches return files; a no-match returns "No files found", NOT upload
+        // guidance.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("up")).unwrap();
+        std::fs::write(dir.path().join("up/a.rs"), "").unwrap();
+        let tool = GlobTool::new(dir.path());
+
+        let hit = tool
+            .execute(&serde_json::json!({"pattern": "up/*.rs"}))
+            .await
+            .unwrap();
+        assert!(
+            hit.success && hit.output.contains("a.rs"),
+            "got: {}",
+            hit.output
+        );
+        assert!(!hit.output.contains("opaque upload handle"));
+
+        let miss = tool
+            .execute(&serde_json::json!({"pattern": "up/*.toml"}))
+            .await
+            .unwrap();
+        assert!(
+            miss.output.contains("No files found"),
+            "real up/ dir with no match must say No files found, got: {}",
+            miss.output
+        );
+        assert!(!miss.output.contains("opaque upload handle"));
+    }
+
+    #[tokio::test]
+    async fn glob_guides_when_up_is_a_regular_file_not_a_dir() {
+        // codex round-2 P3: `up` is a regular FILE (not a dir), so glob('up/**')
+        // can't enumerate it — guidance should still fire (is_dir, not exists).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("up"), "i am a file").unwrap();
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "up/**"}))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("opaque upload handle"),
+            "expected guidance when up is a file, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn glob_guides_for_a_decoded_handle_even_with_a_real_up_dir() {
+        // codex round-3 P2: a syntactically valid upload handle must redirect to
+        // read_file even when the workspace also has a real `up/` directory —
+        // glob must not fall back to "No files found".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("up")).unwrap();
+        std::fs::write(dir.path().join("up/decoy.rs"), "").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
+            &octos_bus::file_handle::temp_upload_root().join("u-x-report.md"),
+            Some("report.md"),
+        )
+        .expect("encode upload handle");
+
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": handle }))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("opaque upload handle"),
+            "expected guidance for a decoded handle despite a real up/ dir, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn glob_redirects_decoded_handle_even_when_it_matches_a_real_path() {
+        // codex round-5 P2: a decoded handle whose literal path ALSO exists in
+        // the workspace must still redirect to read_file (upload-handle
+        // precedence, consistent with read_file/list_dir), NOT be returned as a
+        // glob match. The redirect runs BEFORE the glob walk.
+        let dir = tempfile::tempdir().unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
+            &octos_bus::file_handle::temp_upload_root().join("u-collide-report.md"),
+            Some("report.md"),
+        )
+        .expect("encode handle");
+        // Plant a real workspace file at the handle's literal path so a naive
+        // glob would match it.
+        let lit = dir.path().join(&handle);
+        std::fs::create_dir_all(lit.parent().unwrap()).unwrap();
+        std::fs::write(&lit, "decoy").unwrap();
+
+        let tool = GlobTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": handle }))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("opaque upload handle"),
+            "decoded handle must redirect even when its literal path exists, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Found "),
+            "must NOT return the colliding workspace match, got: {}",
+            result.output
+        );
+    }
 
     #[tokio::test]
     async fn test_glob_finds_files() {
@@ -749,5 +1029,149 @@ mod tests {
         let (prefix, remainder) = split_glob_prefix("src/lib*.rs");
         assert_eq!(prefix, "src");
         assert_eq!(remainder, "lib*.rs");
+    }
+
+    // ------------------------------------------------------------------
+    // FIX 2: glob must not WARN-flood / waste time on unreadable system
+    // dirs, and should prune well-known noisy trees during traversal.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn noisy_system_dirs_are_pruned() {
+        for name in ["Library", ".git", "node_modules", "target"] {
+            assert!(
+                is_noisy_skip_dir(name),
+                "{name} should be pruned during traversal"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_dirs_are_not_pruned() {
+        for name in ["src", "tests", "docs", "research", "lib", "up"] {
+            assert!(
+                !is_noisy_skip_dir(name),
+                "{name} must NOT be pruned during traversal"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_glob_skips_unreadable_dir_without_erroring() {
+        // mini5 soak: a broad glob from an unscoped cwd that contains an
+        // unreadable subtree (e.g. ~/Library/... with mode 000) must NOT
+        // hang or surface an error result — it returns the readable
+        // matches and silently skips the unreadable subtree.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readable.txt"), "ok").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inside.txt"), "secret").unwrap();
+        // Make the dir unreadable/untraversable.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let tool = GlobTool::new(dir.path()).with_filesystem_scope(FilesystemScope::Host);
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "**/*.txt"}))
+            .await
+            .unwrap();
+
+        // Restore perms so the tempdir can be cleaned up.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+
+        assert!(result.success, "glob must succeed, got: {}", result.output);
+        assert!(
+            result.output.contains("readable.txt"),
+            "readable match must be returned, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_glob_does_not_descend_into_noisy_dirs() {
+        // A `**/*.js` from an unscoped cwd must NOT descend into a
+        // `node_modules` tree (the convention every search tool follows)
+        // so a broad scan stays fast. The non-noisy match is still found.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), "").unwrap();
+        let nm = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("dep.js"), "").unwrap();
+
+        let tool = GlobTool::new(dir.path()).with_filesystem_scope(FilesystemScope::Host);
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "**/*.js"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {}", result.output);
+        assert!(
+            result.output.contains("app.js"),
+            "workspace match must be found, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("dep.js"),
+            "must not descend into node_modules, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_glob_anchored_at_noisy_dir_still_matches() {
+        // Conservative guarantee: pruning is for DESCENT only. If the user
+        // explicitly anchors the pattern AT a noisy dir, its contents must
+        // still match (we don't prune the walker root itself).
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("dep.js"), "").unwrap();
+
+        let tool = GlobTool::new(dir.path()).with_filesystem_scope(FilesystemScope::Host);
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "node_modules/**/*.js"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {}", result.output);
+        assert!(
+            result.output.contains("dep.js"),
+            "explicitly anchoring at node_modules must still match, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_glob_does_not_descend_into_noisy_dirs() {
+        // Same pruning for the SessionScope walker path.
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("app.js"), "").unwrap();
+        let nm = workspace.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("dep.js"), "").unwrap();
+
+        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![]).unwrap();
+        let tool = GlobTool::new(workspace.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"pattern": "**/*.js"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {}", result.output);
+        assert!(
+            result.output.contains("app.js"),
+            "workspace match must be found, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("dep.js"),
+            "scoped walker must not descend into node_modules, got: {}",
+            result.output
+        );
     }
 }

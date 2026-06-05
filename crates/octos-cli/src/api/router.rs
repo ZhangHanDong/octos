@@ -19,6 +19,7 @@ use super::frps_plugin;
 use super::handlers;
 use super::metrics;
 use super::purge;
+use super::solo_auth;
 use super::static_files;
 use super::swarm as swarm_api;
 use super::ui_protocol;
@@ -86,10 +87,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     };
 
     // Public auth endpoints (no auth required)
+    //
+    // `/api/auth/solo*` are the no-password solo login routes. They are
+    // public by design — no credential exists yet on a fresh local install
+    // — and fail closed inside the handlers (`solo_auth::solo_login_allowed`)
+    // unless the host is Local-solo AND the peer is loopback.
     let auth_api = Router::new()
         .route("/api/auth/status", get(auth_handlers::auth_status))
         .route("/api/auth/send-code", post(auth_handlers::send_code))
         .route("/api/auth/verify", post(auth_handlers::verify))
+        .route("/api/auth/solo", post(solo_auth::solo_login))
+        .route("/api/auth/solo/create", post(solo_auth::solo_create))
         .route("/api/auth/logout", post(auth_handlers::logout));
 
     // Chat + status API (existing)
@@ -176,7 +184,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/files/list", get(handlers::list_content_files))
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
-        // M7.9 / W2 — task supervisor exposure (kept REST)
+        // M7.9 / W2 — task supervisor exposure (kept REST). NOT an AppUI
+        // duplicate of the WS `task/cancel` method: this is the channel/CLI
+        // task-cancel path, also backed by the octos-bus API channel
+        // (crates/octos-bus/src/api_channel.rs). See octos#1371 + spec §11.
         .route("/api/tasks/{task_id}/cancel", post(handlers::cancel_task))
         .route(
             "/api/tasks/{task_id}/restart-from-node",
@@ -250,6 +261,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             delete(auth_handlers::remove_my_profile_skill),
         )
         .route("/api/auth/me", get(auth_handlers::me))
+        // Admin/config plane (kept REST): consumed by the admin dashboard SPA
+        // (dashboard/src/api.ts), not the AppUI WS client. These functionally
+        // overlap `profile/llm/*` but serve the REST-based admin surface, which
+        // is intentionally outside the M12 WS migration scope. See octos#1371.
         .route("/api/my/test-provider", post(admin::test_provider))
         .route("/api/my/provider-models", post(admin::provider_models))
         .route("/api/my/test-search", post(admin::test_search))
