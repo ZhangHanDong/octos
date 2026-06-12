@@ -307,6 +307,97 @@ pub(super) fn compose_system_prompt(agent: &Agent) -> String {
 }
 
 impl Agent {
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): re-check a pending
+    /// human approval just before executing it. Policies may have changed
+    /// while the approval waited (config hot-reload, hook edits), so the
+    /// approver list is re-checked and `before_tool_call` hooks are re-run
+    /// against the original arguments. A hook that now denies — or modifies
+    /// the arguments away from the digest the human approved — invalidates
+    /// the approval.
+    pub async fn revalidate_pending_approval(
+        &self,
+        pending: &crate::approval::PendingApproval,
+        sender_user_id: &str,
+    ) -> std::result::Result<(), String> {
+        if !pending
+            .request
+            .authorized_approvers
+            .iter()
+            .any(|approver| approver == sender_user_id)
+        {
+            return Err("approver is not authorized".to_string());
+        }
+
+        if let Some(ref hooks) = self.hooks {
+            let payload = HookPayload::before_tool(
+                &pending.request.tool_name,
+                pending.tool_args.clone(),
+                &pending.tool_id,
+                self.hook_ctx().as_ref(),
+            );
+            match hooks.run(HookEvent::BeforeToolCall, &payload).await {
+                HookResult::Allow => Ok(()),
+                HookResult::Modified(new_args) => {
+                    if crate::approval::digest_tool_args(&new_args)
+                        == pending.request.tool_args_digest
+                    {
+                        Ok(())
+                    } else {
+                        Err("tool arguments changed since approval request was created".to_string())
+                    }
+                }
+                HookResult::Deny(reason) => {
+                    if reason.is_empty() {
+                        Err("current policy denied the approved tool call".to_string())
+                    } else {
+                        Err(reason)
+                    }
+                }
+                HookResult::Error(err) => Err(err),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): execute a tool call
+    /// whose human approval was granted. Runs the tool directly with the
+    /// digest-bound arguments — no LLM round trip — and fires the
+    /// `after_tool_call` hooks. The caller is responsible for validating and
+    /// consuming the pending approval first
+    /// (`PendingApprovalStore::consume` + [`Agent::revalidate_pending_approval`]).
+    pub async fn execute_approved_tool(
+        &self,
+        pending: &crate::approval::PendingApproval,
+    ) -> Result<crate::tools::ToolResult> {
+        let tool_start = Instant::now();
+        let ctx = ToolContext {
+            tool_id: pending.tool_id.clone(),
+            ..ToolContext::zero()
+        };
+        let result = TOOL_CTX
+            .scope(
+                ctx,
+                self.tools
+                    .execute(&pending.request.tool_name, &pending.tool_args),
+            )
+            .await?;
+
+        if let Some(ref hooks) = self.hooks {
+            let payload = HookPayload::after_tool(
+                &pending.request.tool_name,
+                &pending.tool_id,
+                octos_core::truncated_utf8(&result.output, 500, "..."),
+                result.success,
+                tool_start.elapsed().as_millis() as u64,
+                self.hook_ctx().as_ref(),
+            );
+            let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+        }
+
+        Ok(result)
+    }
+
     /// Spawn a single tool call as a detached `tokio::spawn` task.
     ///
     /// The returned [`JoinHandle`] yields the per-call [`ToolCallResult`]:

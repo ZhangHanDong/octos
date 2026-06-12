@@ -47,6 +47,8 @@ const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
 const CONTENT_APP: &str = "org.octos.app";
 const CONTENT_ACTIONS: &str = "org.octos.actions";
 const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
+const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
+const CONTENT_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 const CONTENT_BROADCAST_TARGETS: &str = "org.octos.broadcast_targets";
@@ -1280,6 +1282,11 @@ async fn handle_transaction(
         if let Some(action_response) = content.get(CONTENT_ACTION_RESPONSE) {
             metadata[CONTENT_ACTION_RESPONSE] = action_response.clone();
         }
+        // Phase 4: approval responses (Approve/Deny button presses) flow back
+        // to the session actor via InboundMessage metadata.
+        if let Some(approval_response) = content.get(CONTENT_APPROVAL_RESPONSE) {
+            metadata[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
+        }
         if let Some(profile_id) = route_by_explicit_target(&state.bot_router, content).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
         } else if let Some(profile_id) =
@@ -2151,6 +2158,16 @@ impl MatrixChannel {
         }
         if let Some(action_response) = metadata.get(CONTENT_ACTION_RESPONSE) {
             body[CONTENT_ACTION_RESPONSE] = action_response.clone();
+        }
+        // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): human-approval
+        // request envelopes ride the same metadata→content projection as app
+        // cards; Robrix renders Approve/Deny buttons, other clients show the
+        // plain-text fallback body.
+        if let Some(approval_request) = metadata.get(CONTENT_APPROVAL_REQUEST) {
+            body[CONTENT_APPROVAL_REQUEST] = approval_request.clone();
+        }
+        if let Some(approval_response) = metadata.get(CONTENT_APPROVAL_RESPONSE) {
+            body[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
         }
 
         let resp = self
@@ -7055,6 +7072,121 @@ mod tests {
                 Some("profile-alex".to_string()),
             )],
             "/allbots should skip stale bindings and still fan out to valid child bots",
+        );
+    }
+
+    #[tokio::test]
+    async fn should_project_approval_request_into_event_content() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "Approval required: Approve shell command".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({
+                CONTENT_APPROVAL_REQUEST: {
+                    "request_id": "req_1_1",
+                    "tool_name": "shell",
+                    "tool_args_digest": "sha256:abc",
+                    "title": "Approve shell command",
+                    "summary": "rm -rf tmp",
+                    "risk_level": "critical",
+                    "authorized_approvers": ["@alice:localhost"],
+                    "expires_at": "2026-06-13T12:00:00Z",
+                    "on_timeout": "notify"
+                },
+                CONTENT_ACTIONS: [
+                    { "id": "approve", "label": "Approve", "style": "primary" },
+                    { "id": "deny", "label": "Deny", "style": "danger" }
+                ]
+            }),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert_eq!(
+            req.body[CONTENT_APPROVAL_REQUEST]["request_id"],
+            json!("req_1_1")
+        );
+        assert_eq!(
+            req.body[CONTENT_APPROVAL_REQUEST]["tool_name"],
+            json!("shell")
+        );
+        assert_eq!(req.body[CONTENT_ACTIONS][0]["id"], json!("approve"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_copy_approval_response_into_inbound_metadata() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let state = make_test_state(inbound_tx);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$approval_resp",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "approve",
+                    "org.octos.approval_response": {
+                        "request_id": "req_1_1",
+                        "decision": "approve",
+                        "source_event_id": "$approval_resp",
+                        "tool_args_digest": "sha256:abc"
+                    }
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_approval?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let inbound = inbound_rx.recv().await.expect("inbound message");
+        assert_eq!(
+            inbound.metadata[CONTENT_APPROVAL_RESPONSE]["request_id"],
+            json!("req_1_1")
+        );
+        assert_eq!(
+            inbound.metadata[CONTENT_APPROVAL_RESPONSE]["decision"],
+            json!("approve")
         );
     }
 

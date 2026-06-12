@@ -1101,6 +1101,13 @@ impl GatewayRuntime {
             max_timeout: Some(std::time::Duration::from_secs(session_timeout_secs)),
             chat_max_tokens: gw_config.max_output_tokens,
             reasoning_effort: gw_config.reasoning_effort,
+            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): config-driven
+            // human-approval rules gate matching tool calls behind a
+            // suspend-and-resume approval on the gateway channel.
+            human_approval_rules: config
+                .approval_policy
+                .as_ref()
+                .map(|policy| policy.to_runtime_rules()),
             ..Default::default()
         };
 

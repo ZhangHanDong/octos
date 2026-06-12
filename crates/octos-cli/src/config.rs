@@ -102,6 +102,12 @@ pub struct Config {
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
 
+    /// Human-approval rules for tool calls that require a human decision
+    /// before executing (suspend-and-resume flow on gateway channels — see
+    /// `docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`).
+    #[serde(default)]
+    pub approval_policy: Option<ApprovalPolicyConfig>,
+
     /// Context-based tool tag filter. When set, only tools matching at least one
     /// tag are visible to the LLM. Example: `["code", "search"]`.
     #[serde(default)]
@@ -341,6 +347,99 @@ pub struct FallbackModel {
 
 pub fn default_true() -> bool {
     true
+}
+
+/// Default disposition for tools not matched by any approval rule.
+/// v1 supports `allow` only (unmatched tools run without human approval).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalPolicyDefault {
+    #[default]
+    Allow,
+}
+
+/// Severity attached to approval requests (rendered by capable clients).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalPolicyRiskLevel {
+    Normal,
+    Critical,
+}
+
+/// What happens when an approval request expires unanswered.
+/// v1 supports `notify` only (a notice is sent to the originating chat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalPolicyTimeoutBehavior {
+    Notify,
+}
+
+/// One human-approval rule: tool calls matching `tools` suspend the turn
+/// until a user in `authorized_approvers` approves or denies, or the request
+/// expires after `expires_in_secs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRuleConfig {
+    /// Tool names this rule gates (exact match, e.g. `["shell", "write_file"]`).
+    pub tools: Vec<String>,
+    /// Must be `true` — present so a rule's intent is explicit in config.
+    pub require_approval: bool,
+    pub risk_level: ApprovalPolicyRiskLevel,
+    /// Channel user IDs allowed to answer (e.g. `["@alice:example.org"]`).
+    pub authorized_approvers: Vec<String>,
+    /// Seconds until the pending request expires.
+    pub expires_in_secs: u64,
+    pub on_timeout: ApprovalPolicyTimeoutBehavior,
+}
+
+/// Config surface for the human-approval flow
+/// (`docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). Converted to
+/// [`octos_agent::HumanApprovalRules`] via [`Self::to_runtime_rules`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ApprovalPolicyConfig {
+    #[serde(default)]
+    pub default: ApprovalPolicyDefault,
+    #[serde(default)]
+    pub rules: Vec<ApprovalRuleConfig>,
+}
+
+impl ApprovalPolicyRiskLevel {
+    pub fn to_runtime(self) -> octos_agent::ApprovalRiskLevel {
+        match self {
+            Self::Normal => octos_agent::ApprovalRiskLevel::Normal,
+            Self::Critical => octos_agent::ApprovalRiskLevel::Critical,
+        }
+    }
+}
+
+impl ApprovalPolicyTimeoutBehavior {
+    pub fn to_runtime(self) -> octos_agent::ApprovalTimeoutBehavior {
+        match self {
+            Self::Notify => octos_agent::ApprovalTimeoutBehavior::Notify,
+        }
+    }
+}
+
+impl ApprovalRuleConfig {
+    pub fn to_runtime(&self) -> octos_agent::ApprovalRule {
+        octos_agent::ApprovalRule {
+            tools: self.tools.clone(),
+            risk_level: self.risk_level.to_runtime(),
+            authorized_approvers: self.authorized_approvers.clone(),
+            expires_in_secs: self.expires_in_secs,
+            on_timeout: self.on_timeout.to_runtime(),
+        }
+    }
+}
+
+impl ApprovalPolicyConfig {
+    pub fn to_runtime_rules(&self) -> octos_agent::HumanApprovalRules {
+        octos_agent::HumanApprovalRules::new(
+            self.rules
+                .iter()
+                .map(ApprovalRuleConfig::to_runtime)
+                .collect(),
+        )
+    }
 }
 
 /// A sub-provider available for subagent spawning via the spawn tool.
@@ -1135,6 +1234,7 @@ impl Config {
 
         // Expand environment variables in config values
         config.expand_env_vars();
+        config.validate_approval_policy()?;
 
         // Section B (codex review round-5 P1.2): the host's
         // `plugins.require_signed` policy must reach spawned gateway
@@ -1155,6 +1255,31 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Validate the human-approval rule set at config-load time so a typo'd
+    /// rule fails fast instead of silently never gating (or gating with an
+    /// unanswerable request). Runs after `expand_env_vars` so `${VAR}`
+    /// references in approver lists are validated post-expansion.
+    fn validate_approval_policy(&self) -> Result<()> {
+        let Some(policy) = &self.approval_policy else {
+            return Ok(());
+        };
+        for (idx, rule) in policy.rules.iter().enumerate() {
+            if rule.tools.is_empty() {
+                eyre::bail!("approval_policy.rules[{idx}].tools must not be empty");
+            }
+            if !rule.require_approval {
+                eyre::bail!("approval_policy.rules[{idx}].require_approval must be true");
+            }
+            if rule.authorized_approvers.is_empty() {
+                eyre::bail!("approval_policy.rules[{idx}].authorized_approvers must not be empty");
+            }
+            if rule.expires_in_secs == 0 {
+                eyre::bail!("approval_policy.rules[{idx}].expires_in_secs must be > 0");
+            }
+        }
+        Ok(())
     }
 
     /// Expand environment variables in config values.
@@ -2104,5 +2229,69 @@ mod tests {
         let json = r#"{ "tts_provider": "sovits" }"#;
         let cfg: VoiceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.tts_provider, "sovits");
+    }
+
+    #[test]
+    fn should_deserialize_approval_policy_when_present() {
+        let json = r#"{
+            "provider": "anthropic",
+            "approval_policy": {
+                "default": "allow",
+                "rules": [{
+                    "tools": ["shell"],
+                    "require_approval": true,
+                    "risk_level": "critical",
+                    "authorized_approvers": ["@alice:example.org"],
+                    "expires_in_secs": 300,
+                    "on_timeout": "notify"
+                }]
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let policy = config.approval_policy.as_ref().unwrap();
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].tools, vec!["shell"]);
+        assert!(config.validate_approval_policy().is_ok());
+
+        let runtime = policy.to_runtime_rules();
+        assert!(runtime.matching_rule("shell").is_some());
+        assert!(runtime.matching_rule("read_file").is_none());
+    }
+
+    #[test]
+    fn should_reject_approval_policy_when_rule_invalid() {
+        let base = ApprovalRuleConfig {
+            tools: vec!["shell".into()],
+            require_approval: true,
+            risk_level: ApprovalPolicyRiskLevel::Critical,
+            authorized_approvers: vec!["@alice:example.org".into()],
+            expires_in_secs: 300,
+            on_timeout: ApprovalPolicyTimeoutBehavior::Notify,
+        };
+        let config_with = |rule: ApprovalRuleConfig| Config {
+            approval_policy: Some(ApprovalPolicyConfig {
+                default: ApprovalPolicyDefault::Allow,
+                rules: vec![rule],
+            }),
+            ..Default::default()
+        };
+
+        let mut rule = base.clone();
+        rule.tools.clear();
+        assert!(config_with(rule).validate_approval_policy().is_err());
+
+        let mut rule = base.clone();
+        rule.require_approval = false;
+        assert!(config_with(rule).validate_approval_policy().is_err());
+
+        let mut rule = base.clone();
+        rule.authorized_approvers.clear();
+        assert!(config_with(rule).validate_approval_policy().is_err());
+
+        let mut rule = base.clone();
+        rule.expires_in_secs = 0;
+        assert!(config_with(rule).validate_approval_policy().is_err());
+
+        assert!(config_with(base).validate_approval_policy().is_ok());
     }
 }

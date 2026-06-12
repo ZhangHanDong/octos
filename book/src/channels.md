@@ -430,6 +430,8 @@ These commands are scoped to the current chat context. `/schedules` only shows j
 
 In a BotFather management room, `/allbots <message>` broadcasts a command to the room's bound child bots (at most 8 per broadcast). Stale bindings are skipped, and private bots only accept broadcasts from their owner.
 
+When `approval_policy` rules are configured (see Configuration → Human Approval Rules), tool calls matching a rule pause the turn and post an approval card to the room. Robrix renders native Approve/Deny buttons; the decision is only accepted from the rule's `authorized_approvers`, in the originating room, before expiry.
+
 ---
 
 ## Message Coalescing

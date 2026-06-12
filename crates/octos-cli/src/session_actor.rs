@@ -22,8 +22,10 @@ use octos_agent::tools::{
     ReadTaskOutputTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
-    Agent, AgentConfig, AgentVerifierConfig, CompactionSummarizerKind, HookContext, HookExecutor,
-    HookPayload, HookResult, LoopRetryState, PromptContextManager, PromptContextPhase,
+    Agent, AgentConfig, AgentVerifierConfig, ApprovalDecision, ApprovalRequestEnvelope,
+    ApprovalResponsePayload, ApprovalTimeoutBehavior, CompactionSummarizerKind, HookContext,
+    HookExecutor, HookPayload, HookResult, HumanPendingApprovalStore, LoopRetryState,
+    PendingApproval, PendingApprovalDraft, PromptContextManager, PromptContextPhase,
     PromptContextReport, PromptContextRequest, TaskSupervisor, TokenTracker, TurnAttachmentContext,
     WorkspacePolicy, read_workspace_policy, workspace_policy_path, write_workspace_policy,
 };
@@ -1754,6 +1756,14 @@ fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): metadata keys for the
+// suspend-and-resume approval flow. The matrix channel projects the request
+// key (plus action buttons) into outgoing event content and copies the
+// response key from incoming events into `InboundMessage.metadata`.
+const METADATA_APPROVAL_REQUEST: &str = "org.octos.approval_request";
+const METADATA_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
+const METADATA_APPROVAL_ACTIONS: &str = "org.octos.actions";
+
 async fn dispatch_background_result_to_actor(
     tx: mpsc::Sender<ActorMessage>,
     payload: BackgroundResultPayload,
@@ -2133,6 +2143,9 @@ pub enum ActorMessage {
         /// Serialized JSON of the BackgroundTask.
         task_json: String,
     },
+    /// A pending human-approval request reached its expiry deadline
+    /// (Phase 4, docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md).
+    ApprovalExpired { request_id: String },
     /// Synthetic recovery turn enqueued by the spawn_only failure-signal
     /// callback (M8.9). Drives the LLM to re-engage on a failed background
     /// task with the actionable error and (optionally parsed) alternatives.
@@ -3553,6 +3566,12 @@ impl ActorFactory {
             active_sessions: self.active_sessions.clone(),
             user_workspace: user_workspace.clone(),
             cron_tool: cron_tool_ref,
+            self_tx: tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                &self.data_dir,
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             persistent_retry_state,
             context_manager,
             retry_state_path: Some(retry_state_path),
@@ -4052,6 +4071,16 @@ struct SessionActor {
     user_workspace: std::path::PathBuf,
     /// Per-session cron tool reference — updated with channel/chat_id on each message.
     cron_tool: Option<Arc<CronTool>>,
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): sender half of this
+    /// actor's own inbox, used by approval-expiry timer tasks to wake the
+    /// actor with `ActorMessage::ApprovalExpired`.
+    self_tx: mpsc::Sender<ActorMessage>,
+    /// Pending human-approval requests awaiting a decision (in-memory; lost
+    /// on restart — documented v1 limitation in the ADR).
+    pending_approvals: HumanPendingApprovalStore,
+    /// Append-only JSONL audit log for approval decisions (shared record
+    /// shape with the UI-protocol approval path).
+    approvals_audit: Arc<crate::approvals_audit::ApprovalsAuditLog>,
     /// Review A F-015: cross-turn persistent retry-bucket handle. The
     /// agent loop's `PersistentRetryStateGuard` hydrates from this at turn
     /// start and writes back on drop. We hold a clone of the same `Arc` so
@@ -4604,6 +4633,255 @@ impl SessionActor {
         false
     }
 
+    // ── Phase 4: human-approval bridge (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
+
+    fn approval_request_message_content(request: &ApprovalRequestEnvelope) -> String {
+        format!(
+            "Approval required: {}\n\n{}",
+            request.title, request.summary
+        )
+    }
+
+    fn approval_actions_metadata() -> serde_json::Value {
+        serde_json::json!([
+            { "id": "approve", "label": "Approve", "style": "primary" },
+            { "id": "deny", "label": "Deny", "style": "danger" }
+        ])
+    }
+
+    /// Project the approval request to the channel. Capable clients (Robrix)
+    /// render the `org.octos.approval_request` envelope plus action buttons
+    /// natively; other clients show the plain text fallback.
+    async fn emit_approval_request(&self, pending: &PendingApproval) {
+        let metadata = serde_json::json!({
+            METADATA_APPROVAL_REQUEST: pending.request,
+            METADATA_APPROVAL_ACTIONS: Self::approval_actions_metadata(),
+        });
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: Self::approval_request_message_content(&pending.request),
+                reply_to: None,
+                media: vec![],
+                metadata,
+            })
+            .await;
+    }
+
+    fn parse_approval_response(message: &InboundMessage) -> Option<ApprovalResponsePayload> {
+        message
+            .metadata
+            .get(METADATA_APPROVAL_RESPONSE)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    /// Wake this actor with `ApprovalExpired` once the request's deadline
+    /// passes. The timer task holds only the inbox sender, so an actor that
+    /// shuts down first simply drops the wake-up.
+    fn schedule_approval_expiry(&self, request: &ApprovalRequestEnvelope) {
+        let request_id = request.request_id.clone();
+        let expires_at = request.expires_at;
+        let inbox_tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let now = chrono::Utc::now();
+            if expires_at > now {
+                let sleep_for = (expires_at - now)
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_secs(0));
+                tokio::time::sleep(sleep_for).await;
+            }
+            let _ = inbox_tx
+                .send(ActorMessage::ApprovalExpired { request_id })
+                .await;
+        });
+    }
+
+    async fn emit_approval_notice(&self, content: String) {
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content,
+                reply_to: None,
+                media: vec![],
+                metadata: system_notice_metadata(self.sender_user_id.as_deref()),
+            })
+            .await;
+    }
+
+    /// Append the decision to the shared approvals JSONL audit log (same
+    /// record shape as the UI-protocol approval path). The human-readable
+    /// `request_id` rides in `client_note` for correlation; the UUID ids are
+    /// minted per record because the gateway flow has no protocol-level
+    /// approval/turn UUIDs.
+    fn audit_approval_decision(
+        &self,
+        pending: &PendingApproval,
+        decision: ApprovalDecision,
+        decided_by: &str,
+    ) {
+        use octos_core::ui_protocol as uip;
+        let mut event = uip::ApprovalDecidedEvent::manual(
+            self.session_key.clone(),
+            uip::ApprovalId::new(),
+            uip::TurnId(uuid::Uuid::now_v7()),
+            match decision {
+                ApprovalDecision::Approve => uip::ApprovalDecision::Approve,
+                ApprovalDecision::Deny => uip::ApprovalDecision::Deny,
+            },
+            decided_by,
+        );
+        event.policy_id = Some("human_approval_rules".to_string());
+        event.client_note = Some(format!("request_id={}", pending.request.request_id));
+        crate::approvals_audit::log_decision_tracing(&event, Some(&pending.request.tool_name));
+        if let Err(err) = self
+            .approvals_audit
+            .record(&event, Some(&pending.request.tool_name))
+        {
+            tracing::warn!(error = %err, "failed to append approval audit record");
+        }
+    }
+
+    /// The agent suspended a turn on a rule-matched tool call: project the
+    /// request, start the expiry timer, and remember the pending approval.
+    async fn handle_pending_approval(
+        &mut self,
+        inbound: &InboundMessage,
+        draft: PendingApprovalDraft,
+    ) {
+        let pending = draft.into_pending(self.chat_id.clone(), inbound.sender_id.clone());
+        tracing::info!(
+            request_id = %pending.request.request_id,
+            tool_name = %pending.request.tool_name,
+            requester = %pending.requester,
+            room_id = %pending.room_id,
+            expires_at = %pending.request.expires_at,
+            "approval request created"
+        );
+        self.emit_approval_request(&pending).await;
+        self.schedule_approval_expiry(&pending.request);
+        self.pending_approvals.insert(pending);
+    }
+
+    async fn handle_approval_expired(&mut self, request_id: &str) {
+        let Some(pending) = self.pending_approvals.get(request_id) else {
+            return;
+        };
+        if !pending.is_expired(chrono::Utc::now()) {
+            return;
+        }
+        if let Some(expired) = self.pending_approvals.remove(request_id) {
+            tracing::info!(
+                request_id = %request_id,
+                tool_name = %expired.request.tool_name,
+                room_id = %expired.room_id,
+                "approval request expired"
+            );
+            if matches!(expired.request.on_timeout, ApprovalTimeoutBehavior::Notify) {
+                self.emit_approval_notice(format!(
+                    "Approval request expired: {}",
+                    expired.request.title
+                ))
+                .await;
+            }
+        }
+    }
+
+    /// Intercept an inbound message that carries an approval response.
+    /// Returns `true` when the message was consumed (valid or not) and must
+    /// not flow into the normal LLM turn.
+    async fn handle_approval_response_message(&mut self, inbound: &InboundMessage) -> bool {
+        let Some(response) = Self::parse_approval_response(inbound) else {
+            return false;
+        };
+
+        let now = chrono::Utc::now();
+        let consumed =
+            self.pending_approvals
+                .consume(&self.chat_id, &inbound.sender_id, &response, now);
+        let pending = match consumed {
+            Ok(pending) => pending,
+            Err(err) => {
+                tracing::warn!(
+                    request_id = %response.request_id,
+                    sender = %inbound.sender_id,
+                    room_id = %self.chat_id,
+                    error = ?err,
+                    "approval response rejected"
+                );
+                self.emit_approval_notice(format!("Approval rejected: {err:?}"))
+                    .await;
+                return true;
+            }
+        };
+
+        // Policy may have changed while the approval waited — re-run the
+        // before-tool hooks and the approver check against current state.
+        if let Err(err) = self
+            .agent
+            .revalidate_pending_approval(&pending, &inbound.sender_id)
+            .await
+        {
+            tracing::warn!(
+                request_id = %response.request_id,
+                sender = %inbound.sender_id,
+                error = %err,
+                "approval response failed policy revalidation"
+            );
+            self.emit_approval_notice(format!("Approval rejected: {err}"))
+                .await;
+            return true;
+        }
+
+        self.audit_approval_decision(&pending, response.decision, &inbound.sender_id);
+
+        match response.decision {
+            ApprovalDecision::Deny => {
+                tracing::info!(
+                    request_id = %response.request_id,
+                    approver = %inbound.sender_id,
+                    "approval request denied"
+                );
+                self.emit_approval_notice(format!("Denied: {}", pending.request.title))
+                    .await;
+            }
+            ApprovalDecision::Approve => {
+                tracing::info!(
+                    request_id = %response.request_id,
+                    approver = %inbound.sender_id,
+                    "approval request approved"
+                );
+                match self.agent.execute_approved_tool(&pending).await {
+                    Ok(result) if result.success => {
+                        let output = if result.output.trim().is_empty() {
+                            format!("Approved and executed: {}", pending.request.title)
+                        } else {
+                            result.output
+                        };
+                        self.emit_approval_notice(output).await;
+                    }
+                    Ok(result) => {
+                        self.emit_approval_notice(format!(
+                            "Approved but execution failed: {}",
+                            result.output
+                        ))
+                        .await;
+                    }
+                    Err(err) => {
+                        self.emit_approval_notice(format!("Approved but execution errored: {err}"))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
     async fn run(mut self) {
         self.emit_resume_hook().await;
         // Wave-4 B3.4 — surface adaptive-router failovers on the bus so
@@ -4648,6 +4926,11 @@ impl SessionActor {
                             attachment_prompt,
                         }) => {
                             idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
+                            // Phase 4: approval responses resolve a pending
+                            // approval instead of starting an LLM turn.
+                            if self.handle_approval_response_message(&message).await {
+                                continue;
+                            }
                             // Update cron tool context with current channel/chat_id
                             // so new cron jobs inherit the correct delivery target.
                             if let Some(ref cron) = self.cron_tool {
@@ -4841,6 +5124,10 @@ impl SessionActor {
                                     .await;
                             }
                             let _ = self.drain_master_continuations().await;
+                        }
+                        Some(ActorMessage::ApprovalExpired { request_id }) => {
+                            idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
+                            self.handle_approval_expired(&request_id).await;
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
                             idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
@@ -5659,6 +5946,9 @@ impl SessionActor {
                                 let _ = ack.send(persisted);
                             }
                         }
+                        Ok(ActorMessage::ApprovalExpired { request_id }) => {
+                            self.handle_approval_expired(&request_id).await;
+                        }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
                         }
@@ -5749,6 +6039,9 @@ impl SessionActor {
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
                             }
+                        }
+                        Ok(ActorMessage::ApprovalExpired { request_id }) => {
+                            self.handle_approval_expired(&request_id).await;
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
@@ -6662,6 +6955,9 @@ impl SessionActor {
         let started = Instant::now();
         let mut overflow_served = false;
         let mut overflow_commands: Vec<InboundMessage> = Vec::new();
+        // Phase 4: expiry wake-ups that arrive while the agent turn is
+        // running are buffered and processed once the turn completes.
+        let mut expired_approval_requests: Vec<String> = Vec::new();
 
         let (agent_result, llm_latency) = loop {
             tokio::select! {
@@ -6763,6 +7059,9 @@ impl SessionActor {
                                 let _ = ack.send(persisted);
                             }
                         }
+                        Some(ActorMessage::ApprovalExpired { request_id }) => {
+                            expired_approval_requests.push(request_id);
+                        }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
                             let _ = self.out_tx.send(octos_core::OutboundMessage {
                                 channel: self.channel.clone(),
@@ -6836,6 +7135,10 @@ impl SessionActor {
         }
         // If any deferred commands were processed, cancel in-flight overflow
         // tasks so their responses don't preempt command replies (#21).
+        for request_id in expired_approval_requests.drain(..) {
+            self.handle_approval_expired(&request_id).await;
+        }
+
         if !overflow_commands.is_empty() {
             self.overflow_cancelled.store(true, Ordering::Release);
         }
@@ -7182,6 +7485,15 @@ impl SessionActor {
                         files = ?conv_response.files_modified.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
                         "conv_response has files_modified"
                     );
+                }
+
+                // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): the agent
+                // suspended this turn on a rule-matched tool call. Project
+                // the approval request and stop — no assistant reply yet;
+                // the resolution arrives as a later inbound message.
+                if let Some(draft) = conv_response.pending_approval.clone() {
+                    self.handle_pending_approval(&inbound, draft).await;
+                    return;
                 }
 
                 // Send reply
@@ -7735,6 +8047,27 @@ impl SessionActor {
 
             match result {
                 Ok(Ok(conv_response)) => {
+                    // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md):
+                    // concurrent overflow turns have no pending-approval
+                    // store (they run detached from the actor), so a
+                    // rule-matched tool call cannot suspend here. Tell the
+                    // user to retry serially instead of dropping silently.
+                    if conv_response.pending_approval.is_some() {
+                        let _ = out_tx
+                            .send(OutboundMessage {
+                                channel: channel.clone(),
+                                chat_id: chat_id.clone(),
+                                content: "This request needs a human approval, which is not \
+                                          supported for concurrent turns. Please send it again \
+                                          after the current turn finishes."
+                                    .to_string(),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            })
+                            .await;
+                        return;
+                    }
                     let final_content = finalize_assistant_content(
                         &session_key,
                         &user_workspace,
@@ -8483,6 +8816,15 @@ impl SessionActor {
                     // here; rewriting it through the legacy in-memory
                     // compactor would create a second model-context truth and
                     // force a stale rebuild over the compacted context ledger.
+                }
+
+                // Phase 4: suspend-and-resume human approval (see
+                // process_inbound_speculative for rationale). The turn is
+                // over — release the concurrency permit before suspending.
+                if let Some(draft) = conv_response.pending_approval.clone() {
+                    drop(_permit);
+                    self.handle_pending_approval(&inbound, draft).await;
+                    return;
                 }
 
                 // Send reply — always goes to this actor's chat (no race!)
@@ -10442,6 +10784,12 @@ mod tests {
             chat_id: "test".to_string(),
             tenant_id: None,
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             agent: Arc::new(agent),
             hooks: None,
             hook_context: None,
@@ -10514,6 +10862,12 @@ mod tests {
             chat_id: "test".to_string(),
             tenant_id: None,
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             agent: Arc::new(agent),
             hooks: None,
             hook_context: None,
@@ -10664,6 +11018,12 @@ mod tests {
             chat_id: "test".to_string(),
             tenant_id: None,
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             agent: Arc::new(agent),
             hooks: Some(hooks),
             hook_context: Some(HookContext {
@@ -10789,6 +11149,12 @@ mod tests {
             chat_id: "test".to_string(),
             tenant_id: None,
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             agent: Arc::new(agent),
             hooks: Some(hooks),
             hook_context: Some(HookContext {
@@ -10913,6 +11279,12 @@ mod tests {
             chat_id: "test".to_string(),
             tenant_id: None,
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             agent: Arc::new(agent),
             hooks: None,
             hook_context: None,
@@ -11006,6 +11378,12 @@ mod tests {
             chat_id: "test".to_string(),
             tenant_id: None,
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             agent: Arc::new(agent),
             hooks: None,
             hook_context: None,
@@ -11101,6 +11479,12 @@ mod tests {
             chat_id: "test-api-chat".to_string(),
             tenant_id: None,
             inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
             agent: Arc::new(agent),
             hooks: None,
             hook_context: None,
@@ -16124,5 +16508,286 @@ mod tests {
             "profile B's skill file MUST be OutOfScope under profile A's scope; \
              got {b_classification:?}",
         );
+    }
+
+    // ── Phase 4: human-approval bridge tests (ROBRIX-PHASE4 ADR) ────────────
+
+    /// Provider that issues one `list_dir` tool call, then ends the turn.
+    struct GatedToolCallProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for GatedToolCallProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call_gated".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments: serde_json::json!({"path": "."}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Spawn an actor whose agent gates `list_dir` behind a human-approval
+    /// rule authorizing only `@alice:localhost`.
+    async fn setup_actor_with_approval_rules(
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+    ) {
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(GatedToolCallProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let rules = octos_agent::HumanApprovalRules::new(vec![octos_agent::ApprovalRule {
+            tools: vec!["list_dir".to_string()],
+            risk_level: octos_agent::ApprovalRiskLevel::Critical,
+            authorized_approvers: vec!["@alice:localhost".to_string()],
+            expires_in_secs: 300,
+            on_timeout: octos_agent::ApprovalTimeoutBehavior::Notify,
+        }]);
+
+        let agent = Agent::new(AgentId::new("approval-actor"), provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 3,
+                human_approval_rules: Some(rules),
+                ..Default::default()
+            });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("matrix", "!room:localhost"),
+            channel: "matrix".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            tenant_id: None,
+            inbox: inbox_rx,
+            self_tx: inbox_tx.clone(),
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
+            agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("matrix", "!room:localhost"),
+            ))),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            lane_routing: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&SessionKey::new("matrix", "!room:localhost")),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
+            current_command_cmid: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle)
+    }
+
+    fn approval_inbound(content: &str, sender: &str, metadata: serde_json::Value) -> ActorMessage {
+        ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "matrix".into(),
+                sender_id: sender.to_string(),
+                chat_id: "!room:localhost".into(),
+                content: content.to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata,
+                message_id: None,
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        }
+    }
+
+    async fn recv_outbound(out_rx: &mut mpsc::Receiver<OutboundMessage>) -> OutboundMessage {
+        tokio::time::timeout(Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("timed out waiting for outbound message")
+            .expect("outbound channel closed")
+    }
+
+    #[tokio::test]
+    async fn should_emit_approval_card_and_execute_on_authorized_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inbox_tx, mut out_rx, handle) = setup_actor_with_approval_rules(&dir).await;
+
+        inbox_tx
+            .send(approval_inbound(
+                "list the files",
+                "@user:localhost",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+
+        // First outbound: the approval request card.
+        let card = recv_outbound(&mut out_rx).await;
+        assert!(
+            card.content.starts_with("Approval required:"),
+            "got: {}",
+            card.content
+        );
+        let request = card
+            .metadata
+            .get(METADATA_APPROVAL_REQUEST)
+            .expect("metadata should carry the approval request envelope");
+        let request_id = request["request_id"].as_str().unwrap().to_string();
+        let digest = request["tool_args_digest"].as_str().unwrap().to_string();
+        assert_eq!(request["tool_name"], "list_dir");
+        assert!(
+            card.metadata.get(METADATA_APPROVAL_ACTIONS).is_some(),
+            "approval card should carry action buttons"
+        );
+
+        // Authorized approver answers: tool executes and the output flows out.
+        let response_meta = serde_json::json!({
+            METADATA_APPROVAL_RESPONSE: {
+                "request_id": request_id,
+                "decision": "approve",
+                "source_event_id": "$ev1",
+                "tool_args_digest": digest,
+            }
+        });
+        inbox_tx
+            .send(approval_inbound("", "@alice:localhost", response_meta))
+            .await
+            .unwrap();
+
+        let outcome = recv_outbound(&mut out_rx).await;
+        assert!(
+            !outcome.content.starts_with("Approval rejected"),
+            "authorized approval should not be rejected: {}",
+            outcome.content
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_reject_approval_response_when_sender_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inbox_tx, mut out_rx, handle) = setup_actor_with_approval_rules(&dir).await;
+
+        inbox_tx
+            .send(approval_inbound(
+                "list the files",
+                "@user:localhost",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+
+        let card = recv_outbound(&mut out_rx).await;
+        let request = card.metadata.get(METADATA_APPROVAL_REQUEST).unwrap();
+        let request_id = request["request_id"].as_str().unwrap().to_string();
+        let digest = request["tool_args_digest"].as_str().unwrap().to_string();
+
+        // Mallory tries to approve — rejected, request stays pending.
+        let response_meta = serde_json::json!({
+            METADATA_APPROVAL_RESPONSE: {
+                "request_id": request_id,
+                "decision": "approve",
+                "source_event_id": "$ev2",
+                "tool_args_digest": digest,
+            }
+        });
+        inbox_tx
+            .send(approval_inbound(
+                "",
+                "@mallory:localhost",
+                response_meta.clone(),
+            ))
+            .await
+            .unwrap();
+
+        let rejection = recv_outbound(&mut out_rx).await;
+        assert!(
+            rejection.content.starts_with("Approval rejected"),
+            "got: {}",
+            rejection.content
+        );
+
+        // The request was NOT consumed — alice can still deny it.
+        let mut deny_meta = response_meta;
+        deny_meta[METADATA_APPROVAL_RESPONSE]["decision"] = serde_json::json!("deny");
+        inbox_tx
+            .send(approval_inbound("", "@alice:localhost", deny_meta))
+            .await
+            .unwrap();
+
+        let denied = recv_outbound(&mut out_rx).await;
+        assert!(
+            denied.content.starts_with("Denied:"),
+            "got: {}",
+            denied.content
+        );
+
+        handle.abort();
     }
 }

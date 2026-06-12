@@ -237,6 +237,10 @@ pub struct ProfileRuntime {
     /// workflow resolve specialists from the same profile runtime that
     /// owns model, memory, sandbox, and tools.
     pub review_config: Option<ReviewConfig>,
+    /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): per-profile
+    /// human-approval rules, converted once at bootstrap and inherited by
+    /// every per-session Agent this profile spawns.
+    pub human_approval_rules: Option<octos_agent::HumanApprovalRules>,
 
     /// Long-lived [`EpisodeStore`] for this profile (redb at
     /// `<data_dir>/episodes.redb`). Shared across all sessions of
@@ -990,6 +994,11 @@ impl ProfileRuntime {
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
             review_config: profile.config.review.clone(),
+            human_approval_rules: profile
+                .config
+                .approval_policy
+                .as_ref()
+                .map(|policy| policy.to_runtime_rules()),
             system_prompt,
             memory,
             memory_store,

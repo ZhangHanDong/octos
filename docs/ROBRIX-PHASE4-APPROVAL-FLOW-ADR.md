@@ -1,6 +1,6 @@
 # ADR: Human Approval Flow for Matrix/Gateway Channels (Robrix Phase 4)
 
-> Status: **Proposed** | Date: 2026-06-12 | Workstream: [robrix-integration](../workstreams/robrix-integration.md)
+> Status: **Accepted & implemented** (2026-06-13) | Date: 2026-06-12 | Workstream: [robrix-integration](../workstreams/robrix-integration.md)
 > Decision owners: @AlexZ
 
 ## Context
