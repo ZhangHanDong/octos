@@ -34,6 +34,10 @@ const CHANNEL_NAME: &str = "matrix";
 const EVENT_ROOM_MESSAGE: &str = "m.room.message";
 const EVENT_ROOM_MEMBER: &str = "m.room.member";
 const MSGTYPE_TEXT: &str = "m.text";
+const MSGTYPE_IMAGE: &str = "m.image";
+const MSGTYPE_AUDIO: &str = "m.audio";
+const MSGTYPE_VIDEO: &str = "m.video";
+const MSGTYPE_FILE: &str = "m.file";
 const MEMBERSHIP_INVITE: &str = "invite";
 const REL_TYPE_REPLACE: &str = "m.replace";
 const LIVE_MARKER: &str = "org.matrix.msc4357.live";
@@ -463,6 +467,8 @@ struct AppserviceState {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: Option<Arc<dyn BotManager>>,
+    /// Directory for downloaded media files (inbound images, files, audio, video).
+    media_dir: PathBuf,
 }
 
 fn error_json_response(
@@ -510,6 +516,8 @@ pub struct MatrixChannel {
     /// M7.3 swarm supervisor state. `None` means the supervisor contract is
     /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
+    /// Directory for downloaded media files (inbound images, files, audio, video).
+    media_dir: PathBuf,
 }
 
 impl MatrixChannel {
@@ -544,7 +552,14 @@ impl MatrixChannel {
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
+            media_dir: std::env::temp_dir().join("octos-matrix-media"),
         }
+    }
+
+    /// Set the directory for downloaded media files.
+    pub fn with_media_dir(mut self, media_dir: PathBuf) -> Self {
+        self.media_dir = media_dir;
+        self
     }
 
     /// Restrict bot-management slash commands to the given Matrix user IDs.
@@ -742,6 +757,34 @@ fn percent_encode_path(s: &str) -> String {
         }
     }
     encoded
+}
+
+/// Guess a MIME content type from a file path's extension for Matrix media
+/// uploads. Unknown extensions fall back to `application/octet-stream`
+/// (rendered as `m.file` on the receiving side).
+fn media_content_type(file_path: &std::path::Path) -> &'static str {
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Check if a Matrix user ID is managed by this appservice (bot or virtual user).
@@ -1121,12 +1164,71 @@ async fn handle_transaction(
             .get("msgtype")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if msgtype != MSGTYPE_TEXT {
+
+        // Accept text and media message types; skip everything else
+        // (e.g. m.location, m.notice from other bots).
+        let is_media = matches!(
+            msgtype,
+            MSGTYPE_IMAGE | MSGTYPE_FILE | MSGTYPE_AUDIO | MSGTYPE_VIDEO
+        );
+        if msgtype != MSGTYPE_TEXT && !is_media {
             continue;
         }
 
         let body_text = content.get("body").and_then(|v| v.as_str()).unwrap_or("");
-        if body_text.is_empty() {
+
+        // For media messages, download the file from the mxc:// URL so the
+        // agent can use it for vision/tool input. Download failure degrades
+        // to a text-only inbound message.
+        let mut media = vec![];
+        if is_media {
+            if let Some(mxc_url) = content.get("url").and_then(|v| v.as_str()) {
+                // Use the filename field if available, fall back to body
+                // (which is the filename per the Matrix spec).
+                let filename = content
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .or(Some(body_text))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("file");
+
+                let download_url = format!(
+                    "{}/_matrix/media/v3/download/{}",
+                    state.homeserver,
+                    mxc_url.strip_prefix("mxc://").unwrap_or(mxc_url),
+                );
+                let unique_filename = format!(
+                    "matrix_{}_{}",
+                    chrono::Utc::now().timestamp_millis(),
+                    filename,
+                );
+                match crate::media::download_media(
+                    &state.http,
+                    &download_url,
+                    &[("Authorization", &format!("Bearer {}", state.as_token))],
+                    &state.media_dir,
+                    &unique_filename,
+                )
+                .await
+                {
+                    Ok(local_path) => {
+                        info!(
+                            mxc_url,
+                            filename,
+                            ?local_path,
+                            "downloaded Matrix media file"
+                        );
+                        media.push(local_path.to_string_lossy().into_owned());
+                    }
+                    Err(e) => {
+                        warn!(mxc_url, error = %e, "failed to download Matrix media file, continuing without media");
+                    }
+                }
+            }
+        }
+
+        // For text messages, body must be non-empty. For media, allow empty body.
+        if !is_media && body_text.is_empty() {
             continue;
         }
 
@@ -1188,13 +1290,20 @@ async fn handle_transaction(
             }
         }
 
+        // For media messages with an empty body, provide a descriptive placeholder.
+        let content_text = if body_text.is_empty() && !media.is_empty() {
+            "[User sent a file]".to_string()
+        } else {
+            body_text.to_string()
+        };
+
         let inbound = InboundMessage {
             channel: CHANNEL_NAME.into(),
             sender_id: sender.to_string(),
             chat_id: room_id.to_string(),
-            content: body_text.to_string(),
+            content: content_text,
             timestamp: Utc::now(),
-            media: vec![],
+            media,
             metadata,
             message_id: event_id,
         };
@@ -1530,6 +1639,7 @@ impl Channel for MatrixChannel {
             dedup: self.dedup.clone(),
             bot_router: self.bot_router.clone(),
             bot_manager: self.bot_manager.get().cloned(),
+            media_dir: self.media_dir.clone(),
         };
 
         let app = Router::new()
@@ -1581,6 +1691,68 @@ impl Channel for MatrixChannel {
                     "sender_user_id {uid} is not registered as a managed user"
                 ));
             }
+        }
+
+        // Handle media files (images, documents, audio, video): upload each
+        // to the Matrix media repo, then send one m.* media event per file.
+        if !msg.media.is_empty() {
+            let caption = if msg.content.is_empty() {
+                None
+            } else {
+                Some(msg.content.as_str())
+            };
+            let mut last_event_id = None;
+
+            for (i, path_str) in msg.media.iter().enumerate() {
+                let file_path = std::path::Path::new(path_str);
+                let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+                let filename = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                let content_type = media_content_type(file_path);
+
+                info!(
+                    path = path_str,
+                    size = file_size,
+                    content_type,
+                    "sending media file via Matrix"
+                );
+
+                let mxc_url = self
+                    .upload_media(file_path, content_type, sender_user_id)
+                    .await?;
+
+                // Only the first file gets the caption.
+                let cap = if i == 0 { caption } else { None };
+                let event_id = self
+                    .send_media_message(
+                        &msg.chat_id,
+                        &mxc_url,
+                        filename,
+                        content_type,
+                        file_size,
+                        cap,
+                        sender_user_id,
+                    )
+                    .await?;
+                last_event_id = Some(event_id);
+            }
+
+            // Remember which sender sent this event so edit_message can use
+            // the same identity.
+            if let (Some(uid), Some(event_id)) = (sender_user_id, &last_event_id) {
+                let mut event_senders = self.event_senders.write().await;
+                if let Some(pos) = event_senders.iter().position(|(id, _)| id == event_id) {
+                    event_senders.remove(pos);
+                }
+                event_senders.push_back((event_id.clone(), uid.to_string()));
+                while event_senders.len() > MAX_EVENT_SENDER_CACHE {
+                    event_senders.pop_front();
+                }
+            }
+
+            return Ok(last_event_id);
         }
 
         let live = msg
@@ -1780,6 +1952,152 @@ impl MatrixChannel {
                 .unwrap_or("");
             return Err(eyre::eyre!(
                 "Matrix send failed: status={status} errcode={errcode} error={error}"
+            ));
+        }
+
+        let event_id = resp_body
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(event_id)
+    }
+
+    /// Upload a file to the Matrix media repository and return the `mxc://` URI.
+    async fn upload_media(
+        &self,
+        file_path: &std::path::Path,
+        content_type: &str,
+        sender_user_id: Option<&str>,
+    ) -> Result<String> {
+        let data = std::fs::read(file_path)
+            .wrap_err_with(|| format!("failed to read media file: {}", file_path.display()))?;
+
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        let effective_sender = sender_user_id.unwrap_or(&self.bot_user_id);
+        let url = self.make_api_url(&format!(
+            "/_matrix/media/v3/upload?filename={}&user_id={}",
+            percent_encode_path(filename),
+            percent_encode_path(effective_sender),
+        ));
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .header("Content-Type", content_type)
+            .body(data)
+            .send()
+            .await
+            .wrap_err("failed to upload media to Matrix")?;
+
+        let status = resp.status();
+        let resp_body: Value = resp
+            .json()
+            .await
+            .wrap_err("failed to parse Matrix upload response")?;
+
+        if !status.is_success() {
+            let errcode = resp_body
+                .get("errcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let error = resp_body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            return Err(eyre::eyre!(
+                "Matrix media upload failed: status={status} errcode={errcode} error={error}"
+            ));
+        }
+
+        let content_uri = resp_body
+            .get("content_uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| eyre::eyre!("Matrix upload response missing content_uri"))?
+            .to_string();
+
+        Ok(content_uri)
+    }
+
+    /// Send a media message (`m.image`, `m.audio`, `m.video`, or `m.file`) to a Matrix room.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_media_message(
+        &self,
+        room_id: &str,
+        mxc_url: &str,
+        filename: &str,
+        content_type: &str,
+        file_size: u64,
+        caption: Option<&str>,
+        sender_user_id: Option<&str>,
+    ) -> Result<String> {
+        let txn_id = uuid::Uuid::now_v7().to_string();
+        let effective_sender = sender_user_id.unwrap_or(&self.bot_user_id);
+        let mut path = format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            percent_encode_path(room_id),
+            percent_encode_path(&txn_id),
+        );
+        path.push_str("?user_id=");
+        path.push_str(&percent_encode_path(effective_sender));
+        let url = self.make_api_url(&path);
+
+        // Select msgtype by MIME type prefix.
+        let msgtype = if content_type.starts_with("image/") {
+            MSGTYPE_IMAGE
+        } else if content_type.starts_with("audio/") {
+            MSGTYPE_AUDIO
+        } else if content_type.starts_with("video/") {
+            MSGTYPE_VIDEO
+        } else {
+            MSGTYPE_FILE
+        };
+
+        let body_text = caption.unwrap_or(filename);
+
+        let body = json!({
+            "msgtype": msgtype,
+            "body": body_text,
+            "url": mxc_url,
+            "filename": filename,
+            "info": {
+                "mimetype": content_type,
+                "size": file_size,
+            },
+        });
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send media message to Matrix")?;
+
+        let status = resp.status();
+        let resp_body: Value = resp
+            .json()
+            .await
+            .wrap_err("failed to parse Matrix send response")?;
+
+        if !status.is_success() {
+            let errcode = resp_body
+                .get("errcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let error = resp_body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            return Err(eyre::eyre!(
+                "Matrix media send failed: status={status} errcode={errcode} error={error}"
             ));
         }
 
@@ -2859,6 +3177,7 @@ mod tests {
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
             bot_manager: None,
+            media_dir: std::env::temp_dir().join("octos-matrix-test-media"),
         }
     }
 
@@ -2945,6 +3264,11 @@ mod tests {
             )
             .route(
                 "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
+                any(capture_homeserver_request),
+            )
+            .route("/_matrix/media/v3/upload", any(capture_homeserver_request))
+            .route(
+                "/_matrix/media/v3/download/{server_name}/{media_id}",
                 any(capture_homeserver_request),
             )
             .with_state(state);
@@ -3987,6 +4311,244 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_upload_and_send_m_image_when_outbound_has_media() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver_with_response(
+            StatusCode::OK,
+            json!({
+                "event_id": "$media_event",
+                "content_uri": "mxc://localhost/abc123"
+            }),
+        )
+        .await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("photo.png");
+        std::fs::write(&file, b"fake png bytes").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "look at this".into(),
+            reply_to: None,
+            media: vec![file.to_string_lossy().into_owned()],
+            metadata: json!({}),
+        };
+
+        let event_id = ch.send_with_id(&msg).await.unwrap();
+        assert_eq!(event_id.as_deref(), Some("$media_event"));
+
+        wait_for_request_count(&requests, 2).await;
+        let reqs = requests.lock().await;
+
+        let upload = reqs
+            .iter()
+            .find(|r| r.path.contains("/_matrix/media/v3/upload"))
+            .expect("should have an upload request");
+        assert_eq!(upload.method, Method::POST);
+        let query = upload.query.as_deref().unwrap_or("");
+        assert!(query.contains("filename=photo.png"), "query: {query}");
+
+        let send = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a media send request");
+        assert_eq!(send.body["msgtype"], json!("m.image"));
+        assert_eq!(send.body["url"], json!("mxc://localhost/abc123"));
+        assert_eq!(send.body["body"], json!("look at this"));
+        assert_eq!(send.body["filename"], json!("photo.png"));
+        assert_eq!(send.body["info"]["mimetype"], json!("image/png"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_caption_first_file_only_when_outbound_has_multiple_media() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver_with_response(
+            StatusCode::OK,
+            json!({
+                "event_id": "$media_event",
+                "content_uri": "mxc://localhost/abc123"
+            }),
+        )
+        .await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let img = dir.path().join("a.png");
+        let doc = dir.path().join("b.pdf");
+        std::fs::write(&img, b"img").unwrap();
+        std::fs::write(&doc, b"doc").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "the caption".into(),
+            reply_to: None,
+            media: vec![
+                img.to_string_lossy().into_owned(),
+                doc.to_string_lossy().into_owned(),
+            ],
+            metadata: json!({}),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 4).await;
+        let reqs = requests.lock().await;
+        let sends: Vec<_> = reqs.iter().filter(|r| r.path.contains("/send/")).collect();
+        assert_eq!(sends.len(), 2, "expected one send per media file");
+        assert_eq!(sends[0].body["msgtype"], json!("m.image"));
+        assert_eq!(sends[0].body["body"], json!("the caption"));
+        assert_eq!(sends[1].body["msgtype"], json!("m.file"));
+        // Second file gets its filename as body, not the caption.
+        assert_eq!(sends[1].body["body"], json!("b.pdf"));
+        assert_eq!(sends[1].body["info"]["mimetype"], json!("application/pdf"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_download_media_and_attach_path_when_inbound_image_event() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Mock homeserver serves the media download endpoint with canned bytes.
+        let (homeserver, hs_requests, hs_handle) =
+            spawn_mock_homeserver_with_response(StatusCode::OK, json!({"bytes": "fake"})).await;
+
+        let media_dir = tempfile::TempDir::new().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.homeserver = homeserver;
+        state.media_dir = media_dir.path().to_path_buf();
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ev_media",
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.png",
+                    "url": "mxc://localhost/catmedia",
+                    "filename": "cat.png"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_media?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let inbound = inbound_rx.recv().await.expect("inbound media message");
+        assert_eq!(inbound.content, "cat.png");
+        assert_eq!(inbound.media.len(), 1, "media path should be attached");
+        let local = std::path::Path::new(&inbound.media[0]);
+        assert!(local.exists(), "downloaded file should exist: {local:?}");
+        assert!(
+            inbound.media[0].contains("cat.png"),
+            "local path should keep the original filename: {}",
+            inbound.media[0]
+        );
+
+        let reqs = hs_requests.lock().await;
+        assert!(
+            reqs.iter().any(|r| r
+                .path
+                .contains("/_matrix/media/v3/download/localhost/catmedia")),
+            "should have hit the media download endpoint"
+        );
+
+        hs_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn should_deliver_text_only_when_media_download_fails() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let media_dir = tempfile::TempDir::new().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        // Unreachable homeserver — download must fail, message must still flow.
+        state.homeserver = "http://127.0.0.1:1".to_string();
+        state.media_dir = media_dir.path().to_path_buf();
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ev_media_fail",
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.png",
+                    "url": "mxc://localhost/gonemedia"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn_media_fail?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let inbound = inbound_rx.recv().await.expect("inbound message");
+        assert_eq!(inbound.content, "cat.png");
+        assert!(
+            inbound.media.is_empty(),
+            "failed download should degrade to text-only"
+        );
     }
 
     #[tokio::test]

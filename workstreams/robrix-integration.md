@@ -43,7 +43,7 @@ Missing from main:
 
 ## Phases
 
-### Phase 1 (P0) — app-card tool chain  ← CURRENT
+### Phase 1 (P0) — app-card tool chain  ✅ DONE (54dcdf73)
 The Robrix-facing core. Producer contract v1 (see `specs/task-agent-to-app-system.spec.md`
 in the robrix2 repo): event content carries `msgtype:"m.text"`, fallback `body`,
 `org.octos.app` `{type, version, initial_state, scope?, app_id?}`, optional
@@ -57,7 +57,7 @@ back to plain body.
 3. E2E: assert event-content projection via existing `spawn_mock_homeserver` harness.
 4. `show_weather_card` (846-line demo): deferred — re-evaluate as an app-skill.
 
-### Phase 2 (P1) — bidirectional media
+### Phase 2 (P1) — bidirectional media  ✅ DONE
 - Inbound: accept `m.image|m.file|m.audio|m.video`, download `mxc://` via
   `/_matrix/media/v3/download` (reuse `media.rs`) into `with_media_dir`, attach to
   `InboundMessage.media`; degrade gracefully on failure.
