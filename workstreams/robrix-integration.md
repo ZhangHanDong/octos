@@ -73,10 +73,15 @@ back to plain body.
   `org.octos.broadcast_targets`, stale-binding skip, `MAX_ALLBOTS_TARGETS = 8`.
 - Wire `matrix_integration.rs`; document in `book/` (channels, cli-reference, advanced).
 
-### Phase 4 (P2) — approval flow (design first, separate effort)
-PR version predates the M11 runtime unification and overlaps with hooks' deny
-mechanism. Write an ADR on how approvals should sit on ProfileRuntime/SessionRuntime
-+ hooks before implementing. Do not port as-is.
+### Phase 4 (P2) — approval flow  📐 ADR WRITTEN
+Investigation done; decision recorded in
+[docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md](../docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md).
+Chosen: suspend-and-resume transport for gateway channels (the PR's shape) with
+semantics unified onto main's existing approval vocabulary — one rule schema
+(`HumanApprovalRules`, renamed to avoid colliding with `policy::ApprovalPolicy`),
+one audit trail (reuse `ApprovalDecidedEvent` + JSONL audit log), security
+invariants (digest binding / consumed-set / revalidation) ported verbatim,
+hook exit-code-3 deferred. Est. ~1,200 lines incl. tests; single PR.
 
 ## Verification
 
