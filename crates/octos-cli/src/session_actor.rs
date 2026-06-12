@@ -4,7 +4,7 @@
 //! `set_context()` race condition where shared tools could route messages
 //! to the wrong chat.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3046,6 +3046,11 @@ impl ActorFactory {
         tools.add_base_tools(["read_task_output"]);
         tools.register(message_tool);
         tools.register(send_file_tool);
+        tools.register(octos_agent::SendAppCardTool::with_context(
+            proxy_tx.clone(),
+            channel,
+            chat_id,
+        ));
 
         // M8 Runtime Parity W2.B1: build the same M8.7 summary generator
         // that goes onto the parent Agent so the child workers we spawn
@@ -6472,6 +6477,24 @@ impl SessionActor {
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
 
+        // Matrix app-reply hook: tools tagged "app_reply" produce GPU cards
+        // that replace the agent's text reply on capable clients. When any
+        // such tool is registered AND we're on matrix, suppress the persistent
+        // status message and final streamed text after an app-reply succeeds.
+        let app_reply_tools: Arc<HashSet<String>> = Arc::new(
+            self.agent
+                .tool_registry()
+                .names_with_tag("app_reply")
+                .into_iter()
+                .collect(),
+        );
+        let channel_is_matrix = self
+            .status_indicator
+            .as_ref()
+            .map(|si| si.channel().name() == "matrix")
+            .unwrap_or(false);
+        let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
+
         // Start status indicator
         let status_handle = self.status_indicator.as_ref().map(|si| {
             let voice_transcript = inbound
@@ -6492,6 +6515,7 @@ impl SessionActor {
                 &self.user_status_config,
                 self.sender_user_id.clone(),
                 client_message_id.clone(),
+                persist_visible_status,
             )
         });
 
@@ -6554,6 +6578,7 @@ impl SessionActor {
                     // shared sticky map from collapsing them onto one
                     // bubble.
                     client_message_id.clone(),
+                    Arc::clone(&app_reply_tools),
                 )))
             } else {
                 drop(stream_rx);
@@ -7566,6 +7591,20 @@ impl SessionActor {
             };
             let tracker = Arc::new(TokenTracker::new());
 
+            // Matrix app-reply hook (see process_inbound for rationale).
+            let app_reply_tools: Arc<HashSet<String>> = Arc::new(
+                agent
+                    .tool_registry()
+                    .names_with_tag("app_reply")
+                    .into_iter()
+                    .collect(),
+            );
+            let channel_is_matrix = status_indicator
+                .as_ref()
+                .map(|si| si.channel().name() == "matrix")
+                .unwrap_or(false);
+            let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
+
             // ── Per-overflow status indicator (own "✦ Thinking..." message) ──
             //
             // PR F (M8.10): bind the overflow turn's cmid to the status
@@ -7581,6 +7620,7 @@ impl SessionActor {
                     &user_status_config,
                     sender_user_id.clone(),
                     overflow_client_message_id.clone(),
+                    persist_visible_status,
                 )
             });
 
@@ -7620,6 +7660,7 @@ impl SessionActor {
                     // fight over the shared sticky map and collapse onto
                     // the bubble of whichever turn arrived last.
                     overflow_client_message_id.clone(),
+                    Arc::clone(&app_reply_tools),
                 )))
             } else {
                 drop(stream_rx);
@@ -8051,6 +8092,21 @@ impl SessionActor {
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
 
+        // Matrix app-reply hook (see process_inbound_speculative for rationale).
+        let app_reply_tools: Arc<HashSet<String>> = Arc::new(
+            self.agent
+                .tool_registry()
+                .names_with_tag("app_reply")
+                .into_iter()
+                .collect(),
+        );
+        let channel_is_matrix = self
+            .status_indicator
+            .as_ref()
+            .map(|si| si.channel().name() == "matrix")
+            .unwrap_or(false);
+        let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
+
         // Start status indicator
         //
         // PR F (M8.10) — codex review P1 #1: bind the inbound's cmid
@@ -8071,6 +8127,7 @@ impl SessionActor {
                 &self.user_status_config,
                 self.sender_user_id.clone(),
                 client_message_id.clone(),
+                persist_visible_status,
             )
         });
 
@@ -8131,6 +8188,7 @@ impl SessionActor {
                     // #649 follow-up (rapid-fire): forward this turn's
                     // cmid so streaming chunks stamp it on the wire.
                     client_message_id.clone(),
+                    Arc::clone(&app_reply_tools),
                 )))
             } else {
                 drop(stream_rx);
