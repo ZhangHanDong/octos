@@ -57,7 +57,7 @@ back to plain body.
 3. E2E: assert event-content projection via existing `spawn_mock_homeserver` harness.
 4. `show_weather_card` (846-line demo): deferred — re-evaluate as an app-skill.
 
-### Phase 2 (P1) — bidirectional media  ✅ DONE
+### Phase 2 (P1) — bidirectional media  ✅ DONE (a063c54b)
 - Inbound: accept `m.image|m.file|m.audio|m.video`, download `mxc://` via
   `/_matrix/media/v3/download` (reuse `media.rs`) into `with_media_dir`, attach to
   `InboundMessage.media`; degrade gracefully on failure.
@@ -65,7 +65,7 @@ back to plain body.
   captions, multi-attachment.
 - Check whether audio-attachment persistence fixups (PR `284c5193`/`0043a206`) still apply.
 
-### Phase 3 (P1) — /allbots + NL scheduling
+### Phase 3 (P1) — /allbots + NL scheduling  ✅ DONE
 - `cron_tool.rs`: NL parser family (relative one-shot, interval, daily, weekly;
   CJK + English; local-wall-time→UTC; CJK-aware job naming). Pure functions, test-first.
 - `matrix_channel.rs`: `/schedule|/schedules|/unschedule|/allbots` dispatch,

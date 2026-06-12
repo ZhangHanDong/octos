@@ -49,10 +49,13 @@ const CONTENT_ACTIONS: &str = "org.octos.actions";
 const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
+const CONTENT_BROADCAST_TARGETS: &str = "org.octos.broadcast_targets";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
 #[cfg(test)]
 const MAX_EVENT_SENDER_CACHE: usize = 4;
+/// Upper bound on child bots a single `/allbots` broadcast may fan out to.
+const MAX_ALLBOTS_TARGETS: usize = 8;
 
 // ── Bot Manager trait ────────────────────────────────────────────────────────
 
@@ -78,6 +81,21 @@ pub trait BotManager: Send + Sync {
 
     /// List all registered bots. Returns a formatted list.
     async fn list_bots(&self, sender: &str) -> Result<String>;
+
+    /// Create a natural-language schedule for the current room context.
+    async fn schedule_bot_task(&self, request: &str, sender: &str, room_id: &str)
+    -> Result<String>;
+
+    /// List schedule jobs visible to the current room context.
+    async fn list_schedules(&self, sender: &str, room_id: &str) -> Result<String>;
+
+    /// Remove a schedule job visible to the current room context.
+    async fn unschedule_bot_task(
+        &self,
+        job_id: &str,
+        sender: &str,
+        room_id: &str,
+    ) -> Result<String>;
 }
 
 // ── Bot Router ───────────────────────────────────────────────────────────────
@@ -418,6 +436,26 @@ async fn route_by_explicit_target(bot_router: &BotRouter, content: &Value) -> Op
         .and_then(|v| v.as_str())
         .filter(|value| !value.is_empty())?;
     bot_router.route(target_user_id).await
+}
+
+/// Extract the deduplicated `org.octos.broadcast_targets` list from event
+/// content. Capable clients (Robrix management rooms) attach the room's
+/// bound child-bot user IDs here so `/allbots` knows where to fan out.
+fn broadcast_target_matrix_user_ids(content: &Value) -> Vec<String> {
+    let Some(targets) = content
+        .get(CONTENT_BROADCAST_TARGETS)
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut deduped = Vec::new();
+    for target in targets.iter().filter_map(|value| value.as_str()) {
+        if !deduped.iter().any(|existing| existing == target) {
+            deduped.push(target.to_string());
+        }
+    }
+    deduped
 }
 
 async fn route_by_matrix_mention(
@@ -1232,14 +1270,6 @@ async fn handle_transaction(
             continue;
         }
 
-        // Intercept slash commands before routing to agent
-        if let Some(response) = handle_slash_command(&state, sender, room_id, body_text).await {
-            if let Err(e) = send_text_to_room(&state, room_id, &response).await {
-                warn!(error = %e, room_id, "failed to send slash command response");
-            }
-            continue;
-        }
-
         let event_id = event
             .get("event_id")
             .and_then(|v| v.as_str())
@@ -1290,6 +1320,33 @@ async fn handle_transaction(
             }
         }
 
+        // Intercept slash commands before routing to the agent. Runs AFTER
+        // routing so commands explicitly aimed at a child bot (mention /
+        // explicit target) flow through to that bot instead of being
+        // swallowed by BotFather.
+        if let Some(response) = handle_slash_command(
+            &state,
+            sender,
+            room_id,
+            body_text,
+            metadata
+                .get(METADATA_TARGET_MATRIX_USER_ID)
+                .and_then(|value| value.as_str()),
+            content,
+            event_id.as_deref(),
+        )
+        .await
+        {
+            // `/allbots` answers with an empty string on success (the fanned
+            // out child-bot replies are the visible outcome) — skip the echo.
+            if !response.trim().is_empty()
+                && let Err(e) = send_text_to_room(&state, room_id, &response).await
+            {
+                warn!(error = %e, room_id, "failed to send slash command response");
+            }
+            continue;
+        }
+
         // For media messages with an empty body, provide a descriptive placeholder.
         let content_text = if body_text.is_empty() && !media.is_empty() {
             "[User sent a file]".to_string()
@@ -1321,13 +1378,23 @@ async fn handle_transaction(
 
 /// Check if a message is a slash command and handle it.
 /// Returns `Some(response_text)` if it was a slash command, `None` otherwise.
+#[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
     state: &AppserviceState,
     sender: &str,
-    _room_id: &str,
+    room_id: &str,
     body: &str,
+    target_matrix_user_id: Option<&str>,
+    content: &Value,
+    source_event_id: Option<&str>,
 ) -> Option<String> {
     let bot_manager = state.bot_manager.as_ref()?;
+
+    // A slash command explicitly aimed at a child bot (mention / explicit
+    // target) belongs to that bot's conversation — don't intercept it.
+    if target_matrix_user_id.is_some_and(|target| target != state.bot_user_id) {
+        return None;
+    }
 
     let trimmed = body.trim();
     if !trimmed.starts_with('/') {
@@ -1342,6 +1409,20 @@ async fn handle_slash_command(
         "/createbot" => Some(dispatch_createbot(bot_manager.as_ref(), args_str, sender).await),
         "/deletebot" => Some(dispatch_deletebot(bot_manager.as_ref(), args_str, sender).await),
         "/listbots" | "/listbot" => Some(dispatch_listbots(bot_manager.as_ref(), sender).await),
+        "/schedule" => {
+            Some(dispatch_schedule(bot_manager.as_ref(), args_str, sender, room_id).await)
+        }
+        "/schedules" => Some(dispatch_schedules(bot_manager.as_ref(), sender, room_id).await),
+        "/unschedule" => {
+            Some(dispatch_unschedule(bot_manager.as_ref(), args_str, sender, room_id).await)
+        }
+        "/allbots" => {
+            match dispatch_allbots(state, sender, room_id, args_str, content, source_event_id).await
+            {
+                Ok(()) => Some(String::new()),
+                Err(error) => Some(error),
+            }
+        }
         "/bothelp" => Some(SLASH_HELP.to_string()),
         _ => None,
     }
@@ -1354,9 +1435,155 @@ const SLASH_HELP: &str = "\
 • Missing visibility defaults to `private`
 • `/deletebot <matrix_user_id>`
 • `/listbots` (public bots + your private bots)
+• `/schedule <task>` (natural-language scheduling in this chat)
+• `/schedules` (list this chat's schedules)
+• `/unschedule <job-id>`
+• `/allbots <message>` (management rooms only)
 • `/bothelp`
 
 **Tip:** I'm BotFather — you can chat with me directly, or create your own bot with `/createbot` for a dedicated AI assistant.";
+
+/// Fan a BotFather-room command out to the room's bound child bots.
+///
+/// Targets come from the event's `org.octos.broadcast_targets` content field
+/// (attached by capable clients). Stale bindings — targets with no router
+/// entry — are skipped with a warning; private bots reject broadcasts from
+/// non-owners. Returns `Ok(())` on dispatch (the child-bot replies are the
+/// visible outcome) or `Err(user-facing message)` when nothing was sent.
+async fn dispatch_allbots(
+    state: &AppserviceState,
+    sender: &str,
+    room_id: &str,
+    args_str: &str,
+    content: &Value,
+    source_event_id: Option<&str>,
+) -> std::result::Result<(), String> {
+    if args_str.is_empty() {
+        return Err("Usage: `/allbots <message>`".to_string());
+    }
+
+    let target_matrix_user_ids = broadcast_target_matrix_user_ids(content)
+        .into_iter()
+        .filter(|user_id| user_id != &state.bot_user_id)
+        .collect::<Vec<_>>();
+
+    if target_matrix_user_ids.is_empty() {
+        return Err("No bound child bots were found for this room.".to_string());
+    }
+
+    if target_matrix_user_ids.len() > MAX_ALLBOTS_TARGETS {
+        return Err(format!(
+            "/allbots can target at most {MAX_ALLBOTS_TARGETS} bound child bots at once."
+        ));
+    }
+
+    let mut deliveries = Vec::new();
+    let mut unresolved_targets = Vec::new();
+    for target_matrix_user_id in target_matrix_user_ids {
+        let Some(entry) = state.bot_router.get_entry(&target_matrix_user_id).await else {
+            unresolved_targets.push(target_matrix_user_id);
+            continue;
+        };
+
+        if entry.visibility == BotVisibility::Private && sender != entry.owner {
+            return Err(format!(
+                "You do not have permission to broadcast to private bot `{target_matrix_user_id}`."
+            ));
+        }
+
+        deliveries.push((target_matrix_user_id, entry.profile_id));
+    }
+
+    if deliveries.is_empty() {
+        if !unresolved_targets.is_empty() {
+            return Err(format!(
+                "Could not resolve any bound child bots for /allbots. Stale bindings: {}",
+                unresolved_targets.join(", ")
+            ));
+        }
+        return Err("No bound child bots were found for this room.".to_string());
+    }
+
+    let request_id = source_event_id.unwrap_or("allbots");
+    info!(
+        requester = sender,
+        room_id,
+        request_id,
+        targets = ?deliveries.iter().map(|(target, _)| target).collect::<Vec<_>>(),
+        "dispatching /allbots broadcast"
+    );
+    if !unresolved_targets.is_empty() {
+        warn!(
+            requester = sender,
+            room_id,
+            request_id,
+            stale_targets = ?unresolved_targets,
+            "skipping unresolved stale /allbots bindings"
+        );
+    }
+
+    for (target_matrix_user_id, profile_id) in deliveries {
+        let inbound = InboundMessage {
+            channel: CHANNEL_NAME.into(),
+            sender_id: sender.to_string(),
+            chat_id: room_id.to_string(),
+            content: args_str.to_string(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: json!({
+                METADATA_TARGET_PROFILE_ID: profile_id,
+                METADATA_TARGET_MATRIX_USER_ID: target_matrix_user_id,
+                "org.octos.broadcast_request_id": request_id,
+                "org.octos.broadcast_origin_room_id": room_id,
+                "org.octos.broadcast_source_event_id": source_event_id,
+            }),
+            message_id: source_event_id.map(str::to_string),
+        };
+
+        state.inbound_tx.send(inbound).await.map_err(|_| {
+            "broadcast dispatch failed because the inbound channel is closed".to_string()
+        })?;
+    }
+
+    Ok(())
+}
+
+async fn dispatch_schedule(
+    bot_manager: &dyn BotManager,
+    request: &str,
+    sender: &str,
+    room_id: &str,
+) -> String {
+    if request.trim().is_empty() {
+        return "Usage: `/schedule <natural-language task>`".to_string();
+    }
+    bot_manager
+        .schedule_bot_task(request.trim(), sender, room_id)
+        .await
+        .unwrap_or_else(|e| format!("Failed to create schedule: {e}"))
+}
+
+async fn dispatch_schedules(bot_manager: &dyn BotManager, sender: &str, room_id: &str) -> String {
+    bot_manager
+        .list_schedules(sender, room_id)
+        .await
+        .unwrap_or_else(|e| format!("Failed to list schedules: {e}"))
+}
+
+async fn dispatch_unschedule(
+    bot_manager: &dyn BotManager,
+    job_id: &str,
+    sender: &str,
+    room_id: &str,
+) -> String {
+    if job_id.trim().is_empty() {
+        return "Usage: `/unschedule <job-id>`".to_string();
+    }
+    bot_manager
+        .unschedule_bot_task(job_id.trim(), sender, room_id)
+        .await
+        .unwrap_or_else(|e| format!("Failed to remove schedule: {e}"))
+}
 
 async fn dispatch_createbot(mgr: &dyn BotManager, args: &str, sender: &str) -> String {
     if args.is_empty() {
@@ -6276,8 +6503,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let state = make_test_state(tx);
         // bot_manager is None, so slash commands should not be intercepted
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -6287,9 +6522,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "hello world")
-                .await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "hello world",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -6299,8 +6541,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbots",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -6316,6 +6566,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --prompt \"你是天气助手\"",
+            None,
+            &json!({}),
+            None,
         )
         .await;
         assert!(result.is_some());
@@ -6334,6 +6587,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot",
+            None,
+            &json!({}),
+            None,
         )
         .await;
 
@@ -6356,6 +6612,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/createbot weather Weather Bot --public",
+            None,
+            &json!({}),
+            None,
         )
         .await;
 
@@ -6375,6 +6634,9 @@ mod tests {
             "@alice:localhost",
             "!room:localhost",
             "/deletebot @bot_weather:localhost",
+            None,
+            &json!({}),
+            None,
         )
         .await;
         assert!(result.is_some());
@@ -6387,8 +6649,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/createbot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/createbot",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -6399,8 +6669,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/deletebot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/deletebot",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("Usage"));
     }
@@ -6411,8 +6689,16 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbot").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/listbot",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("mock list"));
     }
@@ -6423,11 +6709,352 @@ mod tests {
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
 
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/unknown").await;
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/unknown",
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
         assert!(
             result.is_none(),
             "unknown slash commands should pass through to agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_intercept_slash_command_when_aimed_at_child_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/schedule 每天早上 9 点提醒我看天气",
+            Some("@octos_child:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "slash commands aimed at a child bot must flow through to that bot"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_intercept_schedule_command_when_aimed_at_primary_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/schedule 每天早上 9 点提醒我看天气",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("mock schedule: 每天早上 9 点提醒我看天气 in !room:localhost".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_intercept_schedules_command_when_aimed_at_primary_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/schedules",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("mock schedules for !room:localhost".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn should_intercept_unschedule_command_when_aimed_at_primary_bot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/unschedule cron_deadbeef",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("mock unschedule: cron_deadbeef in !room:localhost".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_require_message_body_when_allbots_invoked() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/allbots",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Some("Usage: `/allbots <message>`".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_reject_allbots_when_no_broadcast_targets() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/allbots summarize this issue",
+            Some("@octos_bot:localhost"),
+            &json!({}),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some("No bound child bots were found for this room.".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_enforce_target_cap_when_allbots_invoked() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let targets = (0..=MAX_ALLBOTS_TARGETS)
+            .map(|i| format!("@octos_child_{i}:localhost"))
+            .collect::<Vec<_>>();
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/allbots summarize this issue",
+            Some("@octos_bot:localhost"),
+            &json!({
+                "org.octos.broadcast_targets": targets,
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "/allbots can target at most {MAX_ALLBOTS_TARGETS} bound child bots at once."
+            )),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_fan_out_allbots_to_bound_child_bots() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "profile-parent")
+            .await
+            .unwrap();
+        router
+            .register("@octos_alex:localhost", "profile-alex")
+            .await
+            .unwrap();
+        router
+            .register("@octos_bob:localhost", "profile-bob")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$allbots-fanout-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "/allbots summarize this issue",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.broadcast_targets": [
+                        "@octos_alex:localhost",
+                        "@octos_bob:localhost"
+                    ]
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-allbots-fanout-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut seen = Vec::new();
+        while let Ok(msg) = inbound_rx.try_recv() {
+            seen.push((
+                msg.content,
+                msg.metadata
+                    .get(METADATA_TARGET_PROFILE_ID)
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned),
+            ));
+        }
+
+        seen.sort();
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "summarize this issue".to_string(),
+                    Some("profile-alex".to_string()),
+                ),
+                (
+                    "summarize this issue".to_string(),
+                    Some("profile-bob".to_string()),
+                ),
+            ],
+            "/allbots should internally fan out to the bound child bots",
+        );
+    }
+
+    #[tokio::test]
+    async fn should_skip_stale_bindings_when_allbots_fans_out() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "profile-parent")
+            .await
+            .unwrap();
+        router
+            .register("@octos_alexbot:localhost", "profile-alex")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        // "@octos_alex:localhost" has no router entry — a stale binding.
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$allbots-fanout-stale-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "/allbots summarize this issue",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.broadcast_targets": [
+                        "@octos_alex:localhost",
+                        "@octos_alexbot:localhost"
+                    ]
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-allbots-fanout-stale-1?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut seen = Vec::new();
+        while let Ok(msg) = inbound_rx.try_recv() {
+            seen.push((
+                msg.content,
+                msg.metadata
+                    .get(METADATA_TARGET_PROFILE_ID)
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned),
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            vec![(
+                "summarize this issue".to_string(),
+                Some("profile-alex".to_string()),
+            )],
+            "/allbots should skip stale bindings and still fan out to valid child bots",
         );
     }
 
@@ -6455,6 +7082,26 @@ mod tests {
         async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
         }
+
+        async fn schedule_bot_task(
+            &self,
+            request: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock schedule: {request} in {room_id}"))
+        }
+        async fn list_schedules(&self, _sender: &str, room_id: &str) -> Result<String> {
+            Ok(format!("mock schedules for {room_id}"))
+        }
+        async fn unschedule_bot_task(
+            &self,
+            job_id: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock unschedule: {job_id} in {room_id}"))
+        }
     }
 
     #[async_trait]
@@ -6476,6 +7123,26 @@ mod tests {
 
         async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
+        }
+
+        async fn schedule_bot_task(
+            &self,
+            request: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock schedule: {request} in {room_id}"))
+        }
+        async fn list_schedules(&self, _sender: &str, room_id: &str) -> Result<String> {
+            Ok(format!("mock schedules for {room_id}"))
+        }
+        async fn unschedule_bot_task(
+            &self,
+            job_id: &str,
+            _sender: &str,
+            room_id: &str,
+        ) -> Result<String> {
+            Ok(format!("mock unschedule: {job_id} in {room_id}"))
         }
     }
 }
