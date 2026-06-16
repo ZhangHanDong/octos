@@ -285,6 +285,18 @@ impl BotRouter {
         Ok(())
     }
 
+    /// Whether the given profile (child bot) is bound to the given room.
+    ///
+    /// Server-side authority for `/allbots`: a broadcast may only reach bots
+    /// actually bound to the originating room, regardless of what
+    /// `org.octos.broadcast_targets` a (possibly forged) event claims.
+    pub async fn is_profile_in_room(&self, room_id: &str, profile_id: &str) -> bool {
+        let room_bots = self.room_bots.read().await;
+        room_bots
+            .get(room_id)
+            .is_some_and(|profiles| profiles.contains(profile_id))
+    }
+
     /// Return all room IDs that a given profile is in.
     pub async fn rooms_for_profile(&self, profile_id: &str) -> Vec<String> {
         let room_bots = self.room_bots.read().await;
@@ -797,6 +809,22 @@ fn percent_encode_path(s: &str) -> String {
         }
     }
     encoded
+}
+
+/// Reject an outbound media file whose on-disk size exceeds `cap`, by reading
+/// metadata only (never the whole file). Prevents a runaway producer from
+/// OOMing the gateway via `upload_media`'s `std::fs::read`.
+fn check_upload_within_cap(file_path: &std::path::Path, cap: u64) -> Result<u64> {
+    let file_size = std::fs::metadata(file_path)
+        .map(|m| m.len())
+        .wrap_err_with(|| format!("failed to stat media file: {}", file_path.display()))?;
+    if file_size > cap {
+        eyre::bail!(
+            "media file exceeds max upload size ({file_size} bytes > {cap} byte cap): {}",
+            file_path.display()
+        );
+    }
+    Ok(file_size)
 }
 
 /// Guess a MIME content type from a file path's extension for Matrix media
@@ -1486,11 +1514,25 @@ async fn dispatch_allbots(
 
     let mut deliveries = Vec::new();
     let mut unresolved_targets = Vec::new();
+    let mut unbound_targets = Vec::new();
     for target_matrix_user_id in target_matrix_user_ids {
         let Some(entry) = state.bot_router.get_entry(&target_matrix_user_id).await else {
             unresolved_targets.push(target_matrix_user_id);
             continue;
         };
+
+        // Server-side authority: the client-supplied broadcast_targets are
+        // untrusted. Only deliver to bots actually bound to THIS room — a
+        // forged event must not be able to fan out to a public bot in some
+        // other room, or to the sender's own private bot bound elsewhere.
+        if !state
+            .bot_router
+            .is_profile_in_room(room_id, &entry.profile_id)
+            .await
+        {
+            unbound_targets.push(target_matrix_user_id);
+            continue;
+        }
 
         if entry.visibility == BotVisibility::Private && sender != entry.owner {
             return Err(format!(
@@ -1502,6 +1544,12 @@ async fn dispatch_allbots(
     }
 
     if deliveries.is_empty() {
+        if !unbound_targets.is_empty() {
+            return Err(format!(
+                "None of the requested bots are bound to this room: {}",
+                unbound_targets.join(", ")
+            ));
+        }
         if !unresolved_targets.is_empty() {
             return Err(format!(
                 "Could not resolve any bound child bots for /allbots. Stale bindings: {}",
@@ -1526,6 +1574,15 @@ async fn dispatch_allbots(
             request_id,
             stale_targets = ?unresolved_targets,
             "skipping unresolved stale /allbots bindings"
+        );
+    }
+    if !unbound_targets.is_empty() {
+        warn!(
+            requester = sender,
+            room_id,
+            request_id,
+            unbound_targets = ?unbound_targets,
+            "rejecting /allbots targets not bound to this room"
         );
     }
 
@@ -2215,6 +2272,11 @@ impl MatrixChannel {
         content_type: &str,
         sender_user_id: Option<&str>,
     ) -> Result<String> {
+        // Bound outbound uploads by the same cap as inbound downloads: check
+        // the file size via metadata before reading the whole file into memory,
+        // so a runaway producer can't OOM the gateway.
+        check_upload_within_cap(file_path, crate::media::max_media_bytes())?;
+
         let data = std::fs::read(file_path)
             .wrap_err_with(|| format!("failed to read media file: {}", file_path.display()))?;
 
@@ -6931,6 +6993,14 @@ mod tests {
             .register("@octos_bob:localhost", "profile-bob")
             .await
             .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-alex")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-bob")
+            .await
+            .unwrap();
         state.bot_router = Arc::new(router);
 
         let app = Router::new()
@@ -7016,6 +7086,10 @@ mod tests {
             .register("@octos_alexbot:localhost", "profile-alex")
             .await
             .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-alex")
+            .await
+            .unwrap();
         state.bot_router = Arc::new(router);
 
         let app = Router::new()
@@ -7072,6 +7146,100 @@ mod tests {
                 Some("profile-alex".to_string()),
             )],
             "/allbots should skip stale bindings and still fan out to valid child bots",
+        );
+    }
+
+    #[test]
+    fn should_reject_outbound_media_file_over_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("big.bin");
+        std::fs::write(&file, vec![0u8; 2048]).unwrap();
+
+        // 2048-byte file, cap = 1024 → rejected.
+        let err = check_upload_within_cap(&file, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max upload size"),
+            "got: {err}"
+        );
+
+        // Same file, cap = 4096 → accepted, returns the size.
+        assert_eq!(check_upload_within_cap(&file, 4096).unwrap(), 2048);
+    }
+
+    #[tokio::test]
+    async fn should_reject_allbots_targets_not_bound_to_this_room() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.bot_manager = Some(Arc::new(MockBotManager));
+
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "profile-parent")
+            .await
+            .unwrap();
+        // A public bot that exists globally but is bound to a DIFFERENT room.
+        router
+            .register("@octos_elsewhere:localhost", "profile-elsewhere")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!other:localhost", "profile-elsewhere")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        // Forged event tries to broadcast to a bot bound to "!other:localhost"
+        // from within "!room:localhost".
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$allbots-cross-room",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "/allbots leak to other room",
+                    "org.octos.target_user_id": "@octos_bot:localhost",
+                    "org.octos.broadcast_targets": ["@octos_elsewhere:localhost"]
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-allbots-cross-room?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // No broadcast should have been dispatched to the cross-room bot.
+        let mut dispatched = Vec::new();
+        while let Ok(msg) = inbound_rx.try_recv() {
+            if let Some(p) = msg
+                .metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|v| v.as_str())
+            {
+                dispatched.push(p.to_string());
+            }
+        }
+        assert!(
+            !dispatched.iter().any(|p| p == "profile-elsewhere"),
+            "/allbots must not fan out to a bot bound to a different room: {dispatched:?}"
         );
     }
 

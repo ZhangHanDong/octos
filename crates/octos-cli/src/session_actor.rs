@@ -4713,6 +4713,18 @@ impl SessionActor {
             .await;
     }
 
+    /// Persist the outcome of a resolved approval into session history as a
+    /// system message so the NEXT LLM turn sees that the gated tool ran and
+    /// what it produced. Without this, history keeps only the
+    /// "[APPROVAL REQUESTED]" placeholder tool-result and the model never
+    /// learns the real result (review finding #5).
+    async fn persist_approval_outcome(&self, content: String) {
+        let mut handle = self.session_handle.lock().await;
+        if let Err(e) = handle.add_message_with_seq(Message::system(content)).await {
+            warn!(session = %self.session_key, error = %e, "failed to persist approval outcome to history");
+        }
+    }
+
     /// Append the decision to the shared approvals JSONL audit log (same
     /// record shape as the UI-protocol approval path). The human-readable
     /// `request_id` rides in `client_note` for correlation; the UUID ids are
@@ -4848,6 +4860,11 @@ impl SessionActor {
                 );
                 self.emit_approval_notice(format!("Denied: {}", pending.request.title))
                     .await;
+                self.persist_approval_outcome(format!(
+                    "[approval] {} ({}) was DENIED by {}; the tool did not run.",
+                    pending.request.title, pending.request.tool_name, inbound.sender_id
+                ))
+                .await;
             }
             ApprovalDecision::Approve => {
                 tracing::info!(
@@ -4855,6 +4872,7 @@ impl SessionActor {
                     approver = %inbound.sender_id,
                     "approval request approved"
                 );
+                let tool_name = pending.request.tool_name.clone();
                 match self.agent.execute_approved_tool(&pending).await {
                     Ok(result) if result.success => {
                         let output = if result.output.trim().is_empty() {
@@ -4862,7 +4880,13 @@ impl SessionActor {
                         } else {
                             result.output
                         };
-                        self.emit_approval_notice(output).await;
+                        self.emit_approval_notice(output.clone()).await;
+                        self.persist_approval_outcome(format!(
+                            "[approval] {} ({tool_name}) was APPROVED by {} and executed. \
+                             Result:\n{output}",
+                            pending.request.title, inbound.sender_id
+                        ))
+                        .await;
                     }
                     Ok(result) => {
                         self.emit_approval_notice(format!(
@@ -4870,10 +4894,20 @@ impl SessionActor {
                             result.output
                         ))
                         .await;
+                        self.persist_approval_outcome(format!(
+                            "[approval] {} ({tool_name}) was approved but execution FAILED: {}",
+                            pending.request.title, result.output
+                        ))
+                        .await;
                     }
                     Err(err) => {
                         self.emit_approval_notice(format!("Approved but execution errored: {err}"))
                             .await;
+                        self.persist_approval_outcome(format!(
+                            "[approval] {} ({tool_name}) was approved but execution ERRORED: {err}",
+                            pending.request.title
+                        ))
+                        .await;
                     }
                 }
             }
@@ -7564,7 +7598,16 @@ impl SessionActor {
                     // Skip streaming edit when session is inactive — let the
                     // reply go through proxy → pending buffer for later flush.
                     let session_active = self.is_active().await;
-                    let streamed = if session_active {
+                    // Review finding #6: when an app-card tool already delivered
+                    // the reply (suppression fired in the stream forwarder),
+                    // treat the turn as already replied so we neither finish a
+                    // streamed bubble nor send conv_response.content separately.
+                    let app_reply_suppressed = stream_result
+                        .as_ref()
+                        .is_some_and(|sr| sr.suppressed_by_app_reply);
+                    let streamed = if app_reply_suppressed {
+                        true
+                    } else if session_active {
                         if let Some(ref sr) = stream_result {
                             if let Some(ref mid) = sr.message_id {
                                 if let Some(ref si) = self.status_indicator {
@@ -8180,6 +8223,12 @@ impl SessionActor {
                         && stream_result
                             .as_ref()
                             .is_some_and(|sr| sr.message_id.is_some());
+                    // Review finding #6: an app-card tool already delivered the
+                    // reply — don't also emit conv_response.content as a text
+                    // bubble on this overflow turn.
+                    let app_reply_suppressed = stream_result
+                        .as_ref()
+                        .is_some_and(|sr| sr.suppressed_by_app_reply);
 
                     // FA-12 defect C: `already_streamed` is an unreliable
                     // "content already delivered" signal for ApiChannel —
@@ -8197,8 +8246,9 @@ impl SessionActor {
                     // with empty body so non-API channels don't produce a
                     // duplicate bubble and the web side doesn't double-render.
                     let have_durable_metadata = committed_seq.is_some();
-                    let should_emit =
-                        !reply.trim().is_empty() && (have_durable_metadata || !already_streamed);
+                    let should_emit = !reply.trim().is_empty()
+                        && !app_reply_suppressed
+                        && (have_durable_metadata || !already_streamed);
 
                     if should_emit {
                         let mut metadata = serde_json::Map::new();

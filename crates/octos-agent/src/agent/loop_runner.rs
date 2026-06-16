@@ -7702,6 +7702,41 @@ printf '{"output":"voice saved","success":true}\n'
     }
 
     #[tokio::test]
+    async fn should_not_re_deny_approved_shell_command_tripping_safepolicy_ask() {
+        // Codex/mempal review #1: an approved `shell` command that ALSO trips
+        // SafePolicy's Decision::Ask (sudo / rm -rf / git push --force) must
+        // not be re-denied by the in-tool approval gate. `execute_approved_tool`
+        // scopes an auto-approver so the already-human-approved call runs.
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approval-shell"), provider, tools, memory);
+
+        // `git push --force` trips SafePolicy::Ask; with no remote it fails
+        // fast and harmlessly — we only assert the approval gate was passed.
+        let pending = human_approval_rules_for("shell")
+            .draft_for_tool_call(
+                "shell",
+                "call_shell",
+                serde_json::json!({"command": "git push --force"}),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_pending("!room:example.org", "@requester:example.org");
+
+        let result = agent.execute_approved_tool(&pending).await.unwrap();
+        assert!(
+            !result.output.contains("requires approval"),
+            "approved shell command must not be re-denied by the in-tool gate: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn should_reject_revalidation_when_sender_not_authorized() {
         let dir = tempfile::tempdir().unwrap();
         let tools = ToolRegistry::with_builtins(dir.path());

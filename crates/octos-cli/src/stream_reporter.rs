@@ -278,6 +278,12 @@ pub struct StreamResult {
     pub message_id: Option<String>,
     /// The full accumulated text that was streamed.
     pub text: String,
+    /// Set when an `app_reply`-tagged tool (e.g. `send_app_card`) succeeded and
+    /// the forwarder suppressed the LLM's follow-up text: the GPU card IS the
+    /// reply on capable clients. The session actor must then NOT also send
+    /// `conv_response.content` through the final-reply path, or the user sees
+    /// the card plus a duplicate text bubble (review finding #6).
+    pub suppressed_by_app_reply: bool,
 }
 
 /// Check if a session is currently the active session for its chat.
@@ -667,6 +673,7 @@ pub async fn run_stream_forwarder(
     StreamResult {
         message_id,
         text: buffer,
+        suppressed_by_app_reply: suppress_follow_up_text_after_app_reply,
     }
 }
 
@@ -1204,6 +1211,12 @@ mod tests {
         assert!(result.message_id.is_none());
         assert!(result.text.is_empty());
         assert!(mock.sent.lock().await.is_empty());
+        // Review finding #6: the suppression decision must be propagated so the
+        // session actor's final-reply path can skip conv_response.content.
+        assert!(
+            result.suppressed_by_app_reply,
+            "app-reply suppression must be reported to the caller"
+        );
     }
 
     /// #649 follow-up (rapid-fire): the streaming path must stamp the

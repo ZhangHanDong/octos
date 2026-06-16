@@ -432,6 +432,29 @@ impl ApprovalRuleConfig {
 }
 
 impl ApprovalPolicyConfig {
+    /// Validate every rule: non-empty `tools`, `require_approval` true,
+    /// non-empty `authorized_approvers`, positive `expires_in_secs`. Shared by
+    /// the top-level config load and the per-profile bootstrap path so a bad
+    /// rule fails fast in both instead of gating unexpectedly / creating
+    /// unanswerable or instantly-expiring requests (review finding #4).
+    pub fn validate(&self) -> Result<()> {
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if rule.tools.is_empty() {
+                eyre::bail!("approval_policy.rules[{idx}].tools must not be empty");
+            }
+            if !rule.require_approval {
+                eyre::bail!("approval_policy.rules[{idx}].require_approval must be true");
+            }
+            if rule.authorized_approvers.is_empty() {
+                eyre::bail!("approval_policy.rules[{idx}].authorized_approvers must not be empty");
+            }
+            if rule.expires_in_secs == 0 {
+                eyre::bail!("approval_policy.rules[{idx}].expires_in_secs must be > 0");
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_runtime_rules(&self) -> octos_agent::HumanApprovalRules {
         octos_agent::HumanApprovalRules::new(
             self.rules
@@ -1262,24 +1285,10 @@ impl Config {
     /// unanswerable request). Runs after `expand_env_vars` so `${VAR}`
     /// references in approver lists are validated post-expansion.
     fn validate_approval_policy(&self) -> Result<()> {
-        let Some(policy) = &self.approval_policy else {
-            return Ok(());
-        };
-        for (idx, rule) in policy.rules.iter().enumerate() {
-            if rule.tools.is_empty() {
-                eyre::bail!("approval_policy.rules[{idx}].tools must not be empty");
-            }
-            if !rule.require_approval {
-                eyre::bail!("approval_policy.rules[{idx}].require_approval must be true");
-            }
-            if rule.authorized_approvers.is_empty() {
-                eyre::bail!("approval_policy.rules[{idx}].authorized_approvers must not be empty");
-            }
-            if rule.expires_in_secs == 0 {
-                eyre::bail!("approval_policy.rules[{idx}].expires_in_secs must be > 0");
-            }
+        match &self.approval_policy {
+            Some(policy) => policy.validate(),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Expand environment variables in config values.
@@ -1293,6 +1302,17 @@ impl Config {
         }
         if let Some(ref mut provider) = self.provider {
             *provider = Self::expand_env_var(provider);
+        }
+        // Approval rules: expand ${VAR} in authorized_approvers so a
+        // deployment can reference `${MATRIX_APPROVER}` etc. Without this the
+        // literal `${VAR}` would pass the non-empty validation check and then
+        // never match a real Matrix user id (review finding #4).
+        if let Some(ref mut policy) = self.approval_policy {
+            for rule in &mut policy.rules {
+                for approver in &mut rule.authorized_approvers {
+                    *approver = Self::expand_env_var(approver);
+                }
+            }
         }
     }
 
@@ -2256,6 +2276,39 @@ mod tests {
         let runtime = policy.to_runtime_rules();
         assert!(runtime.matching_rule("shell").is_some());
         assert!(runtime.matching_rule("read_file").is_none());
+    }
+
+    #[test]
+    fn should_expand_env_vars_in_authorized_approvers() {
+        // Use an env var reliably present in the test environment instead of
+        // mutating the environment (workspace is `deny(unsafe_code)`, and
+        // std::env::set_var is unsafe under edition 2024).
+        let var = if std::env::var("HOME").is_ok() {
+            "HOME"
+        } else {
+            "PATH"
+        };
+        let expected = std::env::var(var).unwrap();
+        let mut config = Config {
+            approval_policy: Some(ApprovalPolicyConfig {
+                default: ApprovalPolicyDefault::Allow,
+                rules: vec![ApprovalRuleConfig {
+                    tools: vec!["shell".into()],
+                    require_approval: true,
+                    risk_level: ApprovalPolicyRiskLevel::Critical,
+                    authorized_approvers: vec![format!("${{{var}}}")],
+                    expires_in_secs: 300,
+                    on_timeout: ApprovalPolicyTimeoutBehavior::Notify,
+                }],
+            }),
+            ..Default::default()
+        };
+        config.expand_env_vars();
+        assert_eq!(
+            config.approval_policy.unwrap().rules[0].authorized_approvers,
+            vec![expected],
+            "${{VAR}} in authorized_approvers must be expanded before validation"
+        );
     }
 
     #[test]

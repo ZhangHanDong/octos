@@ -39,8 +39,9 @@ use crate::progress::ProgressEvent;
 use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{
-    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolApprovalRequester,
-    ToolContext, USER_QUESTION_CTX, UserQuestionRequester,
+    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprovalRequester, ToolContext, USER_QUESTION_CTX,
+    UserQuestionRequester,
 };
 use crate::workspace_contract::{
     SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
@@ -306,6 +307,20 @@ pub(super) fn compose_system_prompt(agent: &Agent) -> String {
     content
 }
 
+/// Auto-approves the in-tool approval gate when re-running a tool whose human
+/// approval was already granted through the gateway approval flow
+/// (`docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`). Scoped only around
+/// [`Agent::execute_approved_tool`], so it can never auto-approve an ordinary
+/// turn — that path never installs this requester.
+struct ApprovedToolAutoApprover;
+
+#[async_trait::async_trait]
+impl ToolApprovalRequester for ApprovedToolAutoApprover {
+    async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+        ToolApprovalDecision::Approve
+    }
+}
+
 impl Agent {
     /// Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): re-check a pending
     /// human approval just before executing it. Policies may have changed
@@ -375,11 +390,22 @@ impl Agent {
             tool_id: pending.tool_id.clone(),
             ..ToolContext::zero()
         };
-        let result = TOOL_CTX
+        // The human already approved this exact (digest-bound) call through the
+        // gateway approval flow. Some tools (e.g. `shell` on a SafePolicy
+        // `Decision::Ask` command — sudo / rm -rf / git push --force) run a
+        // SECOND, in-tool approval gate that reads `TOOL_APPROVAL_CTX` and
+        // denies when absent. Scope an auto-approving requester so the
+        // already-approved call is not re-denied by that inner gate.
+        let approver: std::sync::Arc<dyn ToolApprovalRequester> =
+            std::sync::Arc::new(ApprovedToolAutoApprover);
+        let result = TOOL_APPROVAL_CTX
             .scope(
-                ctx,
-                self.tools
-                    .execute(&pending.request.tool_name, &pending.tool_args),
+                approver,
+                TOOL_CTX.scope(
+                    ctx,
+                    self.tools
+                        .execute(&pending.request.tool_name, &pending.tool_args),
+                ),
             )
             .await?;
 
