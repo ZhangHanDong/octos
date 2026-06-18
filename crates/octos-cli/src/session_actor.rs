@@ -938,11 +938,126 @@ fn inbound_client_message_id(inbound: &InboundMessage) -> Option<String> {
 }
 
 fn inbound_is_master_continuation(inbound: &InboundMessage) -> bool {
+    inbound_bool_metadata(inbound, "_master_continuation")
+}
+
+fn inbound_is_approval_continuation(inbound: &InboundMessage) -> bool {
+    inbound_bool_metadata(inbound, "_approval_continuation")
+}
+
+fn inbound_bool_metadata(inbound: &InboundMessage, key: &str) -> bool {
     inbound
         .metadata
-        .get("_master_continuation")
+        .get(key)
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+fn runtime_internal_inbound(inbound: &InboundMessage) -> bool {
+    inbound_is_master_continuation(inbound) || inbound_is_approval_continuation(inbound)
+}
+
+fn approval_path_summary(path: Option<&Path>) -> String {
+    path.map(|path| path.to_string_lossy().into_owned())
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| "(none)".to_string())
+}
+
+fn approval_paths_summary(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "(none)".to_string();
+    }
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n- ")
+}
+
+fn build_approval_continuation_prompt(
+    pending: &PendingApproval,
+    approved_by: &str,
+    result: &octos_agent::tools::ToolResult,
+) -> String {
+    let status = if result.success { "success" } else { "failure" };
+    let output = if result.output.trim().is_empty() {
+        "(empty output)"
+    } else {
+        result.output.trim()
+    };
+    let files_to_send = approval_paths_summary(&result.files_to_send);
+    format!(
+        "Internal approval continuation metadata.\n\
+         A suspended tool call was resolved by human approval.\n\n\
+         Approval title: {title}\n\
+         Tool name: {tool_name}\n\
+         Tool call id: {tool_id}\n\
+         Approved by: {approved_by}\n\
+         Execution status: {status}\n\
+         Plain output:\n{output}\n\n\
+         file_modified: {file_modified}\n\
+         files_to_send: {files_to_send}\n\
+         This metadata is runtime generated and is not a user-authored request.",
+        title = pending.request.title,
+        tool_name = pending.request.tool_name,
+        tool_id = pending.tool_id,
+        file_modified = approval_path_summary(result.file_modified.as_deref()),
+    )
+}
+
+fn build_approval_continuation_inbound(
+    channel: &str,
+    chat_id: &str,
+    pending: &PendingApproval,
+    approved_by: &str,
+    result: &octos_agent::tools::ToolResult,
+) -> InboundMessage {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "_approval_continuation".to_string(),
+        serde_json::json!(true),
+    );
+    metadata.insert(
+        "approval_request_id".to_string(),
+        serde_json::json!(pending.request.request_id),
+    );
+    metadata.insert(
+        "approval_tool_name".to_string(),
+        serde_json::json!(pending.request.tool_name),
+    );
+    metadata.insert(
+        "approval_execution_success".to_string(),
+        serde_json::json!(result.success),
+    );
+    if let Some(path) = &result.file_modified {
+        metadata.insert(
+            "file_modified".to_string(),
+            serde_json::json!(path.to_string_lossy()),
+        );
+    }
+    if !result.files_to_send.is_empty() {
+        metadata.insert(
+            "files_to_send".to_string(),
+            serde_json::json!(
+                result
+                    .files_to_send
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+
+    InboundMessage {
+        channel: channel.to_string(),
+        sender_id: "octos-runtime".to_string(),
+        chat_id: chat_id.to_string(),
+        content: build_approval_continuation_prompt(pending, approved_by, result),
+        timestamp: chrono::Utc::now(),
+        media: vec![],
+        metadata: serde_json::Value::Object(metadata),
+        message_id: None,
+    }
 }
 
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
@@ -4878,7 +4993,7 @@ impl SessionActor {
                         let output = if result.output.trim().is_empty() {
                             format!("Approved and executed: {}", pending.request.title)
                         } else {
-                            result.output
+                            result.output.clone()
                         };
                         self.emit_approval_notice(output.clone()).await;
                         self.persist_approval_outcome(format!(
@@ -4887,6 +5002,15 @@ impl SessionActor {
                             pending.request.title, inbound.sender_id
                         ))
                         .await;
+                        let synthetic = build_approval_continuation_inbound(
+                            &self.channel,
+                            &self.chat_id,
+                            &pending,
+                            &inbound.sender_id,
+                            &result,
+                        );
+                        self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
+                            .await;
                     }
                     Ok(result) => {
                         self.emit_approval_notice(format!(
@@ -4899,6 +5023,15 @@ impl SessionActor {
                             pending.request.title, result.output
                         ))
                         .await;
+                        let synthetic = build_approval_continuation_inbound(
+                            &self.channel,
+                            &self.chat_id,
+                            &pending,
+                            &inbound.sender_id,
+                            &result,
+                        );
+                        self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
+                            .await;
                     }
                     Err(err) => {
                         self.emit_approval_notice(format!("Approved but execution errored: {err}"))
@@ -4908,6 +5041,20 @@ impl SessionActor {
                             pending.request.title
                         ))
                         .await;
+                        let result = octos_agent::tools::ToolResult {
+                            output: format!("Execution errored: {err}"),
+                            success: false,
+                            ..Default::default()
+                        };
+                        let synthetic = build_approval_continuation_inbound(
+                            &self.channel,
+                            &self.chat_id,
+                            &pending,
+                            &inbound.sender_id,
+                            &result,
+                        );
+                        self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
+                            .await;
                     }
                 }
             }
@@ -8389,7 +8536,12 @@ impl SessionActor {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let is_master_continuation_inbound = inbound_is_master_continuation(&inbound);
-        if !is_recovery_turn && !is_completion_review && !is_master_continuation_inbound {
+        let is_approval_continuation = inbound_is_approval_continuation(&inbound);
+        if !is_recovery_turn
+            && !is_completion_review
+            && !is_master_continuation_inbound
+            && !is_approval_continuation
+        {
             self.reset_consecutive_recovery_turns();
         }
 
@@ -8403,9 +8555,12 @@ impl SessionActor {
         let is_master_continuation = inbound_is_master_continuation(&inbound);
         let status_prompt = if is_master_continuation {
             "supervised agent continuation"
+        } else if is_approval_continuation {
+            "approved tool continuation"
         } else {
             inbound.content.as_str()
         };
+        let is_runtime_internal_inbound = runtime_internal_inbound(&inbound);
 
         // Acquire concurrency permit
         let _permit = match self.semaphore.acquire().await {
@@ -8708,7 +8863,7 @@ impl SessionActor {
                     // Auto-generate summary from first user message
                     {
                         let session = handle.get_or_create();
-                        if !is_master_continuation
+                        if !is_runtime_internal_inbound
                             && session.summary.is_none()
                             && !inbound.content.trim().is_empty()
                         {
@@ -8732,14 +8887,16 @@ impl SessionActor {
                     };
                     let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
-                        if is_master_continuation
+                        if is_runtime_internal_inbound
                             && !persisted_user_message
                             && msg.role == MessageRole::User
                         {
                             persisted_user_message = true;
                             debug!(
                                 session = %self.session_key,
-                                "skipping durable user-row persist for internal master continuation"
+                                approval_continuation = is_approval_continuation,
+                                master_continuation = is_master_continuation,
+                                "skipping durable user-row persist for internal continuation"
                             );
                             continue;
                         }
@@ -16562,43 +16719,68 @@ mod tests {
 
     // ── Phase 4: human-approval bridge tests (ROBRIX-PHASE4 ADR) ────────────
 
-    /// Provider that issues one `list_dir` tool call, then ends the turn.
-    struct GatedToolCallProvider {
+    #[derive(Clone)]
+    enum ApprovalProviderStep {
+        Tool {
+            id: &'static str,
+            name: &'static str,
+            arguments: serde_json::Value,
+        },
+        Text(&'static str),
+    }
+
+    struct SequencedApprovalProvider {
         calls: std::sync::atomic::AtomicUsize,
+        steps: Vec<ApprovalProviderStep>,
+        observed_prompts: Arc<StdMutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
-    impl octos_llm::LlmProvider for GatedToolCallProvider {
+    impl octos_llm::LlmProvider for SequencedApprovalProvider {
         async fn chat(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[ToolSpec],
             _config: &ChatConfig,
         ) -> eyre::Result<ChatResponse> {
+            if let Some(last_user) = messages.iter().rev().find(|m| m.role == MessageRole::User) {
+                self.observed_prompts
+                    .lock()
+                    .unwrap()
+                    .push(last_user.content.clone());
+            }
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(if call == 0 {
-                ChatResponse {
+            let step = self
+                .steps
+                .get(call)
+                .cloned()
+                .unwrap_or(ApprovalProviderStep::Text("done"));
+            Ok(match step {
+                ApprovalProviderStep::Tool {
+                    id,
+                    name,
+                    arguments,
+                } => ChatResponse {
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![octos_core::ToolCall {
-                        id: "call_gated".to_string(),
-                        name: "list_dir".to_string(),
-                        arguments: serde_json::json!({"path": "."}),
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments,
                         metadata: None,
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
                     provider_index: None,
-                }
-            } else {
-                ChatResponse {
-                    content: Some("done".to_string()),
+                },
+                ApprovalProviderStep::Text(content) => ChatResponse {
+                    content: Some(content.to_string()),
                     reasoning_content: None,
                     tool_calls: vec![],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
                     provider_index: None,
-                }
+                },
             })
         }
 
@@ -16611,23 +16793,92 @@ mod tests {
         }
     }
 
-    /// Spawn an actor whose agent gates `list_dir` behind a human-approval
-    /// rule authorizing only `@alice:localhost`.
-    async fn setup_actor_with_approval_rules(
+    struct ApprovalTestTool {
+        name: &'static str,
+        output: &'static str,
+        success: bool,
+        file_modified: Option<&'static str>,
+        files_to_send: Vec<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_agent::tools::Tool for ApprovalTestTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Approval test tool"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: &serde_json::Value,
+        ) -> eyre::Result<octos_agent::tools::ToolResult> {
+            Ok(octos_agent::tools::ToolResult {
+                output: self.output.to_string(),
+                success: self.success,
+                file_modified: self.file_modified.map(PathBuf::from),
+                files_to_send: self.files_to_send.iter().map(PathBuf::from).collect(),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct ApprovalActorFixture {
+        inbox_tx: mpsc::Sender<ActorMessage>,
+        out_rx: mpsc::Receiver<OutboundMessage>,
+        handle: JoinHandle<()>,
+        observed_prompts: Arc<StdMutex<Vec<String>>>,
+        session_key: SessionKey,
+    }
+
+    impl ApprovalActorFixture {
+        fn build_approval_continuation_inbound(
+            &self,
+            pending: &PendingApproval,
+            approved_by: &str,
+            result: &octos_agent::tools::ToolResult,
+        ) -> InboundMessage {
+            build_approval_continuation_inbound(
+                "matrix",
+                "!room:localhost",
+                pending,
+                approved_by,
+                result,
+            )
+        }
+    }
+
+    /// Spawn an actor whose agent gates selected tools behind human approval
+    /// authorizing only `@alice:localhost`.
+    async fn setup_actor_with_approval_provider(
         dir: &tempfile::TempDir,
-    ) -> (
-        mpsc::Sender<ActorMessage>,
-        mpsc::Receiver<OutboundMessage>,
-        JoinHandle<()>,
-    ) {
+        steps: Vec<ApprovalProviderStep>,
+        gated_tools: Vec<&'static str>,
+        extra_tools: Vec<ApprovalTestTool>,
+    ) -> ApprovalActorFixture {
         let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
-        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(GatedToolCallProvider {
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        for tool in extra_tools {
+            tools.register(tool);
+        }
+        let observed_prompts = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(SequencedApprovalProvider {
             calls: std::sync::atomic::AtomicUsize::new(0),
+            steps,
+            observed_prompts: Arc::clone(&observed_prompts),
         });
 
         let rules = octos_agent::HumanApprovalRules::new(vec![octos_agent::ApprovalRule {
-            tools: vec!["list_dir".to_string()],
+            tools: gated_tools.into_iter().map(str::to_string).collect(),
             risk_level: octos_agent::ApprovalRiskLevel::Critical,
             authorized_approvers: vec!["@alice:localhost".to_string()],
             expires_in_secs: 300,
@@ -16645,8 +16896,9 @@ mod tests {
         let (inbox_tx, inbox_rx) = mpsc::channel(32);
         let (out_tx, out_rx) = mpsc::channel(64);
 
+        let session_key = SessionKey::new("matrix", "!room:localhost");
         let actor = SessionActor {
-            session_key: SessionKey::new("matrix", "!room:localhost"),
+            session_key: session_key.clone(),
             channel: "matrix".to_string(),
             chat_id: "!room:localhost".to_string(),
             tenant_id: None,
@@ -16686,7 +16938,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("matrix", "!room:localhost")),
+            context_manager: test_context_manager(&session_key),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -16694,7 +16946,39 @@ mod tests {
         };
 
         let handle = tokio::spawn(actor.run());
-        (inbox_tx, out_rx, handle)
+        ApprovalActorFixture {
+            inbox_tx,
+            out_rx,
+            handle,
+            observed_prompts,
+            session_key,
+        }
+    }
+
+    /// Spawn an actor whose agent gates `list_dir` behind a human-approval
+    /// rule authorizing only `@alice:localhost`.
+    async fn setup_actor_with_approval_rules(
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+    ) {
+        let fixture = setup_actor_with_approval_provider(
+            dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_gated",
+                    name: "list_dir",
+                    arguments: serde_json::json!({"path": "."}),
+                },
+                ApprovalProviderStep::Text("done"),
+            ],
+            vec!["list_dir"],
+            vec![],
+        )
+        .await;
+        (fixture.inbox_tx, fixture.out_rx, fixture.handle)
     }
 
     fn approval_inbound(content: &str, sender: &str, metadata: serde_json::Value) -> ActorMessage {
@@ -16720,6 +17004,55 @@ mod tests {
             .await
             .expect("timed out waiting for outbound message")
             .expect("outbound channel closed")
+    }
+
+    async fn recv_outbound_fast(out_rx: &mut mpsc::Receiver<OutboundMessage>) -> OutboundMessage {
+        tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("timed out waiting for outbound message")
+            .expect("outbound channel closed")
+    }
+
+    async fn request_approval(
+        inbox_tx: &mpsc::Sender<ActorMessage>,
+        out_rx: &mut mpsc::Receiver<OutboundMessage>,
+        content: &str,
+    ) -> (String, String, OutboundMessage) {
+        inbox_tx
+            .send(approval_inbound(
+                content,
+                "@user:localhost",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let card = recv_outbound_fast(out_rx).await;
+        let request = card
+            .metadata
+            .get(METADATA_APPROVAL_REQUEST)
+            .expect("metadata should carry the approval request envelope");
+        let request_id = request["request_id"].as_str().unwrap().to_string();
+        let digest = request["tool_args_digest"].as_str().unwrap().to_string();
+        (request_id, digest, card)
+    }
+
+    async fn approve_request(
+        inbox_tx: &mpsc::Sender<ActorMessage>,
+        request_id: String,
+        digest: String,
+    ) {
+        let response_meta = serde_json::json!({
+            METADATA_APPROVAL_RESPONSE: {
+                "request_id": request_id,
+                "decision": "approve",
+                "source_event_id": "$approved",
+                "tool_args_digest": digest,
+            }
+        });
+        inbox_tx
+            .send(approval_inbound("", "@alice:localhost", response_meta))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -16777,6 +17110,502 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approved_tool_success_enqueues_internal_continuation_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_alpha",
+                    name: "alpha",
+                    arguments: serde_json::json!({}),
+                },
+                ApprovalProviderStep::Text("continuation saw alpha result"),
+            ],
+            vec!["alpha"],
+            vec![ApprovalTestTool {
+                name: "alpha",
+                output: "alpha approved output",
+                success: true,
+                file_modified: None,
+                files_to_send: vec![],
+            }],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "run alpha").await;
+        approve_request(&fixture.inbox_tx, request_id, digest).await;
+
+        let approval_notice = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(approval_notice.content.contains("alpha approved output"));
+        let continuation = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(
+            continuation
+                .content
+                .contains("continuation saw alpha result"),
+            "approval result should re-enter the normal agent loop, got: {}",
+            continuation.content
+        );
+        let prompts = fixture.observed_prompts.lock().unwrap().clone();
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("alpha approved output")),
+            "continuation prompt should expose approved tool result: {prompts:?}"
+        );
+
+        let session = SessionHandle::open(dir.path(), &fixture.session_key)
+            .session()
+            .clone();
+        assert!(
+            session.messages.iter().any(|message| {
+                message.role == MessageRole::System
+                    && message.content.contains("alpha approved output")
+            }),
+            "approval outcome should be persisted in session history: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approval_continuation_prompt_contains_facts_not_directives() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = setup_actor_with_approval_provider(&dir, vec![], vec!["alpha"], vec![]).await;
+        let pending = octos_agent::HumanApprovalRules::new(vec![octos_agent::ApprovalRule {
+            tools: vec!["alpha".to_string()],
+            risk_level: octos_agent::ApprovalRiskLevel::Critical,
+            authorized_approvers: vec!["@alice:localhost".to_string()],
+            expires_in_secs: 300,
+            on_timeout: octos_agent::ApprovalTimeoutBehavior::Notify,
+        }])
+        .draft_for_tool_call(
+            "alpha",
+            "call_alpha",
+            serde_json::json!({}),
+            chrono::Utc::now(),
+        )
+        .unwrap()
+        .unwrap()
+        .into_pending("!room:localhost", "@user:localhost");
+        let result = octos_agent::tools::ToolResult {
+            output: "plain output".to_string(),
+            success: true,
+            file_modified: Some(PathBuf::from("rust_slides.html")),
+            files_to_send: vec![PathBuf::from("deck.pptx")],
+            ..Default::default()
+        };
+
+        let inbound =
+            fixture.build_approval_continuation_inbound(&pending, "@alice:localhost", &result);
+
+        assert!(inbound_is_approval_continuation(&inbound));
+        assert!(inbound.content.is_ascii());
+        assert!(inbound.content.contains("alpha"));
+        assert!(inbound.content.contains("success"));
+        assert!(inbound.content.contains("plain output"));
+        assert!(inbound.content.contains("rust_slides.html"));
+        assert!(inbound.content.contains("deck.pptx"));
+        let lower = inbound.content.to_ascii_lowercase();
+        for forbidden in [
+            "call send_file",
+            "send media",
+            "request download confirmation",
+            "execute another follow-up tool",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "synthetic prompt must carry facts, not directives; found {forbidden:?} in: {}",
+                inbound.content
+            );
+        }
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approved_write_file_continuation_does_not_directly_send_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_write",
+                    name: "write_file",
+                    arguments: serde_json::json!({
+                        "path": "rust_slides.html",
+                        "content": "<!doctype html>\n<title>Rust</title>\n",
+                    }),
+                },
+                ApprovalProviderStep::Text(
+                    "I wrote rust_slides.html. What would you like to do next?",
+                ),
+            ],
+            vec!["write_file"],
+            vec![],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "create html").await;
+        approve_request(&fixture.inbox_tx, request_id, digest).await;
+
+        let approval_notice = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(
+            approval_notice.content.contains("Successfully wrote"),
+            "write_file result should be surfaced as text: {}",
+            approval_notice.content
+        );
+        assert!(
+            approval_notice.media.is_empty(),
+            "approval handler must not emit media directly: {:?}",
+            approval_notice.media
+        );
+        let continuation = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(continuation.media.is_empty());
+        let prompts = fixture.observed_prompts.lock().unwrap().clone();
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("rust_slides.html")),
+            "continuation context should contain generated path: {prompts:?}"
+        );
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approved_write_file_continuation_can_ask_user_to_send_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_write",
+                    name: "write_file",
+                    arguments: serde_json::json!({
+                        "path": "rust_slides.html",
+                        "content": "<!doctype html>\n<title>Rust</title>\n",
+                    }),
+                },
+                ApprovalProviderStep::Text(
+                    "rust_slides.html has been created. Do you want me to send the file?",
+                ),
+            ],
+            vec!["write_file"],
+            vec![],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "create html").await;
+        approve_request(&fixture.inbox_tx, request_id, digest).await;
+
+        let _approval_notice = recv_outbound_fast(&mut fixture.out_rx).await;
+        let continuation = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(continuation.content.contains("rust_slides.html"));
+        assert!(
+            continuation.content.contains("Do you want"),
+            "assistant should ask for the user's next action: {}",
+            continuation.content
+        );
+        assert!(
+            continuation.media.is_empty(),
+            "asking the user must not attach media"
+        );
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approved_tool_continuation_can_use_allowed_tool_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_alpha",
+                    name: "alpha",
+                    arguments: serde_json::json!({}),
+                },
+                ApprovalProviderStep::Tool {
+                    id: "call_beta",
+                    name: "beta",
+                    arguments: serde_json::json!({}),
+                },
+                ApprovalProviderStep::Text("beta follow-up complete"),
+            ],
+            vec!["alpha"],
+            vec![
+                ApprovalTestTool {
+                    name: "alpha",
+                    output: "alpha approved output",
+                    success: true,
+                    file_modified: None,
+                    files_to_send: vec![],
+                },
+                ApprovalTestTool {
+                    name: "beta",
+                    output: "beta normal output",
+                    success: true,
+                    file_modified: None,
+                    files_to_send: vec![],
+                },
+            ],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "run alpha").await;
+        approve_request(&fixture.inbox_tx, request_id, digest).await;
+
+        let _approval_notice = recv_outbound_fast(&mut fixture.out_rx).await;
+        let continuation = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(continuation.content.contains("beta follow-up complete"));
+        let session = SessionHandle::open(dir.path(), &fixture.session_key)
+            .session()
+            .clone();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool
+                    && message.content.contains("beta normal output")),
+            "allowed follow-up tool should execute through normal ToolRegistry: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approved_tool_continuation_reenters_approval_for_gated_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_alpha",
+                    name: "alpha",
+                    arguments: serde_json::json!({}),
+                },
+                ApprovalProviderStep::Tool {
+                    id: "call_gamma",
+                    name: "gamma",
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            vec!["alpha", "gamma"],
+            vec![
+                ApprovalTestTool {
+                    name: "alpha",
+                    output: "alpha approved output",
+                    success: true,
+                    file_modified: None,
+                    files_to_send: vec![],
+                },
+                ApprovalTestTool {
+                    name: "gamma",
+                    output: "gamma output must wait",
+                    success: true,
+                    file_modified: None,
+                    files_to_send: vec![],
+                },
+            ],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "run alpha").await;
+        approve_request(&fixture.inbox_tx, request_id, digest).await;
+
+        let _approval_notice = recv_outbound_fast(&mut fixture.out_rx).await;
+        let second_card = recv_outbound_fast(&mut fixture.out_rx).await;
+        let request = second_card
+            .metadata
+            .get(METADATA_APPROVAL_REQUEST)
+            .expect("continuation should emit a second approval request");
+        assert_eq!(request["tool_name"], "gamma");
+        assert!(
+            !second_card.content.contains("gamma output must wait"),
+            "second gated tool must not execute before approval"
+        );
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approved_tool_failure_continuation_reports_failure_without_followup_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_fails",
+                    name: "fails",
+                    arguments: serde_json::json!({}),
+                },
+                ApprovalProviderStep::Text("The approved tool failed with fail output."),
+            ],
+            vec!["fails"],
+            vec![ApprovalTestTool {
+                name: "fails",
+                output: "fail output",
+                success: false,
+                file_modified: None,
+                files_to_send: vec![],
+            }],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "run failing tool").await;
+        approve_request(&fixture.inbox_tx, request_id, digest).await;
+
+        let approval_notice = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(
+            approval_notice
+                .content
+                .contains("Approved but execution failed")
+        );
+        let continuation = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(continuation.content.contains("fail output"));
+        let prompts = fixture.observed_prompts.lock().unwrap().clone();
+        assert!(
+            prompts.iter().any(|prompt| {
+                prompt.contains("Execution status: failure") && prompt.contains("fail output")
+            }),
+            "failure status and output should be visible in continuation context: {prompts:?}"
+        );
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn approval_continuation_inbound_is_internal_not_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_alpha",
+                    name: "alpha",
+                    arguments: serde_json::json!({}),
+                },
+                ApprovalProviderStep::Text("continuation finished"),
+            ],
+            vec!["alpha"],
+            vec![ApprovalTestTool {
+                name: "alpha",
+                output: "alpha approved output",
+                success: true,
+                file_modified: None,
+                files_to_send: vec![],
+            }],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "run alpha").await;
+        approve_request(&fixture.inbox_tx, request_id, digest).await;
+
+        let _approval_notice = recv_outbound_fast(&mut fixture.out_rx).await;
+        let _continuation = recv_outbound_fast(&mut fixture.out_rx).await;
+
+        let session = SessionHandle::open(dir.path(), &fixture.session_key)
+            .session()
+            .clone();
+        assert!(
+            session.messages.iter().all(|message| {
+                message.role != MessageRole::User
+                    || !message
+                        .content
+                        .contains("Internal approval continuation metadata")
+            }),
+            "synthetic continuation must not be persisted as a user-authored request: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_approval_response_does_not_enqueue_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = setup_actor_with_approval_provider(
+            &dir,
+            vec![
+                ApprovalProviderStep::Tool {
+                    id: "call_alpha",
+                    name: "alpha",
+                    arguments: serde_json::json!({}),
+                },
+                ApprovalProviderStep::Text("must not run after rejected approval"),
+            ],
+            vec!["alpha"],
+            vec![ApprovalTestTool {
+                name: "alpha",
+                output: "alpha approved output",
+                success: true,
+                file_modified: None,
+                files_to_send: vec![],
+            }],
+        )
+        .await;
+
+        let (request_id, digest, _) =
+            request_approval(&fixture.inbox_tx, &mut fixture.out_rx, "run alpha").await;
+        let response_meta = serde_json::json!({
+            METADATA_APPROVAL_RESPONSE: {
+                "request_id": request_id,
+                "decision": "approve",
+                "source_event_id": "$mallory",
+                "tool_args_digest": digest,
+            }
+        });
+        fixture
+            .inbox_tx
+            .send(approval_inbound("", "@mallory:localhost", response_meta))
+            .await
+            .unwrap();
+
+        let rejection = recv_outbound_fast(&mut fixture.out_rx).await;
+        assert!(
+            rejection.content.starts_with("Approval rejected"),
+            "got: {}",
+            rejection.content
+        );
+        let prompts = fixture.observed_prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "unauthorized approval must not trigger a continuation LLM turn: {prompts:?}"
+        );
+        let no_extra =
+            tokio::time::timeout(Duration::from_millis(250), fixture.out_rx.recv()).await;
+        assert!(
+            no_extra.is_err(),
+            "rejected approval should not emit a continuation outbound"
+        );
+
+        fixture.handle.abort();
     }
 
     #[tokio::test]
