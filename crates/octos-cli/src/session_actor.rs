@@ -4951,6 +4951,14 @@ impl SessionActor {
                 room_id = %expired.room_id,
                 "approval request expired"
             );
+            // Persist a durable timeout outcome (like the approve/deny paths),
+            // so the next LLM turn sees that the tool did not run instead of a
+            // dangling `[APPROVAL REQUESTED]` placeholder in session history.
+            self.persist_approval_outcome(format!(
+                "[approval] {} ({}) EXPIRED without a decision; the tool did not run.",
+                expired.request.title, expired.request.tool_name
+            ))
+            .await;
             if matches!(expired.request.on_timeout, ApprovalTimeoutBehavior::Notify) {
                 self.emit_approval_notice(format!(
                     "Approval request expired: {}",
@@ -8302,6 +8310,12 @@ impl SessionActor {
                                 metadata: serde_json::json!({}),
                             })
                             .await;
+                        // Decrement before the early return, like the
+                        // workspace-snapshot path above. Otherwise this
+                        // speculative-overflow task leaks an active-task slot,
+                        // permanently inflating the counter and eventually
+                        // blocking master continuations / new overflow turns.
+                        overflow_counter.fetch_sub(1, Ordering::Release);
                         return;
                     }
                     let final_content = finalize_assistant_content(

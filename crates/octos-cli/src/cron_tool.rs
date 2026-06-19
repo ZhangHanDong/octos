@@ -432,17 +432,23 @@ fn interval_to_seconds(value: i64, unit: &str) -> Option<i64> {
     if value <= 0 {
         return None;
     }
-    match unit {
-        "秒" | "second" | "seconds" => Some(value),
-        "分钟" | "minute" | "minutes" => Some(value * 60),
-        "小时" | "hour" | "hours" => Some(value * 60 * 60),
-        "天" | "day" | "days" => Some(value * 24 * 60 * 60),
-        _ => None,
-    }
+    // Checked multiplication: an oversized natural-language interval (e.g.
+    // `every 9223372036854775807 days`) must be rejected, not silently wrapped.
+    // In release builds an unchecked product can wrap to a negative/zero
+    // `every_ms`, which CronService treats as immediately due and re-arms with
+    // zero delay — a scheduler tight-loop driven by untrusted gateway input.
+    let per_unit: i64 = match unit {
+        "秒" | "second" | "seconds" => 1,
+        "分钟" | "minute" | "minutes" => 60,
+        "小时" | "hour" | "hours" => 60 * 60,
+        "天" | "day" | "days" => 24 * 60 * 60,
+        _ => return None,
+    };
+    value.checked_mul(per_unit)
 }
 
 fn interval_to_ms(value: i64, unit: &str) -> Option<i64> {
-    interval_to_seconds(value, unit).map(|seconds| seconds * 1000)
+    interval_to_seconds(value, unit).and_then(|seconds| seconds.checked_mul(1000))
 }
 
 fn interval_label(value: i64, unit: &str) -> String {
@@ -1158,6 +1164,37 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("couldn't understand"));
+        assert!(service.list_all_jobs().is_empty());
+    }
+
+    #[test]
+    fn should_reject_interval_when_multiplication_overflows() {
+        // `i64::MAX` days overflows `value * 24 * 60 * 60` in release builds and
+        // wraps to a negative/zero interval; checked arithmetic must reject it
+        // (returning None) rather than feed a tight-loop interval to CronService.
+        assert_eq!(interval_to_seconds(i64::MAX, "days"), None);
+        assert_eq!(interval_to_seconds(i64::MAX, "天"), None);
+        assert_eq!(interval_to_seconds(i64::MAX, "hours"), None);
+        assert_eq!(interval_to_ms(i64::MAX, "seconds"), None);
+        // Valid intervals still compute exactly.
+        assert_eq!(interval_to_seconds(5, "minutes"), Some(300));
+        assert_eq!(interval_to_ms(2, "hours"), Some(2 * 60 * 60 * 1000));
+    }
+
+    #[tokio::test]
+    async fn should_reject_nl_schedule_when_interval_overflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let result = CronTool::add_natural_language_for_context(
+            &service,
+            "matrix",
+            "!room:localhost",
+            "每9223372036854775807天检查系统状态",
+        )
+        .unwrap();
+
+        assert!(!result.success);
         assert!(service.list_all_jobs().is_empty());
     }
 
