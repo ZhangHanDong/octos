@@ -1398,6 +1398,7 @@ async fn handle_transaction(
             media,
             metadata,
             message_id: event_id,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         if state.inbound_tx.send(inbound).await.is_err() {

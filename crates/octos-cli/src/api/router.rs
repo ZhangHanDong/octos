@@ -14,6 +14,7 @@ use super::AppState;
 use super::admin;
 use super::admin_setup;
 use super::auth_handlers;
+use super::bilibili;
 use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
@@ -145,6 +146,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/events/harness", get(events_harness::events_harness))
         .route("/api/ui-protocol/ws", get(ui_protocol::ws_handler))
         .route(
+            "/api/integrations/bilibili/first-video",
+            get(bilibili::first_video),
+        )
+        .route(
             "/api/upload",
             post(handlers::upload).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
@@ -201,6 +206,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let my_api = Router::new()
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        // Reply-voice selection: list synthesizable voices + set this user's
+        // sticky default. Both need the caller's identity, so they live in the
+        // authenticated `my_api` group.
+        .route("/api/voices", get(auth_handlers::list_voices))
+        .route("/api/my/voice", put(auth_handlers::set_my_voice))
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))

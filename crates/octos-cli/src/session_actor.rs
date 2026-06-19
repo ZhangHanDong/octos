@@ -1057,7 +1057,47 @@ fn build_approval_continuation_inbound(
         media: vec![],
         metadata: serde_json::Value::Object(metadata),
         message_id: None,
+        origin: octos_core::MessageOrigin::Synthetic,
     }
+}
+
+/// Decide whether forced-workflow keyword detection may run on this turn.
+///
+/// #1455: detection must only see EXTERNAL user traffic. Synthetic
+/// self-messages (child-completion notices, master continuations, recovery
+/// turns) embed workflow labels in their text — a deep-research completion
+/// notice always contains "Deep research" — so running detection on them
+/// respawns the workflow they report on: an unbounded feedback loop that is
+/// independent of child success/failure.
+///
+/// The `_completion_review` metadata check predates `MessageOrigin` and
+/// stays as defense in depth; `origin` is the load-bearing gate because it
+/// covers every synthetic producer by construction instead of requiring
+/// each one to opt out by flag.
+fn forced_workflow_detection_allowed(
+    inbound: &InboundMessage,
+    actor_channel: &str,
+    image_media: &[String],
+    attachment_media: &[String],
+) -> bool {
+    if !image_media.is_empty() || !attachment_media.is_empty() {
+        return false;
+    }
+    if actor_channel == "system" {
+        return false;
+    }
+    if !inbound.is_external_user() {
+        return false;
+    }
+    if inbound
+        .metadata
+        .get("_completion_review")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    true
 }
 
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
@@ -4501,6 +4541,7 @@ impl SessionActor {
             media: vec![],
             metadata: serde_json::Value::Object(metadata),
             message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
         }
     }
 
@@ -4534,6 +4575,7 @@ impl SessionActor {
             media: vec![],
             metadata: serde_json::Value::Object(metadata),
             message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
         }
     }
 
@@ -4562,6 +4604,7 @@ impl SessionActor {
             media: vec![],
             metadata: serde_json::Value::Object(metadata),
             message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
         }
     }
 
@@ -6519,6 +6562,7 @@ impl SessionActor {
         &self,
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
+        live_video: bool,
     ) -> TurnAttachmentContext {
         let mut audio_attachment_paths = Vec::new();
         let mut file_attachment_paths = Vec::new();
@@ -6535,7 +6579,20 @@ impl SessionActor {
             audio_attachment_paths,
             file_attachment_paths,
             prompt_summary: attachment_prompt,
+            live_video,
         }
+    }
+
+    /// Whether this turn is an explicit live video call — the client signals it
+    /// by setting `metadata.live_video = true` on the inbound (e.g. a turn/start
+    /// from a video-call surface). Defaults false; never inferred from
+    /// attachment types (a voice note + uploaded image is not a camera frame).
+    fn inbound_live_video(inbound: &octos_core::InboundMessage) -> bool {
+        inbound
+            .metadata
+            .get("live_video")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     }
 
     fn persisted_user_content(
@@ -6558,22 +6615,7 @@ impl SessionActor {
         image_media: &[String],
         attachment_media: &[String],
     ) -> Option<WorkflowInstance> {
-        if !image_media.is_empty() || !attachment_media.is_empty() {
-            return None;
-        }
-        if self.channel == "system" {
-            return None;
-        }
-        // A completion-review turn is a system-internal prompt that EMBEDS the
-        // finished task's label (e.g. "Deep research"). Running forced-workflow
-        // detection on it would match that label and spawn a DUPLICATE workflow
-        // instead of reviewing the result — re-triggering on every completion up
-        // to the auto-turn cap. Never force a workflow from a review prompt.
-        if inbound
-            .metadata
-            .get("_completion_review")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        if !forced_workflow_detection_allowed(inbound, &self.channel, image_media, attachment_media)
         {
             return None;
         }
@@ -7068,7 +7110,11 @@ impl SessionActor {
         let agent = Arc::clone(&self.agent);
         let content = inbound.content.clone();
         let media = image_media;
-        let attachments = self.build_turn_attachment_context(attachment_media, attachment_prompt);
+        let attachments = self.build_turn_attachment_context(
+            attachment_media,
+            attachment_prompt,
+            Self::inbound_live_video(&inbound),
+        );
         let tracker = Arc::clone(&token_tracker);
         let session_timeout = self.session_timeout;
         // Wave-4 B3.4 — stamp session_id / turn_id into the task-local
@@ -8758,7 +8804,11 @@ impl SessionActor {
                     &inbound.content,
                     &history,
                     image_media,
-                    self.build_turn_attachment_context(attachment_media, attachment_prompt),
+                    self.build_turn_attachment_context(
+                        attachment_media,
+                        attachment_prompt,
+                        Self::inbound_live_video(&inbound),
+                    ),
                     &token_tracker,
                 ),
             ),
@@ -9307,6 +9357,45 @@ mod tests {
 
     fn test_context_manager(key: &SessionKey) -> Arc<StdMutex<ContextManager>> {
         Arc::new(StdMutex::new(context_manager_from_history(key, &[])))
+    }
+
+    fn inbound_with(metadata: serde_json::Value, media: Vec<String>) -> octos_core::InboundMessage {
+        octos_core::InboundMessage {
+            channel: "appui".into(),
+            sender_id: "user".into(),
+            chat_id: "c".into(),
+            content: "look".into(),
+            timestamp: chrono::Utc::now(),
+            media,
+            metadata,
+            message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
+        }
+    }
+
+    #[test]
+    fn inbound_live_video_reads_explicit_flag_not_attachments() {
+        // Explicit client signal → live video call.
+        assert!(SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({ "live_video": true }),
+            vec![],
+        )));
+        // Explicit false / absent → not a video call.
+        assert!(!SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({ "live_video": false }),
+            vec![],
+        )));
+        assert!(!SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({}),
+            vec![],
+        )));
+        // Regression (the codex P2): a voice note + uploaded image — audio AND
+        // image attachments but NO explicit flag — must NOT be treated as a
+        // live camera frame.
+        assert!(!SessionActor::inbound_live_video(&inbound_with(
+            serde_json::json!({}),
+            vec!["/tmp/note.ogg".into(), "/tmp/photo.png".into()],
+        )));
     }
 
     fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
@@ -10920,6 +11009,7 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -10938,11 +11028,33 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![attachment_path.to_string()],
             attachment_prompt: Some(summary.to_string()),
         }
+    }
+
+    /// Per-test session key derived from the test's unique `TempDir` path.
+    ///
+    /// These actor tests previously all shared `test_session_key(dir.path())`.
+    /// `SessionActor::drain_master_continuations` drains
+    /// `default_agent_orchestrator()` (a process-global singleton) FOR ITS OWN
+    /// `session_key`, so a shared key let one test's actor drain a continuation
+    /// queued under "cli:test" by a concurrent test — surfacing as a spurious
+    /// extra recovery/review turn and flaking the suite ~1/8 of full parallel
+    /// runs. Deriving the key from `dir.path()` (each test gets a unique temp
+    /// dir) makes every test's actor session globally distinct, so the
+    /// per-session drain is isolated WITHOUT a process-global clear (which would
+    /// itself race under parallel execution). Stable within a test (same dir),
+    /// unique across concurrent tests.
+    fn test_session_key(dir: &std::path::Path) -> SessionKey {
+        let tag = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("test");
+        SessionKey::new("cli", tag)
     }
 
     /// Build a SessionActor with configurable queue mode and optional adaptive router.
@@ -10986,7 +11098,7 @@ mod tests {
         }
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -11002,7 +11114,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -11026,7 +11138,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -11064,7 +11176,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(64);
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -11080,7 +11192,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -11104,7 +11216,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -11125,7 +11237,7 @@ mod tests {
         ));
         let (tx, _out_rx, handle, _session_mgr) =
             setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
-        let session_id = SessionKey::new("cli", "test");
+        let session_id = test_session_key(dir.path());
 
         crate::api::agent_orchestrator::default_agent_orchestrator().upsert_agent(
             crate::api::agent_orchestrator::AgentUpsert {
@@ -11220,7 +11332,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(64);
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -11239,7 +11351,7 @@ mod tests {
             }),
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -11263,7 +11375,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -11351,7 +11463,7 @@ mod tests {
         });
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -11370,7 +11482,7 @@ mod tests {
             }),
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -11394,7 +11506,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -11481,7 +11593,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(64);
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -11497,7 +11609,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -11521,7 +11633,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: Some(cron_tool),
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -11580,7 +11692,7 @@ mod tests {
         // For the test, the slow call takes 15s, so 15s > 10s triggers overflow.
 
         let actor = SessionActor {
-            session_key: SessionKey::new("cli", "test"),
+            session_key: test_session_key(dir.path()),
             channel: "cli".to_string(),
             chat_id: "test".to_string(),
             tenant_id: None,
@@ -11596,7 +11708,7 @@ mod tests {
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
-                &SessionKey::new("cli", "test"),
+                &test_session_key(dir.path()),
             ))),
             out_tx,
             status_indicator: None,
@@ -11620,7 +11732,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -11741,6 +11853,7 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: Some("client-msg-bravo".to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -12002,7 +12115,7 @@ mod tests {
         // ── Phase 4: Verify history is sorted by timestamp ──
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let messages = &session.messages;
             assert!(
@@ -12233,6 +12346,7 @@ mod tests {
                     "client_message_id": "client-msg-overflow-test",
                 }),
                 message_id: Some("client-msg-overflow-test".to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -12357,6 +12471,7 @@ mod tests {
                     "client_message_id": primary_cmid,
                 }),
                 message_id: Some(primary_cmid.to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -12381,6 +12496,7 @@ mod tests {
                     "client_message_id": overflow_cmid,
                 }),
                 message_id: Some(overflow_cmid.to_string()),
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -12955,7 +13071,7 @@ mod tests {
         // Verify background result is in session history
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let report_messages: Vec<_> = session
                 .messages
@@ -13029,7 +13145,7 @@ mod tests {
             responses
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let report_messages: Vec<_> = session
             .messages
@@ -13100,7 +13216,7 @@ mod tests {
             vec![media_path.to_string_lossy().to_string()]
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let persisted = session.messages.iter().any(|message| {
             message.role == MessageRole::Assistant
@@ -13224,7 +13340,7 @@ mod tests {
     async fn late_background_result_persists_with_originating_thread_id_not_derived_from_latest_user()
      {
         let dir = tempfile::TempDir::new().unwrap();
-        let session_key = SessionKey::new("cli", "test");
+        let session_key = test_session_key(dir.path());
 
         // Pre-seed three user messages, each with its own client_message_id,
         // through the canonical persist path so the JSONL has the same
@@ -13415,7 +13531,7 @@ mod tests {
             "background report should still count as persisted when live fanout is unavailable"
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         assert!(
             session
@@ -13507,7 +13623,7 @@ mod tests {
             .expect("outbound timeout message");
         assert_eq!(outbound.content, "Processing timed out. Please try again.");
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         assert!(
             session
@@ -13543,7 +13659,7 @@ mod tests {
             .expect("outbound error message");
         assert_eq!(outbound.content, "Error: scripted failure");
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         assert!(
             session
@@ -13590,7 +13706,7 @@ mod tests {
             .expect("response timeout")
             .expect("channel closed");
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let contents = session
             .messages
@@ -13670,7 +13786,7 @@ mod tests {
         // Verify session history: second user message should contain batched content
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
@@ -13750,7 +13866,7 @@ mod tests {
         // Verify session history: "second message" should NOT appear as a user message
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
@@ -13818,7 +13934,7 @@ mod tests {
         // All 3 user messages should be in history individually
         {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
-            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
             let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
@@ -14218,6 +14334,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         registry
@@ -14261,6 +14378,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         registry
@@ -14305,6 +14423,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
         registry
             .dispatch(DispatchParams {
@@ -14332,6 +14451,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
         registry
             .dispatch(DispatchParams {
@@ -14382,6 +14502,7 @@ mod tests {
             media: vec![],
             metadata: serde_json::json!({}),
             message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
         registry
             .dispatch(DispatchParams {
@@ -14401,13 +14522,25 @@ mod tests {
             .await;
 
         registry.cancel(&sk.to_string()).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        registry.reap_dead_actors();
-
-        assert!(
-            registry.actor_keys().is_empty(),
-            "cancel should stop the profiled actor when called with the bare session key"
-        );
+        // Cancel propagation + actor teardown is asynchronous; the previous
+        // fixed `sleep(250ms)` was too short under heavy parallel test load
+        // (the actor hadn't stopped before `reap_dead_actors`, so the key
+        // lingered — a flake). Poll reap-then-check until the cancelled actor
+        // is actually gone, with a generous deadline that absorbs CPU
+        // starvation rather than racing it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            registry.reap_dead_actors();
+            if registry.actor_keys().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancel should stop the profiled actor when called with the bare session key; still alive: {:?}",
+                registry.actor_keys()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[test]
@@ -14665,6 +14798,85 @@ mod tests {
             ),
             Some(WorkflowKind::DeepResearch)
         );
+    }
+
+    /// The exact shape of the #1455 production loop: a ChildCompleted
+    /// master-continuation notice whose metadata embeds the child's own
+    /// nickname ("Deep research"). The notice text DOES match detection —
+    /// that is the trap — so the origin gate must refuse to run detection
+    /// on it.
+    #[test]
+    fn should_not_allow_forced_workflow_when_inbound_is_synthetic() {
+        let notice = "[system-internal]\nA supervised child agent finished.\n\n\
+            Child agent: task-dspfac-telegram-1#databricks-child-1\n\
+            Group: agent-group:dspfac:telegram:1#databricks:master\n\
+            Metadata:\n- nickname: Deep research deep_research\n- status: failed\n\
+            - summary: deep_research completed without required report terminal artifact\n\n\
+            Give the user a concise progress update.";
+        // Prove the trap exists: the notice itself matches detection.
+        assert_eq!(
+            WorkflowKind::detect_forced_background(notice),
+            Some(WorkflowKind::DeepResearch)
+        );
+        let inbound = InboundMessage {
+            channel: "telegram".to_string(),
+            sender_id: "octos-runtime".to_string(),
+            chat_id: "1".to_string(),
+            content: notice.to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({ "_master_continuation": true }),
+            message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
+        };
+        assert!(
+            !forced_workflow_detection_allowed(&inbound, "telegram", &[], &[]),
+            "synthetic self-message must never reach forced-workflow detection (#1455)"
+        );
+    }
+
+    /// Regression guard for the legitimate path: a real external user
+    /// research request must still be eligible for forced detection.
+    #[test]
+    fn should_allow_forced_workflow_for_external_user_research_request() {
+        let inbound = InboundMessage {
+            channel: "telegram".to_string(),
+            sender_id: "8516089817".to_string(),
+            chat_id: "8516089817".to_string(),
+            content: "深度搜索一下databricks业务模式被ai agent的影响".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
+        };
+        assert!(forced_workflow_detection_allowed(
+            &inbound,
+            "telegram",
+            &[],
+            &[]
+        ));
+        assert_eq!(
+            WorkflowKind::detect_forced_background(&inbound.content),
+            Some(WorkflowKind::DeepResearch)
+        );
+        // Media-bearing and completion-review turns stay excluded.
+        assert!(!forced_workflow_detection_allowed(
+            &inbound,
+            "telegram",
+            &["img.png".to_string()],
+            &[]
+        ));
+        let review = InboundMessage {
+            metadata: serde_json::json!({ "_completion_review": true }),
+            ..inbound.clone()
+        };
+        assert!(!forced_workflow_detection_allowed(
+            &review,
+            "telegram",
+            &[],
+            &[]
+        ));
     }
 
     #[test]
@@ -14986,7 +15198,7 @@ mod tests {
         );
 
         // Verify the synthetic recovery prompt actually landed in history.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_user_msgs: Vec<_> = session
             .messages
@@ -15186,7 +15398,7 @@ mod tests {
         let task_id = supervisor.register_with_input(
             "fm_tts",
             "call-int-1",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
         );
         // Synth-ack gate (feat/spawn-only-failure-feedback-loop): mark
@@ -15215,7 +15427,7 @@ mod tests {
             responses
         );
 
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let prompt_present = session.messages.iter().any(|m| {
             m.role == MessageRole::User
@@ -15281,7 +15493,7 @@ mod tests {
         let task_id = supervisor.register_with_input_and_cmid(
             "deep_research",
             "call-738",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"query": "rust news"})),
             Some(ORIGINATING_CMID.to_string()),
         );
@@ -15308,7 +15520,7 @@ mod tests {
         // minted server UUIDv7. Pre-fix this was None or a fresh UUID
         // because synthetic_recovery_inbound only stamped
         // `_recovery_turn` and `process_inbound` had nothing to read.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_msg = session
             .messages
@@ -15919,7 +16131,7 @@ mod tests {
         // around `process_inbound`; the test mirrors that.
         octos_llm::with_router_context(
             octos_llm::RouterContext {
-                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                session_id: Some(test_session_key(dir.path()).to_string()),
                 turn_id: None,
             },
             async {
@@ -15976,7 +16188,7 @@ mod tests {
         // window — must produce at most one push.
         octos_llm::with_router_context(
             octos_llm::RouterContext {
-                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                session_id: Some(test_session_key(dir.path()).to_string()),
                 turn_id: None,
             },
             async {
@@ -15992,20 +16204,39 @@ mod tests {
         )
         .await;
 
-        // First push arrives.
-        let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("first push must arrive")
-            .expect("channel must not close");
-        assert!(first.content.starts_with("↺ Router failover:"));
+        // The first ROUTER-FAILOVER push must arrive. Under parallel test load
+        // an unrelated startup/noop message can reach `rx` before the failover
+        // banner, so drain any such noise until the banner appears — rather than
+        // asserting the very first message IS the banner (the previous flake).
+        let banner = "↺ Router failover:";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut failover_pushes = 0usize;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) if msg.content.starts_with(banner) => {
+                    failover_pushes += 1;
+                    break;
+                }
+                Ok(Some(_)) => continue, // unrelated message — keep looking
+                Ok(None) => panic!("channel must not close before the failover push"),
+                Err(_) => panic!("first router-failover push must arrive"),
+            }
+        }
 
-        // No further pushes within the debounce window. Wait briefly and
-        // confirm the receiver is idle.
-        let further = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
-        assert!(
-            further.is_err(),
-            "debounce must suppress further pushes; got: {:?}",
-            further.ok().flatten().map(|m| m.content)
+        // Debounce: NO second failover push within the window. Unrelated
+        // messages are ignored — the contract is "at most one FAILOVER push per
+        // debounce window", not "the bus is silent".
+        let window = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout_at(window, rx.recv()).await {
+                Ok(Some(msg)) if msg.content.starts_with(banner) => failover_pushes += 1,
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            failover_pushes, 1,
+            "a burst of failovers must debounce to exactly one push"
         );
 
         drop(tx);
@@ -16055,7 +16286,7 @@ mod tests {
         // Then a same-session failover MUST get through.
         octos_llm::with_router_context(
             octos_llm::RouterContext {
-                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                session_id: Some(test_session_key(dir.path()).to_string()),
                 turn_id: None,
             },
             async {
@@ -16128,7 +16359,7 @@ mod tests {
         let task_id = supervisor.register_with_input(
             "mofa_slides",
             "call-spawn-fb-1",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"topic": "rust"})),
         );
         supervisor.mark_synth_ack_emitted("call-spawn-fb-1");
@@ -16152,7 +16383,7 @@ mod tests {
 
         // The synthetic user message MUST land in persisted history so
         // the LLM has it on its next turn — Design A constraint.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_prompts: Vec<_> = session
             .messages
@@ -16193,7 +16424,7 @@ mod tests {
         let task_id = supervisor.register_with_input(
             "mofa_slides",
             "call-spawn-fb-2",
-            Some("cli:test"),
+            Some(test_session_key(dir.path()).to_string().as_str()),
             Some(serde_json::json!({"topic": "rust"})),
         );
         // Deliberately omit `mark_synth_ack_emitted` — simulates the
@@ -16215,7 +16446,7 @@ mod tests {
         );
 
         // History must not contain a recovery prompt either.
-        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
         let session = session_handle.session();
         let recovery_present = session
             .messages
@@ -16245,7 +16476,11 @@ mod tests {
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
-        let task_id = supervisor.register("mofa_slides", "call-spawn-fb-3", Some("cli:test"));
+        let task_id = supervisor.register(
+            "mofa_slides",
+            "call-spawn-fb-3",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-spawn-fb-3");
         supervisor.mark_running(&task_id);
         supervisor.mark_completed(&task_id, vec!["/tmp/deck.pptx".to_string()]);
@@ -16287,7 +16522,11 @@ mod tests {
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
-        let task_id = supervisor.register("mofa_slides", "call-spawn-fb-4", Some("cli:test"));
+        let task_id = supervisor.register(
+            "mofa_slides",
+            "call-spawn-fb-4",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-spawn-fb-4");
         supervisor.mark_failed(&task_id, "first fail".to_string());
         // Second mark_failed must not re-fire the signal — supervisor guard.
@@ -16341,59 +16580,89 @@ mod tests {
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
 
-        // Three distinct failed tasks back-to-back, each with their own
-        // tool_call_id and synth-ack — simulates LLM retrying with
-        // corrected-but-still-broken inputs.
-        for n in 0..3 {
-            let tcid = format!("call-cap-{n}");
-            let task_id = supervisor.register("mofa_slides", &tcid, Some("cli:test"));
-            supervisor.mark_synth_ack_emitted(&tcid);
-            supervisor.mark_failed(&task_id, format!("fail #{n}"));
-            // Pace the marks so the actor processes them in order — without
-            // this, the second mark_failed could race the first recovery
-            // turn's `claim_recovery_slot` and the per-task dedup might
-            // mask the cap test.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        // Drain `rx`, accumulating every non-empty message into `seen`, until
+        // one containing `needle` arrives. Deterministic sequencing: each
+        // failure below is injected only AFTER the prior recovery turn's output
+        // is observed, which proves that turn ran to completion and its
+        // `consecutive_recovery_turns` increment is visible before the next
+        // failure can `claim_recovery_slot`. This replaces the previous
+        // wall-clock `sleep(300ms)` pacing, which under heavy parallel test
+        // load was too short — the next `mark_failed` could claim a slot before
+        // the prior turn bumped the counter, letting the third recovery slip
+        // past the cap (the flaky `recovery-3` firing). The generous timeout
+        // absorbs CPU starvation rather than racing it.
+        async fn drain_until(
+            rx: &mut mpsc::Receiver<OutboundMessage>,
+            needle: &str,
+            seen: &mut Vec<String>,
+        ) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                if msg.content.is_empty() {
+                    continue;
+                }
+                let matched = msg.content.contains(needle);
+                seen.push(msg.content);
+                if matched {
+                    return;
+                }
+            }
+            panic!("timed out waiting for {needle:?}; saw: {seen:?}");
         }
 
-        let mut responses = Vec::new();
-        let mut banners = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-            if msg.content.contains("could not be recovered") {
-                banners.push(msg.content.clone());
-            } else if !msg.content.is_empty() {
-                responses.push(msg.content);
-            }
-            if !banners.is_empty()
-                && responses.iter().filter(|c| c.contains("recovery-")).count() >= 2
-            {
-                break;
-            }
-        }
+        let mut seen: Vec<String> = Vec::new();
+
+        // Failure 0 → first recovery turn runs.
+        let t0 = supervisor.register(
+            "mofa_slides",
+            "call-cap-0",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
+        supervisor.mark_synth_ack_emitted("call-cap-0");
+        supervisor.mark_failed(&t0, "fail #0".to_string());
+        drain_until(&mut rx, "recovery-1", &mut seen).await;
+
+        // Failure 1 → second recovery turn runs; the consecutive-recovery
+        // counter now sits at the cap.
+        let t1 = supervisor.register(
+            "mofa_slides",
+            "call-cap-1",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
+        supervisor.mark_synth_ack_emitted("call-cap-1");
+        supervisor.mark_failed(&t1, "fail #1".to_string());
+        drain_until(&mut rx, "recovery-2", &mut seen).await;
+
+        // Failure 2 → the cap kicks in: a final banner is emitted INSTEAD of a
+        // third LLM turn. (If the cap regressed, `recovery-3-MUST-NOT-RUN`
+        // would arrive here and the `!recovery-3` assertion below would fail.)
+        let t2 = supervisor.register(
+            "mofa_slides",
+            "call-cap-2",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
+        supervisor.mark_synth_ack_emitted("call-cap-2");
+        supervisor.mark_failed(&t2, "fail #2".to_string());
+        drain_until(
+            &mut rx,
+            "Background failure could not be recovered",
+            &mut seen,
+        )
+        .await;
+
         // The first two recovery LLM turns must have run.
         assert!(
-            responses.iter().any(|c| c.contains("recovery-1")),
-            "first recovery should run, got: {responses:?}",
+            seen.iter().any(|c| c.contains("recovery-1")),
+            "first recovery should run, got: {seen:?}",
         );
         assert!(
-            responses.iter().any(|c| c.contains("recovery-2")),
-            "second recovery should run, got: {responses:?}",
+            seen.iter().any(|c| c.contains("recovery-2")),
+            "second recovery should run, got: {seen:?}",
         );
-        // The third must NOT run — the cap kicks in before the LLM is
-        // invoked.
+        // The third must NOT run — the cap intercepts it before the LLM.
         assert!(
-            !responses
-                .iter()
-                .any(|c| c.contains("recovery-3-MUST-NOT-RUN")),
-            "third recovery beyond the cap must not invoke the LLM, got: {responses:?}",
-        );
-        // The banner MUST land instead.
-        assert!(
-            banners
-                .iter()
-                .any(|c| c.contains("Background failure could not be recovered")),
-            "final banner expected once cap exceeded, got: {banners:?}",
+            !seen.iter().any(|c| c.contains("recovery-3-MUST-NOT-RUN")),
+            "third recovery beyond the cap must not invoke the LLM, got: {seen:?}",
         );
 
         drop(tx);
@@ -16418,7 +16687,11 @@ mod tests {
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         let supervisor = wire_supervisor_to_actor_inbox(&tx);
-        let task_id = supervisor.register("mofa_slides", "call-reset-1", Some("cli:test"));
+        let task_id = supervisor.register(
+            "mofa_slides",
+            "call-reset-1",
+            Some(test_session_key(dir.path()).to_string().as_str()),
+        );
         supervisor.mark_synth_ack_emitted("call-reset-1");
         supervisor.mark_failed(&task_id, "boom".to_string());
 
@@ -16447,6 +16720,7 @@ mod tests {
                 media: vec![],
                 metadata: serde_json::json!({}),
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],
@@ -16992,6 +17266,7 @@ mod tests {
                 media: vec![],
                 metadata,
                 message_id: None,
+                origin: octos_core::MessageOrigin::ExternalUser,
             },
             image_media: vec![],
             attachment_media: vec![],

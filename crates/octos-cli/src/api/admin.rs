@@ -226,6 +226,38 @@ pub async fn get_profile(
     ))
 }
 
+/// Move any keychain-backed secrets (e.g. the Vertex service-account JSON, which
+/// carries a private key) out of plaintext profile config and into the OS
+/// keychain. Shared by every profile/sub-account create/update save path so they
+/// all uphold the same keychain-only contract as `PUT /api/my/profile`. A raw
+/// secret on a non-macOS host is rejected rather than silently persisted.
+///
+/// Detection is by **content** (a raw service-account JSON), not just the
+/// declared `VERTEX_SA_JSON` name — so a private key pasted under a custom env
+/// var (e.g. a dashboard "Custom" provider deriving `VERTEX_API_KEY`) can't slip
+/// past into plaintext config.
+pub(crate) fn relocate_keychain_backed_secrets(
+    env_vars: &mut std::collections::HashMap<String, String>,
+    profile_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let keys: Vec<String> = env_vars
+        .iter()
+        .filter(|(key, value)| crate::auth::keychain::needs_keychain_relocation(key, value))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in keys {
+        super::auth_handlers::relocate_secret_to_keychain(
+            env_vars,
+            &key,
+            profile_id,
+            cfg!(target_os = "macos"),
+            crate::auth::keychain::set_secret,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+    Ok(())
+}
+
 /// POST /api/admin/profiles
 pub async fn create_profile(
     State(state): State<Arc<AppState>>,
@@ -253,7 +285,7 @@ pub async fn create_profile(
     }
 
     let now = Utc::now();
-    let profile = UserProfile {
+    let mut profile = UserProfile {
         id: req.id,
         name: req.name,
         public_subdomain: req
@@ -267,6 +299,12 @@ pub async fn create_profile(
         created_at: now,
         updated_at: now,
     };
+
+    // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA
+    // JSON, which carries a private key) out of plaintext config and into the
+    // OS keychain before persisting — same contract as `PUT /api/my/profile`.
+    let profile_id = profile.id.clone();
+    relocate_keychain_backed_secrets(&mut profile.config.env_vars, &profile_id)?;
 
     store.save(&profile).map_err(|e| {
         tracing::error!(profile = %profile.id, error = %e, "failed to create profile");
@@ -336,23 +374,11 @@ pub async fn update_profile(
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
     }
-    // Merge config: parse the raw JSON "config" object and overlay only the
-    // keys that are explicitly present, preserving all other existing fields.
-    // This lets the admin tool send `{"config":{"model":"x"}}` without wiping
-    // channels/env_vars, while the dashboard can still send a full config object.
-    {
-        let raw: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-        if let Some(config_patch) = raw.get("config") {
-            if config_patch.is_object() {
-                let mut existing =
-                    serde_json::to_value(&profile.config).unwrap_or(serde_json::json!({}));
-                json_merge(&mut existing, config_patch);
-                if let Ok(merged) = serde_json::from_value(existing) {
-                    profile.config = merged;
-                }
-            }
-        }
-    }
+    merge_profile_config_from_body(&mut profile.config, &body, false);
+    // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA
+    // JSON) into the OS keychain before persisting, so an admin edit can't
+    // write a private key into plaintext profile config.
+    relocate_keychain_backed_secrets(&mut profile.config.env_vars, &id)?;
     profile.updated_at = Utc::now();
 
     store.save_with_merge(&mut profile).map_err(|e| {
@@ -740,7 +766,11 @@ pub async fn test_provider(
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,
     // so 16 tokens is too small — they return empty content.  Use 128 for
     // Gemini and keep 16 for everyone else (fast, cheap connectivity check).
-    let max_tokens = if req.provider == "gemini" { 128 } else { 16 };
+    let max_tokens = if req.provider == "gemini" || req.provider == "vertex" {
+        128
+    } else {
+        16
+    };
     let config = ChatConfig {
         max_tokens: Some(max_tokens),
         temperature: Some(0.0),
@@ -846,6 +876,49 @@ pub(crate) async fn fetch_provider_models(
     })
 }
 
+/// Merge a request body's `config` object into an existing profile config.
+///
+/// Only keys present in `config` are overwritten; absent keys are preserved.
+/// This lets callers send `{"config":{"model":"x"}}` without wiping
+/// channels/env_vars, while dashboards can still send a full config object.
+/// Merge a `{ "config": {...} }` request body into `config`. RFC-7396 semantics:
+/// keys the client omits are preserved. `env_vars_authoritative` selects how a
+/// provided `env_vars` map is treated:
+/// - `true` — self-service `/api/my/*`, where the dashboard sends the COMPLETE
+///   desired map (including `{}` to clear): replace `env_vars` wholesale so the
+///   client can drop keys / clear secrets (a deep-merge can only add, never
+///   remove).
+/// - `false` — admin tool `admin_update_profile`, which sends only the keys the
+///   operator supplied: deep-merge `env_vars` so a partial update never deletes
+///   unrelated secrets.
+///
+/// Either way, masked/empty display values are restored per-key downstream by
+/// `ProfileStore::save_with_merge`, so round-tripping masked secrets does not
+/// lose them.
+pub(crate) fn merge_profile_config_from_body(
+    config: &mut ProfileConfig,
+    body: &str,
+    env_vars_authoritative: bool,
+) {
+    let raw: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    if let Some(config_patch) = raw.get("config") {
+        if config_patch.is_object() {
+            let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
+            json_merge(&mut existing, config_patch);
+            if env_vars_authoritative {
+                if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
+                    if let Some(existing_obj) = existing.as_object_mut() {
+                        existing_obj.insert("env_vars".to_string(), env_vars.clone());
+                    }
+                }
+            }
+            if let Ok(merged) = serde_json::from_value(existing) {
+                *config = merged;
+            }
+        }
+    }
+}
+
 /// Recursively merge `patch` into `target` (RFC 7396 JSON Merge Patch).
 /// Only keys present in `patch` are overwritten; absent keys are preserved.
 fn json_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -904,12 +977,15 @@ fn resolve_saved_key(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "profile not found".into()))?;
 
-    Ok(profile
+    let raw = profile
         .config
         .env_vars
         .get(env_name)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // Resolve a `keychain:` marker to the real secret (e.g. a Vertex SA JSON
+    // stored in the OS keychain); plain values pass through unchanged.
+    Ok(crate::auth::keychain::resolve_value(env_name, &raw).unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -1377,6 +1453,10 @@ pub async fn create_sub_account(
     // Set channel-specific env vars if provided
     if !req.env_vars.is_empty() {
         sub.config.env_vars = req.env_vars;
+        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
+        // persisting so a sub-account never writes a private key to disk.
+        let sub_id = sub.id.clone();
+        relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
         sub.updated_at = Utc::now();
         store
             .save(&sub)
@@ -4645,12 +4725,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
+        // The shared helper used by every profile/sub-account save path must
+        // refuse a raw SA JSON on a non-macOS host (where keychain storage
+        // isn't available) rather than let it fall through to plaintext config.
+        // On macOS it would relocate to the keychain instead, so only assert on
+        // the non-macOS path (the one CI runs and the plaintext risk lives on).
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "VERTEX_SA_JSON".to_string(),
+            r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
+        );
+        let res = relocate_keychain_backed_secrets(&mut env, "sub-account-1");
+        assert!(
+            res.is_err(),
+            "raw VERTEX_SA_JSON must be rejected off macOS, never saved as plaintext"
+        );
+        // The raw value is left untouched (the caller bails before saving).
+        assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
+    }
+
+    #[test]
+    fn relocate_rejects_service_account_json_under_custom_env_name_off_macos() {
+        // The dashboard "Custom" bypass: SA JSON pasted under VERTEX_API_KEY
+        // (not the whitelisted name) must still be caught by content detection
+        // and rejected off macOS — never written to plaintext config.
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "VERTEX_API_KEY".to_string(),
+            r#"{"type":"service_account","private_key":"x"}"#.to_string(),
+        );
+        let res = relocate_keychain_backed_secrets(&mut env, "tenant-1");
+        assert!(
+            res.is_err(),
+            "SA JSON under a custom env name must be rejected off macOS"
+        );
+        assert!(env.get("VERTEX_API_KEY").unwrap().starts_with('{'));
+    }
+
+    #[test]
     fn shell_request_deserialize_minimal() {
         let json = r#"{"command": "echo hello"}"#;
         let req: ShellRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.command, "echo hello");
         assert!(req.cwd.is_none());
         assert!(req.timeout_secs.is_none());
+    }
+
+    // The admin tool (`admin_update_profile`) sends only the keys the operator
+    // supplied, so its path must NOT be authoritative — a partial env_vars
+    // update must merge and preserve omitted secrets, never delete them.
+    #[test]
+    fn merge_config_admin_path_preserves_omitted_env_vars() {
+        let mut config = ProfileConfig::default();
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".into(), "sk-real".into());
+        config.env_vars.insert("SMTP_PASSWORD".into(), "old".into());
+
+        merge_profile_config_from_body(
+            &mut config,
+            r#"{"config":{"env_vars":{"SMTP_PASSWORD":"new"}}}"#,
+            false,
+        );
+
+        assert_eq!(
+            config.env_vars.get("SMTP_PASSWORD").map(String::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            config.env_vars.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-real"),
+            "a partial admin update must not delete env vars it didn't mention"
+        );
+    }
+
+    // Self-service `/api/my/*` sends the complete desired map, so its path is
+    // authoritative: an omitted key is dropped and `{}` clears everything.
+    #[test]
+    fn merge_config_self_service_replaces_env_vars() {
+        let mut config = ProfileConfig::default();
+        config.env_vars.insert("A".into(), "a".into());
+        config.env_vars.insert("B".into(), "b".into());
+
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true);
+        assert_eq!(config.env_vars.get("A").map(String::as_str), Some("a2"));
+        assert!(
+            !config.env_vars.contains_key("B"),
+            "authoritative replace drops omitted keys"
+        );
+
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true);
+        assert!(
+            config.env_vars.is_empty(),
+            "an explicit empty map clears all entries"
+        );
     }
 
     #[test]
