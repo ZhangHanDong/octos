@@ -1603,6 +1603,7 @@ async fn dispatch_allbots(
                 "org.octos.broadcast_source_event_id": source_event_id,
             }),
             message_id: source_event_id.map(str::to_string),
+            origin: octos_core::MessageOrigin::ExternalUser,
         };
 
         state.inbound_tx.send(inbound).await.map_err(|_| {
