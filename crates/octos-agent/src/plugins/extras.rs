@@ -201,6 +201,10 @@ fn resolve_mcp_server(srv: &SkillMcpServer, skill_dir: &Path) -> McpServerConfig
         env,
         url: srv.url.clone(),
         headers: srv.headers.clone(),
+        // Skill-bundled MCP servers use stdio/static-HTTP only; OAuth servers
+        // are operator-configured (they require an interactive `octos mcp login`).
+        oauth: false,
+        scopes: Vec::new(),
         // Skill-bundled MCP servers fall through to the wrapper's
         // server default (`Safe` — read-only common case). A skill
         // that bundles a mutating MCP server should plumb a per-server
@@ -217,6 +221,7 @@ fn resolve_hook(def: &SkillHookDef, skill_dir: &Path) -> Option<HookConfig> {
     use crate::hooks::HookEvent;
 
     let event = match def.event.as_str() {
+        "user_prompt_submit" => HookEvent::UserPromptSubmit,
         "before_tool_call" => HookEvent::BeforeToolCall,
         "after_tool_call" => HookEvent::AfterToolCall,
         "before_llm_call" => HookEvent::BeforeLlmCall,

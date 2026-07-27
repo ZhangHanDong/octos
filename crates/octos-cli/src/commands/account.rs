@@ -106,7 +106,7 @@ pub enum AccountAction {
 impl Executable for AccountCommand {
     fn execute(self) -> Result<()> {
         let data_dir = super::resolve_data_dir(None)?;
-        let store = ProfileStore::open(&data_dir)?;
+        let store = ProfileStore::open_unified(&data_dir)?;
 
         match self.action {
             AccountAction::List { profile } => {
@@ -207,9 +207,7 @@ impl Executable for AccountCommand {
                 if sub.config.channels.is_empty() {
                     println!();
                     println!("No channels configured. Add via dashboard or:");
-                    println!(
-                        "  octos account create --profile {profile} --sub-account-id <id> --public-subdomain <slug> <name> --telegram-token <token>"
-                    );
+                    println!("  octos account update {} --telegram-token <token>", sub.id);
                 }
             }
 

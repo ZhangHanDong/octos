@@ -21,13 +21,16 @@ const CURRENT_SESSION_SCHEMA: u32 = 1;
 /// `message/persisted` notification dispatches through.
 ///
 /// Strict-ordering invariant: `add_message_with_seq` calls observers
-/// synchronously after the in-memory append, with the registry global lock
-/// held in [`set_message_commit_observer`]. Two concurrent commits to the
-/// same session serialize on the `&mut self` borrow of `SessionManager` /
-/// `SessionHandle`, so observer fires preserve commit order per session.
+/// synchronously after the in-memory append. Two concurrent commits to the
+/// same session key serialize on the per-key persist lock (see
+/// `persist_lock_for`) — independent writers (separate `SessionHandle`s,
+/// the canonical persist helper, a `SessionManager`) all contend on the
+/// same lock, so observer fires preserve commit order per session.
 ///
-/// The seq passed to the observer is the row's index in `Session::messages`
-/// after the append (`messages.len() - 1`).
+/// The seq passed to the observer is the row's index in the durable
+/// transcript: on the `SessionHandle` path it is read back from the
+/// on-disk file under the persist lock; on the `SessionManager` path it is
+/// the merged in-memory mirror's `messages.len() - 1` after the append.
 ///
 /// Errors raised by an observer are logged and dropped: the durable commit
 /// has already happened, and the observer is best-effort fan-out for
@@ -158,20 +161,25 @@ fn default_session_schema() -> u32 {
 /// Trims whitespace, strips JSON content-array wrappers if present, and
 /// truncates to 50 Unicode characters at a UTF-8 boundary so the result
 /// is safe to persist and round-trip through serde.
-fn derive_title_from_message(content: &str) -> String {
+/// Unwrap `[{"type":"text","text":"…"}]`-shaped content (many UI clients send
+/// this) to its inner text; plain-string content passes through unchanged.
+/// Shared by title derivation and the last-prompt preview so neither surfaces
+/// raw content-part JSON.
+fn content_display_text(content: &str) -> String {
     let plain = content.trim();
-    // Many UI clients send `[{"type":"text","text":"..."}]`-shaped content;
-    // unwrap to the inner text part if so. Plain strings pass through.
-    let text = serde_json::from_str::<Vec<serde_json::Value>>(plain)
+    serde_json::from_str::<Vec<serde_json::Value>>(plain)
         .ok()
         .and_then(|parts| {
             parts
                 .into_iter()
                 .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
         })
-        .unwrap_or_else(|| plain.to_string());
-    let trimmed = text.trim();
-    trimmed
+        .unwrap_or_else(|| plain.to_string())
+}
+
+fn derive_title_from_message(content: &str) -> String {
+    content_display_text(content)
+        .trim()
         .chars()
         .take(50)
         .collect::<String>()
@@ -356,6 +364,104 @@ pub(crate) fn synthesize_thread_ids(messages: &mut [Message]) {
             }
         }
     }
+}
+
+/// Append-only control records interleaved with `Message` lines in a session
+/// JSONL. Discriminated on `kind` so [`assemble_session_messages`] can tell
+/// them apart from `Message` rows — a persisted [`Message`] never carries a
+/// `kind` field, and an internally-tagged control record has no `role`, so the
+/// two decode paths are mutually exclusive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SessionControlRecord {
+    /// Conversation-only rewind marker: drop the last `num_turns` user turns
+    /// from the transcript accumulated up to this point in the log. Written by
+    /// [`SessionManager::rollback_last_n_user_turns`] and replayed on every
+    /// load (append-only, never a truncation).
+    Rollback { num_turns: u32, at: DateTime<Utc> },
+}
+
+/// Serialize a rollback control record to its single-line JSONL form.
+fn rollback_marker_line(num_turns: u32) -> Result<String> {
+    let record = SessionControlRecord::Rollback {
+        num_turns,
+        at: Utc::now(),
+    };
+    Ok(serde_json::to_string(&record)?)
+}
+
+/// One ordered item in a session JSONL's post-meta timeline: a persisted
+/// [`Message`] or an append-only rollback control marker. Parsing keeps the two
+/// interleaved in log order so the marker can be replayed positionally — by log
+/// order within a single file ([`fold_session_timeline`]) or by timestamp after
+/// a flat + per-user merge (in [`SessionManager::load_from_disk`]).
+///
+/// `Message` is boxed so the small `Rollback` variant does not inflate every
+/// element of a session-length `Vec` (clippy `large_enum_variant`).
+enum SessionTimelineItem {
+    Message(Box<Message>),
+    Rollback { num_turns: u32, at: DateTime<Utc> },
+}
+
+/// Parse a session JSONL's post-meta lines into an ordered timeline WITHOUT
+/// applying any rollback drop.
+///
+/// Control lines are recognized before the `Message` decode (they carry a
+/// `kind` discriminator a `Message` never has) and are NOT parsed as messages.
+/// Unparseable lines are skipped, matching the prior
+/// `filter_map(|line| serde_json::from_str(line).ok())` behavior. The rollback
+/// drop is deferred to [`fold_session_timeline`] so the merge path in
+/// [`SessionManager::load_from_disk`] can apply markers against the combined
+/// flat + per-user transcript rather than one file in isolation.
+fn parse_session_timeline<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<SessionTimelineItem> {
+    let mut timeline: Vec<SessionTimelineItem> = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        if let Ok(control) = serde_json::from_str::<SessionControlRecord>(line) {
+            match control {
+                SessionControlRecord::Rollback { num_turns, at } => {
+                    timeline.push(SessionTimelineItem::Rollback { num_turns, at });
+                }
+            }
+            continue;
+        }
+        if let Ok(message) = serde_json::from_str::<Message>(line) {
+            timeline.push(SessionTimelineItem::Message(Box::new(message)));
+        }
+    }
+    timeline
+}
+
+/// Fold an ordered timeline into the trimmed `Message` list, replaying each
+/// rollback marker at its position.
+///
+/// A `rollback` record drops the last N user turns accumulated *so far* —
+/// applying it positionally (rather than after the whole timeline) is what makes
+/// rewind-then-continue survive a reload: turns appended after the marker are
+/// kept, turns before it are trimmed. `thread_id`s are synthesized for legacy
+/// rows before each drop and once at the end, so a timeline without any control
+/// record folds exactly as it did pre-marker (a single synthesize pass over the
+/// full transcript).
+fn fold_session_timeline(timeline: Vec<SessionTimelineItem>) -> Vec<Message> {
+    let mut messages: Vec<Message> = Vec::new();
+    for item in timeline {
+        match item {
+            SessionTimelineItem::Message(message) => messages.push(*message),
+            SessionTimelineItem::Rollback { num_turns, .. } => {
+                synthesize_thread_ids(&mut messages);
+                crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+            }
+        }
+    }
+    synthesize_thread_ids(&mut messages);
+    messages
+}
+
+/// Assemble the ordered `Message` list from a session JSONL's post-meta lines,
+/// applying any interleaved [`SessionControlRecord`] at its position in the
+/// log. Single-file convenience over [`parse_session_timeline`] +
+/// [`fold_session_timeline`].
+fn assemble_session_messages<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Message> {
+    fold_session_timeline(parse_session_timeline(lines))
 }
 
 fn record_session_persist(outcome: &'static str) {
@@ -685,11 +791,115 @@ const DEFAULT_MAX_SESSIONS: usize = 1000;
 /// Maximum session file size we'll load (10 MB). Prevents OOM on corrupted/adversarial files.
 const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
+/// One row of the title/recency session listing:
+/// `(session_key, message_count, title, updated_at)`. `title` and `updated_at`
+/// are `None` for legacy files that pre-date those meta fields (with `updated_at`
+/// falling back to the JSONL mtime when available).
+pub type SessionTitleMetaRow = (
+    String,
+    usize,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+);
+
+/// Byte budget for the `last_prompt` preview surfaced on `session/list`.
+/// UTF-8 safe truncation (see [`last_user_prompt_from_jsonl`]) keeps this a
+/// soft ~100-character cap; multibyte scripts yield fewer characters.
+const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
+
+/// Extract the text of the MOST RECENT user message from an already-loaded
+/// session JSONL transcript, truncated to [`LAST_PROMPT_PREVIEW_BYTES`].
+///
+/// Cheap by construction: the listing walk already loads the whole file into
+/// memory to parse the first (`SessionMeta`) line, so this reuses that same
+/// `content` string and adds no extra I/O. It scans lines from the tail and
+/// returns the first that decodes as a [`Message`] with `role == User`, so a
+/// typical transcript only decodes the trailing assistant/tool reply plus the
+/// last user line before short-circuiting. Control records (rollback markers)
+/// and the leading meta line never decode as a user `Message`, so they are
+/// skipped implicitly. Returns `None` when the session has no user message.
+///
+/// Honors `/rewind`: a rolled-back session keeps its dropped rows on disk
+/// (removed only by [`fold_session_timeline`] at load), so previewing the raw
+/// last line could show a prompt hydrate no longer shows (codex P2). When a
+/// rollback marker is present the timeline is folded first; the common
+/// (unrewound) case stays a cheap O(tail) reverse scan.
+fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
+    // The rollback control record serializes as `{"kind":"rollback",…}`.
+    if content.contains("\"rollback\"") {
+        return assemble_session_messages(content.lines())
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .and_then(|message| last_prompt_preview(&message.content));
+    }
+    for line in content.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Cheap pre-filter: a serialized user `Message` always contains the
+        // `"role":"user"` token (role is the first field, lowercase-renamed).
+        // This lets us skip full JSON decode of large assistant/tool blobs.
+        if !line.contains("\"role\":\"user\"") {
+            continue;
+        }
+        if let Ok(message) = serde_json::from_str::<Message>(line) {
+            if matches!(message.role, MessageRole::User) {
+                if let Some(preview) = last_prompt_preview(&message.content) {
+                    return Some(preview);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Content-part-unwrapped, trimmed, byte-truncated preview of a user message's
+/// content, or `None` when it is empty. `[{"type":"text","text":"…"}]` content
+/// parts (codex P2) surface their inner text, never the raw JSON wrapper.
+fn last_prompt_preview(content: &str) -> Option<String> {
+    let text = content_display_text(content);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(octos_core::truncated_utf8(
+        text,
+        LAST_PROMPT_PREVIEW_BYTES,
+        "…",
+    ))
+}
+
 /// Manages sessions with in-memory LRU cache and JSONL disk persistence.
 ///
 /// Uses `lru::LruCache` for O(1) get/put with automatic eviction of the
 /// least-recently-used session when capacity is exceeded. Evicted sessions
 /// remain on disk and are lazy-loaded on next access.
+/// One physical session file discovered by [`SessionManager::list_for_analysis`].
+#[derive(Debug, Clone)]
+pub struct AnalysisFile {
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+    pub len: u64,
+}
+
+/// One session (canonical key) as seen by a background analysis sweep,
+/// with every physical layout copy and lineage hints.
+#[derive(Debug, Clone)]
+pub struct AnalysisSession {
+    pub key: SessionKey,
+    /// Every JSONL copy (legacy flat and/or canonical per-user), sorted by
+    /// path for stable watermarking.
+    pub files: Vec<AnalysisFile>,
+    /// Lineage from the freshest meta line, when present.
+    pub parent_key: Option<String>,
+    /// True for spawned/child/task-ledger sessions a memory sweep must
+    /// skip (also true whenever `parent_key` is set).
+    pub internal: bool,
+}
+
 pub struct SessionManager {
     sessions_dir: PathBuf,
     cache: LruCache<String, Session>,
@@ -736,6 +946,9 @@ impl SessionManager {
     /// `GET /sessions` endpoint to surface server-authoritative titles.
     pub fn list_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(false)
+            .into_iter()
+            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
+            .collect()
     }
 
     /// List only top-level sessions — those whose topic is empty (the
@@ -758,38 +971,78 @@ impl SessionManager {
     /// pre-#617 sessions).
     pub fn list_top_level_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(true)
+            .into_iter()
+            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
+            .collect()
+    }
+
+    /// Like [`Self::list_top_level_sessions_with_title`] but also returns each
+    /// session's recency timestamp and a preview of its most recent user
+    /// prompt:
+    /// - `updated_at`: `SessionMeta.updated_at`, or the JSONL file's mtime when
+    ///   the meta line is missing/unparseable (the LATER of the two when both
+    ///   exist), or `None` when neither is available. Backs the `updated_at`
+    ///   field on the WS `session/list` RPC so clients can sort by recency.
+    /// - `last_prompt`: the truncated text of the session's most recent
+    ///   user-role message (see [`last_user_prompt_from_jsonl`]), or `None`
+    ///   when the session has no user message. Backs the `last_prompt` field on
+    ///   `session/list` so the `/resume` picker can preview each session.
+    pub fn list_top_level_sessions_with_meta(&self) -> Vec<SessionTitleMetaRow> {
+        self.list_sessions_inner_with_title(true)
     }
 
     fn list_sessions_inner_with_title(
         &self,
         skip_internal_topics: bool,
-    ) -> Vec<(String, usize, Option<String>)> {
+    ) -> Vec<SessionTitleMetaRow> {
         // Reuse the path discovery from list_sessions_inner, but read each
         // file's first line to extract the title alongside the line count.
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
 
-        let push_with_title =
-            |path: &Path,
-             session_key: String,
-             seen: &mut std::collections::HashSet<String>,
-             out: &mut Vec<(String, usize, Option<String>)>| {
-                if seen.contains(&session_key) {
-                    return;
-                }
-                // Read just the first line for metadata; fall back to count_lines
-                // for the message count.
-                let title = std::fs::read_to_string(path).ok().and_then(|content| {
-                    content
-                        .lines()
+        let push_with_title = |path: &Path,
+                               session_key: String,
+                               seen: &mut std::collections::HashSet<String>,
+                               out: &mut Vec<SessionTitleMetaRow>| {
+            if seen.contains(&session_key) {
+                return;
+            }
+            // Load the file once (the listing already pays this cost to parse
+            // the first `SessionMeta` line for the title) and reuse the same
+            // in-memory content for both the meta read and the `last_prompt`
+            // preview — no extra I/O beyond the single read.
+            let content = std::fs::read_to_string(path).ok();
+            let (title, meta_updated_at) = content
+                .as_deref()
+                .and_then(|c| {
+                    c.lines()
                         .next()
                         .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
-                        .and_then(|meta| meta.title)
-                });
-                let count = Self::count_lines(path);
-                seen.insert(session_key.clone());
-                out.push((session_key, count, title));
+                })
+                .map(|meta| (meta.title, Some(meta.updated_at)))
+                .unwrap_or((None, None));
+            // Recency for the `session/list` sort. `SessionMeta.updated_at` is
+            // only rewritten on create / rename / summary rewrite — NOT on an
+            // ordinary message append — so an active chat's meta timestamp goes
+            // stale while its JSONL file mtime keeps advancing. Take the LATER
+            // of the two (codex P2) so recency tracks real writes; the file
+            // mtime alone also covers the missing / unparseable-meta case.
+            let file_mtime = std::fs::metadata(path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .map(DateTime::<Utc>::from);
+            let updated_at = match (meta_updated_at, file_mtime) {
+                (Some(meta_at), Some(mtime)) => Some(meta_at.max(mtime)),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
             };
+            // Reuse the already-loaded `content` (no extra I/O) to preview the
+            // session's most recent user prompt for the `/resume` picker.
+            let last_prompt = content.as_deref().and_then(last_user_prompt_from_jsonl);
+            let count = Self::count_lines(path);
+            seen.insert(session_key.clone());
+            out.push((session_key, count, title, updated_at, last_prompt));
+        };
 
         if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
             for entry in entries.flatten() {
@@ -1031,7 +1284,33 @@ impl SessionManager {
     }
 
     /// Add a message to a session, persist it, and return its committed sequence.
+    ///
+    /// Serialises on the per-key persist lock (see [`persist_lock_for`]) so a
+    /// concurrent writer on the same key cannot interleave between the disk
+    /// append and the seq derivation. The lock is NOT reentrant: a caller
+    /// that already holds it must use
+    /// [`Self::add_message_with_seq_unlocked`] instead.
     pub async fn add_message_with_seq(
+        &mut self,
+        key: &SessionKey,
+        message: Message,
+    ) -> Result<usize> {
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
+        self.add_message_with_seq_unlocked(key, message).await
+    }
+
+    /// Append + seq derivation without taking the persist lock — the caller
+    /// must already hold it (see [`persist_lock_for`]).
+    ///
+    /// The committed seq is derived from this manager's in-memory mirror:
+    /// the manager's transcript is the MERGED flat + per-user view assembled
+    /// at load time (see [`Self::load_from_disk`]), so the merged mirror —
+    /// not a single file's row count — is the closest authority the manager
+    /// has. The lock still guarantees the append and the len-read are atomic
+    /// against every other locked writer (canonical appends, rewrites,
+    /// rollback markers) on the same key.
+    async fn add_message_with_seq_unlocked(
         &mut self,
         key: &SessionKey,
         mut message: Message,
@@ -1114,6 +1393,163 @@ impl SessionManager {
             .to_path_buf()
     }
 
+    /// Enumerate sessions for a background analysis sweep (memory refresh).
+    ///
+    /// Unlike the `list_*` family, this returns EVERY physical JSONL copy
+    /// of a session — legacy flat AND canonical per-user — per canonical
+    /// key, with each file's `(modified, len)` snapshot, so a sweep can
+    /// watermark on the exact bytes it read and notice a stale legacy copy.
+    /// Read-only: no cache insertion, no migration, no directory creation.
+    ///
+    /// Limitation: legacy flat filenames that were truncated + FNV-suffixed
+    /// (keys over ~183 encoded chars) can't be decoded back to their true
+    /// key and are skipped (warn-logged).
+    pub fn list_for_analysis(&self) -> Vec<AnalysisSession> {
+        let mut by_key: std::collections::BTreeMap<String, AnalysisSession> =
+            std::collections::BTreeMap::new();
+
+        let mut record = |key_str: String, path: PathBuf| {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                return;
+            };
+            let Ok(modified) = meta.modified() else {
+                return;
+            };
+            // Cheap meta-line read for lineage: buffered, bounded to the
+            // first 64KB — a sweep over many/large session files must not
+            // slurp whole transcripts just to peek at line one.
+            let parent_key = std::fs::File::open(&path)
+                .ok()
+                .and_then(|file| {
+                    use std::io::{BufRead, BufReader, Read};
+                    let mut first = String::new();
+                    BufReader::new(file.take(64 * 1024))
+                        .read_line(&mut first)
+                        .ok()?;
+                    serde_json::from_str::<SessionMeta>(first.trim_end()).ok()
+                })
+                .and_then(|m| m.parent_key);
+
+            let entry = by_key
+                .entry(key_str.clone())
+                .or_insert_with(|| AnalysisSession {
+                    key: SessionKey(key_str),
+                    files: Vec::new(),
+                    parent_key: None,
+                    internal: false,
+                });
+            entry.files.push(AnalysisFile {
+                path,
+                modified,
+                len: meta.len(),
+            });
+            if entry.parent_key.is_none() {
+                entry.parent_key = parent_key;
+            }
+        };
+
+        // Legacy flat layout: sessions/{encoded_full_key}.jsonl
+        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "jsonl") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let decoded = Self::decode_filename(stem);
+                // Truncated names carry a `_{16 hex}` suffix and cannot be
+                // decoded back to the real key.
+                if Self::flat_stem_is_truncated(stem) {
+                    tracing::warn!(
+                        file = %path.display(),
+                        "skipping truncated legacy session filename in analysis sweep"
+                    );
+                    continue;
+                }
+                record(decoded, path);
+            }
+        }
+
+        // Canonical per-user layout: users/{base}/sessions/{topic}.jsonl
+        let users_root = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        if let Ok(users) = std::fs::read_dir(&users_root) {
+            for user in users.flatten() {
+                let Some(encoded_base) = user.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let base = Self::decode_filename(&encoded_base);
+                let sessions = user.path().join("sessions");
+                let Ok(files) = std::fs::read_dir(&sessions) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().is_none_or(|e| e != "jsonl") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let topic = Self::decode_filename(stem);
+                    let key_str = if topic == "default" {
+                        base.clone()
+                    } else {
+                        format!("{base}#{topic}")
+                    };
+                    record(key_str, path);
+                }
+            }
+        }
+
+        let mut out: Vec<AnalysisSession> = by_key.into_values().collect();
+        for session in &mut out {
+            session.internal =
+                session.parent_key.is_some() || Self::analysis_key_is_internal(&session.key.0);
+            // Deterministic file order (path) for stable watermarks.
+            session.files.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        out
+    }
+
+    /// True when a flat filename stem carries the truncation hash suffix
+    /// (`…_{16 uppercase hex}`) appended by `session_path_static`.
+    fn flat_stem_is_truncated(stem: &str) -> bool {
+        stem.len() > 17
+            && stem.as_bytes()[stem.len() - 17] == b'_'
+            && stem[stem.len() - 16..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+    }
+
+    /// Internal-session classifier for the analysis sweep: the standard
+    /// internal topics PLUS `spawn-*` worker sessions (which the legacy
+    /// filter does not cover) — background lineage a memory sweep must not
+    /// mine as user-facing conversation.
+    fn analysis_key_is_internal(decoded_key: &str) -> bool {
+        decoded_key.split_once('#').is_some_and(|(_, topic)| {
+            Self::is_internal_session_topic(topic) || topic.starts_with("spawn-")
+        })
+    }
+
+    /// Load a session's messages READ-ONLY for analysis, with stable
+    /// indices into the folded transcript.
+    ///
+    /// Same semantics as [`Self::load`] (both layouts merged, rollback
+    /// control records folded — rolled-back turns are absent — schema
+    /// handling, 10MB cap) and none of `SessionHandle::open`'s migration
+    /// side effects (no legacy deletion, no marker writes, no dir
+    /// creation).
+    pub async fn export_transcript(&self, key: &SessionKey) -> Option<Vec<(usize, Message)>> {
+        let session = self.load(key).await?;
+        Some(session.messages.into_iter().enumerate().collect())
+    }
+
     /// Static version of `session_path` — used by `SessionHandle` too.
     pub(crate) fn session_path_static(sessions_dir: &Path, key: &SessionKey) -> PathBuf {
         // Max encoded name length: 200 chars + ".jsonl" (6) = 206, well within 255.
@@ -1193,14 +1629,23 @@ impl SessionManager {
 
         let key_clone = key.clone();
         tokio::task::spawn_blocking(move || {
-            fn load_session_file(path: &Path, key: &SessionKey) -> Option<Session> {
+            // Parse a session file into its meta + an un-applied timeline
+            // (messages interleaved with rollback markers). The rollback drop
+            // is DEFERRED — the flat + per-user merge below applies markers
+            // against the COMBINED transcript, so a marker co-located with one
+            // layout still trims turns that live in the other (codex P1: a
+            // mixed flat/per-user layout must not resurrect rolled-back turns).
+            fn parse_session_file(
+                path: &Path,
+                key: &SessionKey,
+            ) -> Option<(SessionMeta, Vec<SessionTimelineItem>)> {
                 // Guard against oversized files to prevent OOM
-                if let Ok(meta) = std::fs::metadata(path) {
-                    if meta.len() > MAX_SESSION_FILE_SIZE {
+                if let Ok(file_meta) = std::fs::metadata(path) {
+                    if file_meta.len() > MAX_SESSION_FILE_SIZE {
                         warn!(
                             key = %key,
                             path = %path.display(),
-                            size = meta.len(),
+                            size = file_meta.len(),
                             limit = MAX_SESSION_FILE_SIZE,
                             "session file too large, skipping"
                         );
@@ -1225,16 +1670,17 @@ impl SessionManager {
                     return None;
                 }
 
-                let mut messages: Vec<Message> = lines
-                    .filter(|line| !line.trim().is_empty())
-                    .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
+                Some((meta, parse_session_timeline(lines)))
+            }
 
-                // M8.10 PR #1: synthesize `thread_id` for legacy rows
-                // (pre-field). In-memory only.
-                synthesize_thread_ids(&mut messages);
-
-                Some(Session {
+            // Fold a single file's timeline into a `Session` (per-user only or
+            // legacy flat only — the marker application is unambiguous).
+            fn session_from(
+                meta: SessionMeta,
+                messages: Vec<Message>,
+                key: &SessionKey,
+            ) -> Session {
+                Session {
                     key: key.clone(),
                     parent_key: meta.parent_key.map(SessionKey),
                     topic: meta.topic,
@@ -1245,52 +1691,115 @@ impl SessionManager {
                     messages,
                     created_at: meta.created_at,
                     updated_at: meta.updated_at,
-                })
+                }
             }
 
             let flat = flat_path
                 .exists()
-                .then(|| load_session_file(&flat_path, &key_clone))
+                .then(|| parse_session_file(&flat_path, &key_clone))
                 .flatten();
             let per_user = per_user_path
                 .exists()
-                .then(|| load_session_file(&per_user_path, &key_clone))
+                .then(|| parse_session_file(&per_user_path, &key_clone))
                 .flatten();
 
             let merged = match (flat, per_user) {
-                (Some(flat), Some(per_user)) => {
-                    let mut merged_messages = Vec::with_capacity(
-                        flat.messages.len().saturating_add(per_user.messages.len()),
+                (Some((flat_meta, flat_timeline)), Some((per_user_meta, per_user_timeline))) => {
+                    // Merge the two timelines: dedup messages by fingerprint (a
+                    // message migrated into both layouts appears once), keep
+                    // EVERY rollback marker, then order by timestamp so each
+                    // marker lands after the messages it should trim
+                    // (message-before-marker on an exact tie). Folding the
+                    // combined, ordered timeline applies the drop across BOTH
+                    // files — the fix for the mixed-layout resurrection.
+                    let mut items: Vec<SessionTimelineItem> = Vec::with_capacity(
+                        flat_timeline.len().saturating_add(per_user_timeline.len()),
                     );
-                    let mut seen = std::collections::HashSet::new();
+                    let mut seen: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
 
-                    for message in flat.messages.into_iter().chain(per_user.messages) {
-                        let Ok(fingerprint) = serde_json::to_string(&message) else {
-                            continue;
-                        };
-                        if seen.insert(fingerprint) {
-                            merged_messages.push(message);
+                    for item in flat_timeline.into_iter().chain(per_user_timeline) {
+                        match item {
+                            SessionTimelineItem::Rollback { .. } => items.push(item),
+                            SessionTimelineItem::Message(message) => {
+                                // The dedup fingerprint must be synthesis-INDEPENDENT: a
+                                // legacy flat row (no persisted `thread_id`) and its
+                                // migrated per-user copy (a `thread_id` synthesized +
+                                // persisted by an earlier migration, possibly a
+                                // migration-added `client_message_id`) are the SAME
+                                // logical message. `thread_id` is only synthesized later
+                                // in `fold_session_timeline`, and neither field is content
+                                // identity, so normalize both to `None` before
+                                // fingerprinting — else the two copies fingerprint
+                                // differently, both survive, and a partial-migration
+                                // (stale flat + per-user) session doubles on reload.
+                                let mut ident = (*message).clone();
+                                ident.thread_id = None;
+                                ident.client_message_id = None;
+                                let Ok(fingerprint) = serde_json::to_string(&ident) else {
+                                    continue;
+                                };
+                                // On a cross-layout dup, keep the RICHER copy: the
+                                // migrated per-user row carries the canonical
+                                // thread_id/client_message_id the legacy flat row lacks,
+                                // so hydrate/thread projections resolve the real IDs on
+                                // reload rather than the flat row's missing/synthesized
+                                // ones (flat is processed first, so without this the
+                                // stale row would win).
+                                let richness = message.thread_id.is_some() as u8
+                                    + message.client_message_id.is_some() as u8;
+                                match seen.get(&fingerprint).copied() {
+                                    None => {
+                                        seen.insert(fingerprint, items.len());
+                                        items.push(SessionTimelineItem::Message(message));
+                                    }
+                                    Some(idx) => {
+                                        let kept = match &items[idx] {
+                                            SessionTimelineItem::Message(existing) => {
+                                                existing.thread_id.is_some() as u8
+                                                    + existing.client_message_id.is_some() as u8
+                                            }
+                                            SessionTimelineItem::Rollback { .. } => u8::MAX,
+                                        };
+                                        if richness > kept {
+                                            items[idx] = SessionTimelineItem::Message(message);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                    merged_messages.sort_by_key(|message| message.timestamp);
+                    // Stable sort: preserves flat-before-per-user order for
+                    // messages sharing a timestamp (matches the prior merge's
+                    // `sort_by_key(|m| m.timestamp)` stability).
+                    items.sort_by_key(|item| match item {
+                        SessionTimelineItem::Message(message) => (message.timestamp, 0u8),
+                        SessionTimelineItem::Rollback { at, .. } => (*at, 1u8),
+                    });
+                    let messages = fold_session_timeline(items);
 
                     Session {
                         key: key_clone.clone(),
-                        parent_key: per_user.parent_key.or(flat.parent_key),
-                        topic: per_user.topic.or(flat.topic),
-                        summary: per_user.summary.or(flat.summary),
-                        title: per_user.title.or(flat.title),
-                        title_manual: per_user.title_manual || flat.title_manual,
+                        parent_key: per_user_meta
+                            .parent_key
+                            .or(flat_meta.parent_key)
+                            .map(SessionKey),
+                        topic: per_user_meta.topic.or(flat_meta.topic),
+                        summary: per_user_meta.summary.or(flat_meta.summary),
+                        title: per_user_meta.title.or(flat_meta.title),
+                        title_manual: per_user_meta.title_manual || flat_meta.title_manual,
                         child_contracts: merge_child_contracts(
-                            flat.child_contracts,
-                            per_user.child_contracts,
+                            flat_meta.child_contracts,
+                            per_user_meta.child_contracts,
                         ),
-                        messages: merged_messages,
-                        created_at: flat.created_at.min(per_user.created_at),
-                        updated_at: flat.updated_at.max(per_user.updated_at),
+                        messages,
+                        created_at: flat_meta.created_at.min(per_user_meta.created_at),
+                        updated_at: flat_meta.updated_at.max(per_user_meta.updated_at),
                     }
                 }
-                (Some(session), None) | (None, Some(session)) => session,
+                (Some((meta, timeline)), None) | (None, Some((meta, timeline))) => {
+                    session_from(meta, fold_session_timeline(timeline), &key_clone)
+                }
                 (None, None) => return None,
             };
 
@@ -1390,7 +1899,21 @@ impl SessionManager {
     /// Rewrite a session's JSONL file from the in-memory state.
     /// Uses atomic write-then-rename to avoid corruption on crash.
     /// Uses spawn_blocking to avoid blocking the async runtime.
+    ///
+    /// Serialises on the per-key persist lock so the whole-file rewrite
+    /// cannot interleave with (and erase) a canonical locked append or a
+    /// concurrent `SessionHandle` rewrite of the same key.
+    /// The directory session files persist under — the on-disk
+    /// collision domain for fork child keys (serve scopes its fork
+    /// reservations by it; two managers over the same dir CAN collide,
+    /// two different profiles' dirs cannot).
+    pub fn sessions_dir(&self) -> &std::path::Path {
+        &self.sessions_dir
+    }
+
     pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
         let session = self
             .cache
             .peek(&key.0)
@@ -1454,9 +1977,9 @@ impl SessionManager {
     ) -> Result<SessionKey> {
         let parent = self.get_or_create(parent_key).await;
         let messages: Vec<Message> = parent.get_history(copy_messages).to_vec();
-        // Derive channel from parent key (format: "channel:chat_id")
-        let channel = parent_key.0.split(':').next().unwrap_or("cli");
-        let new_key = SessionKey::new(channel, new_chat_id);
+        // Shared derivation rule (SessionKey::fork_child): profile +
+        // channel preserved, raw SPA parents yield raw children.
+        let new_key = parent_key.fork_child(new_chat_id);
 
         let now = Utc::now();
         let session = Session {
@@ -1472,7 +1995,14 @@ impl SessionManager {
             updated_at: now,
         };
         self.cache.put(new_key.0.clone(), session);
-        self.rewrite(&new_key).await?;
+        if let Err(error) = self.rewrite(&new_key).await {
+            // A failed write must not leave a cache-resident ghost:
+            // `session_known` would keep answering true for a child
+            // that was never durably created, wedging retries on
+            // `child_exists` (codex #1613 P2).
+            self.cache.pop(&new_key.0);
+            return Err(error);
+        }
 
         debug!(
             parent = %parent_key,
@@ -1592,6 +2122,106 @@ impl SessionManager {
         self.cache.pop(&key.0);
     }
 
+    /// Roll back the last `num_turns` user turns for `key` (conversation-only
+    /// rewind): append an idempotent rollback marker to the session JSONL and
+    /// trim the in-memory transcript to match. Returns the number of user turns
+    /// actually dropped, clamped to the session's turn count.
+    ///
+    /// The marker is appended to the same on-disk file that holds the session's
+    /// messages (per-user layout preferred, legacy flat as fallback), so both
+    /// [`Self::load_from_disk`] and the per-user `SessionHandle` load path
+    /// replay the drop at the marker's log position on the next load. This is
+    /// what keeps the trim durable without truncating history. `num_turns == 0`
+    /// is a defensive no-op (the handler rejects it as `invalid_params`).
+    ///
+    /// Conversation-only: no git, worktree, or workspace file state is touched.
+    pub async fn rollback_last_n_user_turns(
+        &mut self,
+        key: &SessionKey,
+        num_turns: u32,
+    ) -> Result<u32> {
+        // Ensure the session is resident so the trim reflects the full
+        // (merged) on-disk transcript.
+        let _ = self.get_or_create(key).await;
+        // Serialise the count-read + marker-append + trim under the per-key
+        // persist lock — the SAME lock the rewrite / canonical-append paths
+        // hold (#1528). Without it this read-then-append raced a concurrent
+        // `rewrite`, which snapshots the pre-marker message vec and renames
+        // over the file, silently ERASING the appended rollback marker; and a
+        // concurrent append could land between the turn-count read and the
+        // marker write, computing the marker's `num_turns` against a stale
+        // transcript. `append_rollback_marker` takes no lock itself, so
+        // holding it here does not re-enter.
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
+        let dropped = {
+            let session = self
+                .cache
+                .peek(&key.0)
+                .ok_or_else(|| eyre::eyre!("session not in cache after get_or_create: {key}"))?;
+            num_turns.min(crate::resume_policy::count_user_turns(&session.messages))
+        };
+        if dropped == 0 {
+            return Ok(0);
+        }
+        // Durable first: append the append-only marker to disk so a crash
+        // between here and the in-memory trim still replays identically on the
+        // next load.
+        self.append_rollback_marker(key, num_turns).await?;
+        // Trim the in-memory mirror to match the persisted state so the next
+        // turn continues from the trimmed transcript.
+        if let Some(session) = self.cache.get_mut(&key.0) {
+            crate::resume_policy::drop_last_n_user_turns(&mut session.messages, num_turns);
+            session.updated_at = Utc::now();
+        }
+        Ok(dropped)
+    }
+
+    /// Append a rollback control line to the on-disk JSONL for `key`. Chooses
+    /// the per-user layout file when present, else the legacy flat file; when
+    /// neither exists there is nothing on disk to trim on reload, so the append
+    /// is skipped (the in-memory trim is authoritative for a cache-only
+    /// session).
+    async fn append_rollback_marker(&self, key: &SessionKey, num_turns: u32) -> Result<()> {
+        let flat_path = self.session_path(key);
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        let per_user_path = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+
+        // Write the marker to the canonical layout (per-user preferred, legacy
+        // flat as fallback). `load_from_disk` folds markers AFTER merging both
+        // layouts (by timestamp), so the drop trims the combined transcript
+        // even when the rolled-back turns live in the OTHER file — a
+        // single-file `SessionHandle::open` still applies it in log order.
+        let target = if per_user_path.exists() {
+            per_user_path
+        } else if flat_path.exists() {
+            flat_path
+        } else {
+            return Ok(());
+        };
+
+        let line = rollback_marker_line(num_turns)?;
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&target)?;
+            writeln!(file, "{line}")?;
+            Ok::<_, eyre::Report>(())
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+        Ok(())
+    }
+
     /// Scan the per-user layout for every JSONL belonging to `base_key` and
     /// return their reconstructed `SessionKey`s. The default file maps back to
     /// the base key (no topic suffix); other files map to `{base_key}#{topic}`.
@@ -1709,11 +2339,19 @@ pub struct SessionHandle {
 /// Without serialisation, both observe `len = N`, both append, both return
 /// `seq = N` — duplicate seqs that break watcher correlation.
 ///
-/// This map gives `persist_message_through_canonical_path` a per-key Tokio
-/// mutex so all writes for the same `SessionKey.0` serialise. The mutex is
-/// scoped to the session_key string (NOT the file path) so callers reaching
+/// This map gives `persist_message_through_canonical_path` — and every other
+/// session write path: `SessionManager::add_message_with_seq`,
+/// `SessionHandle::add_message_with_seq`, the `rewrite`s,
+/// `rollback_last_n_user_turns`, and the child-contract upserts — a per-key
+/// Tokio mutex so all writes for the same `SessionKey.0` serialise. The mutex
+/// is scoped to the session_key string (NOT the file path) so callers reaching
 /// the canonical per-user JSONL via different code paths still contend on
 /// the same lock.
+///
+/// The mutex is NOT reentrant. Methods that need to run inside an
+/// already-held lock use the `_unlocked` variants
+/// (`add_message_with_seq_unlocked`, `rewrite_unlocked`,
+/// `upsert_child_contract_unlocked`).
 ///
 /// Memory note: entries leak forever, one per active session_key. In a long-
 /// lived bus process this grows with active distinct sessions; given
@@ -1755,7 +2393,34 @@ pub async fn persist_message_through_canonical_path(
     let lock = persist_lock_for(key);
     let _guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
-    handle.add_message_with_seq(message).await
+    // `_unlocked`: this function already holds the per-key persist lock and
+    // the tokio mutex is not reentrant — calling the locking
+    // `add_message_with_seq` here would deadlock.
+    handle.add_message_with_seq_unlocked(message).await
+}
+
+/// Upsert a durable child-session contract through the canonical locked
+/// path: per-key persist lock → FRESH open (latest disk state) → mutate →
+/// rewrite, all inside one critical section.
+///
+/// Contract writes are whole-file read-modify-write cycles (`rewrite`
+/// snapshots the in-memory session and renames over the file), so two
+/// concurrent writers that each open their own handle both read the same
+/// pre-state and the second rename silently erases the first's update.
+/// This is the production-documented fanout race: two children terminating
+/// together each stamp their terminal contract into the SHARED PARENT
+/// session; the loser's contract reverts to pre-terminal and the task is
+/// stuck un-Joined forever. Holding the per-key lock across open→rewrite
+/// makes the cycle atomic per session key.
+pub async fn upsert_child_contract_through_canonical_path(
+    data_dir: &Path,
+    key: &SessionKey,
+    contract: ChildSessionContract,
+) -> Result<bool> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let mut handle = SessionHandle::open(data_dir, key);
+    handle.upsert_child_contract_unlocked(contract).await
 }
 
 impl SessionHandle {
@@ -2050,7 +2715,23 @@ impl SessionHandle {
     }
 
     /// Add a message to the session, persist it, and return its committed sequence.
-    pub async fn add_message_with_seq(&mut self, mut message: Message) -> Result<usize> {
+    ///
+    /// Serialises on the per-key persist lock (see [`persist_lock_for`]) so a
+    /// concurrent writer on the same key — another `SessionHandle`, the
+    /// canonical [`persist_message_through_canonical_path`] helper, or a
+    /// rewrite — cannot interleave between the disk append and the seq
+    /// derivation. The lock is NOT reentrant: a caller that already holds it
+    /// (the canonical helper) must use
+    /// [`Self::add_message_with_seq_unlocked`] instead.
+    pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.add_message_with_seq_unlocked(message).await
+    }
+
+    /// Append + seq derivation without taking the persist lock — the caller
+    /// must already hold it (see [`persist_message_through_canonical_path`]).
+    async fn add_message_with_seq_unlocked(&mut self, mut message: Message) -> Result<usize> {
         // Auto-derive title from first user message before persistence so the
         // first append_to_disk includes the title in the JSONL meta line.
         // Manual titles set via update_title elsewhere are preserved.
@@ -2093,7 +2774,32 @@ impl SessionHandle {
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
         record_session_persist("committed");
-        let committed_seq = self.session.messages.len().saturating_sub(1);
+        // Derive the committed sequence from the ON-DISK transcript, not
+        // from this handle's in-memory mirror. The caller holds the per-key
+        // persist lock, so no other writer can append between our disk
+        // write and this read-back — but THIS handle's mirror may be stale
+        // relative to rows other writers committed after it was opened
+        // (e.g. a long-lived actor handle racing the canonical persist
+        // path). Two such writers each pushing onto their own stale mirror
+        // both returned the same seq for different durable rows.
+        // `load_from_file` runs the same assembly a reload uses (meta line
+        // + rollback-marker replay), so the returned seq is exactly the
+        // index the appended row has in the durable transcript; under the
+        // lock our row is the last one. Falls back to the mirror length if
+        // the read-back fails: the row already committed, and a post-commit
+        // read failure must not turn the call into an error.
+        let path = self.session_path();
+        let key = self.session.key.clone();
+        let disk_len = tokio::task::spawn_blocking(move || {
+            Self::load_from_file(&path, &key).map(|on_disk| on_disk.messages.len())
+        })
+        .await
+        .ok()
+        .flatten();
+        let committed_seq = match disk_len {
+            Some(len) if len > 0 => len - 1,
+            _ => self.session.messages.len().saturating_sub(1),
+        };
         // Post-commit observer fan-out: fires AFTER the disk write
         // returned Ok AND after the in-memory mirror was updated. A
         // commit failure (`append_to_disk` Err) returns above without
@@ -2115,10 +2821,29 @@ impl SessionHandle {
     }
 
     /// Insert or update a durable child-session contract and persist it.
+    ///
+    /// Serialises on the per-key persist lock (see [`persist_lock_for`]).
+    /// NOTE: the lock covers mutate→rewrite only; this handle's in-memory
+    /// state was snapshotted at open time, so a handle opened BEFORE a
+    /// concurrent writer committed will still rewrite from that stale
+    /// snapshot. Callers racing other writers must use
+    /// [`upsert_child_contract_through_canonical_path`], which holds the
+    /// lock across the fresh open as well.
     pub async fn upsert_child_contract(&mut self, contract: ChildSessionContract) -> Result<bool> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.upsert_child_contract_unlocked(contract).await
+    }
+
+    /// Mutate + rewrite without taking the persist lock — the caller must
+    /// already hold it (see [`upsert_child_contract_through_canonical_path`]).
+    async fn upsert_child_contract_unlocked(
+        &mut self,
+        contract: ChildSessionContract,
+    ) -> Result<bool> {
         let existed = self.session.upsert_child_contract(contract);
         self.session.updated_at = Utc::now();
-        self.rewrite().await?;
+        self.rewrite_unlocked().await?;
         Ok(existed)
     }
 
@@ -2128,7 +2853,21 @@ impl SessionHandle {
     }
 
     /// Rewrite the session to disk (atomic write-then-rename).
+    ///
+    /// Serialises on the per-key persist lock so a whole-file rewrite cannot
+    /// interleave with the canonical locked append path
+    /// ([`persist_message_through_canonical_path`]) — an append committed
+    /// between an unlocked rewrite's snapshot and its rename was silently
+    /// erased by the rename.
     pub async fn rewrite(&self) -> Result<()> {
+        let lock = persist_lock_for(&self.session.key);
+        let _guard = lock.lock().await;
+        self.rewrite_unlocked().await
+    }
+
+    /// Snapshot-and-rename without taking the persist lock — the caller
+    /// must already hold it.
+    async fn rewrite_unlocked(&self) -> Result<()> {
         let meta = SessionMeta {
             schema_version: CURRENT_SESSION_SCHEMA,
             session_key: self.session.key.0.clone(),
@@ -2338,14 +3077,10 @@ impl SessionHandle {
             return None;
         }
 
-        let mut messages: Vec<Message> = lines
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-
-        // M8.10 PR #1: synthesize `thread_id` for legacy rows that pre-date
-        // the field. In-memory only — nothing is rewritten on load.
-        synthesize_thread_ids(&mut messages);
+        // Assemble messages, replaying any append-only rollback control
+        // records at their log position so a rewind survives a per-user
+        // reload too (this path backs the next turn's `SessionHandle::open`).
+        let messages = assemble_session_messages(lines);
 
         debug!(key = %key, messages = messages.len(), "Loaded session from disk");
 
@@ -2678,2314 +3413,5 @@ pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use octos_core::MessageRole;
-    use tempfile::TempDir;
-
-    fn make_message(role: MessageRole, content: &str) -> Message {
-        // PR F (M8.10): pre-stamp Assistant/Tool messages with a synthetic
-        // thread_id so they pass the new-write fail-closed check. Tests
-        // that exercise the legacy untagged path use bare struct literals
-        // or the dedicated helpers directly. Production code uses the
-        // typed `Message::assistant_with_thread`/`tool_with_thread`
-        // constructors and the canonical `persist_assistant_message`
-        // helper, both of which already supply thread_id.
-        let thread_id = match role {
-            MessageRole::Assistant | MessageRole::Tool => Some("test-thread-default".to_string()),
-            _ => None,
-        };
-        Message {
-            role,
-            content: content.into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id,
-            timestamp: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn test_session_get_history() {
-        let mut session = Session::new(SessionKey::new("cli", "test"));
-        for i in 0..10 {
-            session
-                .messages
-                .push(make_message(MessageRole::User, &format!("msg{i}")));
-        }
-        let history = session.get_history(3);
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[0].content, "msg7");
-        assert_eq!(history[2].content, "msg9");
-    }
-
-    #[test]
-    fn test_session_get_history_all() {
-        let mut session = Session::new(SessionKey::new("cli", "test"));
-        session.messages.push(make_message(MessageRole::User, "a"));
-        session.messages.push(make_message(MessageRole::User, "b"));
-        let history = session.get_history(10);
-        assert_eq!(history.len(), 2);
-    }
-
-    #[test]
-    fn test_sort_by_timestamp_restores_order() {
-        use chrono::Duration;
-        let mut session = Session::new(SessionKey::new("cli", "test"));
-        let t0 = Utc::now();
-
-        // Simulate speculative overflow: primary pre-saved at t0,
-        // overflow inserted at t0+15s, primary results saved at t0+45s.
-        let mut msg_a = make_message(MessageRole::User, "primary question");
-        msg_a.timestamp = t0;
-
-        let mut msg_b_user = make_message(MessageRole::User, "overflow question");
-        msg_b_user.timestamp = t0 + Duration::seconds(15);
-
-        let mut msg_b_asst = make_message(MessageRole::Assistant, "overflow answer");
-        msg_b_asst.timestamp = t0 + Duration::seconds(16);
-
-        // Primary's tool call happened at t=5s but saved later
-        let mut msg_a_tool = make_message(MessageRole::Assistant, "tool_call for primary");
-        msg_a_tool.timestamp = t0 + Duration::seconds(5);
-
-        let mut msg_a_result = make_message(MessageRole::User, "tool_result");
-        msg_a_result.timestamp = t0 + Duration::seconds(8);
-
-        let mut msg_a_reply = make_message(MessageRole::Assistant, "primary answer");
-        msg_a_reply.timestamp = t0 + Duration::seconds(44);
-
-        // Insert in write order (primary pre-save, overflow, primary completion)
-        session.messages.push(msg_a); // t0
-        session.messages.push(msg_b_user); // t0+15
-        session.messages.push(msg_b_asst); // t0+16
-        session.messages.push(msg_a_tool); // t0+5 (out of order!)
-        session.messages.push(msg_a_result); // t0+8 (out of order!)
-        session.messages.push(msg_a_reply); // t0+44
-
-        // Before sort: insertion order
-        assert_eq!(session.messages[1].content, "overflow question");
-        assert_eq!(session.messages[3].content, "tool_call for primary");
-
-        session.sort_by_timestamp();
-
-        // After sort: chronological order
-        assert_eq!(session.messages[0].content, "primary question"); // t0
-        assert_eq!(session.messages[1].content, "tool_call for primary"); // t0+5
-        assert_eq!(session.messages[2].content, "tool_result"); // t0+8
-        assert_eq!(session.messages[3].content, "overflow question"); // t0+15
-        assert_eq!(session.messages[4].content, "overflow answer"); // t0+16
-        assert_eq!(session.messages[5].content, "primary answer"); // t0+44
-    }
-
-    #[tokio::test]
-    async fn test_session_manager_create_and_retrieve() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let key = SessionKey::new("cli", "default");
-
-        let session = mgr.get_or_create(&key).await;
-        assert_eq!(session.messages.len(), 0);
-
-        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
-            .await
-            .unwrap();
-        mgr.add_message(&key, make_message(MessageRole::Assistant, "hi"))
-            .await
-            .unwrap();
-
-        let session = mgr.get_or_create(&key).await;
-        assert_eq!(session.messages.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_session_manager_persistence() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("cli", "persist");
-
-        // Write session
-        {
-            let mut mgr = SessionManager::open(tmp.path()).unwrap();
-            mgr.add_message(&key, make_message(MessageRole::User, "saved"))
-                .await
-                .unwrap();
-            mgr.add_message(&key, make_message(MessageRole::Assistant, "reply"))
-                .await
-                .unwrap();
-        }
-
-        // New manager should load from disk
-        {
-            let mut mgr = SessionManager::open(tmp.path()).unwrap();
-            let session = mgr.get_or_create(&key).await;
-            assert_eq!(session.messages.len(), 2);
-            assert_eq!(session.messages[0].content, "saved");
-            assert_eq!(session.messages[1].content, "reply");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_session_manager_clear() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("cli", "clear-me");
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-
-        mgr.add_message(&key, make_message(MessageRole::User, "temp"))
-            .await
-            .unwrap();
-        assert_eq!(mgr.get_or_create(&key).await.messages.len(), 1);
-
-        mgr.clear(&key).await.unwrap();
-
-        // After clear, should be empty
-        let session = mgr.get_or_create(&key).await;
-        assert_eq!(session.messages.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_sessions() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-
-        let k1 = SessionKey::new("telegram", "chat1");
-        let k2 = SessionKey::new("telegram", "chat2");
-
-        mgr.add_message(&k1, make_message(MessageRole::User, "from chat1"))
-            .await
-            .unwrap();
-        mgr.add_message(&k2, make_message(MessageRole::User, "from chat2"))
-            .await
-            .unwrap();
-
-        assert_eq!(mgr.get_or_create(&k1).await.messages.len(), 1);
-        assert_eq!(mgr.get_or_create(&k2).await.messages.len(), 1);
-        assert_eq!(
-            mgr.get_or_create(&k1).await.messages[0].content,
-            "from chat1"
-        );
-        assert_eq!(
-            mgr.get_or_create(&k2).await.messages[0].content,
-            "from chat2"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_session_rewrite() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("cli", "rewrite");
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-
-        // Add 5 messages
-        for i in 0..5 {
-            mgr.add_message(&key, make_message(MessageRole::User, &format!("msg{i}")))
-                .await
-                .unwrap();
-        }
-
-        // Mutate in-memory: keep only last 2
-        let session = mgr.get_or_create(&key).await;
-        session.messages.drain(0..3);
-        assert_eq!(session.messages.len(), 2);
-
-        // Rewrite to disk
-        mgr.rewrite(&key).await.unwrap();
-
-        // Load fresh from disk — should have only 2 messages
-        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
-        let session2 = mgr2.get_or_create(&key).await;
-        assert_eq!(session2.messages.len(), 2);
-        assert_eq!(session2.messages[0].content, "msg3");
-        assert_eq!(session2.messages[1].content, "msg4");
-    }
-
-    #[tokio::test]
-    async fn concurrent_rewrites_of_same_session_dont_collide_on_tmp_path() {
-        // Regression: prior to using a unique-per-call tmp suffix, two writers
-        // racing the same session file (e.g. fanout children of one parent
-        // calling parent.rewrite() in the same millisecond) shared a single
-        // `<file>.jsonl.tmp` path. Both `File::create` would clobber the same
-        // tmp; one rename succeeded, the other got ENOENT and surfaced as a
-        // failed rewrite — manifested in spawn lifecycle as `Orphaned` instead
-        // of `Joined` for the unlucky child. Asserts the rewrite race no
-        // longer drops state.
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("cli", "rewrite-race");
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        for i in 0..3 {
-            mgr.add_message(&key, make_message(MessageRole::User, &format!("seed{i}")))
-                .await
-                .unwrap();
-        }
-        let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(mgr));
-
-        // Spawn N concurrent rewrites of the same session. Without the unique
-        // suffix, several would race on the shared `<file>.jsonl.tmp` path and
-        // ~1 in N would fail with ENOENT.
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let mgr = mgr.clone();
-            let key = key.clone();
-            handles.push(tokio::spawn(async move {
-                let mgr = mgr.lock().await;
-                mgr.rewrite(&key).await
-            }));
-        }
-        for h in handles {
-            let result = h.await.expect("join");
-            assert!(
-                result.is_ok(),
-                "concurrent rewrite must not lose to tmp-file collision: {result:?}"
-            );
-        }
-
-        // Disk state should still be parseable.
-        let mut reload = SessionManager::open(tmp.path()).unwrap();
-        let session = reload.get_or_create(&key).await;
-        assert_eq!(session.messages.len(), 3);
-    }
-
-    #[test]
-    fn rewrite_tmp_path_is_unique_per_call() {
-        let target = std::path::PathBuf::from("/tmp/some/session.jsonl");
-        let a = rewrite_tmp_path(&target);
-        let b = rewrite_tmp_path(&target);
-        assert_ne!(a, b, "successive calls must produce distinct tmp paths");
-        assert!(
-            a.to_string_lossy().contains(".tmp"),
-            "tmp path keeps a .tmp suffix: {}",
-            a.display()
-        );
-        // Suffix encodes both PID and counter so cross-process races don't
-        // collide either.
-        let pid = std::process::id().to_string();
-        assert!(
-            a.to_string_lossy().contains(&pid),
-            "tmp path includes the pid for cross-process disambiguation: {}",
-            a.display()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fork_creates_child() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let parent = SessionKey::new("telegram", "chat1");
-
-        for i in 0..5 {
-            mgr.add_message(&parent, make_message(MessageRole::User, &format!("msg{i}")))
-                .await
-                .unwrap();
-        }
-
-        let child_key = mgr.fork(&parent, "chat1_fork", 3).await.unwrap();
-        assert_eq!(child_key, SessionKey::new("telegram", "chat1_fork"));
-
-        let child = mgr.get_or_create(&child_key).await;
-        assert_eq!(child.parent_key, Some(parent.clone()));
-        assert_eq!(child.messages.len(), 3);
-        assert_eq!(child.messages[0].content, "msg2");
-        assert_eq!(child.messages[2].content, "msg4");
-    }
-
-    #[tokio::test]
-    async fn test_eviction_keeps_max_sessions() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path())
-            .unwrap()
-            .with_max_sessions(3);
-
-        // Create 5 sessions
-        for i in 0..5 {
-            let key = SessionKey::new("cli", &format!("s{i}"));
-            mgr.add_message(&key, make_message(MessageRole::User, &format!("msg{i}")))
-                .await
-                .unwrap();
-            // Small delay so last_accessed ordering is deterministic
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-
-        // Should have at most 3 in memory
-        assert_eq!(mgr.cache_len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_evicted_session_reloads_from_disk() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path())
-            .unwrap()
-            .with_max_sessions(2);
-
-        let k0 = SessionKey::new("cli", "oldest");
-        mgr.add_message(&k0, make_message(MessageRole::User, "hello from oldest"))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-        let k1 = SessionKey::new("cli", "middle");
-        mgr.add_message(&k1, make_message(MessageRole::User, "hello from middle"))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-        let k2 = SessionKey::new("cli", "newest");
-        mgr.add_message(&k2, make_message(MessageRole::User, "hello from newest"))
-            .await
-            .unwrap();
-
-        // k0 should have been evicted from memory
-        assert_eq!(mgr.cache_len(), 2);
-
-        // But accessing k0 should reload it from disk
-        let session = mgr.get_or_create(&k0).await;
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].content, "hello from oldest");
-    }
-
-    #[test]
-    fn test_with_max_sessions_clamps_zero() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path())
-            .unwrap()
-            .with_max_sessions(0);
-        assert_eq!(mgr.capacity(), 1);
-    }
-
-    /// Integration test: concurrent session processing via multiple tasks.
-    /// Verifies that sessions created from parallel tasks don't corrupt each other
-    /// and the LRU cache correctly evicts and reloads.
-    #[tokio::test]
-    async fn test_concurrent_session_processing() {
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-
-        let tmp = TempDir::new().unwrap();
-        let mgr = Arc::new(Mutex::new(
-            SessionManager::open(tmp.path())
-                .unwrap()
-                .with_max_sessions(5),
-        ));
-
-        // Spawn 10 tasks that each create a session and add messages
-        let mut handles = Vec::new();
-        for i in 0..10 {
-            let mgr = mgr.clone();
-            handles.push(tokio::spawn(async move {
-                let key = SessionKey::new("test", &format!("session-{i}"));
-                let mut mgr = mgr.lock().await;
-                mgr.add_message(
-                    &key,
-                    make_message(MessageRole::User, &format!("hello from {i}")),
-                )
-                .await
-                .unwrap();
-                mgr.add_message(
-                    &key,
-                    make_message(MessageRole::Assistant, &format!("reply to {i}")),
-                )
-                .await
-                .unwrap();
-            }));
-        }
-
-        for h in handles {
-            h.await.unwrap();
-        }
-
-        // Cache should be capped at 5
-        let mgr = mgr.lock().await;
-        assert!(mgr.cache_len() <= 5);
-
-        // But all 10 sessions should be loadable from disk
-        drop(mgr);
-        let mut fresh = SessionManager::open(tmp.path()).unwrap();
-        for i in 0..10 {
-            let key = SessionKey::new("test", &format!("session-{i}"));
-            let session = fresh.get_or_create(&key).await;
-            assert_eq!(
-                session.messages.len(),
-                2,
-                "session-{i} should have 2 messages"
-            );
-            assert_eq!(session.messages[0].content, format!("hello from {i}"));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_fork_persists_to_disk() {
-        let tmp = TempDir::new().unwrap();
-        let parent = SessionKey::new("cli", "main");
-
-        {
-            let mut mgr = SessionManager::open(tmp.path()).unwrap();
-            mgr.add_message(&parent, make_message(MessageRole::User, "hello"))
-                .await
-                .unwrap();
-            mgr.fork(&parent, "branch", 1).await.unwrap();
-        }
-
-        // Reload from disk
-        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
-        let child_key = SessionKey::new("cli", "branch");
-        let child = mgr2.get_or_create(&child_key).await;
-        assert_eq!(child.parent_key, Some(parent));
-        assert_eq!(child.messages.len(), 1);
-        assert_eq!(child.messages[0].content, "hello");
-    }
-
-    #[tokio::test]
-    async fn test_session_handle_fork_from_parent_if_missing_copies_recent_history() {
-        let tmp = TempDir::new().unwrap();
-        let parent = SessionKey::new("api", "web-parent");
-        let child = child_session_key(&parent, "task-123");
-
-        {
-            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
-            parent_handle
-                .add_message(make_message(MessageRole::User, "msg0"))
-                .await
-                .unwrap();
-            parent_handle
-                .add_message(make_message(MessageRole::Assistant, "msg1"))
-                .await
-                .unwrap();
-            parent_handle
-                .add_message(make_message(MessageRole::User, "msg2"))
-                .await
-                .unwrap();
-        }
-
-        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 2)
-            .await
-            .unwrap();
-
-        let child_handle = SessionHandle::open(tmp.path(), &child);
-        let child_session = child_handle.session();
-        assert_eq!(child_session.parent_key, Some(parent.clone()));
-        assert_eq!(child_session.messages.len(), 2);
-        assert_eq!(child_session.messages[0].content, "msg1");
-        assert_eq!(child_session.messages[1].content, "msg2");
-    }
-
-    #[tokio::test]
-    async fn test_session_handle_fork_from_parent_if_missing_is_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        let parent = SessionKey::new("api", "web-parent");
-        let child = child_session_key(&parent, "task-123");
-
-        {
-            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
-            parent_handle
-                .add_message(make_message(MessageRole::User, "msg0"))
-                .await
-                .unwrap();
-        }
-
-        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
-            .await
-            .unwrap();
-
-        {
-            let mut child_handle = SessionHandle::open(tmp.path(), &child);
-            child_handle
-                .add_message(make_message(MessageRole::Assistant, "child-result"))
-                .await
-                .unwrap();
-        }
-
-        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
-            .await
-            .unwrap();
-
-        let child_handle = SessionHandle::open(tmp.path(), &child);
-        let child_session = child_handle.session();
-        assert_eq!(child_session.messages.len(), 2);
-        assert_eq!(child_session.messages[1].content, "child-result");
-    }
-
-    #[tokio::test]
-    async fn test_child_session_contract_round_trips_through_disk() {
-        let tmp = TempDir::new().unwrap();
-        let parent = SessionKey::new("api", "parent");
-        let child = child_session_key(&parent, "task-contract");
-
-        {
-            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
-            parent_handle
-                .add_message(make_message(MessageRole::User, "seed"))
-                .await
-                .unwrap();
-        }
-
-        {
-            let mut child_handle = SessionHandle::open(tmp.path(), &child);
-            child_handle
-                .upsert_child_contract(ChildSessionContract {
-                    task_id: "task-123".to_string(),
-                    task_label: "Research".to_string(),
-                    parent_session_key: parent.to_string(),
-                    child_session_key: child.to_string(),
-                    workflow_kind: Some("deep_research".to_string()),
-                    current_phase: Some("research".to_string()),
-                    terminal_state: None,
-                    join_state: None,
-                    joined_at: None,
-                    failure_action: None,
-                    error: None,
-                    output_files: vec![],
-                })
-                .await
-                .unwrap();
-            child_handle
-                .upsert_child_contract(ChildSessionContract {
-                    task_id: "task-123".to_string(),
-                    task_label: "Research".to_string(),
-                    parent_session_key: parent.to_string(),
-                    child_session_key: child.to_string(),
-                    workflow_kind: Some("deep_research".to_string()),
-                    current_phase: Some("deliver_result".to_string()),
-                    terminal_state: Some(ChildSessionTerminalState::Completed),
-                    join_state: Some(ChildSessionJoinState::Joined),
-                    joined_at: Some(Utc::now()),
-                    failure_action: None,
-                    error: None,
-                    output_files: vec!["/tmp/report.md".to_string()],
-                })
-                .await
-                .unwrap();
-        }
-
-        assert!(SessionHandle::session_exists(tmp.path(), &child));
-
-        let child_handle = SessionHandle::open(tmp.path(), &child);
-        let child_session = child_handle.session();
-        assert_eq!(child_session.child_contracts.len(), 1);
-        let contract = &child_session.child_contracts[0];
-        assert_eq!(contract.task_id, "task-123");
-        assert_eq!(
-            contract.terminal_state,
-            Some(ChildSessionTerminalState::Completed)
-        );
-        assert_eq!(contract.join_state, Some(ChildSessionJoinState::Joined));
-        assert_eq!(contract.output_files, vec!["/tmp/report.md"]);
-        assert!(contract.joined_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_history() {
-        let tmp = TempDir::new().unwrap();
-        let parent = SessionKey::new("api", "web-parent");
-        let child = child_session_key(&parent, "task-linked");
-
-        {
-            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
-            parent_handle
-                .add_message(make_message(MessageRole::User, "parent-msg"))
-                .await
-                .unwrap();
-        }
-
-        {
-            let mut child_handle = SessionHandle::open(tmp.path(), &child);
-            child_handle
-                .add_message(make_message(MessageRole::Assistant, "existing-child-msg"))
-                .await
-                .unwrap();
-            assert_eq!(child_handle.session().parent_key, None);
-        }
-
-        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
-            .await
-            .unwrap();
-
-        let child_handle = SessionHandle::open(tmp.path(), &child);
-        let child_session = child_handle.session();
-        assert_eq!(child_session.parent_key, Some(parent));
-        assert_eq!(child_session.messages.len(), 1);
-        assert_eq!(child_session.messages[0].content, "existing-child-msg");
-    }
-
-    #[tokio::test]
-    async fn test_load_rejects_oversized_file() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let key = SessionKey::new("cli", "huge");
-
-        // Write a normal message so the file exists
-        mgr.add_message(&key, make_message(MessageRole::User, "seed"))
-            .await
-            .unwrap();
-
-        // Evict from cache so next access must load from disk
-        mgr.cache.pop(&key.0);
-
-        // Overwrite the file with junk exceeding the size limit
-        let path = mgr.session_path(&key);
-        let junk = "x".repeat((MAX_SESSION_FILE_SIZE as usize) + 1);
-        std::fs::write(&path, junk).unwrap();
-
-        // load_from_disk should return None for oversized file
-        assert!(mgr.load_from_disk(&key).await.is_none());
-    }
-
-    #[test]
-    fn test_truncated_session_keys_no_collision() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap();
-
-        // Create two keys that share the same 200-char prefix but differ after
-        let prefix = "a".repeat(200);
-        let key1 = SessionKey(format!("{prefix}_suffix1"));
-        let key2 = SessionKey(format!("{prefix}_suffix2"));
-
-        let path1 = mgr.session_path(&key1);
-        let path2 = mgr.session_path(&key2);
-        assert_ne!(
-            path1, path2,
-            "truncated keys with different suffixes must produce different paths"
-        );
-    }
-
-    #[test]
-    fn test_decode_filename() {
-        assert_eq!(
-            SessionManager::decode_filename("feishu%3Aoc_abc123"),
-            "feishu:oc_abc123"
-        );
-        assert_eq!(
-            SessionManager::decode_filename("cli%3Adefault"),
-            "cli:default"
-        );
-        assert_eq!(SessionManager::decode_filename("plain-name"), "plain-name");
-        // Double-byte UTF-8 round-trip
-        assert_eq!(
-            SessionManager::decode_filename("hello%E4%B8%96%E7%95%8C"),
-            "hello\u{4e16}\u{754c}" // hello世界
-        );
-    }
-
-    #[tokio::test]
-    async fn test_list_sessions_returns_decoded_keys() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let key = SessionKey::new("feishu", "oc_abc123");
-
-        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
-            .await
-            .unwrap();
-
-        let sessions = mgr.list_sessions();
-        assert_eq!(sessions.len(), 1);
-        // Should return decoded key, not percent-encoded filename
-        assert_eq!(sessions[0].0, "feishu:oc_abc123");
-    }
-
-    /// Issue #607 §D: `/api/sessions` hung 30 s+ on a user dir with 65 535
-    /// `child-*.jsonl` siblings because the listing iterated every JSONL.
-    /// `list_top_level_sessions` must skip `child-*` and `*.tasks` files at
-    /// the directory walk so the cost stays O(top-level sessions).
-    #[tokio::test]
-    async fn list_top_level_sessions_skips_child_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let parent = SessionKey::new("api", "web-parent");
-
-        // 1 top-level session.
-        mgr.add_message(&parent, make_message(MessageRole::User, "parent"))
-            .await
-            .unwrap();
-
-        // 100 child sessions written via the same canonical handle code path
-        // production uses (so the test exercises real filename encoding).
-        for i in 0..100 {
-            let child = child_session_key(&parent, &format!("task-{i:03}"));
-            mgr.add_message(&child, make_message(MessageRole::Assistant, "child"))
-                .await
-                .unwrap();
-        }
-
-        // The all-inclusive walk reflects every jsonl on disk (1 parent +
-        // 100 children).
-        let all = mgr.list_sessions();
-        assert_eq!(all.len(), 101, "internal walk should include children");
-
-        // The user-facing listing must surface only the top-level session.
-        let top = mgr.list_top_level_sessions();
-        assert_eq!(
-            top.len(),
-            1,
-            "list_top_level_sessions must skip child-* fanouts; got {top:?}"
-        );
-        assert_eq!(top[0].0, "api:web-parent");
-    }
-
-    /// Sidecar `*.tasks.jsonl` ledgers (e.g. `default.tasks.jsonl`) are an
-    /// internal runtime detail and must never appear in the user-facing
-    /// listing.
-    #[test]
-    fn list_top_level_sessions_skips_tasks_sidecar_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap();
-
-        // Construct a per-user dir directly so we can drop in both a
-        // top-level `default.jsonl` and an internal `default.tasks.jsonl`
-        // without having to drive the task-ledger writers in this unit.
-        let user_dir = tmp.path().join("users/api%3Aweb-tasks/sessions");
-        std::fs::create_dir_all(&user_dir).unwrap();
-
-        let meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": "api:web-tasks",
-            "created_at": Utc::now(),
-            "updated_at": Utc::now(),
-        });
-        std::fs::write(
-            user_dir.join("default.jsonl"),
-            format!("{}\n", serde_json::to_string(&meta).unwrap()),
-        )
-        .unwrap();
-        // Sidecar — must be ignored.
-        std::fs::write(
-            user_dir.join("default.tasks.jsonl"),
-            "{\"task_id\":\"t-1\",\"state\":\"queued\"}\n",
-        )
-        .unwrap();
-
-        let top = mgr.list_top_level_sessions();
-        let ids: Vec<&str> = top.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["api:web-tasks"], "got {top:?}");
-    }
-
-    /// Regression guard for the O(N) hang. With 5 000 synthetic
-    /// `child-*.jsonl` files on disk, `list_top_level_sessions` must stay
-    /// well under the 500 ms bound — the original `list_sessions`
-    /// `count_lines`-per-file loop blew past 30 s in the wild on a dir
-    /// 13× larger.
-    #[test]
-    fn list_top_level_sessions_is_fast_with_many_child_jsonls() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap();
-
-        let user_dir = tmp.path().join("users/api%3Aweb-river/sessions");
-        std::fs::create_dir_all(&user_dir).unwrap();
-
-        // Top-level session.
-        std::fs::write(
-            user_dir.join("default.jsonl"),
-            "{\"schema_version\":1,\"session_key\":\"api:web-river\",\
-             \"created_at\":\"2024-01-01T00:00:00Z\",\
-             \"updated_at\":\"2024-01-01T00:00:00Z\"}\n",
-        )
-        .unwrap();
-
-        // Synthetic spawn fanout.
-        const FANOUT: usize = 5_000;
-        for i in 0..FANOUT {
-            std::fs::write(
-                user_dir.join(format!("child-task-{i:05}.jsonl")),
-                "{\"schema_version\":1}\n{\"role\":\"assistant\",\"content\":\"x\"}\n",
-            )
-            .unwrap();
-        }
-
-        let start = std::time::Instant::now();
-        let top = mgr.list_top_level_sessions();
-        let elapsed = start.elapsed();
-
-        assert_eq!(top.len(), 1, "only top-level session should surface");
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "list_top_level_sessions took {elapsed:?} for {FANOUT} child files; \
-             the per-file count_lines fallback regressed",
-        );
-    }
-
-    #[test]
-    fn test_short_key_no_hash_suffix() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap();
-
-        let key = SessionKey::new("cli", "short");
-        let path = mgr.session_path(&key);
-        let name = path.file_stem().unwrap().to_str().unwrap();
-        // Short keys should not have hash suffix (no underscore + hex)
-        assert!(!name.contains('_') || name.len() < 200);
-    }
-
-    #[tokio::test]
-    async fn test_list_sessions_for_chat() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-
-        // Create default session + two topic sessions
-        let base = SessionKey::new("telegram", "12345");
-        let research = SessionKey::with_topic("telegram", "12345", "research");
-        let code = SessionKey::with_topic("telegram", "12345", "code");
-        // Unrelated session
-        let other = SessionKey::new("telegram", "99999");
-
-        mgr.add_message(&base, make_message(MessageRole::User, "hello default"))
-            .await
-            .unwrap();
-        mgr.add_message(&research, make_message(MessageRole::User, "hello research"))
-            .await
-            .unwrap();
-        mgr.add_message(&code, make_message(MessageRole::User, "hello code"))
-            .await
-            .unwrap();
-        mgr.add_message(&other, make_message(MessageRole::User, "unrelated"))
-            .await
-            .unwrap();
-
-        let entries = mgr.list_sessions_for_chat("telegram:12345");
-        assert_eq!(entries.len(), 3);
-
-        let topics: Vec<Option<String>> = entries.iter().map(|e| e.topic.clone()).collect();
-        assert!(topics.contains(&None)); // default
-        assert!(topics.contains(&Some("research".into())));
-        assert!(topics.contains(&Some("code".into())));
-
-        // Each has 1 message
-        for e in &entries {
-            assert_eq!(e.message_count, 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_session_topic_persists() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::with_topic("telegram", "12345", "research");
-
-        {
-            let mut mgr = SessionManager::open(tmp.path()).unwrap();
-            mgr.add_message(&key, make_message(MessageRole::User, "topic data"))
-                .await
-                .unwrap();
-        }
-
-        // Reload and verify topic
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let session = mgr.get_or_create(&key).await;
-        assert_eq!(session.topic.as_deref(), Some("research"));
-    }
-
-    #[tokio::test]
-    async fn test_update_summary() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("telegram", "12345");
-
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
-            .await
-            .unwrap();
-        mgr.update_summary(&key, "A test session".into())
-            .await
-            .unwrap();
-
-        // Reload and verify summary
-        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
-        let session = mgr2.get_or_create(&key).await;
-        assert_eq!(session.summary.as_deref(), Some("A test session"));
-    }
-
-    #[tokio::test]
-    async fn should_persist_title_separately_from_summary_when_renamed() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("telegram", "12345");
-
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
-            .await
-            .unwrap();
-        mgr.update_title(&key, "Custom title".into()).await.unwrap();
-        mgr.update_summary(&key, "Long-form summary".into())
-            .await
-            .unwrap();
-
-        // Reload from disk and verify title + summary are independent.
-        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
-        let session = mgr2.get_or_create(&key).await;
-        assert_eq!(session.title.as_deref(), Some("Custom title"));
-        assert_eq!(session.summary.as_deref(), Some("Long-form summary"));
-    }
-
-    #[tokio::test]
-    async fn should_auto_derive_title_from_first_user_message_when_unset() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("telegram", "12345");
-
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        mgr.add_message(
-            &key,
-            make_message(MessageRole::User, "What is the weather today?"),
-        )
-        .await
-        .unwrap();
-
-        let session = mgr.get_or_create(&key).await;
-        assert_eq!(
-            session.title.as_deref(),
-            Some("What is the weather today?"),
-            "first user message should auto-populate title"
-        );
-    }
-
-    #[tokio::test]
-    async fn should_not_overwrite_manual_title_when_subsequent_messages_arrive() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("telegram", "12345");
-
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        mgr.update_title(&key, "Manual title".into()).await.unwrap();
-        mgr.add_message(&key, make_message(MessageRole::User, "first user message"))
-            .await
-            .unwrap();
-        mgr.add_message(&key, make_message(MessageRole::User, "second user message"))
-            .await
-            .unwrap();
-
-        let session = mgr.get_or_create(&key).await;
-        assert_eq!(
-            session.title.as_deref(),
-            Some("Manual title"),
-            "manual title must be preserved across new messages"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_handle_should_auto_derive_title_from_first_user_message() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "fix-617b-handle-derive-test");
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-        handle
-            .add_message(make_message(
-                MessageRole::User,
-                "What's the weather in San Francisco?",
-            ))
-            .await
-            .unwrap();
-
-        // Reload from disk via SessionHandle::open (forces JSONL deserialize)
-        let handle2 = SessionHandle::open(tmp.path(), &key);
-        assert_eq!(
-            handle2.session().title.as_deref(),
-            Some("What's the weather in San Francisco?"),
-            "SessionHandle::add_message_with_seq must auto-derive title"
-        );
-    }
-
-    #[tokio::test]
-    async fn should_truncate_auto_derived_title_to_50_chars() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("telegram", "12345");
-
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let long_message = "a".repeat(200);
-        mgr.add_message(&key, make_message(MessageRole::User, &long_message))
-            .await
-            .unwrap();
-
-        let session = mgr.get_or_create(&key).await;
-        let title = session.title.as_deref().unwrap();
-        assert!(
-            title.chars().count() <= 50,
-            "title should be at most 50 chars, got {}",
-            title.chars().count()
-        );
-    }
-
-    #[test]
-    fn test_active_session_store() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = ActiveSessionStore::open(tmp.path()).unwrap();
-
-        // Default: no topic
-        assert_eq!(store.get_active_topic("telegram:12345"), "");
-        let key = store.resolve_session_key("telegram:12345");
-        assert_eq!(key.0, "telegram:12345");
-
-        // Switch to "research"
-        store.switch_to("telegram:12345", "research").unwrap();
-        assert_eq!(store.get_active_topic("telegram:12345"), "research");
-        let key = store.resolve_session_key("telegram:12345");
-        assert_eq!(key.0, "telegram:12345#research");
-
-        // Switch to "code"
-        store.switch_to("telegram:12345", "code").unwrap();
-        assert_eq!(store.get_active_topic("telegram:12345"), "code");
-
-        // Go back -> should return "research"
-        let prev = store.go_back("telegram:12345").unwrap();
-        assert_eq!(prev, Some("research".into()));
-        assert_eq!(store.get_active_topic("telegram:12345"), "research");
-    }
-
-    #[test]
-    fn test_active_session_store_persistence() {
-        let tmp = TempDir::new().unwrap();
-
-        {
-            let mut store = ActiveSessionStore::open(tmp.path()).unwrap();
-            store.switch_to("telegram:12345", "research").unwrap();
-        }
-
-        // Reload
-        let store = ActiveSessionStore::open(tmp.path()).unwrap();
-        assert_eq!(store.get_active_topic("telegram:12345"), "research");
-    }
-
-    #[test]
-    fn test_validate_topic_name() {
-        assert!(validate_topic_name("research").is_ok());
-        assert!(validate_topic_name("my-code").is_ok());
-        assert!(validate_topic_name("work_notes").is_ok());
-        assert!(validate_topic_name("").is_err());
-        assert!(validate_topic_name("a#b").is_err());
-        assert!(validate_topic_name("a:b").is_err());
-        assert!(validate_topic_name("a/b").is_err());
-        assert!(validate_topic_name(&"x".repeat(51)).is_err());
-
-        // Reserved: "default" is the no-topic filename in the per-user
-        // layout. Allowing a user-named "default" topic would silently
-        // collide with the topic-less mapping.
-        assert!(validate_topic_name("default").is_err());
-        assert!(validate_topic_name("DEFAULT").is_err());
-        assert!(validate_topic_name("Default").is_err());
-    }
-
-    #[tokio::test]
-    async fn test_append_respects_file_size_limit() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let key = SessionKey::new("cli", "big");
-
-        // Write a seed message
-        mgr.add_message(&key, make_message(MessageRole::User, "seed"))
-            .await
-            .unwrap();
-
-        // Manually inflate the file to just under the limit
-        let path = mgr.session_path(&key);
-        let padding = "x".repeat((MAX_SESSION_FILE_SIZE as usize) - 10);
-        std::fs::write(&path, padding).unwrap();
-
-        // Append should silently skip (file is at limit)
-        mgr.add_message(&key, make_message(MessageRole::User, "should not append"))
-            .await
-            .unwrap();
-
-        // File should not have grown significantly
-        let size = std::fs::metadata(&path).unwrap().len();
-        assert!(size < MAX_SESSION_FILE_SIZE + 1000);
-    }
-
-    #[tokio::test]
-    async fn test_load_rejects_future_schema_version() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap();
-        let key = SessionKey::new("cli", "future");
-
-        // Write a session file with schema version 999
-        let meta = serde_json::json!({
-            "schema_version": 999,
-            "session_key": "cli:future",
-            "created_at": "2025-01-01T00:00:00Z",
-            "updated_at": "2025-01-01T00:00:00Z"
-        });
-        let path = mgr.session_path(&key);
-        let content = format!("{}\n", serde_json::to_string(&meta).unwrap());
-        std::fs::write(&path, content).unwrap();
-
-        // Should refuse to load
-        assert!(mgr.load_from_disk(&key).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_load_from_disk_merges_flat_and_per_user_histories() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap();
-        let key = SessionKey::with_profile("dspfac", "api", "slides-123");
-
-        let older = chrono::Utc::now() - chrono::Duration::minutes(2);
-        let newer = older + chrono::Duration::minutes(1);
-
-        let flat_meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": key.0,
-            "created_at": older,
-            "updated_at": newer
-        });
-        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
-        std::fs::write(
-            mgr.session_path(&key),
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&flat_meta).unwrap(),
-                serde_json::to_string(&Message {
-                    role: MessageRole::Assistant,
-                    content: "artifact".into(),
-                    media: vec!["/tmp/file.png".into()],
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    client_message_id: None,
-                    thread_id: None,
-                    timestamp: newer,
-                })
-                .unwrap()
-            ),
-        )
-        .unwrap();
-
-        let encoded_base = encode_path_component(key.base_key());
-        let per_user_dir = tmp.path().join("users").join(encoded_base).join("sessions");
-        std::fs::create_dir_all(&per_user_dir).unwrap();
-        let per_user_meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": key.0,
-            "created_at": older,
-            "updated_at": older
-        });
-        std::fs::write(
-            per_user_dir.join("default.jsonl"),
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&per_user_meta).unwrap(),
-                serde_json::to_string(&Message {
-                    role: MessageRole::User,
-                    content: "make slides".into(),
-                    media: vec![],
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    client_message_id: None,
-                    thread_id: None,
-                    timestamp: older,
-                })
-                .unwrap()
-            ),
-        )
-        .unwrap();
-
-        let session = mgr
-            .load_from_disk(&key)
-            .await
-            .expect("expected merged session");
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].content, "make slides");
-        assert_eq!(session.messages[1].content, "artifact");
-        assert_eq!(session.updated_at, newer);
-    }
-
-    #[tokio::test]
-    async fn test_purge_stale_sessions() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = SessionManager::open(tmp.path()).unwrap();
-
-        // Create a session
-        let key = SessionKey::new("cli", "old-session");
-        mgr.add_message(&key, make_message(MessageRole::User, "old"))
-            .await
-            .unwrap();
-
-        // Manually backdate the session metadata to 100 days ago
-        let path = mgr.session_path(&key);
-        let content = std::fs::read_to_string(&path).unwrap();
-        let mut lines: Vec<&str> = content.lines().collect();
-        let mut meta: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        let old_date = (Utc::now() - chrono::Duration::days(100))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-        meta["updated_at"] = serde_json::Value::String(old_date);
-        lines[0] = &serde_json::to_string(&meta).unwrap();
-        // Need to own the string for lines[0]
-        let meta_str = serde_json::to_string(&meta).unwrap();
-        let new_content = format!(
-            "{}\n{}\n",
-            meta_str,
-            content.lines().skip(1).collect::<Vec<_>>().join("\n")
-        );
-        std::fs::write(&path, new_content).unwrap();
-
-        // Purge sessions older than 90 days
-        let removed = mgr.purge_stale(90);
-        assert_eq!(removed, 1);
-
-        // File should be gone
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn test_list_user_sessions_merges_both_layouts() {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::open(tmp.path()).unwrap();
-
-        let now = Utc::now();
-        let older = now - chrono::Duration::hours(2);
-        let old = now - chrono::Duration::hours(1);
-
-        // --- Legacy flat layout ---
-        // Default session (older timestamp — should be superseded by per-user default)
-        let legacy_default_meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": "telegram:12345",
-            "created_at": older,
-            "updated_at": older
-        });
-        let legacy_default_path = tmp.path().join("sessions/telegram%3A12345.jsonl");
-        std::fs::write(
-            &legacy_default_path,
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&legacy_default_meta).unwrap(),
-                serde_json::to_string(&make_message(MessageRole::User, "legacy default")).unwrap()
-            ),
-        )
-        .unwrap();
-
-        // "research" topic — only exists in legacy
-        let legacy_research_meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": "telegram:12345#research",
-            "topic": "research",
-            "created_at": old,
-            "updated_at": old
-        });
-        let legacy_research_path = tmp
-            .path()
-            .join("sessions/telegram%3A12345%23research.jsonl");
-        std::fs::write(
-            &legacy_research_path,
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&legacy_research_meta).unwrap(),
-                serde_json::to_string(&make_message(MessageRole::User, "legacy research")).unwrap()
-            ),
-        )
-        .unwrap();
-
-        // --- Per-user layout ---
-        let user_sessions_dir = tmp.path().join("users/telegram%3A12345/sessions");
-        std::fs::create_dir_all(&user_sessions_dir).unwrap();
-
-        // Default session (newer — should win over legacy default)
-        let peruser_default_meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": "telegram:12345",
-            "created_at": old,
-            "updated_at": now
-        });
-        std::fs::write(
-            user_sessions_dir.join("default.jsonl"),
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&peruser_default_meta).unwrap(),
-                serde_json::to_string(&make_message(MessageRole::User, "peruser default")).unwrap()
-            ),
-        )
-        .unwrap();
-
-        // "coding" topic — only exists in per-user
-        let peruser_coding_meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": "telegram:12345#coding",
-            "topic": "coding",
-            "created_at": old,
-            "updated_at": old
-        });
-        std::fs::write(
-            user_sessions_dir.join("coding.jsonl"),
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&peruser_coding_meta).unwrap(),
-                serde_json::to_string(&make_message(MessageRole::User, "peruser coding")).unwrap()
-            ),
-        )
-        .unwrap();
-
-        // --- Call list_user_sessions and assert ---
-        let entries = mgr.list_user_sessions("telegram:12345");
-
-        // Should have 3 entries: default (per-user), research (legacy), coding (per-user)
-        assert_eq!(entries.len(), 3, "expected 3 entries, got: {entries:?}");
-
-        // Sorted by updated_at descending: default(now) > research(old) >= coding(old)
-        let topics: Vec<Option<&str>> = entries.iter().map(|e| e.topic.as_deref()).collect();
-
-        // Default session (from per-user, not legacy) should be first (newest)
-        assert_eq!(
-            entries[0].topic, None,
-            "first entry should be default session"
-        );
-        assert_eq!(
-            entries[0].updated_at, now,
-            "default session should come from per-user layout (newer timestamp)"
-        );
-
-        // "research" and "coding" should both be present
-        assert!(
-            topics.contains(&Some("research")),
-            "research topic should be included from legacy"
-        );
-        assert!(
-            topics.contains(&Some("coding")),
-            "coding topic should be included from per-user"
-        );
-
-        // Each entry should have 1 message
-        for e in &entries {
-            assert_eq!(e.message_count, 1, "each session should have 1 message");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_session_handle_add_message_with_seq_returns_committed_index() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "web-seq-test");
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-
-        let first = handle
-            .add_message_with_seq(make_message(MessageRole::User, "hello"))
-            .await
-            .unwrap();
-        let second = handle
-            .add_message_with_seq(make_message(MessageRole::Assistant, "world"))
-            .await
-            .unwrap();
-
-        assert_eq!(first, 0);
-        assert_eq!(second, 1);
-        assert_eq!(handle.get_history(10).len(), 2);
-    }
-
-    #[tokio::test]
-    async fn add_message_preserves_client_message_id_through_jsonl_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "web-cmid-test");
-
-        // First handle: persist a user message tagged with a client_message_id.
-        {
-            let mut handle = SessionHandle::open(tmp.path(), &key);
-            let user_msg = Message::user("hi there").with_client_message_id("cmid-xyz");
-            let seq = handle.add_message_with_seq(user_msg).await.unwrap();
-            assert_eq!(seq, 0);
-        }
-
-        // Reopen the handle: it should reload from JSONL and the
-        // client_message_id field must survive the disk round-trip.
-        {
-            let handle = SessionHandle::open(tmp.path(), &key);
-            let history = handle.get_history(10);
-            assert_eq!(history.len(), 1);
-            assert_eq!(history[0].content, "hi there");
-            assert_eq!(
-                history[0].client_message_id.as_deref(),
-                Some("cmid-xyz"),
-                "client_message_id must survive append-and-reload"
-            );
-        }
-    }
-
-    #[test]
-    fn test_session_handle_task_state_path_uses_sidecar_file() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "web-task-ledger");
-        let handle = SessionHandle::open(tmp.path(), &key);
-
-        let path = handle.task_state_path();
-        assert!(path.ends_with("default.tasks.jsonl"));
-        assert_eq!(
-            path.parent().unwrap(),
-            handle.session_path().parent().unwrap()
-        );
-    }
-
-    #[test]
-    fn test_child_session_key_derivation_is_stable() {
-        let parent = SessionKey::new("api", "web-task-ledger");
-        let child = child_session_key(&parent, "spawn-01/alpha beta");
-
-        assert_eq!(child.0, "api:web-task-ledger#child-spawn-01%2Falpha%20beta");
-        assert_eq!(child.base_key(), "api:web-task-ledger");
-        assert_eq!(child.topic(), Some("child-spawn-01%2Falpha%20beta"));
-    }
-
-    /// M8.6: `sanitize_loaded_messages` replaces the session's in-memory
-    /// transcript with the cleaned-up version and returns the report. No
-    /// disk state is touched until the caller rewrites.
-    #[test]
-    fn should_sanitize_loaded_messages_in_place() {
-        use octos_core::ToolCall;
-
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "resume-test");
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-
-        // Load an unresolved tool_call + a whitespace-only assistant
-        // message into the handle directly.
-        handle
-            .session
-            .messages
-            .push(make_message(MessageRole::User, "hi"));
-        handle.session.messages.push(Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "unresolved-1".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        });
-        handle.session.messages.push(Message {
-            role: MessageRole::Assistant,
-            content: "   ".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        });
-
-        let before = handle.session.messages.len();
-        let (report, refs) = handle
-            .sanitize_loaded_messages(None, None)
-            .expect("clean outcome — no workspace root");
-
-        assert_eq!(report.input_len, before);
-        assert_eq!(report.unresolved_tool_uses_dropped, 1);
-        assert_eq!(report.whitespace_only_dropped, 1);
-        assert_eq!(report.output_len, 1);
-        assert!(refs.is_empty());
-        // Handle was mutated in place.
-        assert_eq!(handle.session.messages.len(), 1);
-        assert_eq!(handle.session.messages[0].content, "hi");
-    }
-
-    /// M8.6: a missing worktree surfaces as `Err` and DOES NOT mutate the
-    /// session's in-memory transcript — callers can still log what was
-    /// loaded before deciding to refuse resume.
-    #[test]
-    fn should_preserve_messages_when_worktree_missing() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "resume-no-worktree");
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-
-        handle
-            .session
-            .messages
-            .push(make_message(MessageRole::User, "hi"));
-        handle
-            .session
-            .messages
-            .push(make_message(MessageRole::Assistant, "there"));
-
-        let gone = tmp.path().join("ghost-worktree");
-        let before_count = handle.session.messages.len();
-
-        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
-
-        match outcome {
-            Err(crate::SanitizeError::WorktreeMissing { path, .. }) => {
-                assert_eq!(path, gone);
-            }
-            other => panic!("expected WorktreeMissing, got {other:?}"),
-        }
-        // Transcript is preserved.
-        assert_eq!(handle.session.messages.len(), before_count);
-    }
-
-    // ----------------------------------------------------------------------
-    // Item 3 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
-    // worktree-missing must be a hard resume refusal. The session actor
-    // calls `clear_messages_for_unsafe_resume()` on Err so the in-memory
-    // transcript cannot be silently consumed by the first LLM call.
-    // ----------------------------------------------------------------------
-
-    #[test]
-    fn session_actor_refuses_resume_when_worktree_missing() {
-        // Top-level session whose worktree was cleaned up. After the actor
-        // clears the in-memory transcript, the handle must look like a
-        // fresh session.
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "top-level-refusal");
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-        handle
-            .session
-            .messages
-            .push(make_message(MessageRole::User, "do thing"));
-        handle.session.messages.push(make_message(
-            MessageRole::Assistant,
-            "I'll start working on it",
-        ));
-
-        // Step 1: sanitize sees a missing worktree and returns Err.
-        let gone = tmp.path().join("ghost-worktree");
-        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
-        assert!(matches!(
-            outcome,
-            Err(crate::SanitizeError::WorktreeMissing { .. })
-        ));
-
-        // Step 2: session_actor responds with a hard refusal.
-        assert!(
-            !handle.is_child_session(),
-            "test fixture is top-level (no parent_key)"
-        );
-        handle.clear_messages_for_unsafe_resume();
-        assert_eq!(
-            handle.session.messages.len(),
-            0,
-            "top-level worktree-missing refusal must drop the in-memory transcript"
-        );
-    }
-
-    #[test]
-    fn session_actor_does_not_continue_with_unsanitized_transcript_on_worktree_missing() {
-        // The legacy "warn and continue" branch left the original
-        // transcript in `handle.session.messages` so the next LLM call
-        // would see unresolved tool_calls / orphan thinking. Verify the
-        // post-clear state is empty.
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "no-unsafe-llm-call");
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-        // Add a transcript that previously would have been consumed unsafely:
-        //   user → assistant with unresolved tool_call (no matching Tool result).
-        handle
-            .session
-            .messages
-            .push(make_message(MessageRole::User, "go"));
-        handle.session.messages.push(Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![octos_core::ToolCall {
-                id: "unresolved-1".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: Utc::now(),
-        });
-
-        let gone = tmp.path().join("ghost-worktree");
-        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
-        assert!(matches!(
-            outcome,
-            Err(crate::SanitizeError::WorktreeMissing { .. })
-        ));
-        // Even though the sanitizer DID NOT mutate, the actor's hard
-        // refusal must clear before any consumer reads `messages()`.
-        handle.clear_messages_for_unsafe_resume();
-        assert!(
-            handle.session.messages.is_empty(),
-            "no first LLM call must be made using the unsafe transcript"
-        );
-    }
-
-    #[test]
-    fn background_child_session_marks_failed_when_worktree_missing() {
-        // A child session has parent_key set. The session actor uses
-        // `is_child_session()` to drive a "mark task failed" decision in
-        // the supervisor (top-level decision is "drop transcript and
-        // start fresh"). The state-clear is the same on both branches —
-        // the difference is the operator-visible signal. We verify the
-        // parent linkage flows through here so the actor can branch on it.
-        let tmp = TempDir::new().unwrap();
-        let parent = SessionKey::new("api", "parent-task");
-        let child = SessionKey::new("api", "parent-task#child-job-01");
-        let mut child_handle = SessionHandle::open(tmp.path(), &child);
-        child_handle.session.parent_key = Some(parent.clone());
-        child_handle
-            .session
-            .messages
-            .push(make_message(MessageRole::User, "run"));
-
-        assert!(
-            child_handle.is_child_session(),
-            "child session must report is_child_session=true"
-        );
-
-        let gone = tmp.path().join("ghost-child-worktree");
-        let outcome = child_handle.sanitize_loaded_messages(None, Some(&gone));
-        assert!(matches!(
-            outcome,
-            Err(crate::SanitizeError::WorktreeMissing { .. })
-        ));
-        child_handle.clear_messages_for_unsafe_resume();
-        assert_eq!(
-            child_handle.session.messages.len(),
-            0,
-            "child worktree-missing refusal must also clear the unsafe transcript"
-        );
-        // Parent linkage survives the clear so the supervisor can find
-        // the parent on its mark-failed lookup.
-        assert_eq!(child_handle.session.parent_key, Some(parent));
-    }
-
-    /// Helper to build the legacy-flat path for a key.
-    fn legacy_session_path(data_dir: &Path, key: &SessionKey) -> PathBuf {
-        SessionManager::session_path_static(&data_dir.join("sessions"), key)
-    }
-
-    /// Helper to build the per-user session path for a key.
-    fn per_user_session_path(data_dir: &Path, key: &SessionKey) -> PathBuf {
-        let encoded_base = encode_path_component(key.base_key());
-        let topic = key.topic().unwrap_or("default");
-        let encoded_topic = encode_path_component(topic);
-        data_dir
-            .join("users")
-            .join(&encoded_base)
-            .join("sessions")
-            .join(format!("{encoded_topic}.jsonl"))
-    }
-
-    /// Helper to build the migration marker path for a key.
-    fn migration_marker_path_for(data_dir: &Path, key: &SessionKey) -> PathBuf {
-        let encoded_base = encode_path_component(key.base_key());
-        let topic = key.topic().unwrap_or("default");
-        let encoded_topic = encode_path_component(topic);
-        data_dir
-            .join("users")
-            .join(&encoded_base)
-            .join("sessions")
-            .join(format!(".migrated.{encoded_topic}"))
-    }
-
-    /// Write a minimal JSONL with one user message at `path`.
-    fn write_jsonl_with_one_user_message(path: &Path, key: &SessionKey, content: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": key.0,
-            "topic": key.topic(),
-            "created_at": Utc::now(),
-            "updated_at": Utc::now(),
-        });
-        let msg = make_message(MessageRole::User, content);
-        let body = format!(
-            "{}\n{}\n",
-            serde_json::to_string(&meta).unwrap(),
-            serde_json::to_string(&msg).unwrap()
-        );
-        std::fs::write(path, body).unwrap();
-    }
-
-    #[test]
-    fn migration_marker_skips_redundant_migration_when_present() {
-        // Pre-condition: a per-user JSONL exists, the legacy flat file ALSO
-        // exists (e.g. from a stale prior boot), and the per-key migration
-        // marker is present — meaning a previous open already migrated and
-        // confirmed remove. On `SessionHandle::open` we must skip the legacy
-        // load AND the legacy delete entirely: the marker is the authoritative
-        // signal that migration completed, so the per-user file wins and the
-        // stale legacy file is left untouched (a separate operator cleanup
-        // can remove it).
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "marker-skip");
-
-        // 1) Per-user JSONL with the canonical content.
-        let per_user_path = per_user_session_path(tmp.path(), &key);
-        write_jsonl_with_one_user_message(&per_user_path, &key, "canonical");
-
-        // 2) Stale legacy file with DIFFERENT content. If migration runs
-        //    redundantly it would overwrite the per-user file with this
-        //    legacy content — the test catches that.
-        let legacy_path = legacy_session_path(tmp.path(), &key);
-        write_jsonl_with_one_user_message(&legacy_path, &key, "STALE-LEGACY");
-
-        // 3) Migration marker present.
-        let marker = migration_marker_path_for(tmp.path(), &key);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, b"migrated-from-flat\n").unwrap();
-
-        // Open the handle — must skip legacy entirely.
-        let handle = SessionHandle::open(tmp.path(), &key);
-        let session = handle.session();
-
-        assert_eq!(
-            session.messages.len(),
-            1,
-            "marker present: must load per-user only, not merge legacy"
-        );
-        assert_eq!(
-            session.messages[0].content, "canonical",
-            "marker present: per-user content must win, legacy must NOT overwrite"
-        );
-
-        // Stale legacy file must remain untouched (we didn't delete it).
-        assert!(
-            legacy_path.exists(),
-            "marker present + stale legacy: legacy file must remain (no redundant remove)"
-        );
-        // Marker still present.
-        assert!(marker.exists(), "marker must remain after open");
-    }
-
-    #[test]
-    fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
-        // Pre-condition: a previous open succeeded `rewrite_blocking` (per-user
-        // file written) but `remove_file(legacy)` failed (transient errno) —
-        // so we ended up with both files on disk and NO marker. The next open
-        // must detect this partial-migration shape and best-effort RETRY the
-        // legacy removal. On success the marker is written.
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "marker-retry");
-
-        // 1) Per-user JSONL exists — canonical state.
-        let per_user_path = per_user_session_path(tmp.path(), &key);
-        write_jsonl_with_one_user_message(&per_user_path, &key, "canonical");
-
-        // 2) Legacy file ALSO exists (the failed-remove leftover).
-        let legacy_path = legacy_session_path(tmp.path(), &key);
-        write_jsonl_with_one_user_message(&legacy_path, &key, "legacy-leftover");
-
-        // 3) Marker is ABSENT.
-        let marker = migration_marker_path_for(tmp.path(), &key);
-        assert!(
-            !marker.exists(),
-            "precondition: marker must not exist for this case"
-        );
-
-        // Open the handle — must retry the legacy removal.
-        let _handle = SessionHandle::open(tmp.path(), &key);
-
-        assert!(
-            !legacy_path.exists(),
-            "legacy file must be removed by the retry-on-open path"
-        );
-        assert!(
-            marker.exists(),
-            "marker must be written after the retry succeeds"
-        );
-    }
-
-    // ---- M8.10 PR #1: thread_id persistence + legacy synthesis ---------------
-
-    /// Build a Message with a specific role and `client_message_id` for tests.
-    fn make_message_with_cmid(
-        role: MessageRole,
-        content: &str,
-        client_message_id: Option<&str>,
-    ) -> Message {
-        let mut m = make_message(role, content);
-        m.client_message_id = client_message_id.map(String::from);
-        m
-    }
-
-    #[tokio::test]
-    async fn should_round_trip_thread_id() {
-        // M8.10 PR #1: a freshly-arrived user message with a `client_message_id`
-        // becomes the thread_id; the assistant reply inherits it; both survive
-        // a JSONL save/load round-trip.
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "thread-roundtrip");
-
-        {
-            let mut handle = SessionHandle::open(tmp.path(), &key);
-            handle
-                .add_message(make_message_with_cmid(
-                    MessageRole::User,
-                    "ask",
-                    Some("cmid-alpha"),
-                ))
-                .await
-                .unwrap();
-            // PR F (M8.10): caller pre-stamps Assistant with the
-            // originating turn's `thread_id`. In production this is the
-            // canonical helper `persist_assistant_message` (see
-            // `octos-cli/src/session_actor.rs`); the test mirrors that.
-            let mut assistant = make_message(MessageRole::Assistant, "answer");
-            assistant.thread_id = Some("cmid-alpha".into());
-            handle.add_message(assistant).await.unwrap();
-        }
-
-        let reload = SessionHandle::open(tmp.path(), &key);
-        let session = reload.session();
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(
-            session.messages[0].thread_id.as_deref(),
-            Some("cmid-alpha"),
-            "user message thread_id == its client_message_id"
-        );
-        assert_eq!(
-            session.messages[1].thread_id.as_deref(),
-            Some("cmid-alpha"),
-            "assistant inherits the rooting user's thread_id"
-        );
-    }
-
-    #[tokio::test]
-    async fn should_synthesize_thread_id_for_legacy_record_without_field() {
-        // Pre-existing JSONL written by a prior octos build that didn't know
-        // about thread_id. On load the synthesizer must thread the messages
-        // using the `client_message_id` hints already present (or
-        // synth_{seq} when even those are missing) so `Session::threads()`
-        // produces a sensible grouping.
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "legacy-synth");
-        let per_user_path = per_user_session_path(tmp.path(), &key);
-        std::fs::create_dir_all(per_user_path.parent().unwrap()).unwrap();
-
-        let meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": key.0,
-            "topic": key.topic(),
-            "created_at": Utc::now(),
-            "updated_at": Utc::now(),
-        });
-        // Legacy user with cmid (note: no thread_id field at all).
-        let user_with_cmid = serde_json::json!({
-            "role": "user",
-            "content": "hello",
-            "client_message_id": "cmid-legacy-1",
-            "timestamp": Utc::now().to_rfc3339(),
-        });
-        // Legacy assistant — no cmid, no thread_id.
-        let asst_no_cmid = serde_json::json!({
-            "role": "assistant",
-            "content": "hi back",
-            "timestamp": Utc::now().to_rfc3339(),
-        });
-        let body = format!(
-            "{}\n{}\n{}\n",
-            serde_json::to_string(&meta).unwrap(),
-            serde_json::to_string(&user_with_cmid).unwrap(),
-            serde_json::to_string(&asst_no_cmid).unwrap(),
-        );
-        std::fs::write(&per_user_path, body).unwrap();
-
-        let handle = SessionHandle::open(tmp.path(), &key);
-        let session = handle.session();
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(
-            session.messages[0].thread_id.as_deref(),
-            Some("cmid-legacy-1"),
-            "legacy user with cmid synthesizes thread_id == cmid"
-        );
-        assert_eq!(
-            session.messages[1].thread_id.as_deref(),
-            Some("cmid-legacy-1"),
-            "legacy assistant inherits the current thread"
-        );
-    }
-
-    #[tokio::test]
-    async fn should_synthesize_threads_from_real_legacy_session() {
-        // Real-world legacy JSONL: a multi-turn transcript with a mix of
-        // cmid-present and cmid-absent rows, and a tool result wedged
-        // between assistant turns. The synthesizer must produce the same
-        // thread grouping that the new write path would have produced.
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "legacy-multi-turn");
-        let per_user_path = per_user_session_path(tmp.path(), &key);
-        std::fs::create_dir_all(per_user_path.parent().unwrap()).unwrap();
-
-        let now = Utc::now();
-        let meta = serde_json::json!({
-            "schema_version": 1,
-            "session_key": key.0,
-            "topic": key.topic(),
-            "created_at": now,
-            "updated_at": now,
-        });
-        // Turn 1: user with cmid, then assistant + tool.
-        let u1 = serde_json::json!({
-            "role": "user",
-            "content": "first",
-            "client_message_id": "cmid-1",
-            "timestamp": now.to_rfc3339(),
-        });
-        let a1 = serde_json::json!({
-            "role": "assistant",
-            "content": "calling tool",
-            "timestamp": (now + chrono::Duration::seconds(1)).to_rfc3339(),
-        });
-        let t1 = serde_json::json!({
-            "role": "tool",
-            "content": "tool result for turn 1",
-            "tool_call_id": "tc-1",
-            "timestamp": (now + chrono::Duration::seconds(2)).to_rfc3339(),
-        });
-        let a1b = serde_json::json!({
-            "role": "assistant",
-            "content": "answer to first",
-            "timestamp": (now + chrono::Duration::seconds(3)).to_rfc3339(),
-        });
-        // Turn 2: user WITHOUT cmid (legacy: had no client_message_id at all).
-        let u2 = serde_json::json!({
-            "role": "user",
-            "content": "second",
-            "timestamp": (now + chrono::Duration::seconds(10)).to_rfc3339(),
-        });
-        let a2 = serde_json::json!({
-            "role": "assistant",
-            "content": "answer to second",
-            "timestamp": (now + chrono::Duration::seconds(11)).to_rfc3339(),
-        });
-
-        let body = format!(
-            "{meta_line}\n{u1}\n{a1}\n{t1}\n{a1b}\n{u2}\n{a2}\n",
-            meta_line = serde_json::to_string(&meta).unwrap(),
-            u1 = serde_json::to_string(&u1).unwrap(),
-            a1 = serde_json::to_string(&a1).unwrap(),
-            t1 = serde_json::to_string(&t1).unwrap(),
-            a1b = serde_json::to_string(&a1b).unwrap(),
-            u2 = serde_json::to_string(&u2).unwrap(),
-            a2 = serde_json::to_string(&a2).unwrap(),
-        );
-        std::fs::write(&per_user_path, body).unwrap();
-
-        let handle = SessionHandle::open(tmp.path(), &key);
-        let session = handle.session();
-        assert_eq!(session.messages.len(), 6);
-
-        // First turn — all four messages share the cmid-1 thread.
-        for (i, expected_role) in [
-            (0, MessageRole::User),
-            (1, MessageRole::Assistant),
-            (2, MessageRole::Tool),
-            (3, MessageRole::Assistant),
-        ] {
-            assert_eq!(
-                session.messages[i].thread_id.as_deref(),
-                Some("cmid-1"),
-                "msg {i} ({expected_role:?}) must inherit cmid-1 thread"
-            );
-            assert_eq!(session.messages[i].role, expected_role);
-        }
-
-        // Second turn — user without cmid gets a synth_{seq}.
-        let synth = session.messages[4].thread_id.clone().expect("synthesized");
-        assert!(
-            synth.starts_with("synth_"),
-            "user without cmid must get synth_<seq> thread_id (got {synth:?})"
-        );
-        assert_eq!(
-            session.messages[5].thread_id.as_deref(),
-            Some(synth.as_str()),
-            "assistant after legacy user without cmid inherits the synth thread"
-        );
-
-        // threads() groups them sensibly.
-        let threads = session.threads();
-        assert_eq!(threads.len(), 2, "two user-rooted threads");
-        assert_eq!(threads[0].id, "cmid-1");
-        assert_eq!(threads[0].user_msg.content, "first");
-        assert_eq!(threads[0].responses.len(), 3);
-        assert_eq!(threads[0].intra_thread_seq, 0);
-        assert_eq!(threads[1].id, synth);
-        assert_eq!(threads[1].user_msg.content, "second");
-        assert_eq!(threads[1].responses.len(), 1);
-        assert_eq!(threads[1].intra_thread_seq, 1);
-    }
-
-    #[test]
-    fn derive_thread_id_user_uses_client_message_id() {
-        let user_msg = make_message_with_cmid(MessageRole::User, "hi", Some("cmid-x"));
-        let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
-        assert_eq!(id.as_deref(), Some("cmid-x"));
-    }
-
-    #[test]
-    fn derive_thread_id_user_without_cmid_synthesizes_uuid() {
-        let user_msg = make_message(MessageRole::User, "hi");
-        let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
-        assert!(
-            id.is_some(),
-            "user without cmid still gets a synthesized id"
-        );
-        // UUIDv7 surface — at least standard hyphenated length.
-        assert!(id.as_deref().unwrap().contains('-'));
-    }
-
-    #[test]
-    fn derive_thread_id_assistant_inherits_from_recent_user() {
-        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
-        user_msg.thread_id = Some("cmid-q".into());
-        let history = vec![user_msg];
-        let asst = make_message(MessageRole::Assistant, "answer");
-        let id = derive_thread_id_for_legacy_load(&asst, &history);
-        assert_eq!(id.as_deref(), Some("cmid-q"));
-    }
-
-    #[test]
-    fn derive_thread_id_tool_inherits_from_assistant() {
-        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
-        user_msg.thread_id = Some("cmid-q".into());
-        let mut asst = make_message(MessageRole::Assistant, "tool call");
-        asst.thread_id = Some("cmid-q".into());
-        let history = vec![user_msg, asst];
-        let tool = make_message(MessageRole::Tool, "tool result");
-        let id = derive_thread_id_for_legacy_load(&tool, &history);
-        assert_eq!(id.as_deref(), Some("cmid-q"));
-    }
-
-    #[test]
-    fn derive_thread_id_system_returns_none() {
-        let sys = make_message(MessageRole::System, "system primer");
-        let id = derive_thread_id_for_legacy_load(&sys, &[]);
-        assert!(id.is_none(), "system messages aren't thread-scoped");
-    }
-
-    /// PR F (M8.10): the new-write derivation MUST refuse Assistant rows
-    /// that arrived without a caller-supplied `thread_id`. Pre-fix, this
-    /// silently walked history backwards and picked the most-recent user
-    /// — under concurrent rapid-fire writes that's the WRONG turn (a
-    /// sibling user has rotated the in-memory history between the
-    /// originating turn's user-write and its assistant-write). The
-    /// metric `octos_session_persist_total{outcome="rejected_unbound_assistant"}`
-    /// is the alerting hook for soak.
-    #[test]
-    fn derive_thread_id_for_new_write_rejects_unbound_assistant() {
-        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
-        user_msg.thread_id = Some("cmid-q".into());
-        let history = vec![user_msg];
-        let asst = make_message(MessageRole::Assistant, "answer");
-        let result = derive_thread_id_for_new_write(&asst, &history);
-        assert!(
-            result.is_err(),
-            "new-write path must fail-closed for unbound Assistant; got {result:?}"
-        );
-    }
-
-    /// PR F: the new-write derivation MUST refuse Tool rows that arrived
-    /// without a caller-supplied `thread_id`, for the same structural
-    /// reason as Assistant. Tools must inherit from the originating turn
-    /// (carried via `originating_thread_id` in BackgroundResultPayload),
-    /// not from history walking.
-    #[test]
-    fn derive_thread_id_for_new_write_rejects_unbound_tool() {
-        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
-        user_msg.thread_id = Some("cmid-q".into());
-        let history = vec![user_msg];
-        let tool = make_message(MessageRole::Tool, "tool result");
-        let result = derive_thread_id_for_new_write(&tool, &history);
-        assert!(
-            result.is_err(),
-            "new-write path must fail-closed for unbound Tool; got {result:?}"
-        );
-    }
-
-    /// PR F: User rows always synthesize/derive cleanly (cmid → thread_id).
-    /// System rows return `Ok(None)`. These remain non-fail-closed
-    /// because the rule is structurally well-defined for them.
-    #[test]
-    fn derive_thread_id_for_new_write_accepts_user_and_system() {
-        let user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
-        let id = derive_thread_id_for_new_write(&user_msg, &[]).expect("user must succeed");
-        assert_eq!(id.as_deref(), Some("cmid-q"));
-
-        let sys = make_message(MessageRole::System, "primer");
-        let id = derive_thread_id_for_new_write(&sys, &[]).expect("system must succeed");
-        assert!(id.is_none());
-    }
-
-    /// PR F: legacy JSONL replay must continue to gap-fill via
-    /// `derive_thread_id_for_legacy_load` — a transcript that pre-dates
-    /// the PR #1 typed write path has Assistant rows without thread_id
-    /// and must reconstruct via history walking. The new-write
-    /// fail-closed split MUST NOT regress this.
-    #[tokio::test]
-    async fn add_message_with_seq_accepts_legacy_replay_via_legacy_load() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "legacy-replay");
-
-        // Build a session in memory with legacy rows (no thread_id) using
-        // bare struct literals so the test exercises the actual legacy
-        // wire shape (Assistant/Tool rows lacking thread_id).
-        fn legacy_msg(role: MessageRole, content: &str, cmid: Option<&str>) -> Message {
-            Message {
-                role,
-                content: content.into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: cmid.map(String::from),
-                thread_id: None,
-                timestamp: Utc::now(),
-            }
-        }
-        let mut messages = vec![
-            legacy_msg(MessageRole::User, "first", Some("cmid-old-1")),
-            legacy_msg(MessageRole::Assistant, "first reply", None),
-            legacy_msg(MessageRole::User, "second", Some("cmid-old-2")),
-            legacy_msg(MessageRole::Assistant, "second reply", None),
-        ];
-        for m in &mut messages {
-            assert!(m.thread_id.is_none(), "legacy fixture must lack thread_id");
-        }
-        synthesize_thread_ids(&mut messages);
-        // Synthesis populates every row.
-        assert_eq!(messages[0].thread_id.as_deref(), Some("cmid-old-1"));
-        assert_eq!(messages[1].thread_id.as_deref(), Some("cmid-old-1"));
-        assert_eq!(messages[2].thread_id.as_deref(), Some("cmid-old-2"));
-        assert_eq!(messages[3].thread_id.as_deref(), Some("cmid-old-2"));
-
-        // After legacy gap-fill, the rows can be re-persisted via the
-        // new-write path because the gap-fill stamped thread_id.
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-        for m in messages {
-            handle
-                .add_message(m)
-                .await
-                .expect("legacy-gap-filled rows must persist via new write path");
-        }
-    }
-
-    #[tokio::test]
-    async fn add_message_with_seq_stamps_thread_id_on_inbound_messages() {
-        // The new write path must populate thread_id on the persisted line so
-        // a later reload doesn't have to fall back to synthesis.
-        //
-        // PR F (M8.10): the persist path is fail-closed for unbound
-        // Assistant — the caller must pre-stamp `thread_id`. The test
-        // mirrors production: the User row derives its thread_id from
-        // its `client_message_id`; the Assistant row arrives pre-stamped
-        // with the originating turn's `thread_id` (in production via
-        // `Message::assistant_with_thread`).
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "stamp-on-write");
-
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-        handle
-            .add_message(make_message_with_cmid(
-                MessageRole::User,
-                "first",
-                Some("cmid-write-1"),
-            ))
-            .await
-            .unwrap();
-        let mut assistant = make_message(MessageRole::Assistant, "first reply");
-        assistant.thread_id = Some("cmid-write-1".into());
-        handle.add_message(assistant).await.unwrap();
-
-        // In-memory copy carries thread_id.
-        assert_eq!(
-            handle.session().messages[0].thread_id.as_deref(),
-            Some("cmid-write-1")
-        );
-        assert_eq!(
-            handle.session().messages[1].thread_id.as_deref(),
-            Some("cmid-write-1")
-        );
-
-        // Persisted JSONL line carries it too — verified by checking the file.
-        let per_user_path = per_user_session_path(tmp.path(), &key);
-        let content = std::fs::read_to_string(&per_user_path).unwrap();
-        assert!(
-            content.contains("\"thread_id\":\"cmid-write-1\""),
-            "persisted JSONL must include thread_id on the user message: {content}"
-        );
-    }
-
-    #[test]
-    fn session_threads_returns_empty_for_session_without_user_messages() {
-        let session = Session::new(SessionKey::new("cli", "empty"));
-        assert!(session.threads().is_empty());
-    }
-
-    #[test]
-    fn session_threads_skips_system_messages() {
-        let mut session = Session::new(SessionKey::new("cli", "with-system"));
-        let mut sys = make_message(MessageRole::System, "primer");
-        sys.thread_id = None; // explicitly None — system messages aren't thread-scoped
-        session.messages.push(sys);
-        let mut user = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-1"));
-        user.thread_id = Some("cmid-1".into());
-        session.messages.push(user);
-
-        let threads = session.threads();
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].id, "cmid-1");
-        assert_eq!(threads[0].responses.len(), 0);
-    }
-
-    /// Regression for codex retro-review BLOCKING #1: SessionHandle::append_to_disk
-    /// must return Err on size-cap rejection (was returning Ok(()), letting the
-    /// caller push to memory and fire message/persisted observer for a row that
-    /// never committed to disk — UPCR-2026-012 contract violation).
-    #[tokio::test]
-    async fn session_handle_append_returns_err_when_at_size_cap() {
-        let tmp = TempDir::new().unwrap();
-        let key = SessionKey::new("api", "web-cap-test");
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-
-        // Pre-fill the JSONL above MAX_SESSION_FILE_SIZE so the next
-        // append must refuse.
-        let path = handle.session_path();
-        std::fs::create_dir_all(path.parent().unwrap()).ok();
-        let oversize = vec![b'a'; (MAX_SESSION_FILE_SIZE + 1) as usize];
-        std::fs::write(&path, oversize).expect("pre-fill oversize jsonl");
-
-        let msg = make_message(MessageRole::User, "after-cap");
-        let result = handle.add_message_with_seq(msg).await;
-
-        assert!(
-            result.is_err(),
-            "add_message_with_seq must return Err when file at size cap; got {:?}",
-            result
-        );
-        // In-memory state must NOT advance on a refused append.
-        assert_eq!(
-            handle.get_history(10).len(),
-            0,
-            "no message should be in memory when disk append refused"
-        );
-    }
-
-    /// Regression for codex retro-review BLOCKING #2: SessionManager::session_known
-    /// must check both legacy flat layout AND canonical per-user layout. Without
-    /// this dual check, after LRU eviction or daemon restart, sessions persisted
-    /// via ApiChannel's per-user path become un-discoverable to UPCR-2026-009 /
-    /// -010 / -011 handlers.
-    #[tokio::test]
-    async fn session_known_finds_canonical_per_user_path_after_restart() {
-        let tmp = TempDir::new().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-
-        // Simulate ApiChannel's canonical layout:
-        // <data_dir>/users/<encoded-base>/sessions/<encoded-topic>.jsonl
-        let users_dir = tmp.path().join("users");
-        let key = SessionKey::new("api", "user42#chat-1");
-        let base_key = key.base_key();
-        let encoded_base = encode_path_component(base_key);
-        let topic = key.topic().unwrap_or("default");
-        let encoded_topic = encode_path_component(topic);
-        let per_user_path = users_dir
-            .join(&encoded_base)
-            .join("sessions")
-            .join(format!("{encoded_topic}.jsonl"));
-        std::fs::create_dir_all(per_user_path.parent().unwrap()).unwrap();
-        std::fs::write(&per_user_path, b"{}\n").unwrap();
-
-        // Fresh manager (cache empty — simulates post-restart). The legacy flat
-        // path does NOT exist; only the canonical per-user path exists.
-        let mut mgr = SessionManager::open(tmp.path()).expect("open SessionManager");
-        assert!(
-            !mgr.session_path(&key).exists(),
-            "precondition: flat path must NOT exist for this test"
-        );
-        assert!(
-            mgr.session_known(&key),
-            "session_known must find session via canonical per-user layout \
-             when only that layout has the file (regression for UPCR-2026-009/010/011 handlers)"
-        );
-    }
-}
+#[path = "session_tests.rs"]
+mod tests;

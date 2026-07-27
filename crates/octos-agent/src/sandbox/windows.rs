@@ -27,6 +27,11 @@ pub struct AppContainerSandbox {
     pub read_allow_paths: Vec<String>,
     /// Profile name for the AppContainer (typically the octos profile ID).
     pub profile_name: Option<String>,
+    /// When `false`, the workspace cwd is granted READ-ONLY (the helper is
+    /// invoked with `--readonly-cwd`) so shell commands cannot mutate the
+    /// workspace under a read-only permission profile (codex P1). Default
+    /// constructions use `true` (read-write cwd) for backward compatibility.
+    pub workspace_write: bool,
 }
 
 /// Windows system paths that must be readable for shell commands to work.
@@ -40,6 +45,18 @@ const WINDOWS_READ_ALLOW_PATHS: &[&str] = &[
 ];
 
 impl Sandbox for AppContainerSandbox {
+    /// Report no-op enforcement when the `octos-sandbox` helper is unavailable.
+    ///
+    /// Without the helper, [`Self::wrap_command`] falls back to an unsandboxed
+    /// `cmd /C`, so the AppContainer provides no confinement. Surfacing that as
+    /// `is_noop() == true` lets fail-closed callers (e.g. the `mcp-serve` path)
+    /// refuse to run tools rather than silently executing host commands under a
+    /// configured-but-inert sandbox — matching how the Linux Landlock backend
+    /// refuses when its helper is missing.
+    fn is_noop(&self) -> bool {
+        find_sandbox_helper().is_none()
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         // Find the helper binary next to our own executable
         let helper = find_sandbox_helper();
@@ -65,8 +82,13 @@ impl Sandbox for AppContainerSandbox {
         };
         cmd.arg("--profile").arg(&profile);
 
-        // Working directory (read-write)
+        // Working directory. Read-write by default; read-only when the
+        // permission profile denies workspace writes (`--sandbox read-only`)
+        // so shell commands cannot mutate the workspace (codex P1).
         cmd.arg("--cwd").arg(cwd);
+        if !self.workspace_write {
+            cmd.arg("--readonly-cwd");
+        }
 
         // Read-only paths — only pass paths that exist
         for path in WINDOWS_READ_ALLOW_PATHS {
@@ -138,6 +160,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec![],
             profile_name: Some("octos.test-profile".into()),
+            workspace_write: true,
         };
 
         let cmd = sandbox.wrap_command("echo hello", Path::new(r"C:\workspace"));
@@ -156,6 +179,7 @@ mod tests {
             allow_network: true,
             read_allow_paths: vec![r"C:\tools".into()],
             profile_name: None,
+            workspace_write: true,
         };
 
         let cmd = sandbox.wrap_command("dir", Path::new(r"C:\temp"));
@@ -165,6 +189,53 @@ mod tests {
         assert!(
             prog.contains("octos-sandbox") || prog == "cmd",
             "expected octos-sandbox or cmd, got: {prog}"
+        );
+    }
+
+    #[test]
+    fn should_pass_readonly_cwd_to_helper_when_workspace_write_disabled() {
+        // P1 (codex): a read-only permission profile must invoke the
+        // octos-sandbox helper with `--readonly-cwd` so the AppContainer ACL
+        // grants the cwd read-only. When the helper is absent the sandbox
+        // degrades to unsandboxed `cmd` (pre-existing warning path).
+        let sandbox = AppContainerSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            profile_name: None,
+            workspace_write: false,
+        };
+        let cmd = sandbox.wrap_command("echo hello", Path::new(r"C:\workspace"));
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        if prog.contains("octos-sandbox") {
+            assert!(
+                args.iter().any(|a| a == "--readonly-cwd"),
+                "read-only profile must pass --readonly-cwd, args: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_pass_readonly_cwd_to_helper_when_workspace_write_enabled() {
+        let sandbox = AppContainerSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            profile_name: None,
+            workspace_write: true,
+        };
+        let cmd = sandbox.wrap_command("echo hello", Path::new(r"C:\workspace"));
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a == "--readonly-cwd"),
+            "writable profile must NOT pass --readonly-cwd, args: {args:?}"
         );
     }
 }

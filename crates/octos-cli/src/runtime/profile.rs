@@ -32,6 +32,64 @@ use crate::skills_scope::{
     build_account_skills_loader, discover_ominix_url, push_runtime_plugin_env,
 };
 
+/// Build an ISOLATED per-node pipeline provider router from the profile's
+/// `sub_providers` (e.g. the `deep_research` pipeline's `cheap`/`strong`
+/// nodes, resolved via `RunPipelineTool`'s provider router).
+///
+/// Registers ONLY the declared sub-providers — never the coding primary or its
+/// fallbacks — so a research-lane failover (`FallbackProvider` +
+/// `compatible_fallbacks`) trips its OWN circuit breakers and can never disturb
+/// the coding conversation's provider or its KV/prompt cache. Returns `None`
+/// when no sub-providers are configured, in which case pipeline nodes fall back
+/// to the shared coding provider (`self.llm` in `resolve_provider`) exactly as
+/// before. Mirrors the gateway's sub-provider registration
+/// (`gateway_runtime.rs`) but deliberately omits the primary/fallback
+/// auto-registration to keep the research lane isolated.
+fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderRouter>> {
+    if config.sub_providers.is_empty() {
+        return None;
+    }
+    let router = Arc::new(octos_llm::ProviderRouter::new());
+    let mut registered = 0usize;
+    for sp in &config.sub_providers {
+        // Per-sub-provider key override, matching the gateway path: an explicit
+        // `api_key_env` selects a distinct credential; otherwise inherit the
+        // profile's default for the provider.
+        let sp_config = if sp.api_key_env.is_some() {
+            let mut c = config.clone();
+            c.api_key_env = sp.api_key_env.clone();
+            c
+        } else {
+            config.clone()
+        };
+        match chat::create_provider_with_api_type(
+            &sp.provider,
+            &sp_config,
+            sp.model.clone(),
+            sp.base_url.clone(),
+            sp.api_type.as_deref(),
+        ) {
+            Ok(p) => {
+                router.register_with_full_meta(
+                    &sp.key,
+                    Arc::new(octos_llm::RetryProvider::new(p)),
+                    sp.description.clone(),
+                    sp.default_context_window,
+                    sp.max_output_tokens,
+                );
+                registered += 1;
+            }
+            Err(e) => warn!(
+                key = %sp.key,
+                provider = %sp.provider,
+                error = %e,
+                "skipping isolated pipeline sub-provider (research lane)"
+            ),
+        }
+    }
+    if registered > 0 { Some(router) } else { None }
+}
+
 /// All long-lived state that belongs to a single profile within the
 /// current host process.
 ///
@@ -113,6 +171,16 @@ pub struct ProfileRuntime {
     /// session-scope bootstrap code don't have to re-derive it.
     pub data_dir: PathBuf,
 
+    /// The profile's resolved [`crate::config::Config`] (as produced by
+    /// `config_from_profile` at bootstrap, with host memory/plugins merged).
+    /// Most runtime state is pre-extracted into the typed fields below; this
+    /// is retained for the few paths that must resolve a lane provider
+    /// LAZILY from `config.sub_providers` (with the profile's credential /
+    /// timeout config), e.g. a peer session that runs its turns on a named
+    /// `sub_provider` model lane (`peers/<slug>/model`). Kept whole rather
+    /// than re-deriving a `Config` off disk on the hot path.
+    pub config: crate::config::Config,
+
     /// The fully-wrapped LLM provider chain for this profile.
     /// Includes retry, provider failover, and (if `adaptive_router`
     /// is `Some`) adaptive routing. Every session for this profile
@@ -181,6 +249,17 @@ pub struct ProfileRuntime {
     /// starved spawned sub-agents doing multi-step work).
     pub max_iterations: Option<u32>,
 
+    /// Post-edit formatting opt-in (`config.format_after_edit`, issue
+    /// #1774) that per-session agents inherit. When true, successful
+    /// `edit_file` / `write_file` / `diff_edit` calls run the file's
+    /// language formatter and echo the formatted content in the tool
+    /// result. Default: false.
+    pub format_after_edit: bool,
+
+    /// #1768: opt-in workspace-snapshot config per-session agents use to
+    /// build their `SnapshotManager` (None/disabled = no snapshots).
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
+
     /// The base [`ToolRegistry`] template — builtins + plugins +
     /// MCP agents + the LRU pin set — but **NOT** workspace-bound.
     /// Sessions clone this and call `with_workspace_root` to obtain
@@ -221,6 +300,10 @@ pub struct ProfileRuntime {
     /// the heavy work (memory context, skills summary, bootstrap
     /// files) off the per-request hot path.
     pub system_prompt: String,
+    /// The same prompt split at the memory slot — per-session agents
+    /// compose `pre → [memory segment] → post` to keep the pre-refactor
+    /// precedence (memory before skills/tool guidance).
+    pub prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts,
 
     /// Hook configurations contributed by loaded plugins (skill
     /// manifests can declare `before_tool_call` / `after_tool_call` /
@@ -251,6 +334,23 @@ pub struct ProfileRuntime {
     /// Long-lived [`MemoryStore`] (MEMORY.md + daily notes + recent
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
+
+    /// The profile's embedding provider (None when no `embedding`
+    /// config and no resolvable key). Sessions hand this to
+    /// SpawnTool / DelegateTool so worker agents embed the episodes
+    /// they save and run hybrid scored+filtered recall — without it
+    /// workers stored episodes vectorless and recall silently skipped.
+    pub embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    /// Resolved `memory.max_inject_tokens` for per-session memory segments.
+    pub memory_inject_tokens: usize,
+    /// Resolved `memory.refresh.enabled` — gates the capture-policy text in
+    /// the memory segment and the per-turn refresh provider.
+    pub memory_refresh_enabled: bool,
+    /// Background memory-refresh sweep (extraction over idle sessions).
+    /// `Some` only when `memory.refresh.enabled` and this process won the
+    /// profile's refresh lock; dropping the runtime stops the sweep and
+    /// releases the lock.
+    pub memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
 
     /// Shared [`ToolConfigStore`] for the profile (per-tool
     /// runtime overrides, e.g. `deep_crawl.page_settle_ms`).
@@ -411,7 +511,8 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
     ) -> Result<Arc<Self>> {
-        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None).await
+        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None, None)
+            .await
     }
 
     /// Section B (codex review round-3): bootstrap a profile runtime while
@@ -428,6 +529,7 @@ impl ProfileRuntime {
         role: BootstrapRole,
         host_plugins: Option<&crate::config::PluginsConfig>,
         host_voice: Option<&crate::config::VoiceConfig>,
+        host_memory: Option<&crate::config::MemoryConfig>,
     ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
@@ -438,6 +540,11 @@ impl ProfileRuntime {
                 config.plugins.require_signed = true;
             }
         }
+        // Host memory settings apply field-by-field when the profile doesn't
+        // override them (same host-default pattern as plugins/voice). A
+        // profile serialized with an empty `memory: {}` block must still
+        // inherit the host budget.
+        crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
@@ -481,9 +588,25 @@ impl ProfileRuntime {
         // EpisodeStore; gateway falls back to a degraded handle when
         // serve already owns the redb lock so it doesn't crashloop on
         // every startup. Tracked by issue #899.
+        //
+        // The embedder is resolved FIRST because the episodic HNSW index is
+        // built at one fixed width and silently drops any vector of a
+        // different length. Sizing it from the configured provider is what
+        // makes a non-1536-d embedder (e.g. in-process EmbeddingGemma at 768)
+        // actually reach the vector lane instead of degrading to BM25-only.
+        let embedder =
+            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        let index_dimension = embedder
+            .as_ref()
+            .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
+
         let memory_open_result = match role {
-            BootstrapRole::Serve => EpisodeStore::open(data_dir).await,
-            BootstrapRole::Gateway => EpisodeStore::open_or_degraded(data_dir).await,
+            BootstrapRole::Serve => {
+                EpisodeStore::open_with_dimension(data_dir, index_dimension).await
+            }
+            BootstrapRole::Gateway => {
+                EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
+            }
         };
         let memory = Arc::new(memory_open_result.wrap_err_with(|| {
             format!("failed to open episode store for profile '{}'", profile.id)
@@ -609,9 +732,34 @@ impl ProfileRuntime {
                 plugin_dirs.push(dir.clone());
             }
         }
+        // --- Skill layering v1 ---
+        // Resolve the profile's inherited skill-selection layer (parent +
+        // global defaults already merged by `resolve_runtime_profile`) into a
+        // crate-agnostic filter handed to BOTH the plugin loader (tool specs)
+        // and the SkillsLoader (prompt / content injection) below. `None` ⇒ no
+        // skills layer ⇒ every discovered skill loads, exactly as before.
+        let skill_filter = profile.config.skills.as_ref().map(|s| s.to_agent_filter());
+        if profile.config.skills.is_some() {
+            let discovered_skill_ids: Vec<String> = build_account_skills_loader(data_dir)
+                .list_skills()
+                .await
+                .map(|skills| skills.into_iter().map(|s| s.name).collect())
+                .unwrap_or_default();
+            let catalog =
+                crate::skills_scope::resolve_profile_skills(profile, &discovered_skill_ids);
+            if catalog.has_disabled() {
+                info!(
+                    profile_id = %profile.id,
+                    mode = ?catalog.mode,
+                    disabled = ?catalog.disabled,
+                    "skill layering: installed skills disabled by profile config"
+                );
+            }
+        }
+
         let mut plugin_result = PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
-            match PluginLoader::load_into_with_options(
+            match PluginLoader::load_into_with_options_and_filter(
                 &mut tools,
                 &plugin_dirs,
                 &plugin_env_template,
@@ -627,6 +775,7 @@ impl ProfileRuntime {
                     require_signed: config.plugins.require_signed,
                     verified_cache_dir: Some(effective_octos_home.join("cache").join("verified")),
                 },
+                skill_filter.as_ref(),
             ) {
                 Ok(result) => plugin_result = result,
                 Err(e) => warn!(profile_id = %profile.id, error = %e, "plugin loading failed"),
@@ -664,42 +813,17 @@ impl ProfileRuntime {
             tools.set_context_filter(config.context_filter.clone());
         }
 
-        // Step 16: pin core builtins + plugin tools as base so the
-        // LRU evictor never drops them. Mirrors gateway's pin list
-        // (with the gateway-only session tools elided — those are
-        // session-scope via the per-session ActorFactory).
-        let mut base_tools: Vec<&str> = vec![
-            "shell",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "diff_edit",
-            "glob",
-            "grep",
-            "list_dir",
-            "web_search",
-            "web_fetch",
-            "browser",
-            "check_workspace_contract",
-            "workspace_log",
-            "workspace_show",
-            "workspace_diff",
-        ];
-        if cfg!(feature = "git") {
-            base_tools.push("git");
-        }
-        if cfg!(feature = "ast") {
-            base_tools.push("code_structure");
-        }
-        tools.set_base_tools(base_tools);
-        if !plugin_result.tool_names.is_empty() {
-            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
-        }
+        // RFC-0 (#1289): LRU tool deferral was removed — the base-tool pin
+        // list is no longer needed; every enabled tool is emitted every turn.
 
         // Memory bank tools — registered profile-side so every
         // session inherits the same memory_store.
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+        tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
+        if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+            tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+        }
 
         // REG-7 follow-up: register `run_pipeline` at profile scope so
         // the serve path (`/api/sessions/*`, UI Protocol WS) exposes
@@ -743,6 +867,12 @@ impl ProfileRuntime {
         // when adaptive is configured, so per-node calls still
         // fan out through the adaptive layer.
         //
+        // The profile's embedding provider was resolved ONCE back in Step 4
+        // (the episodic index has to be sized from it). The same handle feeds
+        // the pipeline factory below AND rides on the returned ProfileRuntime
+        // so the serve spawn/delegate wiring hands every worker the exact same
+        // embed-on-save + hybrid-recall behaviour.
+
         // NEW-07: hoist the per-instance `RunPipelineTool` builder
         // into a [`crate::session_actor::PipelineToolFactory`] impl
         // so the WS / UI Protocol spawn-wiring site can hand a fresh
@@ -771,10 +901,16 @@ impl ProfileRuntime {
                 /// agents inherit the contamination-safe hybrid scored
                 /// + filtered memory recall path.
                 embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+                /// Isolated per-node model router built from the profile's
+                /// `sub_providers` (e.g. `deep_research`'s `cheap`/`strong`
+                /// nodes). Registers ONLY sub-providers, so per-node failover
+                /// trips its own breakers and never disturbs the coding
+                /// provider/cache. `None` ⇒ nodes use the shared coding `llm`.
+                provider_router: Option<Arc<octos_llm::ProviderRouter>>,
             }
 
             impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
-                fn create(&self) -> Arc<dyn octos_agent::tools::Tool> {
+                fn create(&self, sandbox: &SandboxConfig) -> Arc<dyn octos_agent::tools::Tool> {
                     let mut pt = octos_pipeline::RunPipelineTool::new(
                         self.llm.clone(),
                         self.memory.clone(),
@@ -784,16 +920,23 @@ impl ProfileRuntime {
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
                     .with_plugin_require_signed(self.plugin_require_signed)
+                    // #1607 (codex round 4): confine pipeline command
+                    // validators to the SESSION-effective sandbox passed in by
+                    // the caller (`SessionRuntime`/`ActorFactory`), NOT a
+                    // profile-time default captured at factory-build time — a
+                    // read-only session's validators must not regain removed
+                    // writes/network.
+                    .with_sandbox(sandbox.clone())
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref embedder) = self.embedder {
                         pt = pt.with_embedder(embedder.clone());
                     }
+                    if let Some(ref router) = self.provider_router {
+                        pt = pt.with_provider_router(router.clone());
+                    }
                     Arc::new(pt)
                 }
             }
-
-            let embedder =
-                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
 
             let factory: Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync> =
                 Arc::new(AppUiPipelineToolFactory {
@@ -804,13 +947,17 @@ impl ProfileRuntime {
                     plugin_dirs: plugin_dirs.clone(),
                     octos_home: effective_octos_home.clone(),
                     plugin_require_signed: config.plugins.require_signed,
-                    embedder,
+                    embedder: embedder.clone(),
+                    provider_router: build_sub_provider_router(&config),
                 });
 
-            // Register the parent `run_pipeline` via the same factory
-            // so the parent registry and every spawn-child registry
-            // observe byte-identical config.
-            tools.register_arc(factory.create());
+            // Register the parent `run_pipeline` via the same factory so the
+            // parent registry and every spawn-child registry observe
+            // byte-identical config. This profile-scope registration uses the
+            // profile default sandbox; `SessionRuntime::bootstrap_*` re-registers
+            // it with the SESSION-effective sandbox (which `rebind_cwd` does not
+            // touch, since `run_pipeline` is not a CWD-bound tool).
+            tools.register_arc(factory.create(&sandbox_config));
             tools.mark_spawn_only(
                 "run_pipeline",
                 Some(
@@ -849,6 +996,18 @@ impl ProfileRuntime {
         let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
         cron_service.start();
         tools.register(CronTool::with_context(cron_service.clone(), "api", ""));
+        // #1696 — structured goal tools: goal_get (objective + remaining
+        // budget) and goal_update (model-owned complete|blocked ONLY,
+        // executor-enforced). Session resolved per-call from
+        // ToolContext::parent_session_key; profile scope pinned here.
+        // Goals live in the AppUI orchestrator, so the tools exist only
+        // with the `api` feature (like the orchestrator itself).
+        #[cfg(feature = "api")]
+        {
+            tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
+        }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank
         // registration so deny entries can target plugin-declared
@@ -857,41 +1016,9 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
 
-        // M11-F regression fix REG-1: auto-defer non-core tool groups
-        // when the visible tool count is high so weaker LLMs (notably
-        // GLM, kimi-k2 cold-start) don't return empty responses under
-        // the weight of 30+ tool definitions.
-        //
-        // Mirrors `gateway_runtime.rs:1048-1070` byte-for-byte: defer
-        // `group:admin` / `group:sessions` / `group:web` /
-        // `group:runtime` / `group:media`, then register the
-        // `ActivateToolsTool` when anything ended up deferred so the
-        // LLM can pull a group back on demand mid-loop. Keeps research
-        // (deep_search, deep_crawl) active by leaving `group:search`
-        // alone — users call those directly often enough that hiding
-        // them behind an extra round-trip would regress latency.
-        let visible = tools.specs().len();
-        if visible > 15 {
-            for group in &[
-                "group:admin",
-                "group:sessions",
-                "group:web",
-                "group:runtime",
-                "group:media",
-            ] {
-                tools.defer_group(group);
-            }
-            let after = tools.specs().len();
-            info!(
-                profile_id = %profile.id,
-                before = visible,
-                after,
-                "auto-deferred non-core tool groups to reduce LLM tool-count load"
-            );
-        }
-        if tools.has_deferred() {
-            tools.register(octos_agent::ActivateToolsTool::new());
-        }
+        // RFC-0 (#1289): LRU tool deferral + the `activate_tools` meta-tool
+        // were removed. Every enabled tool is now emitted every turn (full
+        // schema), so the former auto-defer-non-core-groups pass is gone.
 
         // Step 18: pre-assemble the profile-scope system prompt.
         //
@@ -919,20 +1046,25 @@ impl ProfileRuntime {
         // can hand to the helper. Operators who want per-profile
         // bootstrap files drop them in `<data_dir>/`, which matches the
         // pre-M11-F serve-mode behavior.
-        let skills_loader = build_account_skills_loader(data_dir);
-        let mut system_prompt = build_system_prompt(
+        let skills_loader = build_account_skills_loader(data_dir).with_skill_filter(skill_filter);
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+        let mut prompt_parts = build_system_prompt(
             profile.config.gateway.system_prompt.as_deref(),
             data_dir,
             data_dir,
-            &memory_store,
             &skills_loader,
             &tool_config,
         )
         .await;
         for fragment in &plugin_result.prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            prompt_parts.post_memory.push_str("\n\n");
+            prompt_parts.post_memory.push_str(fragment);
         }
+        let system_prompt = prompt_parts.joined();
+        let prompt_parts_for_runtime = prompt_parts.clone();
 
         // M11-F regression fix REG-3: assemble the lifecycle hook
         // executor once per profile and propagate the `Arc` onto every
@@ -984,9 +1116,37 @@ impl ProfileRuntime {
                 .wrap_err("invalid profile approval_policy")?;
         }
 
+        // Start the background memory-refresh sweep when enabled. The
+        // flock decides ownership when serve and gateway share a profile
+        // dir; the loser just logs and skips.
+        let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.to_path_buf(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
+            // Retained whole for lazy per-lane provider resolution (e.g. a
+            // peer running on a named `sub_provider` model lane); the typed
+            // fields below carry the pre-extracted hot-path state.
+            config: config.clone(),
             llm,
             adaptive_router,
             runtime_qos_catalog,
@@ -998,6 +1158,8 @@ impl ProfileRuntime {
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
             max_iterations: config.max_iterations,
+            format_after_edit: config.format_after_edit,
+            snapshots: config.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             plugin_dirs,
@@ -1010,8 +1172,13 @@ impl ProfileRuntime {
                 .as_ref()
                 .map(|policy| policy.to_runtime_rules()),
             system_prompt,
+            prompt_parts: prompt_parts_for_runtime,
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             memory,
             memory_store,
+            embedder,
+            memory_refresh,
             tool_config,
             cron_service: Some(cron_service),
             pipeline_factory,
@@ -1021,15 +1188,19 @@ impl ProfileRuntime {
             // setting living on the top-level config.json, not on per-profile
             // JSON. `config_from_profile` drops it, so the caller (serve/gateway)
             // passes the host's `config.voice` here; fall back to defaults when
-            // absent. The *timbre* (`default_voice`), however, is per-tenant:
-            // overlay the profile's `voice_default` on top so each user keeps
-            // their own reply voice (set via `PUT /api/my/voice`).
+            // absent. Per-tenant settings (*timbre*, TTS route, cloud config) are
+            // overlaid: `voice_default` (reply voice via `PUT /api/my/voice`),
+            // `tts_provider` (route: auto/local/cloud), and `tts_cloud` (cloud
+            // credentials).
             voice: config
                 .voice
                 .clone()
                 .or_else(|| host_voice.cloned())
                 .unwrap_or_default()
-                .with_default_voice_override(profile.config.voice_default.as_deref()),
+                .with_default_voice_override(profile.config.voice_default.as_deref())
+                .with_tts_provider_override(profile.config.tts_provider.as_deref())
+                .with_cloud_override(profile.config.tts_cloud.as_ref())
+                .with_cloud_token_from_env(&profile.config.env_vars),
         }))
     }
 }
@@ -1068,9 +1239,11 @@ mod tests {
     use crate::profiles::{
         GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
     };
+    #[cfg(unix)]
     use crate::runtime::SessionRuntime;
     use chrono::Utc;
     use octos_agent::SandboxConfig;
+    #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
 
@@ -1540,40 +1713,6 @@ mod tests {
         );
     }
 
-    /// M11-F regression fix REG-1: when the visible tool count exceeds
-    /// 15 (the gateway threshold), bootstrap must defer the five
-    /// non-core groups and register `activate_tools`. This mirrors
-    /// `gateway_runtime.rs:1048-1070` and is essential for weaker LLMs
-    /// (kimi-k2, GLM) that return empty responses under tool-spec
-    /// overload.
-    #[tokio::test]
-    async fn profile_runtime_bootstrap_defers_groups_and_registers_activate_tools() {
-        let _key = ScopedEnvKey::set("OCTOS_M11F_REG1_KEY");
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("profile-data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let profile = fixture_profile("reg1", "OCTOS_M11F_REG1_KEY");
-        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
-            .await
-            .expect("bootstrap should succeed");
-
-        // The base builtin set + memory tools + cron exceeds 15 visible
-        // tools, so the defer pass MUST fire and the activate_tools tool
-        // MUST be registered.
-        assert!(
-            rt.tool_specs.has_deferred(),
-            "bootstrap should auto-defer non-core groups when visible > 15",
-        );
-        assert!(
-            rt.tool_specs
-                .specs()
-                .iter()
-                .any(|s| s.name == "activate_tools"),
-            "activate_tools must be registered when any tool is deferred",
-        );
-    }
-
     /// M11-F regression fix REG-5: bootstrap's plugin_dirs must include
     /// the *global* `~/.octos/plugins` and `~/.octos/skills` (via
     /// `Config::plugin_dirs_from_project`) so admin-installed skills
@@ -1612,12 +1751,11 @@ mod tests {
     }
 
     /// Issue #87: sub-account profile skill loading must not strand the
-    /// runtime without `shell` or a usable `activate_tools` back-reference.
-    /// The original report showed a sub-account bot that had loaded skills
-    /// but could not call any tool, including `activate_tools`.
+    /// runtime without `shell`. The original report showed a sub-account bot
+    /// that had loaded skills but could not call any tool.
     #[cfg(unix)]
     #[tokio::test]
-    async fn subaccount_skill_loading_preserves_shell_and_activate_tools() {
+    async fn subaccount_skill_loading_preserves_shell() {
         use std::os::unix::fs::PermissionsExt;
 
         let _key = ScopedEnvKey::set("OCTOS_ISSUE_87_SUBACCOUNT_KEY");
@@ -1674,9 +1812,11 @@ mod tests {
             rt.tool_specs.get("shell").is_some(),
             "sub-account skill loading must not drop the shell tool"
         );
+        // RFC-0 (#1289): `shell` is emitted every turn — no activate_tools
+        // round-trip needed. Verify it stays visible after workspace rebind.
         assert!(
-            rt.tool_specs.get("activate_tools").is_some(),
-            "sub-account skill loading must leave activate_tools available"
+            rt.tool_specs.specs().iter().any(|s| s.name == "shell"),
+            "shell must be visible in specs"
         );
 
         let profile_runtime = Arc::new(rt);
@@ -1695,24 +1835,10 @@ mod tests {
                 "session {} must retain shell after workspace rebind",
                 session.session_key
             );
-            let activate_tools = session
-                .tools
-                .get("activate_tools")
-                .expect("session activate_tools");
-            let result = activate_tools
-                .execute(&serde_json::json!({"tools": ["shell"]}))
-                .await
-                .expect("activate_tools must be wired to the session registry");
             assert!(
-                result.success,
-                "activate_tools should be able to resolve shell for {}; got: {}",
-                session.session_key, result.output
-            );
-            assert!(
-                result.output.contains("shell"),
-                "activate_tools output should name shell for {}; got: {}",
-                session.session_key,
-                result.output
+                session.tools.specs().iter().any(|s| s.name == "shell"),
+                "session {} must expose shell in specs",
+                session.session_key
             );
         }
     }
@@ -1762,6 +1888,7 @@ mod tests {
             Some(&octos_home),
             BootstrapRole::Serve,
             Some(&host_plugins),
+            None,
             None,
         )
         .await
@@ -1887,7 +2014,7 @@ mod tests {
             .pipeline_factory
             .as_ref()
             .expect("pipeline_factory must be Some after a successful bootstrap");
-        let pt = factory.create();
+        let pt = factory.create(&octos_agent::SandboxConfig::default());
         assert_eq!(
             pt.name(),
             "run_pipeline",
@@ -1902,7 +2029,7 @@ mod tests {
         // `ensure_subagent_tools_available` preflight will pass for
         // `allowed_tools=["run_pipeline"]`.
         let mut child_registry = octos_agent::ToolRegistry::with_builtins(&data_dir);
-        child_registry.register_arc(factory.create());
+        child_registry.register_arc(factory.create(&octos_agent::SandboxConfig::default()));
         assert!(
             child_registry.get("run_pipeline").is_some(),
             "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",

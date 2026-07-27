@@ -205,7 +205,11 @@ fn resolve_dashboard_auth_smtp_password(
 }
 
 /// Start the REST API server.
-#[derive(Debug, Args)]
+///
+/// `Serialize`/`Deserialize` back the layered startup config: the resolved
+/// struct is serialized, non-explicit fields are overlaid from
+/// `config.cli.serve`, then deserialized back (see [`crate::config_layer`]).
+#[derive(Debug, Args, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ServeCommand {
     /// Port to listen on. Default lives in IANA's Dynamic/Private range
     /// (49152–65535) to avoid collisions with `http-alt` services like
@@ -229,6 +233,19 @@ pub struct ServeCommand {
     /// Data directory for episodes, memory, sessions (defaults to $OCTOS_HOME or ~/.octos).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+
+    /// Per-instance runtime data dir (redb stores, sessions, goals, serve lock,
+    /// per-profile data). When set, the profile REGISTRY + model catalog still
+    /// resolve from the shared state home (the normal
+    /// `--data-dir`/`OCTOS_HOME`/`~/.octos`), so many stdio instances share one
+    /// config/profile while each owns private runtime state. Unset ⇒ identical
+    /// to today (runtime == state home).
+    ///
+    /// Also settable via `OCTOS_INSTANCE_DATA_DIR` (the flag wins; an empty env
+    /// value is treated as unset). Env is resolved in `run_async` because the
+    /// workspace `clap` build does not enable the `env` feature.
+    #[arg(long)]
+    pub instance_data_dir: Option<PathBuf>,
 
     /// Path to config file.
     #[arg(long)]
@@ -255,29 +272,135 @@ pub struct ServeCommand {
     #[arg(long)]
     pub solo: bool,
 
+    /// Default every session to the dangerous FULL-ACCESS permission
+    /// profile: sandbox disabled, network allowed, approvals never —
+    /// octos' analogue of Claude Code's `--dangerously-skip-permissions`.
+    /// Requires `--solo` (the same local-single-user keystone that gates
+    /// selecting Full Access from the `/permissions` menu). A session's
+    /// explicit `/permissions` choice still overrides the default. Also
+    /// settable via `OCTOS_DANGER_FULL_ACCESS=1`.
+    #[arg(long)]
+    pub danger_full_access: bool,
+
+    /// Opt OUT of the network-on default. By default a fresh Local session with
+    /// no explicit `/permissions` choice runs Workspace-Write with network
+    /// ALLOWED (filesystem still sandboxed) so `npm install` / git / fetch work
+    /// out of the box. Pass `--no-network` (or `OCTOS_NO_NETWORK=1`) to revert
+    /// the default to network DENIED. Cloud/tenant deployments always default to
+    /// network-denied regardless. An explicit `/permissions` choice still wins.
+    #[arg(long)]
+    pub no_network: bool,
+
+    /// Use LLM-summarization for AppUI context compaction: when a session's
+    /// context fills, ask the model for a high-quality handoff summary (a real
+    /// model call — slower, a few seconds) instead of the instant deterministic
+    /// heuristic. Falls back to the heuristic on any error/timeout, so it never
+    /// breaks a turn. Off by default.
+    #[arg(long)]
+    pub llm_compaction: bool,
+
     /// Disable automatic retry on transient errors.
     #[arg(long)]
     pub no_retry: bool,
 
     /// ── swarm ── (M7.6 contract-authoring dashboard)
-    /// Backend transport for the swarm MCP agent. When unset the
+    /// Backend transport for the swarm agent. When unset the
     /// `/api/swarm/*` endpoints return 503 (legacy opt-out behaviour).
-    /// `stdio` pairs with `--swarm-backend-cmd`; `http` pairs with
-    /// `--swarm-backend-url`.
-    #[arg(long, value_name = "stdio|http")]
+    /// `stdio` (MCP subprocess) and `cli` (one-shot headless CLI, e.g.
+    /// `claude -p` / `codex exec`) pair with `--swarm-backend-cmd`;
+    /// `http` pairs with `--swarm-backend-url`.
+    #[arg(long, value_name = "stdio|http|cli")]
     pub swarm_backend: Option<String>,
 
-    /// Stdio MCP agent executable (e.g. `claude`). Required when
-    /// `--swarm-backend stdio` is set. Forwarded to
-    /// [`octos_agent::tools::mcp_agent::StdioMcpAgent`].
+    /// Agent executable (e.g. `claude`). Required when
+    /// `--swarm-backend stdio` or `cli` is set. Forwarded to
+    /// [`octos_agent::tools::mcp_agent::StdioMcpAgent`] /
+    /// [`octos_agent::tools::mcp_agent::CliAgentBackend`].
     #[arg(long, value_name = "CMD")]
     pub swarm_backend_cmd: Option<String>,
+
+    /// Arguments passed to the backend executable before the prompt
+    /// (comma-separated, e.g. `-p` or `exec,--json`). Applies to the
+    /// `stdio` and `cli` backends.
+    #[arg(long, value_name = "ARGS", value_delimiter = ',')]
+    pub swarm_backend_args: Vec<String>,
 
     /// HTTPS URL for a remote MCP agent. Required when
     /// `--swarm-backend http` is set. Forwarded to
     /// [`octos_agent::tools::mcp_agent::HttpMcpAgent`].
     #[arg(long, value_name = "URL")]
     pub swarm_backend_url: Option<String>,
+}
+
+/// Wire a `task_query_store` for `octos serve --stdio` (the in-process
+/// AppUI/TUI deployment); leave it `None` for HTTP/gateway serve.
+///
+/// `--stdio` runs session turns in *this* process with no gateway to proxy
+/// `task/cancel` to. The per-turn `tool_registry.supervisor()` self-registers
+/// into this store (see `ui_protocol.rs`, the `store.register(..)` guarded on
+/// `task_query_store.is_some()`, holding a `Weak<TaskSupervisor>` so it prunes
+/// at end of turn), which lets `handle_task_cancel` reach the live supervisor
+/// and actually cancel a running `spawn_only` background task. Without it the
+/// AppUI task commands fail `runtime_unavailable` ("task supervisor not wired
+/// for AppUI task commands"). HTTP/gateway serve must stay `None` so
+/// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
+fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
+    stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+}
+
+/// Stable, machine-greppable marker embedded in the "data directory is already
+/// owned by another serve" error. octos-tui (a separate repo) spawns
+/// `octos serve --stdio` as a child and greps its stderr for this exact token
+/// on child-exit to recognize the single-writer conflict and STOP relaunching —
+/// instead of the silent ~5s crash-loop it used to hit when the second serve
+/// died mid-startup opening `admin_audit.redb`. MUST stay byte-stable: the
+/// client matches it verbatim (octos-tui `transport.rs` DATA_DIR_LOCKED_MARKER).
+pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
+
+/// Held for the serve process's whole lifetime: an exclusive OS advisory lock
+/// (flock / LockFileEx via `fs2`) on `<data_dir>/.octos-serve.lock`. redb is
+/// single-writer-single-process, so two `octos serve` against one data dir can
+/// never coexist — the second used to crash mid-startup opening the first
+/// data-dir-level redb store (`admin_audit.redb`) with `DatabaseAlreadyOpen`,
+/// which a stdio client silently respawned in a loop. Taking this lock BEFORE
+/// any store open turns that into one clean, greppable refusal. The lock is
+/// released on process exit (fd close), so a legitimate relaunch AFTER the
+/// previous serve has exited acquires it cleanly (no stale-lock hazard).
+struct ServeDataDirLock {
+    _file: std::fs::File,
+}
+
+/// Acquire the serve single-writer lock for `data_dir`, or return a clear error
+/// carrying [`DATA_DIR_LOCKED_MARKER`] when another serve already holds it.
+/// Contention is detected structurally via the platform's canonical
+/// lock-contended errno (`fs2::lock_contended_error`), never string matching.
+/// Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent methods of the
+/// same names and the workspace MSRV is 1.85.
+fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDirLock> {
+    std::fs::create_dir_all(data_dir)
+        .wrap_err_with(|| format!("failed to create data dir: {}", data_dir.display()))?;
+    let lock_path = data_dir.join(".octos-serve.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .wrap_err_with(|| format!("failed to open serve lockfile: {}", lock_path.display()))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(ServeDataDirLock { _file: file }),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Err(eyre::eyre!(
+                "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for this data \
+                 directory ({}). Close the other octos-tui (or `octos serve`), or start this one \
+                 against a different --data-dir.",
+                data_dir.display()
+            ))
+        }
+        Err(error) => Err(eyre::Report::new(error).wrap_err(format!(
+            "failed to acquire serve single-writer lock: {}",
+            lock_path.display()
+        ))),
+    }
 }
 
 impl Executable for ServeCommand {
@@ -302,6 +425,39 @@ impl ServeCommand {
         let ctx = super::resolve_command_context(self.data_dir.clone())?;
         let data_dir = ctx.data_dir.clone();
 
+        // Multi-instance stdio split. `state_home` is the SHARED, config-like
+        // root that holds the profile REGISTRY and the model catalog — always
+        // the normal resolution (`--data-dir`/`OCTOS_HOME`/`~/.octos`), never
+        // the per-instance dir. The `data_dir` used from here on is the
+        // per-instance RUNTIME root (redb stores, sessions, goals, serve lock,
+        // per-profile data): the private per-instance dir when set, else the
+        // state home (byte-identical to today for default installs and for
+        // gateways, which never set a per-instance dir).
+        //
+        // The per-instance dir comes from `--instance-data-dir` (flag wins) or
+        // `OCTOS_INSTANCE_DATA_DIR` (empty ⇒ unset). Env is read here because
+        // the workspace `clap` build omits the `env` feature.
+        let state_home = data_dir.clone();
+        let instance_data_dir = self.instance_data_dir.clone().or_else(|| {
+            std::env::var("OCTOS_INSTANCE_DATA_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+        });
+        let data_dir = instance_data_dir
+            .clone()
+            .unwrap_or_else(|| state_home.clone());
+        if instance_data_dir.is_some() {
+            // A fresh per-instance dir must exist before the serve lock and
+            // redb stores open under it.
+            std::fs::create_dir_all(&data_dir).wrap_err_with(|| {
+                format!(
+                    "failed to create per-instance data dir: {}",
+                    data_dir.display()
+                )
+            })?;
+        }
+
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
@@ -309,6 +465,30 @@ impl ServeCommand {
             Config::load_with_context_path(&cwd, &ctx)?
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
+
+        // Single-writer guard: redb is single-process, so a second `octos serve`
+        // on this data dir can't coexist. Fail FAST here with one clean,
+        // client-greppable refusal instead of crashing mid-startup opening
+        // `admin_audit.redb` (which a stdio client silently respawned in a
+        // ~5s loop). Held for the whole process via `_data_dir_lock`; released
+        // on exit so a relaunch after the prior serve quits still starts.
+        let _data_dir_lock = match acquire_serve_data_dir_lock(&data_dir) {
+            Ok(guard) => guard,
+            Err(error) => {
+                if error.to_string().contains(DATA_DIR_LOCKED_MARKER) {
+                    // A guaranteed clean, un-colored stderr line the octos-tui
+                    // client greps on child-exit (color-eyre's rendering of the
+                    // returned error may interleave ANSI, so don't rely on it).
+                    eprintln!(
+                        "{DATA_DIR_LOCKED_MARKER}: another octos server already owns data \
+                         directory {}",
+                        data_dir.display()
+                    );
+                }
+                return Err(error);
+            }
+        };
+
         if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
             .configure_supervisor_store(data_dir.join("supervisor"))
         {
@@ -316,6 +496,37 @@ impl ServeCommand {
                 %error,
                 "failed to configure durable agent supervisor store; continuing with in-process supervision only"
             );
+        } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
+        {
+            // Solo-boot loop safety: restored loops must not silently resume
+            // firing model turns on a single-operator box. Park them paused;
+            // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
+            for (loop_id, session_id) in
+                crate::api::agent_orchestrator::default_agent_orchestrator()
+                    .pause_restored_loops_for_solo_boot()
+            {
+                tracing::info!(
+                    loop_id = %loop_id,
+                    session_id = %session_id.0,
+                    "solo boot: restored loop parked as paused (resume with /loop resume)"
+                );
+            }
+            // Same safety for GOALS (#1694): a goal restored `active`
+            // resumes autonomous model turns nobody asked this process
+            // for. Park paused; `/goal resume` re-arms,
+            // OCTOS_SOLO_RESUME_GOALS=1 opts out.
+            if std::env::var("OCTOS_SOLO_RESUME_GOALS").ok().as_deref() != Some("1") {
+                for (goal_id, session_id) in
+                    crate::api::agent_orchestrator::default_agent_orchestrator()
+                        .pause_restored_goals_for_solo_boot()
+                {
+                    tracing::info!(
+                        goal_id = %goal_id,
+                        session_id = %session_id.0,
+                        "solo boot: restored goal parked as paused (resume with /goal resume)"
+                    );
+                }
+            }
         }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
@@ -379,10 +590,14 @@ impl ServeCommand {
             None
         };
 
-        // Initialize profile store and process manager for admin dashboard
+        // Initialize profile store and process manager for admin dashboard.
+        // Registry (`<id>.json`) resolves from the SHARED `state_home`; the
+        // per-profile `<id>/data` runtime tree roots under the per-instance
+        // `data_dir`. With no `--instance-data-dir`, `state_home == data_dir`,
+        // so this is byte-identical to `open_unified(&data_dir)`.
         tracing::info!("initializing profile store and process manager");
         let profile_store = Arc::new(
-            crate::profiles::ProfileStore::open(&data_dir)
+            crate::profiles::ProfileStore::open(&state_home, &data_dir)
                 .wrap_err("failed to open profile store")?,
         );
 
@@ -448,6 +663,14 @@ impl ServeCommand {
                 continue;
             }
             let profile_data_dir = profile_store.resolve_data_dir(profile);
+            // Resolve the full runtime profile through the single shared
+            // resolver: parent/sub-account inheritance THEN the store's global
+            // `profile-defaults.json` base, so inherited hooks / plugins /
+            // sandbox / memory settings reach the per-profile bootstrap. Absent
+            // parent + defaults ⇒ effective config == `profile.config` (no
+            // behavior change).
+            let profile = profile_store.resolve_runtime_profile(profile);
+            let profile = &profile;
             // Section B (codex review round-3): thread the host's
             // strict-signing policy so the per-profile plugin load honors
             // `plugins.require_signed = true` from the top-level config
@@ -459,6 +682,7 @@ impl ServeCommand {
                 crate::runtime::BootstrapRole::Serve,
                 Some(&config.plugins),
                 config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -481,10 +705,13 @@ impl ServeCommand {
                 }
             }
         }
-        let session_cache = Arc::new(crate::runtime::SessionRuntimeCache::new(
-            64,
-            std::time::Duration::from_secs(1800),
-        ));
+        let session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
+                // Per-project session storage (opt-in, default off). When set,
+                // a cwd-hinted AppUi session's transcript store relocates to
+                // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
+                .with_sessions_in_cwd(config.appui.sessions_in_cwd),
+        );
 
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
@@ -495,7 +722,13 @@ impl ServeCommand {
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
                 // gateway's effective `plugins.require_signed`.
-                .with_host_plugins_require_signed(config.plugins.require_signed),
+                .with_host_plugins_require_signed(config.plugins.require_signed)
+                .with_host_max_inject_tokens(
+                    config.memory.as_ref().and_then(|m| m.max_inject_tokens),
+                )
+                .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
+                    config.memory.as_ref(),
+                )),
         );
         process_manager.set_self_ref();
 
@@ -533,7 +766,20 @@ impl ServeCommand {
             };
             let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone())
                 .with_sessions_path(data_dir.join("auth_sessions.json"))
-                .with_data_dir(data_dir.clone());
+                .with_data_dir(data_dir.clone())
+                // Registration id generation must treat an existing
+                // PROFILE file as taken, or a generated id claims an
+                // admin-created-but-unclaimed profile (codex #1613
+                // r6/r8). Policy lives on the store — see
+                // id_reserved_for_registration: anonymous claims never
+                // pass a file; authorized (allowlist) claims pass only
+                // a cleanly-loadable record.
+                .with_id_taken_probe({
+                    let ps = profile_store.clone();
+                    std::sync::Arc::new(move |id: &str, authorized: bool| {
+                        ps.id_reserved_for_registration(id, authorized)
+                    })
+                });
 
             if let Some(password) = derived_profile_password {
                 mgr = mgr.with_smtp_password(password);
@@ -606,6 +852,7 @@ impl ServeCommand {
         let swarm_state_init = Self::build_swarm_state_from_flags(
             self.swarm_backend.as_deref(),
             self.swarm_backend_cmd.as_deref(),
+            &self.swarm_backend_args,
             self.swarm_backend_url.as_deref(),
             &data_dir,
             broadcaster.clone(),
@@ -628,6 +875,42 @@ impl ServeCommand {
             crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
         );
 
+        let solo_login_enabled_flag = self.solo
+            || std::env::var("OCTOS_SOLO_LOGIN")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        let dangerous_default_permissions_flag = self.danger_full_access
+            || std::env::var("OCTOS_DANGER_FULL_ACCESS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        let default_network_denied_flag = self.no_network
+            || std::env::var("OCTOS_NO_NETWORK")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        // SECURITY KEYSTONE: the dangerous default rides the SAME solo
+        // opt-in that gates selecting Full Access from the menu — a fleet
+        // config that never sets --solo can reach neither surface.
+        if dangerous_default_permissions_flag && !solo_login_enabled_flag {
+            eyre::bail!(
+                "--danger-full-access requires --solo (local single-user opt-in); \
+                 refusing to default sessions to the dangerous profile on a \
+                 potentially shared host"
+            );
+        }
+        // `effective_permissions_for_session` only grants DangerFullAccess in
+        // Local deployment mode; enabling the default under Tenant/Cloud would
+        // fail every unselected `session/open` at permission resolution and
+        // let `profile/list` advertise a current profile the runtime rejects
+        // (codex P2 on #1639). Refuse the misconfiguration at startup.
+        if dangerous_default_permissions_flag && config.mode != crate::config::DeploymentMode::Local
+        {
+            eyre::bail!(
+                "--danger-full-access requires Local deployment mode (mode is {:?}); \
+                 the full-access profile is not grantable under Tenant/Cloud, so an \
+                 unselected session would fail permission resolution",
+                config.mode
+            );
+        }
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
@@ -676,10 +959,11 @@ impl ServeCommand {
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
-            solo_login_enabled: self.solo
-                || std::env::var("OCTOS_SOLO_LOGIN")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false),
+            host_memory: config.memory.clone(),
+            solo_login_enabled: solo_login_enabled_flag,
+            dangerous_default_permissions: dangerous_default_permissions_flag,
+            default_network_denied: default_network_denied_flag,
+            llm_compaction: self.llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
@@ -698,12 +982,15 @@ impl ServeCommand {
             harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
-            // The serve command is the API server proper — all session
-            // actors live in gateway processes, so `task_query_store`
-            // stays `None` and the cancel/restart handlers proxy via
-            // `resolve_api_port`. The gateway runtime sets its own
-            // store on the embedded api channel.
-            task_query_store: None,
+            // HTTP/gateway serve: session actors live in gateway
+            // processes, so `task_query_store` stays `None` and the
+            // cancel/restart handlers proxy via `resolve_api_port` (the
+            // gateway runtime sets its own store on the embedded api
+            // channel). `--stdio` runs actors in-process with no gateway,
+            // so it wires an empty store the per-turn supervisor
+            // self-registers into — letting AppUI `task/cancel` reach live
+            // `spawn_only` tasks. See `stdio_task_query_store`.
+            task_query_store: stdio_task_query_store(self.stdio),
             // Mirror the operator-configured Tier-2 default cwd so
             // `session_tool_registry` can distinguish "operator chose this
             // dir for sessions" from the boot fallback baked in by
@@ -1051,6 +1338,7 @@ impl ServeCommand {
     async fn build_swarm_state_from_flags(
         swarm_backend: Option<&str>,
         swarm_backend_cmd: Option<&str>,
+        swarm_backend_args: &[String],
         swarm_backend_url: Option<&str>,
         data_dir: &std::path::Path,
         broadcaster: Arc<crate::api::EventBroadcaster>,
@@ -1059,7 +1347,7 @@ impl ServeCommand {
     ) -> Result<Option<Arc<crate::api::SwarmState>>> {
         use octos_agent::cost_ledger::PersistentCostLedger;
         use octos_agent::tools::mcp_agent::{
-            HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, StdioMcpAgent,
+            CliAgentBackend, HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, StdioMcpAgent,
         };
 
         let Some(kind) = swarm_backend else {
@@ -1074,11 +1362,26 @@ impl ServeCommand {
                     ))?;
                 let config = McpAgentBackendConfig::Local {
                     cmd,
-                    args: Vec::new(),
+                    args: swarm_backend_args.to_vec(),
                     env: Default::default(),
                     dispatch_timeout_secs: None,
                 };
                 Arc::new(StdioMcpAgent::from_config(&config)?)
+            }
+            "cli" => {
+                let cmd = swarm_backend_cmd
+                    .map(str::to_owned)
+                    .ok_or_else(|| eyre::eyre!(
+                        "`--swarm-backend cli` requires `--swarm-backend-cmd <path>` (path to a one-shot agent CLI, e.g. `claude`)"
+                    ))?;
+                let config = McpAgentBackendConfig::Cli {
+                    cmd,
+                    args: swarm_backend_args.to_vec(),
+                    env: Default::default(),
+                    dispatch_timeout_secs: None,
+                    prompt_via_stdin: false,
+                };
+                Arc::new(CliAgentBackend::from_config(&config)?)
             }
             "http" => {
                 let url = swarm_backend_url
@@ -1097,7 +1400,9 @@ impl ServeCommand {
                 Arc::new(HttpMcpAgent::from_config(&config)?)
             }
             other => {
-                eyre::bail!("unknown --swarm-backend value `{other}` (expected `stdio` or `http`)");
+                eyre::bail!(
+                    "unknown --swarm-backend value `{other}` (expected `stdio`, `http`, or `cli`)"
+                );
             }
         };
 
@@ -1150,6 +1455,59 @@ impl ServeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdio_serve_wires_task_query_store_for_in_process_cancel() {
+        // `--stdio` runs session actors in-process with no gateway to
+        // proxy `task/cancel` to, so the store must be present for the
+        // per-turn supervisor to self-register into — otherwise AppUI
+        // task commands fail `runtime_unavailable` and octos-tui Esc/`x`
+        // cannot cancel a spawned background task (the reported bug).
+        assert!(
+            stdio_task_query_store(true).is_some(),
+            "stdio serve must wire a task_query_store"
+        );
+    }
+
+    #[test]
+    fn non_stdio_serve_leaves_task_query_store_none_for_gateway_proxy() {
+        // HTTP/gateway serve must leave it `None` so `handle_task_cancel`
+        // takes the gateway-proxy path; a non-`None` store would skip it.
+        assert!(
+            stdio_task_query_store(false).is_none(),
+            "gateway/http serve must leave task_query_store None"
+        );
+    }
+
+    /// Two `octos serve` against one data dir can't coexist (redb is
+    /// single-process). The second must be refused FAST with a stable,
+    /// client-greppable marker — not crash mid-startup opening `admin_audit.redb`
+    /// (which a stdio client respawned in a silent ~5s loop). Releasing the first
+    /// (process exit) must free the lock so a legitimate relaunch still starts.
+    #[test]
+    fn second_serve_on_same_data_dir_is_refused_with_a_greppable_marker() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = acquire_serve_data_dir_lock(dir.path()).expect("first serve acquires the lock");
+
+        let err = acquire_serve_data_dir_lock(dir.path())
+            .err()
+            .expect("a second serve must be refused while the first holds the lock");
+        assert!(
+            err.to_string().contains(DATA_DIR_LOCKED_MARKER),
+            "refusal must carry the stable client-greppable marker; got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&dir.path().display().to_string()),
+            "refusal must name the contended data dir; got: {err}"
+        );
+
+        // Prior serve exits → lock released → a fresh relaunch acquires it. This
+        // pins that the guard never false-positives a normal client relaunch.
+        drop(first);
+        let _relaunch = acquire_serve_data_dir_lock(dir.path())
+            .expect("after the holder exits, a fresh serve acquires the lock");
+    }
 
     fn dashboard_smtp_test_env_lock() -> &'static std::sync::Mutex<()> {
         use std::sync::{Mutex, OnceLock};
@@ -1211,7 +1569,7 @@ mod tests {
     #[test]
     fn derives_dashboard_auth_from_admin_profile_email_tool() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1264,7 +1622,7 @@ mod tests {
         let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
         let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_ADMIN_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1315,7 +1673,7 @@ mod tests {
     #[test]
     fn derives_dashboard_auth_from_first_usable_non_admin_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1388,7 +1746,7 @@ mod tests {
         let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
         let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_PROFILE_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: "dspfac".into(),
@@ -1403,7 +1761,10 @@ mod tests {
                         smtp_host: Some("smtp.gmail.com".into()),
                         smtp_port: Some(587),
                         username: Some("dspfac@gmail.com".into()),
-                        password_env: Some("eqepkfbyfymwfhnv".into()),
+                        // Env var NAME, not a password. This field previously
+                        // held a 16-lowercase-char literal — the exact shape of
+                        // a Gmail App Password — next to a real gmail username.
+                        password_env: Some("SMTP_PASSWORD".into()),
                         password: Some("app-password".into()),
                         from_address: Some("dspfac@gmail.com".into()),
                         feishu_app_id: None,
@@ -1449,6 +1810,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             None,
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1475,6 +1837,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1499,6 +1862,60 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             None,
+            &[],
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            None,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("missing cmd must be rejected, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--swarm-backend-cmd"),
+            "error must point at the missing flag, got: {msg}"
+        );
+    }
+
+    /// CLI backend: `--swarm-backend cli --swarm-backend-cmd <bin>`
+    /// builds a SwarmState around [`CliAgentBackend`]; args are
+    /// forwarded so `claude` + `-p` compose.
+    #[tokio::test]
+    async fn should_populate_swarm_state_for_cli_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
+        let state = ServeCommand::build_swarm_state_from_flags(
+            Some("cli"),
+            Some("/bin/echo"),
+            &["-n".to_string()],
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            None,
+        )
+        .await
+        .expect("helper must succeed when cli backend is configured");
+        assert!(
+            state.is_some(),
+            "swarm state must be Some with --swarm-backend cli"
+        );
+    }
+
+    /// CLI backend without `--swarm-backend-cmd` fails at startup like
+    /// the stdio variant.
+    #[tokio::test]
+    async fn should_reject_cli_backend_without_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
+        let result = ServeCommand::build_swarm_state_from_flags(
+            Some("cli"),
+            None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1526,6 +1943,7 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("http"),
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1553,6 +1971,7 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("ouija"),
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1566,7 +1985,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("stdio") && msg.contains("http"),
+            msg.contains("stdio") && msg.contains("http") && msg.contains("cli"),
             "error must list accepted backends, got: {msg}"
         );
     }
@@ -1592,6 +2011,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1654,6 +2074,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,

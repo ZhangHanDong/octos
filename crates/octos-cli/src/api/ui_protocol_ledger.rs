@@ -60,8 +60,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
-    Envelope, EnvelopeNotification, Payload, RpcError, RpcNotification, SessionOpened,
-    TurnCompletedEvent, UiCursor, UiNotification, UiProgressEvent, methods,
+    Envelope, EnvelopeNotification, EnvelopeV2, EnvelopeV2Notification, Payload, PayloadV2,
+    RpcError, RpcNotification, SessionOpened, TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent,
+    UiCursor, UiNotification, UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -187,25 +188,17 @@ impl UiProtocolLedgerEvent {
                 }) => {
                     *event_cursor = Some(cursor);
                 }
-                // UPCR-2026-012: stamp the assigned cursor onto the
-                // `MessagePersisted` payload so the wire `cursor` field
-                // matches the ledger envelope's cursor.
-                UiNotification::MessagePersisted(persisted) => {
-                    persisted.cursor = cursor;
-                }
-                // M10 Phase 1: stamp the ledger cursor onto the
-                // `turn/spawn_complete` envelope so cursor-driven
-                // clients can resume cleanly. The flat `seq` field is
-                // intentionally NOT overwritten here — it carries the
-                // committed-row index from the persistence path
-                // (matching `MessagePersistedEvent.seq`), which the
-                // producer set before append (codex P2 follow-up).
-                // The persisted-row seq and the UI-ledger cursor seq
-                // are different scales — conflating them would make
-                // upgraded clients dedupe / anchor against a
-                // non-existent message row on hydrate.
+                // Legacy background records retain their original row seq;
+                // only their durable UI-ledger cursor is stamped here.
                 UiNotification::TurnSpawnComplete(spawn_complete) => {
                     spawn_complete.cursor = cursor;
+                }
+                // V2 normally projects an existing durable source event at
+                // the wire boundary instead of appending a second ledger row.
+                // Stamp it nevertheless if a test or future producer stores a
+                // concrete V2 notification directly.
+                UiNotification::EnvelopeV2(envelope) => {
+                    envelope.envelope.cursor = Some(cursor);
                 }
                 _ => {}
             }
@@ -252,6 +245,65 @@ struct LedgerDiskRecord {
 }
 
 const LEDGER_DISK_VERSION: u32 = 1;
+
+/// Result of parsing one disk line. A pre-Stage-5 persisted-message record
+/// has no representation in the v2-only core enum, so it is explicitly
+/// surfaced as a skipped legacy row rather than being mis-routed as a live
+/// notification or treated as a fatal replay error.
+#[derive(Debug)]
+// This is a short-lived parse result; boxing `Record` would allocate once per
+// recovered ledger line, so retain the stack representation used by the
+// canonical record decoder.
+#[allow(clippy::large_enum_variant)]
+enum ParsedLedgerDiskRecord {
+    Record(LedgerDiskRecord),
+    LegacyMessagePersisted { v: u32, seq: u64 },
+}
+
+/// Minimal, derived decoder used only to recognize an on-disk legacy
+/// `message_persisted` notification after the canonical decoder rejects its
+/// removed inner variant. Keeping this typed (rather than probing through a
+/// `serde_json::Value`) preserves serde's duplicate-field checks for the
+/// discriminator fields that establish the record's identity.
+#[derive(Debug, Deserialize)]
+struct LegacyMessagePersistedDiskRecord {
+    v: u32,
+    seq: u64,
+    #[serde(rename = "event")]
+    _event: LegacyMessagePersistedLedgerEvent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "record_kind", rename_all = "snake_case")]
+enum LegacyMessagePersistedLedgerEvent {
+    Notification(LegacyMessagePersistedNotification),
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyMessagePersistedNotification {
+    #[serde(rename = "kind")]
+    _kind: LegacyMessagePersistedKind,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyMessagePersistedKind {
+    MessagePersisted,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyTaggedMessagePersistedDiskRecord {
+    v: u32,
+    seq: u64,
+    #[serde(rename = "event")]
+    _event: LegacyTaggedMessagePersistedLedgerEvent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "envelope", rename_all = "snake_case")]
+enum LegacyTaggedMessagePersistedLedgerEvent {
+    Notification(LegacyMessagePersistedNotification),
+}
 
 /// Back-compat read shim for records written by the *pre-#1358* binary,
 /// whose `event` carried the outer discriminator under the legacy tag key
@@ -328,10 +380,16 @@ impl From<LegacyLedgerDiskRecord> for LedgerDiskRecord {
 ///
 /// On genuine corruption the *canonical* error is returned (it reflects
 /// the format the writer actually emits) so debug logs stay meaningful.
-fn parse_ledger_disk_record(line: &str) -> Result<LedgerDiskRecord, serde_json::Error> {
+fn parse_ledger_disk_record(line: &str) -> Result<ParsedLedgerDiskRecord, serde_json::Error> {
     match serde_json::from_str::<LedgerDiskRecord>(line) {
-        Ok(record) => Ok(record),
+        Ok(record) => Ok(ParsedLedgerDiskRecord::Record(record)),
         Err(canonical_err) => {
+            if let Ok(legacy) = serde_json::from_str::<LegacyMessagePersistedDiskRecord>(line) {
+                return Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted {
+                    v: legacy.v,
+                    seq: legacy.seq,
+                });
+            }
             // Only attempt the legacy `envelope`-tagged shim when the
             // canonical parse failed specifically because the event is
             // missing its `record_kind` discriminator — i.e. a legacy
@@ -340,8 +398,16 @@ fn parse_ledger_disk_record(line: &str) -> Result<LedgerDiskRecord, serde_json::
             // genuine and must surface the canonical error unchanged so
             // strictness is preserved.
             if is_missing_record_kind_tag(&canonical_err) {
+                if let Ok(legacy) =
+                    serde_json::from_str::<LegacyTaggedMessagePersistedDiskRecord>(line)
+                {
+                    return Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted {
+                        v: legacy.v,
+                        seq: legacy.seq,
+                    });
+                }
                 if let Ok(legacy) = serde_json::from_str::<LegacyLedgerDiskRecord>(line) {
-                    return Ok(legacy.into());
+                    return Ok(ParsedLedgerDiskRecord::Record(legacy.into()));
                 }
             }
             Err(canonical_err)
@@ -416,6 +482,35 @@ impl SessionLedger {
 pub(crate) struct UiProtocolLedger {
     config: LedgerConfig,
     inner: Mutex<LedgerInner>,
+    /// Per-project (`appui.sessions_in_cwd`) storage scopes, keyed by the
+    /// WIRE session id (`SessionKey.0`). When a session's transcript store is
+    /// relocated to `<cwd>/.octos/<profile>` the API layer registers a scope
+    /// here (`set_session_scope`, a 16-hex digest of the relocated
+    /// `sessions_root`), and every ring/disk/cursor identity for that session
+    /// becomes `<key>\u{0}~cwd-<scope>` via [`Self::storage_session_id`].
+    /// Two projects reusing the same wire key then get DISTINCT ledger rings
+    /// and on-disk dirs instead of replaying each other's conversation
+    /// (#1666).
+    ///
+    /// The registry is authoritative: unregistered keys pass through
+    /// verbatim (never parsed for the marker), so a wire key that happens to
+    /// contain the marker text is never reinterpreted, and flag-OFF behavior
+    /// is byte-identical. Wire EVENT payloads and the live-subscriber map
+    /// keep the plain key — the scope exists only in storage identities.
+    ///
+    /// KNOWN RESIDUAL (documented on #1666, same class as the Phase-4
+    /// `session_workspaces()` last-wins map): the registry holds ONE scope
+    /// per wire key, so two connections using the SAME key for DIFFERENT
+    /// cwds **concurrently in one process** flip-flop the mapping
+    /// (last-writer-wins) — appends/replays can land in whichever project
+    /// registered last, and live fan-out (plain-keyed by design) crosses
+    /// projects. Pre-fix, that scenario shared ONE dir outright, so this is
+    /// no new confidentiality exposure, but full isolation needs
+    /// per-connection identity threading. Sequential use — one project at a
+    /// time per key, the shipping AppUi/stdio flow — is fully isolated.
+    ///
+    /// Guarded by its own tiny mutex (never held across `inner`).
+    scopes: Mutex<HashMap<String, String>>,
 }
 
 struct LedgerInner {
@@ -528,6 +623,49 @@ impl UiProtocolLedger {
         Self {
             config,
             inner: Mutex::new(LedgerInner::new()),
+            scopes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register (or clear, with `None`) the per-project storage scope for a
+    /// session — see the `scopes` field doc. Called by the API layer whenever
+    /// a `SessionRuntime` materializes with a RELOCATED transcript store
+    /// (`sessions_root != profile.data_dir`, i.e. `appui.sessions_in_cwd`),
+    /// and always BEFORE that flow replays the session so replay and
+    /// subsequent appends agree on the storage identity. Idempotent;
+    /// re-registering the same scope is a no-op, and `None` removes a stale
+    /// entry (e.g. the flag was toggled off between restarts).
+    pub(crate) fn set_session_scope(&self, session_id: &SessionKey, scope: Option<String>) {
+        let mut scopes = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
+        match scope {
+            Some(scope) => {
+                scopes.insert(session_id.0.clone(), scope);
+            }
+            None => {
+                scopes.remove(session_id.0.as_str());
+            }
+        }
+    }
+
+    /// The STORAGE identity for a wire session id: the id itself, or
+    /// `<id>\u{0}~cwd-<scope>` when a per-project scope is registered.
+    /// Storage identities key the in-memory ring, the LRU, the on-disk
+    /// `ui-protocol/<hex>` dir, thread watermarks/seq state, and replay
+    /// cursors' `stream` — everything EXCEPT wire event payloads and the
+    /// live-subscriber map, which stay on the plain wire id.
+    ///
+    /// The NUL separator makes the encoding injective against realistic wire
+    /// ids: `SessionKey` is an unconstrained string, so a plain-ASCII marker
+    /// could be *equalled* by a hostile client naming its session
+    /// `<victim>~cwd-<hash>` and thereby sharing the victim project's dir
+    /// (codex v2 P2). A NUL pushes that collision outside anything a
+    /// legitimate client id contains; the byte is opaque to the hex dir
+    /// encoding, the HashMap keys, and JSON cursor `stream` strings.
+    fn storage_session_id(&self, session_id: &SessionKey) -> SessionKey {
+        let scopes = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
+        match scopes.get(session_id.0.as_str()) {
+            Some(scope) => SessionKey(format!("{}\u{0}~cwd-{scope}", session_id.0)),
+            None => session_id.clone(),
         }
     }
 
@@ -582,6 +720,17 @@ impl UiProtocolLedger {
                     if count > 0 {
                         sessions += 1;
                         events += count;
+                        // The process that wrote these events is gone; rows it
+                        // left non-terminal will never terminate on their own.
+                        let swept = ledger.reconcile_orphaned_rows(&session_key);
+                        if swept > 0 {
+                            info!(
+                                target = "octos::ledger",
+                                session_id = %session_key.0,
+                                swept,
+                                "recovery: synthesized terminal events for rows orphaned by restart"
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -607,6 +756,127 @@ impl UiProtocolLedger {
         }
     }
 
+    /// Boot-time reconciliation for one recovered session: any task, turn,
+    /// or agent row whose LAST replayed lifecycle event is non-terminal was
+    /// orphaned — the server process that owned it died before emitting the
+    /// terminal event, and no future event will ever close it. Replaying
+    /// such rows verbatim makes every client render phantom running work
+    /// forever (spinners for dead tasks, "Orchestrating…" for dead agents,
+    /// Esc mis-targeting ghost tasks). Append synthesized terminal events so
+    /// hydrate/replay converges to reality.
+    ///
+    /// Safe because recovery runs before this process serves any connection
+    /// (nothing genuinely live exists yet) and idempotent because swept rows
+    /// replay as terminal on the next boot.
+    fn reconcile_orphaned_rows(&self, session_id: &SessionKey) -> usize {
+        let Ok((events, _)) = self.snapshot_with_cursor(session_id, None) else {
+            return 0;
+        };
+        let mut tasks: std::collections::HashMap<
+            String,
+            octos_core::ui_protocol::TaskUpdatedEvent,
+        > = std::collections::HashMap::new();
+        let mut started_turns: std::collections::HashMap<
+            String,
+            (SessionKey, octos_core::TurnId, Option<String>),
+        > = std::collections::HashMap::new();
+        let mut terminal_turns: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut agents: std::collections::HashMap<
+            String,
+            octos_core::ui_protocol::AgentUpdatedEvent,
+        > = std::collections::HashMap::new();
+        for event in &events {
+            let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+                continue;
+            };
+            match notification {
+                UiNotification::TaskUpdated(task) => {
+                    tasks.insert(task.task_id.to_string(), task.clone());
+                }
+                UiNotification::TurnStarted(turn) => {
+                    started_turns.insert(
+                        turn.turn_id.0.to_string(),
+                        // Carry the turn's own WIRE session id for the
+                        // synthesized terminal below: the `session_id` param
+                        // here is a STORAGE identity at recovery time (dir
+                        // decode may include a `~cwd-` scope), which must
+                        // never appear in an event payload.
+                        (
+                            turn.session_id.clone(),
+                            turn.turn_id.clone(),
+                            turn.topic.clone(),
+                        ),
+                    );
+                }
+                UiNotification::TurnCompleted(turn) => {
+                    terminal_turns.insert(turn.turn_id.0.to_string());
+                }
+                UiNotification::TurnError(turn) => {
+                    terminal_turns.insert(turn.turn_id.0.to_string());
+                }
+                UiNotification::AgentUpdated(agent) => {
+                    agents.insert(agent.agent.agent_id.clone(), agent.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut swept = 0usize;
+        for (_, mut task) in tasks {
+            if matches!(
+                task.state,
+                TaskRuntimeState::Pending | TaskRuntimeState::Running
+            ) {
+                task.state = TaskRuntimeState::Cancelled;
+                task.runtime_detail = Some("orphaned_by_restart".to_owned());
+                // Storage-id append: land in the same (possibly scoped) dir
+                // as the orphaned row — see `append_with_storage_id`.
+                self.append_with_storage_id(
+                    session_id.clone(),
+                    UiProtocolLedgerEvent::Notification(UiNotification::TaskUpdated(task)),
+                    None,
+                );
+                swept += 1;
+            }
+        }
+        for (key, (turn_session_id, turn_id, topic)) in started_turns {
+            if terminal_turns.contains(&key) {
+                continue;
+            }
+            // Preserve the topic so topic-scoped replay filters still see the
+            // synthesized terminal for a topic-suffixed turn.
+            self.append_with_storage_id(
+                session_id.clone(),
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnError(TurnErrorEvent {
+                    session_id: turn_session_id,
+                    topic,
+                    turn_id,
+                    code: "orphaned_by_restart".to_owned(),
+                    message: "server restarted before this turn finished".to_owned(),
+                })),
+                None,
+            );
+            swept += 1;
+        }
+        for (_, mut agent) in agents {
+            if matches!(
+                agent.agent.status.as_str(),
+                "completed" | "failed" | "cancelled" | "closed" | "interrupted"
+            ) {
+                continue;
+            }
+            agent.agent.status = "failed".to_owned();
+            agent.agent.summary = Some("orphaned by server restart".to_owned());
+            self.append_with_storage_id(
+                session_id.clone(),
+                UiProtocolLedgerEvent::Notification(UiNotification::AgentUpdated(agent)),
+                None,
+            );
+            swept += 1;
+        }
+        swept
+    }
+
     fn recover_one_session(
         &self,
         session_id: &SessionKey,
@@ -615,7 +885,7 @@ impl UiProtocolLedger {
         let Some(snapshot) = self.read_session_disk_snapshot(session_id, session_dir, None)? else {
             return Ok(0);
         };
-        if snapshot.retained_entries.is_empty() {
+        if snapshot.retained_entries.is_empty() && snapshot.head_seq == 0 {
             return Ok(0);
         }
 
@@ -677,6 +947,7 @@ impl UiProtocolLedger {
             // scan on pre-#1358 ledgers). Per-record detail stays at
             // `debug!` for when it is needed.
             let mut skipped_unknown_version = 0u64;
+            let mut skipped_legacy_message_persisted = 0u64;
             let mut skipped_malformed = 0u64;
             for line_result in reader.lines() {
                 let line = match line_result {
@@ -702,14 +973,47 @@ impl UiProtocolLedger {
                 // round-trip — so duplicate-key corruption is still
                 // rejected on either path.
                 let record = match parse_ledger_disk_record(&line) {
-                    Ok(record) if record.v == LEDGER_DISK_VERSION => record,
-                    Ok(record) => {
+                    Ok(ParsedLedgerDiskRecord::Record(record))
+                        if record.v == LEDGER_DISK_VERSION =>
+                    {
+                        record
+                    }
+                    Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted { v, seq })
+                        if v == LEDGER_DISK_VERSION =>
+                    {
+                        // Stage 5 deliberately removed the old wire and
+                        // ledger variant. Preserve this row's cursor space so
+                        // a later append cannot reuse its sequence, but do
+                        // not reconstruct or route its obsolete payload.
+                        skipped_legacy_message_persisted += 1;
+                        oldest_seq.get_or_insert(seq);
+                        head_seq = head_seq.max(seq);
+                        debug!(
+                            target = "octos::ledger",
+                            session_id = %session_id.0,
+                            path = %path.display(),
+                            seq,
+                            "skipping removed legacy message/persisted ledger record"
+                        );
+                        continue;
+                    }
+                    Ok(ParsedLedgerDiskRecord::Record(record)) => {
                         skipped_unknown_version += 1;
                         debug!(
                             target = "octos::ledger",
                             version = record.v,
                             path = %path.display(),
                             "skipping ledger record with unknown version"
+                        );
+                        continue;
+                    }
+                    Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted { v, .. }) => {
+                        skipped_unknown_version += 1;
+                        debug!(
+                            target = "octos::ledger",
+                            version = v,
+                            path = %path.display(),
+                            "skipping legacy message/persisted ledger record with unknown version"
                         );
                         continue;
                     }
@@ -759,7 +1063,8 @@ impl UiProtocolLedger {
                     retained_entries.pop_front();
                 }
             }
-            let skipped_total = skipped_unknown_version + skipped_malformed;
+            let skipped_total =
+                skipped_unknown_version + skipped_legacy_message_persisted + skipped_malformed;
             if skipped_total > 0 {
                 skipped_records = skipped_records.saturating_add(skipped_total);
                 warn!(
@@ -768,6 +1073,7 @@ impl UiProtocolLedger {
                     path = %path.display(),
                     skipped = skipped_total,
                     skipped_unknown_version,
+                    skipped_legacy_message_persisted,
                     skipped_malformed,
                     "skipped ledger records during scan (aggregated)"
                 );
@@ -889,6 +1195,282 @@ impl UiProtocolLedger {
         self.emit_envelope_inner(session_id, thread_id, payload, client_message_id, topic)
     }
 
+    /// Emit one canonical v2 projection envelope under the same per-thread
+    /// sequence and terminal-barrier discipline as the older projection
+    /// writer. The cursor is assigned by the durable append path, never by a
+    /// caller, so live delivery and replay observe the identical envelope.
+    pub(crate) fn emit_envelope_v2(
+        &self,
+        session_id: &SessionKey,
+        thread_id: String,
+        payload: PayloadV2,
+        client_message_id: Option<String>,
+    ) -> Option<LedgeredUiProtocolEvent> {
+        let topic = session_id.topic().map(ToOwned::to_owned);
+        self.emit_envelope_v2_inner(session_id, thread_id, payload, client_message_id, topic)
+    }
+
+    fn emit_envelope_v2_inner(
+        &self,
+        session_id: &SessionKey,
+        thread_id: String,
+        payload: PayloadV2,
+        client_message_id: Option<String>,
+        topic: Option<String>,
+    ) -> Option<LedgeredUiProtocolEvent> {
+        let session_id_clone = session_id.clone();
+        let storage_id = self.storage_session_id(session_id);
+        let preload_snapshot = self.snapshot_if_session_absent(&storage_id);
+        let cursor;
+        let stamped;
+        let on_disk_delta;
+        let ledgered;
+        let broadcast_sender;
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let is_terminal = matches!(
+                &payload,
+                PayloadV2::TurnTerminal { .. } | PayloadV2::BackgroundChildCompleted { .. }
+            );
+            let seq = match self.allocate_projection_seq_locked(
+                &storage_id,
+                &thread_id,
+                is_terminal,
+                &mut inner,
+            ) {
+                Ok(seq) => seq,
+                Err(kind) => {
+                    drop(inner);
+                    metrics::counter!(
+                        "octos_projection_post_completion_drop_total",
+                        "kind" => kind,
+                    )
+                    .increment(1);
+                    return None;
+                }
+            };
+
+            let mut event = UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(
+                EnvelopeV2Notification {
+                    session_id: session_id_clone.clone(),
+                    topic,
+                    envelope: EnvelopeV2 {
+                        thread_id: thread_id.clone(),
+                        seq,
+                        cursor: None,
+                        turn_id: thread_id,
+                        client_message_id,
+                        payload,
+                    },
+                },
+            ));
+            event.stamp_topic_from_session();
+
+            let append_outcome =
+                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner);
+            cursor = append_outcome.cursor;
+            stamped = append_outcome.stamped;
+            on_disk_delta = append_outcome.on_disk_delta;
+            ledgered = LedgeredUiProtocolEvent {
+                cursor: cursor.clone(),
+                event: stamped.clone(),
+                from_connection: None,
+            };
+
+            if on_disk_delta >= 0 {
+                inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(on_disk_delta as u64);
+            } else {
+                inner.on_disk_bytes = inner.on_disk_bytes.saturating_sub((-on_disk_delta) as u64);
+            }
+            inner.touch_lru(&storage_id);
+            broadcast_sender = inner.subscribers.get(&session_id_clone).cloned();
+            if let Some(sender) = broadcast_sender.as_ref() {
+                let _ = sender.send(ledgered.clone());
+            }
+        }
+        let _ = broadcast_sender;
+        Some(ledgered)
+    }
+
+    /// Return the stable one-based assistant-segment ordinal for a v1
+    /// envelope being projected into Stage-1 v2.
+    ///
+    /// A persisted assistant row closes one iteration. Therefore all deltas
+    /// before the first persisted row are segment 1, the next iteration is
+    /// segment 2, and so on. The calculation reads existing durable ledger
+    /// entries only; it never appends a v2 row, which keeps legacy cursor
+    /// sequences byte-for-byte stable.
+    pub(crate) fn projection_v2_assistant_segment_index(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        envelope_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior_persisted = inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope)) => {
+                    envelope.envelope.thread_id == thread_id
+                        && envelope.envelope.seq < envelope_seq
+                        && matches!(
+                            &envelope.envelope.payload,
+                            Payload::AssistantPersisted { .. }
+                        )
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    envelope.envelope.thread_id == thread_id
+                        && envelope.envelope.seq < envelope_seq
+                        && matches!(
+                            &envelope.envelope.payload,
+                            PayloadV2::AssistantPersisted { .. }
+                        )
+                }
+                _ => false,
+            })
+            .count() as u64;
+        prior_persisted.saturating_add(1)
+    }
+
+    /// Segment currently owning a late attachment as of a particular ledger
+    /// cursor. If no assistant row had persisted yet, retain the first segment
+    /// as the deterministic fallback. Restricting the scan to source entries
+    /// preceding the attachment makes replay stable even after later assistant
+    /// iterations have been appended.
+    pub(crate) fn projection_v2_current_assistant_segment_index(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        before_cursor_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter(|entry| {
+                if entry.seq >= before_cursor_seq {
+                    return false;
+                }
+                match &entry.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope)) => {
+                        envelope.envelope.thread_id == thread_id
+                            && matches!(
+                                &envelope.envelope.payload,
+                                Payload::AssistantPersisted { .. }
+                            )
+                    }
+                    UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                        envelope.envelope.thread_id == thread_id
+                            && matches!(
+                                &envelope.envelope.payload,
+                                PayloadV2::AssistantPersisted { .. }
+                            )
+                    }
+                    _ => false,
+                }
+            })
+            .count()
+            .max(1) as u64
+    }
+
+    /// Next per-thread v1 sequence, used when a legacy terminal or attachment
+    /// is projected directly into a v2 envelope before its v1 dual-emit is
+    /// appended. Only source rows preceding this event's ledger cursor count;
+    /// otherwise a replay after later writes could assign a different v2 seq.
+    /// This is read-only and does not reserve or mutate sequence state.
+    pub(crate) fn projection_v2_next_envelope_seq(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        before_cursor_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter_map(|entry| {
+                if entry.seq >= before_cursor_seq {
+                    return None;
+                }
+                match &entry.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
+                        if envelope.envelope.thread_id == thread_id =>
+                    {
+                        Some(envelope.envelope.seq)
+                    }
+                    UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                        if envelope.envelope.thread_id == thread_id =>
+                    {
+                        Some(envelope.envelope.seq)
+                    }
+                    _ => None,
+                }
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Whether this parent turn has already opened a linked background child
+    /// stream. The legacy background sender appends its per-file
+    /// `file/attached` signals *after* `turn/spawn_complete`; v2 must not
+    /// replay those files onto the already-terminal parent stream because the
+    /// child completion already carries their media.
+    pub(crate) fn projection_v2_has_background_child(
+        &self,
+        session_id: &SessionKey,
+        parent_turn_id: &str,
+        before_cursor_seq: u64,
+    ) -> bool {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .any(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    entry.seq < before_cursor_seq
+                        && matches!(
+                            &envelope.envelope.payload,
+                            PayloadV2::BackgroundChildCompleted {
+                                parent_turn_id: child_parent_turn_id,
+                                ..
+                            } if child_parent_turn_id == parent_turn_id
+                        )
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(spawn)) => {
+                    entry.seq < before_cursor_seq
+                        && spawn.turn_id.as_ref().map(|turn_id| turn_id.0.to_string())
+                            == Some(parent_turn_id.to_owned())
+                }
+                _ => false,
+            })
+    }
+
     fn emit_envelope_inner(
         &self,
         session_id: &SessionKey,
@@ -914,7 +1496,11 @@ impl UiProtocolLedger {
         // order. `broadcast::Sender::send` is non-blocking (try_send on
         // a bounded queue) so the lock-hold is microseconds.
         let session_id_clone = session_id.clone();
-        let preload_snapshot = self.snapshot_if_session_absent(&session_id_clone);
+        // Storage identity for ring/seq/disk/LRU; `session_id_clone` (the
+        // plain wire id) still stamps the envelope payload and keys the live
+        // subscriber lookup below.
+        let storage_id = self.storage_session_id(session_id);
+        let preload_snapshot = self.snapshot_if_session_absent(&storage_id);
         let cursor;
         let stamped;
         let on_disk_delta;
@@ -924,10 +1510,13 @@ impl UiProtocolLedger {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
             // --- step 1: envelope seq allocation + hard barrier ---
-            let alloc = self.allocate_envelope_seq_locked(
-                &session_id_clone,
+            // Seq/thread state follows the STORAGE identity so two projects
+            // sharing a wire key allocate independent, per-project seq
+            // streams consistent with their separate rings/dirs.
+            let alloc = self.allocate_projection_seq_locked(
+                &storage_id,
                 &thread_id,
-                &payload,
+                matches!(&payload, Payload::TurnCompleted { .. }),
                 &mut inner,
             );
             let seq = match alloc {
@@ -961,7 +1550,7 @@ impl UiProtocolLedger {
 
             // --- step 3: append to the ledger (LRU, ring, disk) ---
             let append_outcome =
-                self.append_locked(&session_id_clone, event, None, preload_snapshot, &mut inner);
+                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner);
             cursor = append_outcome.cursor;
             stamped = append_outcome.stamped;
             on_disk_delta = append_outcome.on_disk_delta;
@@ -979,7 +1568,7 @@ impl UiProtocolLedger {
             } else {
                 inner.on_disk_bytes = inner.on_disk_bytes.saturating_sub((-on_disk_delta) as u64);
             }
-            inner.touch_lru(&session_id_clone);
+            inner.touch_lru(&storage_id);
 
             // --- step 4: publish to live subscribers WHILE STILL
             // HOLDING THE LOCK so the broadcast send order strictly
@@ -1013,11 +1602,11 @@ impl UiProtocolLedger {
     /// restart scans the durable ledger for existing envelopes matching
     /// this thread and resumes from `max(seq) + 1` — daemon restart
     /// MUST NOT reissue `seq=1` for a thread the client already saw.
-    fn allocate_envelope_seq_locked(
+    fn allocate_projection_seq_locked(
         &self,
         session_id: &SessionKey,
         thread_id: &str,
-        payload: &Payload,
+        is_terminal: bool,
         inner: &mut LedgerInner,
     ) -> Result<u64, &'static str> {
         let key = (session_id.clone(), thread_id.to_owned());
@@ -1037,9 +1626,8 @@ impl UiProtocolLedger {
             .get_mut(&key)
             .expect("thread_seq entry inserted above");
         // Hard barrier per spec § 14.6.
-        let is_turn_completed = matches!(payload, Payload::TurnCompleted { .. });
         if state.completed {
-            return Err(if is_turn_completed {
+            return Err(if is_terminal {
                 "duplicate_completed"
             } else {
                 "post_completion"
@@ -1050,7 +1638,7 @@ impl UiProtocolLedger {
         }
         let seq = state.next_seq;
         state.next_seq = state.next_seq.saturating_add(1);
-        if is_turn_completed {
+        if is_terminal {
             state.completed = true;
         }
         // Codex #1336 round-2 BLOCKER 3: persist the new watermark to
@@ -1101,9 +1689,10 @@ impl UiProtocolLedger {
             return state;
         };
         for entry in &session_state.entries {
-            if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) = &entry.event
-            {
-                if ev.envelope.thread_id == thread_id {
+            match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev))
+                    if ev.envelope.thread_id == thread_id =>
+                {
                     if ev.envelope.seq >= state.next_seq {
                         state.next_seq = ev.envelope.seq + 1;
                     }
@@ -1111,6 +1700,20 @@ impl UiProtocolLedger {
                         state.completed = true;
                     }
                 }
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(ev))
+                    if ev.envelope.thread_id == thread_id =>
+                {
+                    if ev.envelope.seq >= state.next_seq {
+                        state.next_seq = ev.envelope.seq + 1;
+                    }
+                    if matches!(
+                        &ev.envelope.payload,
+                        PayloadV2::TurnTerminal { .. } | PayloadV2::BackgroundChildCompleted { .. }
+                    ) {
+                        state.completed = true;
+                    }
+                }
+                _ => {}
             }
         }
         state
@@ -1259,19 +1862,38 @@ impl UiProtocolLedger {
 
     fn append(
         &self,
+        event: UiProtocolLedgerEvent,
+        from_connection: Option<ConnectionId>,
+    ) -> LedgeredUiProtocolEvent {
+        // Ring/LRU/disk are keyed by the per-project STORAGE identity; the
+        // live fan-out stays on the plain wire id (`publish_live`).
+        let storage_id = self.storage_session_id(event.session_id());
+        self.append_with_storage_id(storage_id, event, from_connection)
+    }
+
+    /// [`Self::append`] with the storage identity supplied by the caller
+    /// instead of resolved from the scope registry. Recovery-time reconcile
+    /// uses this: it walks dir-decoded storage identities while the registry
+    /// is still empty, and its synthesized terminal events must land in the
+    /// SAME (possibly `~cwd-`-scoped) ring/dir as the orphaned rows they
+    /// close — resolving through the registry would divert them to the
+    /// unscoped dir and leave phantom running turns behind.
+    fn append_with_storage_id(
+        &self,
+        storage_id: SessionKey,
         mut event: UiProtocolLedgerEvent,
         from_connection: Option<ConnectionId>,
     ) -> LedgeredUiProtocolEvent {
         event.stamp_topic_from_session();
         let session_id = event.session_id().clone();
-        let preload_snapshot = self.snapshot_if_session_absent(&session_id);
+        let preload_snapshot = self.snapshot_if_session_absent(&storage_id);
         let cursor;
         let stamped;
         let on_disk_delta;
         {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let outcome =
-                self.append_locked(&session_id, event, None, preload_snapshot, &mut inner);
+                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner);
             cursor = outcome.cursor;
             stamped = outcome.stamped;
             on_disk_delta = outcome.on_disk_delta;
@@ -1280,7 +1902,7 @@ impl UiProtocolLedger {
             } else {
                 inner.on_disk_bytes = inner.on_disk_bytes.saturating_sub((-on_disk_delta) as u64);
             }
-            inner.touch_lru(&session_id);
+            inner.touch_lru(&storage_id);
         }
 
         let ledgered = LedgeredUiProtocolEvent {
@@ -1692,8 +2314,9 @@ impl UiProtocolLedger {
 
     #[cfg(test)]
     pub(crate) fn has_session_in_memory_for_test(&self, session_id: &SessionKey) -> bool {
+        let session_id = self.storage_session_id(session_id);
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        inner.sessions.contains_key(session_id)
+        inner.sessions.contains_key(&session_id)
     }
 
     /// Snapshot of the observability counters. Useful for tests and the
@@ -1729,6 +2352,11 @@ impl UiProtocolLedger {
         session_id: &SessionKey,
         after: Option<&UiCursor>,
     ) -> Result<(Vec<LedgeredUiProtocolEvent>, UiCursor), RpcError> {
+        // Shadow with the per-project STORAGE identity (no-op when no scope
+        // is registered): ring lookups, disk fallbacks, minted cursor
+        // `stream`s, and the `after.stream` check below all follow it, so
+        // cursors round-trip against the same identity appends mint.
+        let session_id = &self.storage_session_id(session_id);
         // Atomicity contract (codex review #1): events and the returned
         // cursor are observed under a single lock acquisition. Concurrent
         // appenders see the same `inner` mutex, so no event can land
@@ -1927,6 +2555,9 @@ impl UiProtocolLedger {
         session_id: &SessionKey,
         after: Option<&UiCursor>,
     ) -> Result<(Vec<LedgeredUiProtocolEvent>, u64), RpcError> {
+        // Per-project STORAGE identity (no-op without a registered scope) —
+        // see `snapshot_with_cursor`. Callers pass the plain wire id.
+        let session_id = &self.storage_session_id(session_id);
         let Some(after) = after else {
             // No `after` — caller asked for "live only", no replay history.
             // Pair the empty replay with the current head_seq so the
@@ -2210,11 +2841,13 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
     match notification {
         UiNotification::SessionOpened(event) => &event.session_id,
         UiNotification::TurnStarted(event) => &event.session_id,
+        UiNotification::PlanUpdated(event) => &event.session_id,
         UiNotification::MessageDelta(event) => &event.session_id,
         UiNotification::ReasoningDelta(event) => &event.session_id,
         UiNotification::VisualGenerating(event) => &event.session_id,
         UiNotification::VisualSucceeded(event) => &event.session_id,
         UiNotification::VisualFailed(event) => &event.session_id,
+        UiNotification::VoiceExit(event) => &event.session_id,
         UiNotification::ToolStarted(event) => &event.session_id,
         UiNotification::ToolProgress(event) => &event.session_id,
         UiNotification::ToolCompleted(event) => &event.session_id,
@@ -2229,9 +2862,9 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::TurnCompleted(event) => &event.session_id,
         UiNotification::TurnError(event) => &event.session_id,
         UiNotification::ReplayLossy(event) => &event.session_id,
-        UiNotification::MessagePersisted(event) => &event.session_id,
         UiNotification::TurnSpawnComplete(event) => &event.session_id,
         UiNotification::FileAttached(event) => &event.session_id,
+        UiNotification::VoiceAudioChunk(event) => &event.session_id,
         UiNotification::SessionEventBridged(event) => &event.session_id,
         UiNotification::RouterStatus(event) => &event.session_id,
         UiNotification::RouterFailover(event) => &event.session_id,
@@ -2245,10 +2878,14 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::LoopFired(event) => &event.session_id,
         UiNotification::LoopCompleted(event) => &event.session_id,
         UiNotification::ContextCompactionCompleted(event) => &event.session_id,
+        UiNotification::ContextCompactionStarted(event) => &event.session_id,
         UiNotification::ContextNormalizationReported(event) => &event.session_id,
         UiNotification::SessionOrchestration(event) => &event.session_id,
+        UiNotification::PeerStaged(event) => &event.session_id,
+        UiNotification::PeerClosed(event) => &event.session_id,
         UiNotification::UserQuestionRequested(event) => &event.session_id,
         UiNotification::Envelope(event) => &event.session_id,
+        UiNotification::EnvelopeV2(event) => &event.session_id,
     }
 }
 
@@ -2258,6 +2895,7 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
         | UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => {
             cursor.as_ref().map(|c| c.seq)
         }
+        UiNotification::EnvelopeV2(envelope) => envelope.envelope.cursor.as_ref().map(|c| c.seq),
         _ => None,
     }
 }
@@ -2828,6 +3466,266 @@ mod tests {
         assert_eq!(replay_texts(&events), vec!["msg-4", "msg-5", "msg-6"]);
     }
 
+    /// Boot recovery must synthesize terminal events for task/turn/agent
+    /// rows the dead server generation left non-terminal — otherwise every
+    /// hydrate replays phantom running work forever.
+    #[test]
+    fn recovery_sweeps_rows_orphaned_by_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:orphan-sweep".into());
+        let turn_id = octos_core::TurnId::new();
+        let ghost_task = octos_core::TaskId::new();
+        {
+            let config = LedgerConfig::durable(temp.path().into());
+            let ledger = UiProtocolLedger::with_config(config);
+            let task: octos_core::ui_protocol::TaskUpdatedEvent = serde_json::from_value(json!({
+                "session_id": session_id.0.clone(),
+                "task_id": ghost_task.to_string(),
+                "title": "astro dev server",
+                "state": "running",
+            }))
+            .expect("task event");
+            ledger.append_notification(UiNotification::TaskUpdated(task));
+            let started: octos_core::ui_protocol::TurnStartedEvent =
+                serde_json::from_value(json!({
+                    "session_id": session_id.0,
+                    "turn_id": turn_id.0,
+                    "timestamp": chrono::Utc::now(),
+                }))
+                .expect("turn started");
+            ledger.append_notification(UiNotification::TurnStarted(started));
+            let agent: octos_core::ui_protocol::AgentUpdatedEvent = serde_json::from_value(json!({
+                "session_id": session_id.0,
+                "agent": {
+                    "agent_id": "agent-ghost",
+                    "session_id": session_id.0,
+                    "path": "root/agent-ghost",
+                    "role": "worker",
+                    "nickname": "ghost",
+                    "backend_kind": "native",
+                    "status": "running",
+                    "profile_id": "dev",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                }
+            }))
+            .expect("agent event");
+            ledger.append_notification(UiNotification::AgentUpdated(agent));
+        } // process "dies" — no terminal events were emitted
+
+        let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (events, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot");
+
+        let mut task_terminal = false;
+        let mut turn_terminal = false;
+        let mut agent_terminal = false;
+        for event in &events {
+            let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+                continue;
+            };
+            match notification {
+                UiNotification::TaskUpdated(task)
+                    if task.state == octos_core::ui_protocol::TaskRuntimeState::Cancelled
+                        && task.runtime_detail.as_deref() == Some("orphaned_by_restart") =>
+                {
+                    task_terminal = true;
+                }
+                UiNotification::TurnError(error)
+                    if error.turn_id == turn_id && error.code == "orphaned_by_restart" =>
+                {
+                    turn_terminal = true;
+                }
+                UiNotification::AgentUpdated(agent)
+                    if agent.agent.agent_id == "agent-ghost" && agent.agent.status == "failed" =>
+                {
+                    agent_terminal = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            task_terminal,
+            "orphaned running task must be swept terminal"
+        );
+        assert!(turn_terminal, "orphaned started turn must error terminal");
+        assert!(
+            agent_terminal,
+            "orphaned running agent must be swept terminal"
+        );
+
+        // Idempotence: a second recovery must not append more sweep events.
+        let count_after_first = events.len();
+        drop(recovered);
+        let recovered_again = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (events_again, _) = recovered_again
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot again");
+        assert_eq!(
+            events_again.len(),
+            count_after_first,
+            "second recovery must sweep nothing (rows already terminal)"
+        );
+    }
+
+    /// #1666 per-project isolation: two projects (`appui.sessions_in_cwd`)
+    /// can share the same WIRE session id. Registering distinct storage
+    /// scopes must give them distinct in-memory rings AND on-disk dirs —
+    /// including the warm-ring case where project A's events are still
+    /// resident when project B opens — while replayed events keep the plain
+    /// wire id in their payloads.
+    #[test]
+    fn should_isolate_ledger_storage_between_cwd_scopes_sharing_a_wire_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        let key = SessionKey("glm:local:tui#coding".into());
+
+        ledger.set_session_scope(&key, Some("aaaa111122223333".into()));
+        ledger.append_notification(delta(&key, "from-project-a"));
+
+        // Project B re-registers the SAME wire key under its own scope while
+        // A's ring entry is still warm.
+        ledger.set_session_scope(&key, Some("bbbb444455556666".into()));
+        ledger.append_notification(delta(&key, "from-project-b"));
+        let (events, _) = ledger
+            .snapshot_with_cursor(&key, None)
+            .expect("scoped snapshot");
+        assert_eq!(
+            replay_texts(&events),
+            vec!["from-project-b"],
+            "project B must not replay project A's warm-ring events"
+        );
+        assert!(
+            events.iter().all(|event| event.event.session_id() == &key),
+            "replayed payloads keep the PLAIN wire id, never the storage id"
+        );
+
+        // Back to A: its events are intact under its own storage identity.
+        ledger.set_session_scope(&key, Some("aaaa111122223333".into()));
+        let (events, _) = ledger
+            .snapshot_with_cursor(&key, None)
+            .expect("re-scoped snapshot");
+        assert_eq!(replay_texts(&events), vec!["from-project-a"]);
+
+        // Clearing the scope falls back to the (empty) legacy identity.
+        ledger.set_session_scope(&key, None);
+        let (events, _) = ledger
+            .snapshot_with_cursor(&key, None)
+            .expect("unscoped snapshot");
+        assert!(
+            replay_texts(&events).is_empty(),
+            "no scope registered → plain storage identity, which holds nothing"
+        );
+
+        // And the two projects own two distinct on-disk dirs (NUL-separated
+        // storage identities — see `storage_session_id`).
+        let scoped_a = SessionKey(format!("{}\u{0}~cwd-aaaa111122223333", key.0));
+        let scoped_b = SessionKey(format!("{}\u{0}~cwd-bbbb444455556666", key.0));
+        for scoped in [&scoped_a, &scoped_b] {
+            let dir = temp
+                .path()
+                .join("ui-protocol")
+                .join(encode_session_dir_name(scoped));
+            assert!(dir.is_dir(), "expected scoped dir {}", dir.display());
+        }
+
+        // Injectivity: a WIRE key that literally spells the old plain-ASCII
+        // marker shape must NOT alias into a scoped dir — its storage
+        // identity is itself (no NUL), so it stays a separate, empty bucket.
+        let impostor = SessionKey(format!("{}~cwd-aaaa111122223333", key.0));
+        let (events, _) = ledger
+            .snapshot_with_cursor(&impostor, None)
+            .expect("impostor snapshot");
+        assert!(
+            replay_texts(&events).is_empty(),
+            "a literal `~cwd-` wire key must not read a scoped project's events"
+        );
+    }
+
+    /// #1666: scoped dirs survive a restart under the SAME storage identity —
+    /// recovery decodes the scoped dir name verbatim, and a re-registered
+    /// scope replays it while an unregistered (plain) read stays empty.
+    #[test]
+    fn should_recover_scoped_sessions_under_their_storage_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = SessionKey("glm:local:tui#coding".into());
+        {
+            let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+            ledger.set_session_scope(&key, Some("aaaa111122223333".into()));
+            ledger.append_notification(delta(&key, "scoped-before-restart"));
+        } // process "dies"
+
+        let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (unregistered, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&key, None)
+            .expect("plain snapshot");
+        assert!(
+            replay_texts(&unregistered).is_empty(),
+            "without a registered scope the plain identity must not see scoped events"
+        );
+
+        recovered
+            .ledger
+            .set_session_scope(&key, Some("aaaa111122223333".into()));
+        let (events, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&key, None)
+            .expect("scoped snapshot after recovery");
+        assert_eq!(replay_texts(&events), vec!["scoped-before-restart"]);
+    }
+
+    /// #1666: recovery's orphan sweep must close rows INSIDE a scoped dir
+    /// (the synthesized terminal lands in the same scoped ring, not the
+    /// plain one) and its synthesized payloads must carry the plain WIRE
+    /// session id — never the `~cwd-` storage identity.
+    #[test]
+    fn recovery_sweeps_orphans_in_scoped_dirs_with_wire_session_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = SessionKey("glm:local:tui#coding".into());
+        let turn_id = octos_core::TurnId::new();
+        {
+            let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+            ledger.set_session_scope(&key, Some("aaaa111122223333".into()));
+            let started: octos_core::ui_protocol::TurnStartedEvent =
+                serde_json::from_value(json!({
+                    "session_id": key.0,
+                    "turn_id": turn_id.0,
+                    "timestamp": chrono::Utc::now(),
+                }))
+                .expect("turn started");
+            ledger.append_notification(UiNotification::TurnStarted(started));
+        } // dies mid-turn, no terminal event
+
+        let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        recovered
+            .ledger
+            .set_session_scope(&key, Some("aaaa111122223333".into()));
+        let (events, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&key, None)
+            .expect("scoped snapshot");
+        let synthesized = events
+            .iter()
+            .find_map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnError(error))
+                    if error.code == "orphaned_by_restart" =>
+                {
+                    Some(error.clone())
+                }
+                _ => None,
+            })
+            .expect("orphan sweep must synthesize the terminal INSIDE the scoped ring");
+        assert_eq!(
+            synthesized.session_id, key,
+            "synthesized terminal must carry the plain wire id, not the storage id"
+        );
+        assert_eq!(synthesized.turn_id, turn_id);
+    }
+
     #[test]
     fn snapshot_with_cursor_does_not_hydrate_stale_disk_over_newer_live() {
         // codex P1: `snapshot_with_cursor` must not let a STALE disk snapshot
@@ -3042,39 +3940,90 @@ mod tests {
         assert_eq!(outcome.sessions_recovered, sessions.len());
     }
 
-    // ---------- live publish-subscribe (issue #760) ----------
+    #[test]
+    fn recovery_skips_legacy_message_persisted_row_and_preserves_cursor_space() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:legacy-persisted".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        fs::create_dir_all(&session_dir).expect("session dir");
 
-    fn message_persisted_event(session: &SessionKey, role_str: &str) -> UiNotification {
-        use chrono::Utc;
-        use octos_core::ui_protocol::{MessagePersistedEvent, MessagePersistedSource};
-        UiNotification::MessagePersisted(MessagePersistedEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: Some(TurnId::new()),
-            thread_id: None,
-            seq: 0,
-            role: role_str.into(),
-            message_id: "msg-1".into(),
-            client_message_id: None,
-            source: MessagePersistedSource::Tool,
-            media: vec![],
-            cursor: UiCursor {
-                stream: session.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            content: None,
-        })
+        // Authentic pre-Stage-5 ledger shape. The v2-only reader recognizes
+        // the removed discriminator, skips its payload deliberately, and
+        // retains its cursor position so a new append cannot reuse seq 7.
+        let legacy = json!({
+            "v": LEDGER_DISK_VERSION,
+            "seq": 7,
+            "event": {
+                "record_kind": "notification",
+                "kind": "message_persisted",
+                "session_id": session_id.0,
+                "topic": null,
+                "turn_id": null,
+                "thread_id": "thread-legacy",
+                "seq": 3,
+                "role": "assistant",
+                "message_id": "local:legacy-persisted:3:1",
+                "client_message_id": null,
+                "source": "assistant",
+                "media": [],
+                "cursor": { "stream": session_id.0.clone(), "seq": 7 },
+                "persisted_at": "2026-01-01T00:00:00Z",
+                "content": null
+            }
+        });
+        fs::write(
+            session_dir.join(new_log_file_name()),
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy).expect("serialize legacy row")
+            ),
+        )
+        .expect("write legacy log");
+
+        let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (replay, cursor) = recovered
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("legacy replay must not crash");
+        assert!(replay.is_empty(), "removed payload must never be re-routed");
+        assert_eq!(cursor.seq, 7, "skipped row still reserves its cursor");
+
+        let next = recovered
+            .ledger
+            .append_notification(delta(&session_id, "v2-next"));
+        assert_eq!(
+            next.cursor.seq, 8,
+            "new row must continue after skipped legacy row"
+        );
     }
 
+    // ---------- live publish-subscribe (issue #760) ----------
+
     #[tokio::test]
-    async fn subscribe_delivers_message_persisted_to_live_receiver() {
+    async fn subscribe_delivers_v2_assistant_persisted_to_live_receiver() {
         let ledger = UiProtocolLedger::new(8);
         let session_id = SessionKey("local:live".into());
         let mut rx = ledger.subscribe(&session_id);
 
-        let appended =
-            ledger.append_notification(message_persisted_event(&session_id, "assistant"));
+        let appended = ledger
+            .emit_envelope_v2(
+                &session_id,
+                "thread-live".into(),
+                PayloadV2::AssistantPersisted {
+                    text: "assistant".into(),
+                    assistant_segment_id: "thread-live:assistant:1".into(),
+                    meta: octos_core::ui_protocol::MessageMeta {
+                        message_id: "msg-1".into(),
+                        persisted_at: chrono::Utc::now(),
+                        media: vec![],
+                    },
+                },
+                None,
+            )
+            .expect("v2 envelope emitted");
 
         let received = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
             .await
@@ -3084,7 +4033,7 @@ mod tests {
         assert_eq!(received.cursor, appended.cursor);
         assert!(matches!(
             received.event,
-            UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_))
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(_))
         ));
     }
 
@@ -3839,6 +4788,9 @@ mod tests {
         let line = legacy_envelope_tagged_record_line(&event, 1);
         let record = parse_ledger_disk_record(&line)
             .unwrap_or_else(|e| panic!("legacy envelope-tagged record MUST deserialize: {e}"));
+        let ParsedLedgerDiskRecord::Record(record) = record else {
+            panic!("legacy envelope-tagged record must remain a canonical record");
+        };
         assert_eq!(
             record.event, event,
             "legacy record must decode to the same variant"
@@ -3873,6 +4825,9 @@ mod tests {
         let line = legacy_envelope_tagged_record_line(&event, 1);
         let record = parse_ledger_disk_record(&line)
             .unwrap_or_else(|e| panic!("legacy envelope-tagged progress MUST deserialize: {e}"));
+        let ParsedLedgerDiskRecord::Record(record) = record else {
+            panic!("legacy envelope-tagged progress must remain a canonical record");
+        };
         assert_eq!(record.event, event);
     }
 

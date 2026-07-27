@@ -1,19 +1,24 @@
 //! CLI commands for octos.
 
 mod account;
+mod acp;
 mod admin;
 mod auth;
 mod channels;
 pub mod chat;
 mod clean;
 mod completions;
+mod config;
 mod cron;
 mod docs;
 mod doctor;
 pub mod gateway;
 mod init;
+pub mod mcp;
 pub mod mcp_serve;
+mod memory;
 mod office;
+mod profile;
 #[cfg(feature = "api")]
 mod serve;
 pub mod skills;
@@ -26,19 +31,30 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 pub use account::AccountCommand;
+pub use acp::AcpCommand;
+// Test-support seam for the `octos acp` bridge: the end-to-end integration test
+// in `crates/octos-cli/tests/acp_integration.rs` drives the real ACP handler
+// wiring with a `MockLlm`-backed agent over an in-process transport. Hidden
+// from docs; not part of the stable surface.
+#[doc(hidden)]
+pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
 pub use clean::CleanCommand;
 pub use completions::CompletionsCommand;
+pub use config::ConfigCommand;
 pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
+pub use mcp::McpCommand;
 pub use mcp_serve::McpServeCommand;
+pub use memory::MemoryCommand;
 pub use office::OfficeCommand;
+pub use profile::ProfileCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
@@ -81,6 +97,8 @@ fn version_string() -> &'static str {
 pub enum Command {
     /// Manage sub-accounts under profiles.
     Account(AccountCommand),
+    /// Run as an Agent Client Protocol (ACP) agent over stdio (Zed, etc.).
+    Acp(AcpCommand),
     /// Admin commands for tenant and tunnel management.
     Admin(AdminCommand),
     /// Manage authentication for LLM providers.
@@ -89,6 +107,8 @@ pub enum Command {
     Channels(ChannelsCommand),
     /// Interactive multi-turn chat with an agent.
     Chat(ChatCommand),
+    /// Inspect the saved startup config (`show` / `path`); read-only.
+    Config(ConfigCommand),
     /// Manage scheduled cron jobs.
     Cron(CronCommand),
     /// Run local environment diagnostics (flutter-doctor style).
@@ -97,6 +117,12 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Manage OAuth-authenticated MCP servers (`login`/`logout`).
+    Mcp(McpCommand),
+    /// Inspect and drive the memory-refresh pipeline.
+    Memory(MemoryCommand),
+    /// Portable profile export (QR) and payload inspection.
+    Profile(ProfileCommand),
     /// Run as an MCP server so outer orchestrators can invoke octos as a sub-agent.
     McpServe(McpServeCommand),
     /// Start the REST API server (requires --features api).
@@ -116,6 +142,31 @@ pub enum Command {
     Completions(CompletionsCommand),
     /// Office file manipulation (extract, unpack, pack, clean, add-slide, validate).
     Office(OfficeCommand),
+}
+
+/// Whether `command` emits machine-readable output on stdout and therefore
+/// needs the tracing console layer routed to stderr so logs never corrupt that
+/// stream.
+///
+/// * `acp` speaks ACP JSON-RPC on stdout (one stray log line → a `-32700`
+///   parse error at strict clients like Zed);
+/// * `mcp-serve --transport stdio` speaks MCP JSON-RPC on stdout;
+/// * `profile` emits payloads meant for `$(...)` capture / piping;
+/// * `chat --json` emits a single JSON result object on stdout (scripting /
+///   agent-to-agent);
+/// * `doctor --json` emits the diagnostics support bundle on stdout — the
+///   config-parse check loads the real config, whose tracing INFO lines
+///   ("no config.json found, using defaults") would otherwise corrupt the
+///   JSON.
+///
+/// Every other command keeps its historical stdout console routing untouched.
+pub fn reserve_stdout(command: &Command) -> bool {
+    match command {
+        Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) => true,
+        Command::Chat(cmd) => cmd.json,
+        Command::Doctor(cmd) => cmd.json,
+        _ => false,
+    }
 }
 
 /// Trait for executable commands (following dora-rs pattern).
@@ -299,14 +350,18 @@ impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
             Self::Account(cmd) => cmd.execute(),
+            Self::Acp(cmd) => cmd.execute(),
             Self::Admin(cmd) => cmd.execute(),
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
+            Self::Config(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
             Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::Mcp(cmd) => cmd.execute(),
+            Self::Profile(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),
             #[cfg(feature = "api")]
             Self::Serve(cmd) => cmd.execute(),
@@ -315,8 +370,62 @@ impl Executable for Command {
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
+            Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
         }
+    }
+}
+
+#[cfg(test)]
+mod reserve_stdout_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn should_reserve_stdout_when_chat_json_set() {
+        // `octos chat --json` opts into a pure-stdout JSON result stream, so
+        // its tracing logs must route to stderr.
+        let args = Args::try_parse_from(["octos", "chat", "--json", "--message", "hi"])
+            .expect("`chat --json` must parse");
+        assert!(reserve_stdout(&args.command));
+    }
+
+    #[test]
+    fn should_not_reserve_stdout_when_chat_lacks_json() {
+        // Plain `octos chat` keeps its historical stdout console routing.
+        let args =
+            Args::try_parse_from(["octos", "chat", "--message", "hi"]).expect("`chat` must parse");
+        assert!(!reserve_stdout(&args.command));
+    }
+
+    #[test]
+    fn should_reserve_stdout_only_for_doctor_json() {
+        // `octos doctor --json` emits the support bundle on stdout; the
+        // config-parse check's tracing INFO lines must route to stderr so the
+        // JSON stays parseable. Plain `octos doctor` keeps stdout logging.
+        let json = Args::try_parse_from(["octos", "doctor", "--json"])
+            .expect("`doctor --json` must parse");
+        assert!(reserve_stdout(&json.command));
+        let human = Args::try_parse_from(["octos", "doctor"]).expect("`doctor` must parse");
+        assert!(!reserve_stdout(&human.command));
+    }
+
+    #[test]
+    fn should_not_reserve_stdout_for_ordinary_command() {
+        // A non-protocol command (e.g. `status`) is unchanged by the chat-json
+        // extension — Serve, Status, etc. never reserve stdout.
+        let args = Args::try_parse_from(["octos", "status"]).expect("`status` must parse");
+        assert!(!reserve_stdout(&args.command));
+    }
+
+    #[test]
+    fn should_reserve_stdout_for_stdio_protocol_commands() {
+        // Pre-existing reservations must remain: acp / mcp-serve speak a
+        // machine protocol on stdout.
+        let acp = Args::try_parse_from(["octos", "acp"]).expect("`acp` must parse");
+        assert!(reserve_stdout(&acp.command));
+        let mcp = Args::try_parse_from(["octos", "mcp-serve"]).expect("`mcp-serve` must parse");
+        assert!(reserve_stdout(&mcp.command));
     }
 }

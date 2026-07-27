@@ -193,6 +193,25 @@ impl PluginLoader {
         extra_env: &[(String, String)],
         options: PluginLoadOptions<'_>,
     ) -> Result<PluginLoadResult> {
+        Self::load_into_with_options_and_filter(registry, dirs, extra_env, options, None)
+    }
+
+    /// Like [`load_into_with_options`](Self::load_into_with_options), but applies
+    /// a skill-layering (v1) selection filter: a plugin whose manifest id is
+    /// not permitted by `skill_filter` is skipped entirely (no tools, hooks,
+    /// MCP servers, or prompt fragments registered).
+    ///
+    /// `skill_filter == None` ⇒ no filtering: every discovered plugin loads
+    /// exactly as before this feature existed (backwards-compatible). The
+    /// filter matches on `DiscoveredPlugin.manifest.id`, which equals the
+    /// skill's `SKILL.md` name and directory name.
+    pub fn load_into_with_options_and_filter(
+        registry: &mut ToolRegistry,
+        dirs: &[PathBuf],
+        extra_env: &[(String, String)],
+        options: PluginLoadOptions<'_>,
+        skill_filter: Option<&crate::skills::SkillFilter>,
+    ) -> Result<PluginLoadResult> {
         let mut result = PluginLoadResult::default();
 
         // Delegate dir scanning + dedup to octos_plugin::discovery so the
@@ -228,6 +247,18 @@ impl PluginLoader {
         let discovered = octos_plugin::discover_plugins(&sources, &extra_env_map);
 
         for plugin in discovered {
+            // Skill layering v1: skip plugins whose skill id is disabled (or
+            // not allow-listed) by the profile's inherited selection. Matched
+            // on the manifest id (== SKILL.md name == skill dir name).
+            if let Some(filter) = skill_filter {
+                if !filter.allows(&plugin.manifest.id) {
+                    info!(
+                        skill = %plugin.manifest.id,
+                        "skill layering: skipping plugin disabled by profile config"
+                    );
+                    continue;
+                }
+            }
             let path = plugin.path;
             // Re-parse via the agent-side manifest type below: octos_plugin's
             // PluginManifest is a structural subset and doesn't model
@@ -280,17 +311,13 @@ impl PluginLoader {
         // companion and hide the individual target tools from the
         // LLM-visible spec list.
         //
-        // Hiding uses `mark_internal_hidden` (not `defer`, not unregister)
-        // so the target tools:
+        // Hiding uses `mark_internal_hidden` (not unregister) so the target
+        // tools:
         //   - remain reachable via `registry.get(name)` — the dispatcher
         //     forwards to them by name, and legacy/internal callers
         //     (e.g. pre-existing test paths) can still invoke them.
-        //   - are invisible to `specs()` — the LLM never sees them.
-        //   - are invisible to `activate_tools` enumeration AND
-        //     non-promotable via `activate(name)` — the LLM cannot
-        //     resurrect them as siblings, which would defeat the
-        //     RFC-1 consolidation. (codex P1 fixup: `defer` allowed
-        //     `activate_tools` to advertise + re-promote them.)
+        //   - are invisible to `specs()` — the LLM never sees them, so the
+        //     LLM only ever reaches them through the `mofa_make` dispatcher.
         //
         // The LLM only sees `mofa_make` + `mofa_describe_content_type`,
         // never the individual `mofa_slides` / `mofa_cards` / ...
@@ -1211,6 +1238,66 @@ mod tests {
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(registry.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_filter_skips_disabled_plugin_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["keep-plugin", "drop-plugin"] {
+            let plugin_dir = dir.path().join(name);
+            std::fs::create_dir(&plugin_dir).unwrap();
+            let tool = format!("{}_tool", name.replace('-', "_"));
+            std::fs::write(
+                plugin_dir.join("manifest.json"),
+                format!(
+                    r#"{{"name": "{name}", "version": "1.0", "tools": [{{"name": "{tool}", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
+                ),
+            )
+            .unwrap();
+            let exec_path = plugin_dir.join(name);
+            std::fs::write(
+                &exec_path,
+                "#!/bin/sh\necho '{\"output\": \"hi\", \"success\": true}'",
+            )
+            .unwrap();
+            std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // AllDiscovered with `drop-plugin` disabled: only keep-plugin loads.
+        let filter = crate::skills::SkillFilter::AllExcept(std::collections::HashSet::from([
+            "drop-plugin".to_string(),
+        ]));
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options_and_filter(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions::default(),
+            Some(&filter),
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_count, 1, "only the enabled plugin's tool loads");
+        assert!(registry.get("keep_plugin_tool").is_some());
+        assert!(
+            registry.get("drop_plugin_tool").is_none(),
+            "a disabled skill must not register tools"
+        );
+
+        // No filter ⇒ both plugins load (backwards-compatible).
+        let mut registry_all = ToolRegistry::new();
+        let result_all = PluginLoader::load_into_with_options_and_filter(
+            &mut registry_all,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result_all.tool_count, 2);
     }
 
     #[test]
@@ -2933,18 +3020,14 @@ path = "src/main.rs"
         );
     }
 
-    /// RFC-1 fixup (codex P1, Finding #2): when a `make_type` skill is
-    /// loaded, the resolved target tool (e.g. `mofa_slides`) MUST NOT
-    /// appear in `activate_tools`'s description-side enumeration of
-    /// deferred tools. Pre-fixup, the loader put each target into
-    /// `deferred`, which made `ToolRegistry::specs()` append the name
-    /// to `activate_tools`'s description ("Currently deferred tools
-    /// available to load: mofa_slides, …") and let weaker models read
-    /// the sibling out and call `activate_tools(["mofa_slides"])` to
-    /// re-promote it — defeating the entire RFC-1 consolidation.
+    /// RFC-1 (issue #1290) + RFC-0 (#1289): when a `make_type` skill is
+    /// loaded, the resolved target tool (e.g. `mofa_slides`) is registered
+    /// (callable via `get()` so the dispatcher can forward to it) but
+    /// hidden from the LLM-visible `specs()` set. The LLM only ever sees
+    /// the `mofa_make` dispatcher.
     #[cfg(unix)]
     #[test]
-    fn mofa_make_targets_not_listed_in_activate_tools_description() {
+    fn mofa_make_targets_hidden_from_specs_but_callable() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2974,7 +3057,6 @@ path = "src/main.rs"
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        registry.register(crate::tools::ActivateToolsTool::new());
         let _ = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
 
         // Sanity: the target tool IS registered (callable via get()),
@@ -2993,115 +3075,11 @@ path = "src/main.rs"
             visible
         );
 
-        // The critical assertion for this fixup: `activate_tools`'s
-        // description (which `specs()` augments with the deferred-list
-        // enumeration) MUST NOT mention the target tool name. With the
-        // old `defer()` path, `specs()` appended "Currently deferred
-        // tools available to load: mofa_slides, …" to the description,
-        // giving the LLM a clear signal to re-promote the sibling.
-        let activate_spec = registry
-            .specs()
-            .into_iter()
-            .find(|s| s.name == "activate_tools")
-            .expect("activate_tools must be in the visible spec set");
+        // The dispatcher itself IS visible.
         assert!(
-            !activate_spec.description.contains("mofa_slides"),
-            "activate_tools description must NOT enumerate mofa_make's hidden \
-             target tools (mofa_slides); RFC-1 says the LLM is supposed to \
-             only see mofa_make. Got description: {:?}",
-            activate_spec.description
-        );
-    }
-
-    /// RFC-1 fixup (codex P1, Finding #2): even if the LLM tries to
-    /// call `activate_tools` with an explicit dispatcher-target name
-    /// (e.g. it cached the name from a prior session, or read it out
-    /// of a tool-error message), the registry MUST refuse to re-promote
-    /// it. The dispatcher is the only supported LLM entry-point for
-    /// these tools.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn make_target_not_re_promotable_via_activate_tools() {
-        use std::os::unix::fs::PermissionsExt;
-
-        use crate::tools::ActivateToolsTool;
-
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("mofa-slides");
-        std::fs::create_dir(&plugin_dir).unwrap();
-        std::fs::write(
-            plugin_dir.join("manifest.json"),
-            r#"{
-                "name": "mofa-slides",
-                "version": "1.0",
-                "make_type": "slides",
-                "content_type_description": "PPTX decks",
-                "tools": [{
-                    "name": "mofa_slides",
-                    "description": "Render slides",
-                    "input_schema": {"type": "object", "properties": {}}
-                }]
-            }"#,
-        )
-        .unwrap();
-        let exec_path = plugin_dir.join("mofa-slides");
-        std::fs::write(
-            &exec_path,
-            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
-        )
-        .unwrap();
-        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let mut registry = ToolRegistry::new();
-        let activate_tool = ActivateToolsTool::new();
-        registry.register_arc(std::sync::Arc::new(activate_tool));
-        let _ = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
-
-        // Wire activate_tools back-ref so its execute path can reach
-        // the registry (mirrors what `Agent::new` + `wire_activate_tools`
-        // does in production).
-        let registry_arc = std::sync::Arc::new(registry);
-        if let Some(arc) = registry_arc.get("activate_tools") {
-            if let Some(t) = arc.as_any().downcast_ref::<ActivateToolsTool>() {
-                t.set_registry(std::sync::Arc::downgrade(&registry_arc));
-            }
-        }
-
-        // Pre-condition: `mofa_slides` is NOT in the visible spec set.
-        let visible_before: Vec<String> =
-            registry_arc.specs().into_iter().map(|s| s.name).collect();
-        assert!(!visible_before.contains(&"mofa_slides".to_string()));
-
-        // The LLM tries to re-promote the dispatcher target by name.
-        // The registry's `activate()` must refuse — internal-hidden
-        // tools are not promotable.
-        let activated = registry_arc.activate("mofa_slides");
-        assert!(
-            activated.is_empty(),
-            "internal-hidden mofa_slides must NOT be activatable by name; \
-             got activated={:?}",
-            activated
-        );
-
-        // Post-condition: `mofa_slides` is still NOT visible to the LLM.
-        let visible_after: Vec<String> = registry_arc.specs().into_iter().map(|s| s.name).collect();
-        assert!(
-            !visible_after.contains(&"mofa_slides".to_string()),
-            "post-activate, mofa_slides must remain hidden; got visible={:?}",
-            visible_after
-        );
-
-        // And the `activate_tools` tool itself (when invoked through
-        // its execute path) MUST NOT advertise mofa_slides in its
-        // "Available tools to load" output.
-        let activate_arc = registry_arc
-            .get("activate_tools")
-            .expect("activate_tools registered");
-        let result = activate_arc.execute(&serde_json::json!({})).await.unwrap();
-        assert!(
-            !result.output.contains("mofa_slides"),
-            "activate_tools output must NOT mention mofa_slides; got {:?}",
-            result.output
+            visible.contains(&"mofa_make".to_string()),
+            "mofa_make dispatcher must be visible; got {:?}",
+            visible
         );
     }
 

@@ -172,15 +172,57 @@ impl RetryProvider {
                 if let Some(status) = reqwest_err.status() {
                     return matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529);
                 }
-                // Connection errors are retryable (may be transient network issue)
+                // Timeout errors should NOT be retried on the same provider —
+                // if a provider is unresponsive, retrying wastes the
+                // per-request budget × retries. Timeouts trigger failover to a
+                // different provider instead. Checked BEFORE `is_connect`: a
+                // connect *timeout* is BOTH `is_timeout()` and `is_connect()`,
+                // and must fail over rather than hammer the same unreachable
+                // lane (empirically confirmed against a black-holed address).
+                if reqwest_err.is_timeout() {
+                    return false;
+                }
+                // Connection *establishment* errors with no timeout (refused,
+                // DNS, TLS handshake) are transient — retry on the same
+                // provider (may be a transient network blip).
                 if reqwest_err.is_connect() {
                     return true;
                 }
-                // Timeout errors should NOT be retried on the same provider —
-                // if a provider is unresponsive, retrying wastes 120s × retries.
-                // Timeouts trigger failover to a different provider instead.
-                if reqwest_err.is_timeout() {
-                    return false;
+                // Transport-level send/body failures WITHOUT an HTTP status —
+                // the status-bearing branch above already returned, so any
+                // reqwest error reaching here carried no response. These are
+                // transient network faults while sending the request or
+                // reading the response head: connection reset, broken pipe,
+                // early EOF, and most importantly "connection closed before
+                // message completed" — reqwest reusing a pooled keepalive
+                // socket that the peer's load balancer already closed. reqwest
+                // classifies these as `is_request()`/`is_body()` (NOT
+                // `is_connect`, NOT `is_timeout`), so the connect-only branch
+                // above missed them and a mid-turn drop hard-failed the whole
+                // turn with no retry and no failover. Retry on the same
+                // provider — a fresh connection is dialed on the next attempt.
+                //
+                // DELIBERATE at-least-once tradeoff: a statusless send failure
+                // is ambiguous — the request may have been fully received and
+                // billed by the server before the connection dropped ("no
+                // response" != "not accepted"). Replaying can therefore
+                // double-bill a non-idempotent chat POST in the rare
+                // mid-generation-drop sub-case. We accept this because (a) the
+                // dominant cause here is a reused idle-keepalive socket the LB
+                // closed BEFORE servicing the request (never billed → safe to
+                // replay), and for a streaming POST a server that had begun
+                // generating would have already flushed response headers, so
+                // `.send()` would have resolved and the drop would surface as a
+                // stream/body error OUTSIDE this retry scope; (b) the agent
+                // loop consumes exactly one ChatResponse, so a replay never
+                // duplicates tool side-effects — the only residual harm is
+                // provider-side double-billing; (c) the alternative is hard-
+                // failing the entire turn on any transient drop, which is
+                // strictly worse UX. Future hardening (not done here): a short
+                // pool idle-timeout to stop reusing about-to-close sockets, or
+                // a client idempotency key where the endpoint supports one.
+                if reqwest_err.is_request() || reqwest_err.is_body() {
+                    return true;
                 }
             }
         }
@@ -194,10 +236,17 @@ impl RetryProvider {
             }
         }
 
-        // Network-level errors without reqwest context
+        // Network-level errors without reqwest context (flattened error
+        // strings, provider `bail!`s, or a cause chain that lost the typed
+        // reqwest error). "connection closed before message completed" is the
+        // reused-keepalive drop; "error sending request" / "broken pipe" cover
+        // the same transport family surfaced as plain text.
         let lower = error_str.to_lowercase();
         if lower.contains("connection refused")
             || lower.contains("connection reset")
+            || lower.contains("connection closed")
+            || lower.contains("broken pipe")
+            || lower.contains("error sending request")
             || lower.contains("timed out")
             || lower.contains("overloaded")
         {
@@ -216,8 +265,8 @@ impl RetryProvider {
 
     /// Extract a longer delay for rate-limit (429 TPM) errors.
     /// OpenAI errors include "Please try again in 29.159s" — parse that.
-    /// Falls back to 30s if unparseable.
-    fn rate_limit_delay(error: &eyre::Report) -> Option<Duration> {
+    /// Falls back to 30s if unparseable. Always clamped to `max_delay`.
+    fn rate_limit_delay(&self, error: &eyre::Report) -> Option<Duration> {
         let msg = error.to_string();
         // Only apply to rate-limit / TPM errors
         let msg_lower = msg.to_lowercase();
@@ -229,20 +278,36 @@ impl RetryProvider {
         {
             return None;
         }
-        // Try to parse "try again in Xs" or "try again in X.XXXs"
+        // Try to parse "try again in Xs" / "X.XXXs" / "Xms". The numeric run
+        // stops at the first unit letter; the UNIT that follows decides the
+        // scale. Consuming only the digits and assuming seconds turned a
+        // sub-second "try again in 906ms" hint into a ~15-minute sleep.
         if let Some(idx) = msg.find("try again in ") {
             let after = &msg[idx + "try again in ".len()..];
             let num_str: String = after
                 .chars()
                 .take_while(|c| c.is_ascii_digit() || *c == '.')
                 .collect();
-            if let Ok(secs) = num_str.parse::<f64>() {
-                // Add 1s buffer
-                return Some(Duration::from_secs_f64(secs + 1.0));
+            if let Ok(value) = num_str.parse::<f64>() {
+                // `num_str` is ASCII digits/'.', so its char len == byte len.
+                let unit = after[num_str.len()..].trim_start();
+                let base = if unit.starts_with("ms") {
+                    Duration::from_secs_f64(value / 1000.0)
+                } else {
+                    // "s", "sec", or a bare number → seconds (OpenAI/Anthropic
+                    // spell sub-second hints in ms, so a unit-less value is a
+                    // whole-second count).
+                    Duration::from_secs_f64(value)
+                };
+                // Add a 1s buffer, then clamp to `max_delay` so a large or
+                // malformed hint ("try again in 1800s") can't park the whole
+                // provider on a multi-minute sleep past the configured ceiling.
+                let delay = base.saturating_add(Duration::from_secs(1));
+                return Some(delay.min(self.config.max_delay));
             }
         }
-        // Fallback: wait 30s for TPM to reset
-        Some(Duration::from_secs(30))
+        // Fallback: wait 30s for TPM to reset (still clamped to max_delay).
+        Some(Duration::from_secs(30).min(self.config.max_delay))
     }
 }
 
@@ -263,8 +328,14 @@ impl LlmProvider for RetryProvider {
                     return Ok(response);
                 }
                 Err(e) => {
-                    if attempt < self.config.max_retries && Self::is_retryable_error(&e) {
-                        let delay = Self::rate_limit_delay(&e)
+                    let fail_fast =
+                        crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+                    if !fail_fast
+                        && attempt < self.config.max_retries
+                        && Self::is_retryable_error(&e)
+                    {
+                        let delay = self
+                            .rate_limit_delay(&e)
                             .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
                             attempt = attempt + 1,
@@ -301,8 +372,14 @@ impl LlmProvider for RetryProvider {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    if attempt < self.config.max_retries && Self::is_retryable_error(&e) {
-                        let delay = Self::rate_limit_delay(&e)
+                    let fail_fast =
+                        crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+                    if !fail_fast
+                        && attempt < self.config.max_retries
+                        && Self::is_retryable_error(&e)
+                    {
+                        let delay = self
+                            .rate_limit_delay(&e)
                             .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
                             attempt = attempt + 1,
@@ -517,28 +594,69 @@ mod tests {
         assert!(RetryProvider::should_failover(&err));
     }
 
+    /// A retry provider with a generous `max_delay` so the clamp does not
+    /// interfere with parse-scale assertions.
+    fn retry_provider_uncapped() -> RetryProvider {
+        RetryProvider {
+            inner: Arc::new(MockProvider),
+            config: RetryConfig {
+                max_delay: Duration::from_secs(3600),
+                ..RetryConfig::default()
+            },
+        }
+    }
+
     #[test]
     fn test_rate_limit_delay_parses_seconds() {
         let err = eyre::eyre!(
             "OpenAI API error: 429 Too Many Requests - Rate limit reached. Please try again in 29.159s"
         );
-        let delay = RetryProvider::rate_limit_delay(&err).unwrap();
+        let delay = retry_provider_uncapped().rate_limit_delay(&err).unwrap();
         // 29.159 + 1.0 buffer = ~30.159s
         assert!(delay.as_secs_f64() > 29.0 && delay.as_secs_f64() < 32.0);
+    }
+
+    #[test]
+    fn test_rate_limit_delay_parses_milliseconds() {
+        // "906ms" must be read as 0.906s, NOT 906s — the unit suffix decides
+        // the scale (the +1s buffer dominates the sub-second value).
+        let err =
+            eyre::eyre!("OpenAI API error: 429 Too Many Requests - Please try again in 906ms");
+        let delay = retry_provider_uncapped().rate_limit_delay(&err).unwrap();
+        assert!(
+            delay.as_secs_f64() > 1.0 && delay.as_secs_f64() < 2.5,
+            "906ms + 1s buffer must be ~1.9s, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_delay_clamps_to_max_delay() {
+        // A large (or malformed) hint cannot exceed the configured ceiling.
+        let provider = RetryProvider {
+            inner: Arc::new(MockProvider),
+            config: RetryConfig {
+                max_delay: Duration::from_secs(60),
+                ..RetryConfig::default()
+            },
+        };
+        let err =
+            eyre::eyre!("OpenAI API error: 429 Too Many Requests - Please try again in 1800s");
+        let delay = provider.rate_limit_delay(&err).unwrap();
+        assert_eq!(delay, Duration::from_secs(60), "must clamp to max_delay");
     }
 
     #[test]
     fn test_rate_limit_delay_fallback() {
         let err =
             eyre::eyre!("OpenAI API error: 429 Too Many Requests - tokens per min limit exceeded");
-        let delay = RetryProvider::rate_limit_delay(&err).unwrap();
+        let delay = retry_provider_uncapped().rate_limit_delay(&err).unwrap();
         assert_eq!(delay, Duration::from_secs(30));
     }
 
     #[test]
     fn test_rate_limit_delay_not_429() {
         let err = eyre::eyre!("OpenAI API error: 500 Internal Server Error");
-        assert!(RetryProvider::rate_limit_delay(&err).is_none());
+        assert!(retry_provider_uncapped().rate_limit_delay(&err).is_none());
     }
 
     #[test]
@@ -559,6 +677,161 @@ mod tests {
         assert_eq!(provider.calculate_delay(3), Duration::from_secs(8));
         // Should cap at max_delay
         assert_eq!(provider.calculate_delay(10), Duration::from_secs(60));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // FailFast policy tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Provider that always returns a retryable error and counts `chat` and
+    /// `chat_stream` calls via a shared counter.
+    struct CountingProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingProvider {
+        fn always_err_429() -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::rate_limited(Some(0)).into())
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::rate_limited(Some(0)).into())
+        }
+
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_call_inner_once_when_failfast_even_if_retryable() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::Ordering;
+        let provider = CountingProvider::always_err_429();
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            retry.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "FailFast must not retry");
+    }
+
+    #[tokio::test]
+    async fn should_retry_when_normal_policy() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::Ordering;
+        // Use a 503 ServerError — NOT a rate-limit error — so that
+        // `rate_limit_delay` returns `None` and `calculate_delay` uses the
+        // configured 1-2 ms delays. Using `rate_limited(Some(0))` here would
+        // trigger the 30 s rate-limit fallback delay (3 retries × 30 s = 90 s).
+        struct CountingServer503 {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl LlmProvider for CountingServer503 {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(LlmError::new(
+                    LlmErrorKind::ServerError { status: 503 },
+                    "service unavailable",
+                )
+                .into())
+            }
+            fn model_id(&self) -> &str {
+                "counting-503"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+
+        let provider = CountingServer503 {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let result = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            retry.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "Normal retries max_retries+1 times"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_call_inner_once_when_failfast_on_stream() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use std::sync::atomic::Ordering;
+        let provider = CountingProvider::always_err_429();
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            retry.chat_stream(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "FailFast must not retry chat_stream"
+        );
     }
 
     struct MockProvider;
@@ -662,5 +935,202 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("503"), "unexpected error: {e}"),
             Ok(_) => panic!("should fail after exhausting retries"),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Transport-level send-failure classification (issue: glm-5.2
+    // `failed to send streaming request` hard-failed a 20-action turn).
+    //
+    // These drive a real `reqwest` client at a local TCP server that fails
+    // the request in the same way z.ai's endpoint does under load, then wrap
+    // the error EXACTLY like `anthropic.rs`
+    // (`.send().await.wrap_err("failed to send streaming request to Anthropic")`)
+    // and assert the retry/failover verdict.
+    // ──────────────────────────────────────────────────────────────────────
+    use eyre::WrapErr;
+
+    /// Produce a real `reqwest` send failure of the requested `kind`, wrapped
+    /// like the Anthropic provider does:
+    ///   - `"refused"`         → nothing listening (reqwest `is_connect`)
+    ///   - `"immediate_close"` → server accepts then drops the socket
+    ///   - `"read_then_close"` → server reads the request then closes without
+    ///     replying ("connection closed before message completed" — the
+    ///     reused-keepalive / half-open-socket case)
+    async fn transport_send_error(kind: &str) -> eyre::Report {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let client = crate::provider::build_http_client(5, 5);
+
+        if kind == "refused" {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let url = format!("http://127.0.0.1:{port}/v1/messages");
+            let res = client
+                .post(&url)
+                .json(&serde_json::json!({"x": 1}))
+                .send()
+                .await;
+            return res
+                .map(|_| ())
+                .wrap_err("failed to send streaming request to Anthropic")
+                .unwrap_err();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let read_then_close = kind == "read_then_close";
+        let accept = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                if read_then_close {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                }
+                drop(sock);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/v1/messages");
+        let res = client
+            .post(&url)
+            .json(&serde_json::json!({"x": 1}))
+            .send()
+            .await;
+        let _ = accept.await;
+        res.map(|_| ())
+            .wrap_err("failed to send streaming request to Anthropic")
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn should_retry_and_failover_on_connection_closed_before_completed() {
+        // The exact failure z.ai returns when reqwest reuses a keepalive
+        // socket the load balancer already closed: reqwest reports it as
+        // `is_request()` (NOT `is_connect`, NOT `is_timeout`, no status).
+        // Before the fix this was classified non-retryable AND
+        // non-failover-worthy, hard-failing the whole turn.
+        let err = transport_send_error("read_then_close").await;
+        assert!(
+            RetryProvider::is_retryable_error(&err),
+            "statusless transport send failure must retry on the same provider: {err:#}"
+        );
+        assert!(
+            RetryProvider::should_failover(&err),
+            "statusless transport send failure must also be failover-worthy: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_retry_and_failover_on_immediate_connection_close() {
+        let err = transport_send_error("immediate_close").await;
+        assert!(
+            RetryProvider::is_retryable_error(&err),
+            "reset-after-accept must retry: {err:#}"
+        );
+        assert!(
+            RetryProvider::should_failover(&err),
+            "reset-after-accept must failover: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_failover_not_retry_on_connect_timeout() {
+        // A connect timeout is BOTH is_connect() and is_timeout(); it must be
+        // treated as a timeout (failover, don't retry the same unreachable
+        // lane), so is_timeout() is checked before is_connect(). TEST-NET-1
+        // (192.0.2.0/24, RFC 5737) is routed nowhere → the connect hangs until
+        // connect_timeout fires.
+        let client = reqwest::Client::builder()
+            // Bypass any ambient HTTP_PROXY/ALL_PROXY — a proxy could answer
+            // the request and turn the expected connect-timeout error into a
+            // response, panicking `unwrap_err()`.
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(400))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let err = client
+            .post("http://192.0.2.1:81/v1/messages")
+            .json(&serde_json::json!({"x": 1}))
+            .send()
+            .await
+            .map(|_| ())
+            .wrap_err("failed to send streaming request to Anthropic")
+            .unwrap_err();
+
+        let is_timeout = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<reqwest::Error>())
+            .map(|re| re.is_timeout())
+            .unwrap_or(false);
+
+        if is_timeout {
+            assert!(
+                !RetryProvider::is_retryable_error(&err),
+                "connect timeout must NOT retry the same provider: {err:#}"
+            );
+            assert!(
+                RetryProvider::should_failover(&err),
+                "connect timeout must fail over to another provider: {err:#}"
+            );
+        } else {
+            // Environment produced an immediate non-timeout connect error
+            // (e.g. network unreachable) instead of a timeout — still a
+            // transient connect failure, which stays retryable.
+            assert!(
+                RetryProvider::is_retryable_error(&err),
+                "connect error must remain retryable: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_retry_and_failover_on_connection_refused() {
+        // Regression guard: connect-refused was already retryable
+        // (`is_connect`); it must stay that way.
+        let err = transport_send_error("refused").await;
+        assert!(RetryProvider::is_retryable_error(&err), "{err:#}");
+        assert!(RetryProvider::should_failover(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_request_timeout_on_same_provider_but_should_failover() {
+        // A per-request timeout keeps its existing semantics: NOT retried on
+        // the same (unresponsive) provider, but failover-worthy. Guards that
+        // the new transport branch sits AFTER the `is_timeout` check.
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            // Accept and hold the socket open without ever responding.
+            if let Ok((sock, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(sock);
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/v1/messages");
+        let err = client
+            .post(&url)
+            .json(&serde_json::json!({"x": 1}))
+            .send()
+            .await
+            .map(|_| ())
+            .wrap_err("failed to send streaming request to Anthropic")
+            .unwrap_err();
+        accept.abort();
+
+        assert!(
+            !RetryProvider::is_retryable_error(&err),
+            "request timeout must not retry the same provider: {err:#}"
+        );
+        assert!(
+            RetryProvider::should_failover(&err),
+            "request timeout must failover to another provider: {err:#}"
+        );
     }
 }

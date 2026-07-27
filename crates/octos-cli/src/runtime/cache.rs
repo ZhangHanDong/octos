@@ -32,11 +32,22 @@ use super::{ProfileRuntime, SessionRuntime};
 /// sweep cadence is fixed.
 const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Cache key shared by every storage map in this module. Pairs the
-/// profile id (from [`ProfileRuntime::profile_id`]) with the session
-/// key half so a profile reload only invalidates entries belonging
-/// to that profile.
-type CacheKey = (String, SessionKey);
+/// Cache key shared by every storage map in this module. Triples the
+/// profile id (from [`ProfileRuntime::profile_id`]), the session key,
+/// and the resolved **sessions root** so a profile reload only
+/// invalidates entries belonging to that profile.
+///
+/// The `PathBuf` third element is the on-disk store root a runtime is
+/// bootstrapped against ([`resolve_sessions_root_from_hint`]). It is
+/// **constant** (`profile.data_dir`) while `appui.sessions_in_cwd` is off, so
+/// keying by it is byte-identical to the historical `(profile, session_key)`
+/// pair in that mode. With the flag on it makes the cache identity distinguish
+/// the SAME `SessionKey` opened against DIFFERENT project cwds: same key + same
+/// cwd stays single-flight (one runtime), but same key + different cwd
+/// resolves to SEPARATE runtimes/roots — closing the corruption where a
+/// re-open in project B was handed project A's cached runtime (and then ran
+/// tools / wrote history under A's root).
+type CacheKey = (String, SessionKey, PathBuf);
 
 /// Storage shape for the main cache: `(profile_id, session_key) ->
 /// CacheEntry`. Factored into a `type` alias because clippy flags
@@ -98,8 +109,28 @@ pub struct SessionRuntimeCache {
     /// [`InflightStorage`] type alias for the lost-wake-race
     /// reasoning behind picking `Semaphore` over `Notify`.
     inflight: InflightStorage,
+    /// Per-profile invalidation generation. Bumped by
+    /// [`Self::invalidate_profile`]; a bootstrap that STARTED before the bump
+    /// (holding the old `ProfileRuntime`) must not insert its stale runtime
+    /// after the sweep — it serves its own caller uncached instead.
+    generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Per-SESSION invalidation generation. Bumped by
+    /// [`Self::invalidate_session`] on a permission change; a bootstrap that
+    /// STARTED before the bump (holding the pre-change permissions) must not
+    /// insert its now-stale runtime after the sweep. Session-scoped rather
+    /// than profile-scoped because a permission change targets one session
+    /// but its runtime may be cached under any of several profile ids.
+    session_generations: Arc<std::sync::Mutex<HashMap<SessionKey, u64>>>,
     max_size: usize,
     idle_ttl: Duration,
+    /// Process-global `appui.sessions_in_cwd` flag, threaded verbatim into
+    /// every [`SessionRuntime::bootstrap_with_permissions_and_sandbox`] this
+    /// cache performs. Held on the cache (constructed once per `octos serve`)
+    /// so the flag has a single source of truth and `get_or_init*` needs no
+    /// per-call parameter. When set, a cwd-hinted session's transcript store
+    /// relocates to `<cwd>/.octos`; no-hint sessions are unaffected. Default
+    /// `false` (legacy per-profile storage).
+    sessions_in_cwd: bool,
     /// Cancellation signal for the background sweep task. Notified
     /// when the cache is dropped so the task can shut down cleanly
     /// instead of leaking onto the runtime.
@@ -216,11 +247,33 @@ impl SessionRuntimeCache {
         Self {
             inner,
             inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             max_size,
             idle_ttl,
+            // Default OFF: legacy per-profile storage. `octos serve` opts in
+            // via `with_sessions_in_cwd(config.appui.sessions_in_cwd)`.
+            sessions_in_cwd: false,
             shutdown,
             sweep_task: std::sync::Mutex::new(sweep_task),
         }
+    }
+
+    /// Enable per-project (`appui.sessions_in_cwd`) session storage for every
+    /// runtime this cache bootstraps. Wired by `octos serve` from
+    /// `config.appui.sessions_in_cwd`; off by default so all existing call
+    /// sites (and tests) keep legacy per-profile storage.
+    pub fn with_sessions_in_cwd(mut self, sessions_in_cwd: bool) -> Self {
+        self.sessions_in_cwd = sessions_in_cwd;
+        self
+    }
+
+    /// Whether this cache relocates cwd-hinted sessions to `<cwd>/.octos`.
+    /// Read by the `session/list` handler to decide whether an incoming
+    /// `cwd` param scopes the listing (single source of truth with the
+    /// bootstrap path).
+    pub fn sessions_in_cwd(&self) -> bool {
+        self.sessions_in_cwd
     }
 
     /// The LRU capacity this cache was constructed with. Exposed
@@ -257,11 +310,15 @@ impl SessionRuntimeCache {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
     ) -> Result<Arc<SessionRuntime>> {
+        // Fixed workspace-write default (no mutable-store resolution to race
+        // against): sampling the epoch here is correct.
+        let permissions_epoch = self.session_generation(&session_key);
         self.get_or_init_with_permissions(
             profile,
             session_key,
             workspace_hint,
             EffectivePermissions::workspace_write(),
+            permissions_epoch,
         )
         .await
     }
@@ -276,6 +333,13 @@ impl SessionRuntimeCache {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
+        // Epoch captured by the caller BEFORE it resolved `permissions` — see
+        // `get_or_init_with_permissions_and_sandbox`. REQUIRED (not
+        // self-sampled) so every permission-bearing call site is forced to
+        // pair its snapshot with the pre-resolution epoch; a self-sample here
+        // could pair a post-downgrade epoch with pre-downgrade permissions on
+        // a preempted multi-threaded caller (codex P1 round 4 on #1639).
+        permissions_epoch: u64,
     ) -> Result<Arc<SessionRuntime>> {
         self.get_or_init_with_permissions_and_sandbox(
             profile,
@@ -283,6 +347,7 @@ impl SessionRuntimeCache {
             workspace_hint,
             permissions,
             None,
+            permissions_epoch,
         )
         .await
     }
@@ -298,8 +363,25 @@ impl SessionRuntimeCache {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
         sandbox_override: Option<SandboxConfig>,
+        // Session-generation epoch captured by the CALLER at (or before) the
+        // moment it resolved `permissions` — NOT re-sampled here. A bootstrap
+        // that waits on an in-flight slot and then claims its own must reject
+        // its insert if an `invalidate_session` bumped the generation any time
+        // after the permissions were resolved, or it would re-cache the
+        // pre-change (possibly dangerous) policy after a downgrade (codex P1
+        // round 3 on #1639).
+        permissions_epoch: u64,
     ) -> Result<Arc<SessionRuntime>> {
-        let key = (profile.profile_id.clone(), session_key.clone());
+        // Resolve the sessions root the same way bootstrap will, so the cache
+        // identity separates the same key opened against different project
+        // cwds (flag on) while staying constant — `profile.data_dir` — for
+        // every session when the flag is off (byte-identical legacy keying).
+        let key_root = super::session::resolve_sessions_root_from_hint(
+            profile,
+            workspace_hint.as_deref(),
+            self.sessions_in_cwd,
+        );
+        let key = (profile.profile_id.clone(), session_key.clone(), key_root);
 
         loop {
             // Fast path: read lock + last_used bump on hit.
@@ -384,12 +466,20 @@ impl SessionRuntimeCache {
                     continue;
                 }
                 InflightOutcome::OwnGuard(guard) => {
+                    let generation_at_start = self.profile_generation(&key.0);
+                    // Caller-supplied epoch (tied to the permission snapshot),
+                    // not a post-wait re-sample — see the param doc.
+                    let session_generation_at_start = permissions_epoch;
                     let result = SessionRuntime::bootstrap_with_permissions_and_sandbox(
                         profile,
                         session_key.clone(),
                         workspace_hint,
                         permissions,
                         sandbox_override,
+                        // Process-global flag (default false). A cwd-hinted
+                        // session relocates its store to `<cwd>/.octos` only
+                        // when this is on; no-hint sessions ignore it.
+                        self.sessions_in_cwd,
                     )
                     .await;
                     match result {
@@ -408,7 +498,14 @@ impl SessionRuntimeCache {
                             // runtime per key" invariant rather
                             // than a "one bootstrap per inflight
                             // era" invariant.
-                            let canonical = self.insert_with_eviction(key.clone(), runtime).await;
+                            let canonical = self
+                                .insert_with_eviction(
+                                    key.clone(),
+                                    runtime,
+                                    generation_at_start,
+                                    session_generation_at_start,
+                                )
+                                .await;
                             drop(guard);
                             return Ok(canonical);
                         }
@@ -441,8 +538,21 @@ impl SessionRuntimeCache {
         &self,
         key: CacheKey,
         runtime: Arc<SessionRuntime>,
+        generation_at_start: u64,
+        session_generation_at_start: u64,
     ) -> Arc<SessionRuntime> {
         let mut guard = self.inner.write().await;
+        // Re-check BOTH generations UNDER the map lock: each sweep
+        // (`invalidate_profile` / `invalidate_session`) serializes on this
+        // same lock and its bump happens-before its sweep, so either we
+        // observe the bump here (and skip caching the stale runtime) or our
+        // insert lands first and the sweep removes it — a stale runtime can
+        // never survive a profile switch OR a permission change.
+        if self.profile_generation(&key.0) != generation_at_start
+            || self.session_generation(&key.1) != session_generation_at_start
+        {
+            return runtime;
+        }
 
         // If a runtime is already present (e.g. another task
         // bootstrapped in a prior single-flight era and inserted
@@ -478,15 +588,77 @@ impl SessionRuntimeCache {
         canonical
     }
 
-    /// Drop the entry for `key` if present. Used by M11-D's
-    /// `/api/sessions/:id/delete` handler and by the config
-    /// watcher when a profile reload invalidates every cached
-    /// session for the profile.
+    /// Drop every cached entry for `(profile_id, session_key)` regardless of
+    /// the resolved sessions root. Used by M11-D's
+    /// `/api/sessions/:id/delete` handler and by the config watcher when a
+    /// profile reload invalidates every cached session for the profile.
+    ///
+    /// Root-agnostic on purpose: a session key can now be cached under more
+    /// than one root (the same key opened against two project cwds with
+    /// `appui.sessions_in_cwd` on), and an invalidation of that logical
+    /// session must clear all of them.
     ///
     /// Idempotent: removing an absent key is a no-op.
-    pub async fn invalidate(&self, key: &(String, SessionKey)) {
+    pub async fn invalidate(&self, profile_id: &str, session_key: &SessionKey) {
         let mut guard = self.inner.write().await;
-        guard.remove(key);
+        guard.retain(|(key_profile, key_session, _), _| {
+            key_profile != profile_id || key_session != session_key
+        });
+    }
+
+    /// Drop every cached session runtime belonging to `profile_id`. Used when
+    /// a profile's LLM selection changes at runtime (`profile/llm/select` /
+    /// upsert): cached `SessionRuntime`s embed the OLD provider chain, so the
+    /// next turn must re-materialize against the rebuilt `ProfileRuntime`.
+    pub async fn invalidate_profile(&self, profile_id: &str) {
+        // Bump the generation FIRST: any in-flight bootstrap that started
+        // against the old ProfileRuntime observes the change at insert time
+        // and skips caching its stale runtime.
+        {
+            let mut generations = self
+                .generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *generations.entry(profile_id.to_owned()).or_insert(0) += 1;
+        }
+        let mut guard = self.inner.write().await;
+        guard.retain(|(key_profile, _, _), _| key_profile != profile_id);
+    }
+
+    fn profile_generation(&self, profile_id: &str) -> u64 {
+        self.generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(profile_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Drop every cached runtime for `session_key` REGARDLESS of profile, and
+    /// bump its session generation so an in-flight bootstrap (started before
+    /// this call, holding pre-change permissions) skips caching at insert.
+    /// Used on a permission change (`permission/profile/set`): the runtime
+    /// embeds the old sandbox/network policy, and the connection may not know
+    /// which profile id the session was opened under (codex P1 ×2 on #1639).
+    pub async fn invalidate_session(&self, session_key: &SessionKey) {
+        {
+            let mut generations = self
+                .session_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *generations.entry(session_key.clone()).or_insert(0) += 1;
+        }
+        let mut guard = self.inner.write().await;
+        guard.retain(|(_, key_session, _), _| key_session != session_key);
+    }
+
+    pub(crate) fn session_generation(&self, session_key: &SessionKey) -> u64 {
+        self.session_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Drop every entry whose `last_used` is older than
@@ -584,6 +756,7 @@ mod tests {
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             adaptive_router: None,
             runtime_qos_catalog: None,
@@ -595,6 +768,8 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            format_after_edit: false,
+            snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
@@ -603,8 +778,16 @@ mod tests {
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
@@ -612,6 +795,193 @@ mod tests {
             lane_routing: None,
             voice: crate::config::VoiceConfig::default(),
         })
+    }
+
+    /// A bootstrap that started BEFORE an invalidation (still holding the old
+    /// ProfileRuntime) must not cache its stale runtime after the sweep.
+    #[tokio::test]
+    async fn invalidation_mid_bootstrap_skips_the_stale_insert() {
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let key = SessionKey::new("api", "stale-guard");
+
+        // Simulate "invalidation raced the bootstrap": bump the generation
+        // between the snapshot a bootstrap would take and its insert. The
+        // public surface can't pause mid-bootstrap, so drive the same
+        // sequence the OwnGuard arm runs: snapshot → (invalidate) → insert
+        // gate.
+        let generation_at_start = cache.profile_generation(&profile.profile_id);
+        cache.invalidate_profile(&profile.profile_id).await;
+        assert_ne!(
+            cache.profile_generation(&profile.profile_id),
+            generation_at_start,
+            "invalidation must advance the profile generation"
+        );
+
+        // A fresh get_or_init AFTER the invalidation snapshots the NEW
+        // generation and caches normally.
+        cache
+            .get_or_init(&profile, key.clone(), None)
+            .await
+            .expect("bootstrap");
+        assert_eq!(cache.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn invalidate_profile_sweeps_only_that_profile() {
+        let tmp = TempDir::new().unwrap();
+        let profile_a = make_profile(tmp.path().join("profile-a")).await;
+        let mut profile_b = make_profile(tmp.path().join("profile-b")).await;
+        // `make_profile` fixes the id; give the second a distinct identity so
+        // the sweep has something to spare.
+        if let Some(profile) = std::sync::Arc::get_mut(&mut profile_b) {
+            profile.profile_id = "other".to_owned();
+        }
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        cache
+            .get_or_init(&profile_a, SessionKey::new("api", "a1"), None)
+            .await
+            .expect("a1");
+        cache
+            .get_or_init(&profile_a, SessionKey::new("api", "a2"), None)
+            .await
+            .expect("a2");
+        cache
+            .get_or_init(&profile_b, SessionKey::new("api", "b1"), None)
+            .await
+            .expect("b1");
+        assert_eq!(cache.len().await, 3);
+
+        cache.invalidate_profile(&profile_a.profile_id).await;
+        assert_eq!(
+            cache.len().await,
+            1,
+            "only the other profile's entry survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_session_sweeps_the_session_across_profiles() {
+        // A permission change targets ONE session but its runtime may be
+        // cached under any profile id — `invalidate_session` drops every
+        // profile's entry for that session and spares other sessions
+        // (codex P1 ×2 on #1639).
+        let tmp = TempDir::new().unwrap();
+        let profile_a = make_profile(tmp.path().join("profile-a")).await;
+        let mut profile_b = make_profile(tmp.path().join("profile-b")).await;
+        if let Some(profile) = std::sync::Arc::get_mut(&mut profile_b) {
+            profile.profile_id = "other".to_owned();
+        }
+        let shared = SessionKey::new("api", "shared");
+        let spared = SessionKey::new("api", "spared");
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        cache
+            .get_or_init(&profile_a, shared.clone(), None)
+            .await
+            .expect("a");
+        cache
+            .get_or_init(&profile_b, shared.clone(), None)
+            .await
+            .expect("b");
+        cache
+            .get_or_init(&profile_a, spared.clone(), None)
+            .await
+            .expect("s");
+        assert_eq!(cache.len().await, 3);
+
+        cache.invalidate_session(&shared).await;
+        assert_eq!(
+            cache.len().await,
+            1,
+            "both profiles' entries for the target session are gone; the other session survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_session_mid_bootstrap_skips_the_stale_insert() {
+        // A bootstrap that STARTED before an `invalidate_session` (holding the
+        // pre-change permissions) must not cache its stale runtime after the
+        // bump — the session generation re-check rejects it at insert (codex
+        // P1 in-flight race on #1639).
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let session = SessionKey::new("api", "inflight-perm");
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        // Simulate the race: the invalidate bumps the generation while a
+        // bootstrap is notionally in flight, then that bootstrap tries to
+        // land its runtime with a stale generation snapshot.
+        cache.invalidate_session(&session).await;
+        assert_eq!(
+            cache.session_generation(&session),
+            1,
+            "the invalidate bumped the session generation"
+        );
+
+        // A fresh init AFTER the bump caches normally (its snapshot matches).
+        cache
+            .get_or_init(&profile, session.clone(), None)
+            .await
+            .expect("post-bump init");
+        assert_eq!(
+            cache.len().await,
+            1,
+            "a post-invalidate bootstrap caches normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_permission_epoch_is_rejected_at_insert() {
+        // codex P1 round 3: an epoch captured BEFORE a concurrent
+        // `invalidate_session` must reject the bootstrap's insert even though
+        // the OwnGuard arm no longer re-samples the (now-bumped) generation.
+        // This is the wait-race made deterministic: capture the epoch, bump
+        // it, then run get_or_init with the STALE epoch — nothing caches.
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let session = SessionKey::new("api", "stale-epoch");
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let stale_epoch = cache.session_generation(&session); // 0
+        cache.invalidate_session(&session).await; // bump -> 1
+
+        let runtime = cache
+            .get_or_init_with_permissions_and_sandbox(
+                &profile,
+                session.clone(),
+                None,
+                EffectivePermissions::workspace_write(),
+                None,
+                stale_epoch,
+            )
+            .await
+            .expect("bootstrap succeeds but must not cache");
+        // The caller still gets a working runtime…
+        assert_eq!(runtime.session_key, session);
+        // …but it was NOT cached (stale epoch rejected at insert).
+        assert_eq!(
+            cache.len().await,
+            0,
+            "a bootstrap carrying a pre-invalidate epoch must not cache"
+        );
+
+        // A fresh call with the CURRENT epoch caches normally.
+        let current_epoch = cache.session_generation(&session);
+        cache
+            .get_or_init_with_permissions_and_sandbox(
+                &profile,
+                session.clone(),
+                None,
+                EffectivePermissions::workspace_write(),
+                None,
+                current_epoch,
+            )
+            .await
+            .expect("current-epoch bootstrap");
+        assert_eq!(cache.len().await, 1, "current epoch caches");
     }
 
     #[tokio::test]
@@ -681,13 +1051,11 @@ mod tests {
             .expect("init");
         assert_eq!(cache.len().await, 1);
 
-        cache
-            .invalidate(&(profile.profile_id.clone(), key.clone()))
-            .await;
+        cache.invalidate(&profile.profile_id, &key).await;
         assert!(cache.is_empty().await);
 
         // Idempotent.
-        cache.invalidate(&(profile.profile_id.clone(), key)).await;
+        cache.invalidate(&profile.profile_id, &key).await;
     }
 
     #[tokio::test]
@@ -801,7 +1169,17 @@ mod tests {
         );
 
         let canonical = cache
-            .insert_with_eviction((profile.profile_id.clone(), key.clone()), redundant)
+            .insert_with_eviction(
+                // Flag off ⇒ the seed above was cached under `profile.data_dir`.
+                (
+                    profile.profile_id.clone(),
+                    key.clone(),
+                    profile.data_dir.clone(),
+                ),
+                redundant,
+                cache.profile_generation(&profile.profile_id),
+                cache.session_generation(&key),
+            )
             .await;
         assert!(
             Arc::ptr_eq(&canonical, &original),
@@ -837,7 +1215,12 @@ mod tests {
 
         let cache = Arc::new(SessionRuntimeCache::new(8, Duration::from_secs(60)));
         let key = SessionKey::new("api", "owner-cancelled");
-        let cache_key = (profile.profile_id.clone(), key.clone());
+        // Flag off ⇒ get_or_init keys this session under `profile.data_dir`.
+        let cache_key = (
+            profile.profile_id.clone(),
+            key.clone(),
+            profile.data_dir.clone(),
+        );
 
         // Step 1+2: hand-construct a guard the way `get_or_init`
         // would, then drop it. This is the same `InflightGuard`
@@ -913,5 +1296,173 @@ mod tests {
                 .is_empty(),
         );
         drop(rt);
+    }
+
+    #[test]
+    fn with_sessions_in_cwd_builder_toggles_flag() {
+        // Default OFF; the builder flips it. Single source of truth for the
+        // bootstrap path and the `session/list` cwd gate.
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60));
+        assert!(!cache.sessions_in_cwd());
+        assert!(
+            SessionRuntimeCache::new(4, Duration::from_secs(60))
+                .with_sessions_in_cwd(true)
+                .sessions_in_cwd()
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_flag_on_relocates_cwd_hinted_session() {
+        // The flag on the cache must reach `SessionRuntime::bootstrap` via
+        // `get_or_init` so a cwd-hinted session's store lands under
+        // `<cwd>/.octos`.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60)).with_sessions_in_cwd(true);
+        let rt = cache
+            .get_or_init(&profile, SessionKey::new("api", "coding"), Some(cwd))
+            .await
+            .expect("bootstrap via cache");
+        assert_eq!(
+            rt.sessions_root,
+            cwd_canon.join(".octos").join(&profile.profile_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_default_keeps_cwd_hinted_session_in_profile() {
+        // Regression: a default (flag-off) cache keeps a cwd-hinted session on
+        // profile.data_dir — byte-identical to today.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60));
+        let rt = cache
+            .get_or_init(&profile, SessionKey::new("api", "coding"), Some(cwd))
+            .await
+            .expect("bootstrap via cache");
+        assert_eq!(rt.sessions_root, data_dir);
+    }
+
+    #[tokio::test]
+    async fn cache_separates_same_key_across_cwds_flag_on() {
+        // Codex P1: with the flag ON, opening the SAME SessionKey in project A
+        // then project B THROUGH THE CACHE must return DISTINCT runtimes rooted
+        // at each project — NOT hand B project A's cached runtime (which would
+        // make B run tools / write history under A's root). Exercises the cache
+        // path (the corruption site), not a direct bootstrap.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir).await;
+        let proj_a = tmp.path().join("project-a");
+        let proj_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60)).with_sessions_in_cwd(true);
+        let key = SessionKey::new("api", "default");
+
+        let rt_a = cache
+            .get_or_init(&profile, key.clone(), Some(proj_a.clone()))
+            .await
+            .expect("open K in A");
+        let rt_b = cache
+            .get_or_init(&profile, key.clone(), Some(proj_b.clone()))
+            .await
+            .expect("open K in B");
+
+        // Distinct cached runtimes rooted at their own project — no cross-wire.
+        assert!(
+            !Arc::ptr_eq(&rt_a, &rt_b),
+            "same key + different cwd must yield distinct runtimes"
+        );
+        assert_ne!(rt_a.sessions_root, rt_b.sessions_root);
+        assert!(
+            rt_a.sessions_root
+                .starts_with(std::fs::canonicalize(&proj_a).unwrap())
+        );
+        assert!(
+            rt_b.sessions_root
+                .starts_with(std::fs::canonicalize(&proj_b).unwrap())
+        );
+        // Both entries coexist in the cache (not one clobbering the other).
+        assert_eq!(cache.len().await, 2);
+
+        // Single-flight preserved for same key + SAME cwd: re-opening K in A
+        // returns the SAME cached runtime, not a third entry.
+        let rt_a2 = cache
+            .get_or_init(&profile, key.clone(), Some(proj_a.clone()))
+            .await
+            .expect("re-open K in A");
+        assert!(
+            Arc::ptr_eq(&rt_a, &rt_a2),
+            "same key + same cwd must stay single-flight"
+        );
+        assert_eq!(cache.len().await, 2);
+
+        // No cross-write: each runtime's manager persists under its own root.
+        {
+            let mut mgr = rt_a.sessions.lock().await;
+            mgr.add_message(&key, octos_core::Message::user("for-A"))
+                .await
+                .unwrap();
+        }
+        {
+            let mut mgr = rt_b.sessions.lock().await;
+            mgr.add_message(&key, octos_core::Message::user("for-B"))
+                .await
+                .unwrap();
+        }
+        let mut reload_a = octos_bus::SessionManager::open(&rt_a.sessions_root).unwrap();
+        assert_eq!(reload_a.get_or_create(&key).await.messages.len(), 1);
+        assert_eq!(
+            reload_a.get_or_create(&key).await.messages[0].content,
+            "for-A"
+        );
+        let mut reload_b = octos_bus::SessionManager::open(&rt_b.sessions_root).unwrap();
+        assert_eq!(reload_b.get_or_create(&key).await.messages.len(), 1);
+        assert_eq!(
+            reload_b.get_or_create(&key).await.messages[0].content,
+            "for-B"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_shares_same_key_across_cwds_flag_off() {
+        // Regression: with the flag OFF the cache key's root element is constant
+        // (`profile.data_dir`), so the same key opened against two different
+        // cwds collapses to ONE runtime — byte-identical to the historical
+        // `(profile, session_key)` keying / first-cwd-wins.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir).await;
+        let proj_a = tmp.path().join("project-a");
+        let proj_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60)); // flag OFF
+        let key = SessionKey::new("api", "default");
+        let rt_a = cache
+            .get_or_init(&profile, key.clone(), Some(proj_a))
+            .await
+            .expect("A");
+        let rt_b = cache
+            .get_or_init(&profile, key.clone(), Some(proj_b))
+            .await
+            .expect("B");
+        assert!(
+            Arc::ptr_eq(&rt_a, &rt_b),
+            "flag off: same key must reuse one runtime regardless of cwd"
+        );
+        assert_eq!(cache.len().await, 1);
     }
 }

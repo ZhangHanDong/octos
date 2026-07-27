@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use redb::{Database, ReadableTable, TableDefinition};
 use tracing::{debug, warn};
 
-use crate::episode::Episode;
+use crate::episode::{Episode, EpisodeSource};
 use crate::hybrid_search::{HybridIndex, HybridScore};
 
 /// Table for episodes: key = episode_id, value = JSON
@@ -19,8 +19,49 @@ const CWD_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("cwd_i
 /// Table for episode embeddings: key = episode_id, value = bincode-serialized Vec<f32>
 const EMBEDDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
 
-/// Default embedding dimension (OpenAI text-embedding-3-small).
-const DEFAULT_DIMENSION: usize = 1536;
+/// Default embedding dimension (OpenAI text-embedding-3-small), used when the
+/// caller opens the store without declaring a width.
+///
+/// Public because remote OpenAI-compatible providers whose native size differs
+/// (e.g. DashScope `text-embedding-v4` at 1024) can be pinned to this value via
+/// the `dimensions` request field. Providers that CANNOT reach it — notably
+/// in-process EmbeddingGemma at 768, since Matryoshka only truncates downward —
+/// must instead size the index itself via [`EpisodeStore::open_with_dimension`].
+pub const DEFAULT_DIMENSION: usize = 1536;
+
+/// Parse a cwd-index JSON array of episode IDs. On corrupt JSON, salvage any
+/// quoted strings that look like episode IDs instead of silently replacing
+/// the list with an empty one (which would orphan every other episode
+/// indexed under that cwd). Shared by the store, scan, and delete paths so
+/// corruption handling stays consistent.
+fn parse_episode_ids_with_salvage(raw: &str) -> Vec<String> {
+    match serde_json::from_str(raw) {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(
+                "failed to parse cwd index JSON ({} bytes): {e}; attempting salvage",
+                raw.len()
+            );
+            let salvaged: Vec<String> = raw
+                .split('"')
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    // Odd indices are inside quotes in valid JSON arrays
+                    if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
+                        Some(s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            warn!(
+                "salvaged {} episode IDs from corrupted index",
+                salvaged.len()
+            );
+            salvaged
+        }
+    }
+}
 
 /// Store for episodes using redb (pure Rust embedded database).
 ///
@@ -89,7 +130,25 @@ impl EpisodeStore {
     /// when the canonical store is owned elsewhere), use
     /// [`Self::open_or_degraded`].
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_inner(data_dir.as_ref(), false).await
+        Self::open_inner(data_dir.as_ref(), false, DEFAULT_DIMENSION).await
+    }
+
+    /// Like [`Self::open`] but sizes the vector index to `dimension` instead of
+    /// [`DEFAULT_DIMENSION`].
+    ///
+    /// The HNSW index is built at ONE fixed width and
+    /// [`HybridIndex::insert`] drops any vector that does not match it,
+    /// degrading that episode to BM25-only. So the index must be sized from the
+    /// embedding provider actually in use — 1536 for `text-embedding-3-small`,
+    /// but 768 for in-process EmbeddingGemma, which can never reach 1536
+    /// (Matryoshka only truncates downward). Callers that have an embedder
+    /// should pass `embedder.dimension()`.
+    ///
+    /// Changing the dimension invalidates previously persisted embeddings:
+    /// they stay in redb but are skipped on rebuild (with a warning) until
+    /// the episodes are re-embedded.
+    pub async fn open_with_dimension(data_dir: impl AsRef<Path>, dimension: usize) -> Result<Self> {
+        Self::open_inner(data_dir.as_ref(), false, dimension).await
     }
 
     /// Open or create an episode store at the given path, falling
@@ -109,10 +168,19 @@ impl EpisodeStore {
     /// degraded fallback; corruption / I/O / permission errors are
     /// returned as `Err`.
     pub async fn open_or_degraded(data_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_inner(data_dir.as_ref(), true).await
+        Self::open_inner(data_dir.as_ref(), true, DEFAULT_DIMENSION).await
     }
 
-    async fn open_inner(data_dir: &Path, allow_degraded: bool) -> Result<Self> {
+    /// [`Self::open_or_degraded`] with an explicit vector-index width.
+    /// See [`Self::open_with_dimension`] for why this must track the embedder.
+    pub async fn open_or_degraded_with_dimension(
+        data_dir: impl AsRef<Path>,
+        dimension: usize,
+    ) -> Result<Self> {
+        Self::open_inner(data_dir.as_ref(), true, dimension).await
+    }
+
+    async fn open_inner(data_dir: &Path, allow_degraded: bool, dimension: usize) -> Result<Self> {
         let data_dir = data_dir.to_path_buf();
         tokio::fs::create_dir_all(&data_dir)
             .await
@@ -147,7 +215,7 @@ impl EpisodeStore {
                 write_txn.commit()?;
 
                 // Rebuild in-memory hybrid index from stored data
-                let mut index = HybridIndex::new(DEFAULT_DIMENSION);
+                let mut index = HybridIndex::new(dimension);
                 {
                     let read_txn = db.begin_read()?;
                     let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
@@ -188,7 +256,7 @@ impl EpisodeStore {
                 );
                 Ok(Self {
                     db: None,
-                    index: RwLock::new(HybridIndex::new(DEFAULT_DIMENSION)),
+                    index: RwLock::new(HybridIndex::new(dimension)),
                 })
             }
             None => Err(eyre::eyre!(
@@ -252,29 +320,7 @@ impl EpisodeStore {
                 let mut index = write_txn.open_table(CWD_INDEX_TABLE)?;
                 let existing: Vec<String> = index
                     .get(cwd.as_str())?
-                    .map(|v| match serde_json::from_str(v.value()) {
-                        Ok(val) => val,
-                        Err(e) => {
-                            // Don't replace with empty Vec — try to salvage by
-                            // extracting any quoted strings that look like episode IDs.
-                            let raw = v.value();
-                            warn!("failed to parse cwd index JSON ({} bytes): {e}; attempting salvage", raw.len());
-                            let salvaged: Vec<String> = raw
-                                .split('"')
-                                .enumerate()
-                                .filter_map(|(i, s)| {
-                                    // Odd indices are inside quotes in valid JSON arrays
-                                    if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
-                                        Some(s.to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            warn!("salvaged {} episode IDs from corrupted index", salvaged.len());
-                            salvaged
-                        }
-                    })
+                    .map(|v| parse_episode_ids_with_salvage(v.value()))
                     .unwrap_or_default();
 
                 let mut ids = existing;
@@ -379,7 +425,13 @@ impl EpisodeStore {
                 limit * 4
             };
             let candidates = self
-                .find_relevant_hybrid_scored_filtered(query, None, inner_limit, min_best_modality)
+                .find_relevant_hybrid_scored_filtered(
+                    query,
+                    None,
+                    inner_limit,
+                    min_best_modality,
+                    false,
+                )
                 .await?;
             let filtered: Vec<Episode> = candidates
                 .into_iter()
@@ -442,23 +494,7 @@ impl EpisodeStore {
             // Get episode IDs for this cwd
             let episode_ids: Vec<String> = index_table
                 .get(cwd_str.as_str())?
-                .map(|v| match serde_json::from_str(v.value()) {
-                    Ok(val) => val,
-                    Err(e) => {
-                        let raw = v.value();
-                        warn!("failed to parse episode index JSON ({} bytes): {e}; attempting salvage", raw.len());
-                        raw.split('"')
-                            .enumerate()
-                            .filter_map(|(i, s)| {
-                                if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
-                                    Some(s.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    }
-                })
+                .map(|v| parse_episode_ids_with_salvage(v.value()))
                 .unwrap_or_default();
 
             // Tokenize query consistently (#127): split on non-alphanumeric, filter short tokens
@@ -584,11 +620,14 @@ impl EpisodeStore {
                     if let Ok(episode) = serde_json::from_str::<Episode>(old_json.value()) {
                         let cwd = episode.working_dir.to_string_lossy().to_string();
                         let mut cwd_index = write_txn.open_table(CWD_INDEX_TABLE)?;
-                        // Read and drop the immutable borrow before mutating
-                        let existing: Option<Vec<String>> =
-                            cwd_index.get(cwd.as_str())?.map(|ids_json| {
-                                serde_json::from_str(ids_json.value()).unwrap_or_default()
-                            });
+                        // Read and drop the immutable borrow before mutating.
+                        // Salvage on corrupt JSON (parity with `store`):
+                        // defaulting to an empty list here would remove the
+                        // whole cwd entry and orphan every other episode
+                        // indexed under it.
+                        let existing: Option<Vec<String>> = cwd_index
+                            .get(cwd.as_str())?
+                            .map(|ids_json| parse_episode_ids_with_salvage(ids_json.value()));
                         if let Some(mut ids) = existing {
                             ids.retain(|id| id != &ep_id);
                             if ids.is_empty() {
@@ -676,7 +715,7 @@ impl EpisodeStore {
         query_embedding: Option<Vec<f32>>,
         limit: usize,
     ) -> Result<Vec<(Episode, HybridScore)>> {
-        self.find_relevant_hybrid_scored_filtered(query, query_embedding, limit, None)
+        self.find_relevant_hybrid_scored_filtered(query, query_embedding, limit, None, false)
             .await
     }
 
@@ -703,14 +742,34 @@ impl EpisodeStore {
         query_embedding: Option<Vec<f32>>,
         limit: usize,
         min_best_modality: Option<f32>,
+        exclude_conversation: bool,
     ) -> Result<Vec<(Episode, HybridScore)>> {
+        // When excluding conversation episodes (task recall, #1587), the
+        // index has no source field, so over-fetch and filter AFTER
+        // resolving episodes, then truncate to `limit`. Excluding is a
+        // SAFETY guarantee (a conversation episode can never enter task
+        // recall regardless of over-fetch size); the over-fetch only
+        // improves COMPLETENESS — under extreme conversation-episode
+        // density task recall may still return fewer than `limit`, which is
+        // safe (less recall, never contamination).
+        const FILTER_OVERFETCH: usize = 8;
+        let search_limit = if exclude_conversation {
+            limit.saturating_mul(FILTER_OVERFETCH).max(limit)
+        } else {
+            limit
+        };
         // Search the in-memory index
         let matches = {
             let idx = self
                 .index
                 .read()
                 .map_err(|e| eyre::eyre!("index lock poisoned: {e}"))?;
-            idx.search_scored_filtered(query, query_embedding.as_deref(), limit, min_best_modality)
+            idx.search_scored_filtered(
+                query,
+                query_embedding.as_deref(),
+                search_limit,
+                min_best_modality,
+            )
         };
 
         // Fetch full episodes from DB. Preserve (id, score) pairing so
@@ -760,6 +819,10 @@ impl EpisodeStore {
             // Preserve the ranking order from hybrid search
             scored.sort_by_key(|(e, _)| id_order.get(e.id.as_str()).copied().unwrap_or(usize::MAX));
 
+            if exclude_conversation {
+                scored.retain(|(e, _)| e.source != EpisodeSource::Conversation);
+            }
+            scored.truncate(limit);
             Ok(scored)
         })
         .await?
@@ -781,6 +844,150 @@ mod tests {
             summary.into(),
             EpisodeOutcome::Success,
         )
+    }
+
+    /// A 768-d embedder (in-process EmbeddingGemma) must actually reach the
+    /// vector lane. Before the index width was made configurable this store
+    /// was hardcoded to 1536, so every 768-d vector was dropped on insert and
+    /// hybrid search silently degraded to BM25-only.
+    #[tokio::test]
+    async fn open_with_dimension_indexes_vectors_at_a_non_default_width() {
+        const DIM: usize = 768;
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), DIM)
+            .await
+            .unwrap();
+
+        let ep = make_episode("deployed the metal shader cache", "/proj");
+        let ep_id = ep.id.clone();
+        store.store(ep).await.unwrap();
+
+        // Unit vector pointing at dim 0; the query points the same way.
+        let mut embedding = vec![0.0f32; DIM];
+        embedding[0] = 1.0;
+        store
+            .store_embedding(&ep_id, embedding.clone())
+            .await
+            .unwrap();
+
+        // Query text deliberately shares NO tokens with the summary, so any
+        // non-zero score has to come from the vector lane.
+        let scored = store
+            .find_relevant_hybrid_scored("zzzz", Some(embedding), 10)
+            .await
+            .unwrap();
+
+        let hit = scored
+            .iter()
+            .find(|(ep, _)| ep.id == ep_id)
+            .expect("768-d vector was dropped — index width did not follow the embedder");
+        assert!(
+            hit.1.vector > 0.9,
+            "expected near-1.0 cosine on an identical unit vector, got {}",
+            hit.1.vector
+        );
+    }
+
+    /// The mismatch guard still has to bite: a vector of the wrong width is
+    /// dropped rather than corrupting the index.
+    #[tokio::test]
+    async fn open_with_dimension_still_drops_mismatched_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+            .await
+            .unwrap();
+
+        let ep = make_episode("wrong width embedding", "/proj");
+        let ep_id = ep.id.clone();
+        store.store(ep).await.unwrap();
+        // 1536-d vector into a 768-d index.
+        store
+            .store_embedding(&ep_id, vec![0.1f32; 1536])
+            .await
+            .unwrap();
+
+        let scored = store
+            .find_relevant_hybrid_scored("wrong width", None, 10)
+            .await
+            .unwrap();
+        let hit = scored.iter().find(|(ep, _)| ep.id == ep_id);
+        // Still findable by BM25, but with no vector contribution.
+        assert!(hit.is_some(), "episode should remain BM25-searchable");
+        assert_eq!(
+            hit.unwrap().1.vector,
+            0.0,
+            "mismatched vector must not enter the index"
+        );
+    }
+
+    #[test]
+    fn parse_episode_ids_salvages_corrupt_json() {
+        // Valid JSON parses normally.
+        assert_eq!(
+            parse_episode_ids_with_salvage(r#"["ep-1","ep-2"]"#),
+            vec!["ep-1".to_string(), "ep-2".to_string()]
+        );
+        // Corrupt JSON (truncated array) salvages the quoted IDs instead of
+        // silently dropping the list — the pre-fix `delete_by_id` behavior
+        // would have emptied the cwd index and orphaned ep-1/ep-2.
+        assert_eq!(
+            parse_episode_ids_with_salvage(r#"["ep-1","ep-2""#),
+            vec!["ep-1".to_string(), "ep-2".to_string()]
+        );
+    }
+
+    /// End-to-end pin for the delete-path salvage: corrupt the on-disk cwd
+    /// index, delete ONE episode, and assert the other episode's ID survives
+    /// in the index. Pre-fix, `delete_by_id` parsed the corrupt JSON with
+    /// `unwrap_or_default()`, saw an empty list, and removed the whole cwd
+    /// entry — orphaning every other episode indexed under that cwd.
+    #[tokio::test]
+    async fn delete_by_id_salvages_corrupt_cwd_index_and_keeps_other_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (id_keep, id_delete);
+        {
+            let store = EpisodeStore::open(dir.path()).await.unwrap();
+            let keeper = make_episode("keeper episode", "/proj");
+            let doomed = make_episode("doomed episode", "/proj");
+            id_keep = keeper.id.clone();
+            id_delete = doomed.id.clone();
+            store.store(keeper).await.unwrap();
+            store.store(doomed).await.unwrap();
+        } // drop the store to release the redb lock
+
+        // Corrupt the cwd index: truncated JSON array (no closing bracket).
+        {
+            let db = Database::create(dir.path().join("episodes.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(CWD_INDEX_TABLE).unwrap();
+                let corrupt = format!("[\"{id_keep}\",\"{id_delete}\"");
+                table.insert("/proj", corrupt.as_str()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        {
+            let store = EpisodeStore::open(dir.path()).await.unwrap();
+            assert!(store.delete_by_id(&id_delete).await.unwrap());
+        }
+
+        // Inspect the index directly: the keeper must have been salvaged.
+        let db = Database::create(dir.path().join("episodes.redb")).unwrap();
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(CWD_INDEX_TABLE).unwrap();
+        let raw = table
+            .get("/proj")
+            .unwrap()
+            .expect("cwd entry must survive when it still lists episodes")
+            .value()
+            .to_string();
+        let ids: Vec<String> = serde_json::from_str(&raw).expect("rewritten index is valid JSON");
+        assert_eq!(
+            ids,
+            vec![id_keep.clone()],
+            "keeper must remain indexed after deleting through a corrupt cwd index"
+        );
     }
 
     #[tokio::test]

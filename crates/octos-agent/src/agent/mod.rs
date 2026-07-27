@@ -11,9 +11,11 @@ mod loop_runner;
 pub mod loop_state;
 pub mod memory;
 mod message_repair;
+pub mod prompt_segments;
 pub mod realtime;
 pub mod rich_output;
 mod streaming;
+pub mod turn_failure;
 mod turn_state;
 pub mod verifier;
 
@@ -25,6 +27,8 @@ use octos_core::{AgentId, Message, SessionScope, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
+pub use prompt_segments::PromptSegmentProvider;
+
 use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
@@ -33,6 +37,7 @@ use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 use verifier::AgentVerifierConfig;
 
+pub use message_repair::normalize_tool_call_id;
 pub use realtime::RealtimeController;
 
 tokio::task_local! {
@@ -106,6 +111,21 @@ pub struct AgentConfig {
     /// tool; the host projects the request to the channel and resumes via
     /// [`Agent::execute_approved_tool`]. `None` disables the flow.
     pub human_approval_rules: Option<crate::approval::HumanApprovalRules>,
+    /// Voice fail-fast overall deadline for a single foreground LLM call,
+    /// covering BOTH the stream-build (`chat_stream().await`) and consume
+    /// phases. `StreamTimeouts` only starts ticking inside `consume_stream`,
+    /// so a provider that hangs while returning response headers would
+    /// otherwise inherit the long production request timeout. Only applied
+    /// under [`octos_llm::LlmCallPolicy::FailFast`] (voice turns). Default 30s;
+    /// env override `OCTOS_VOICE_LLM_DEADLINE_SECS`.
+    pub voice_overall_deadline: std::time::Duration,
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt — see [`crate::format`])
+    /// and echoes the formatted content back in the tool result. Best-effort:
+    /// missing binaries, failures, and timeouts never fail the edit. OFF by
+    /// default — opt in via `format_after_edit: true` in config.json.
+    pub format_after_edit: bool,
 }
 
 /// Default time-to-first-token grace for streaming LLM calls (180s).
@@ -114,6 +134,14 @@ pub const DEFAULT_LLM_FIRST_TOKEN_GRACE_SECS: u64 = 180;
 pub const DEFAULT_LLM_STREAM_IDLE_SECS: u64 = 90;
 /// Default overall wall-clock cap for a single streaming LLM call (1200s / 20m).
 pub const DEFAULT_LLM_CALL_MAX_SECS: u64 = 1200;
+/// Default voice fail-fast overall deadline (30s) covering build + consume.
+pub const DEFAULT_VOICE_LLM_DEADLINE_SECS: u64 = 30;
+/// Tightened time-to-first-token grace for voice fail-fast turns (10s). A
+/// spoken reply cannot wait minutes for the first token the way a reasoning
+/// chat turn can, so the voice path overrides the generous production grace.
+pub const VOICE_STREAM_TTFT_SECS: u64 = 10;
+/// Tightened inter-chunk idle timeout for voice fail-fast turns (10s).
+pub const VOICE_STREAM_IDLE_SECS: u64 = 10;
 
 /// Read an env-overridable seconds value, mirroring the convention in
 /// `octos-cli/src/session_actor.rs` (`std::env::var(...).parse()` with a clamp
@@ -180,6 +208,11 @@ impl Default for AgentConfig {
             ),
             llm_call_max: env_secs_or("OCTOS_LLM_CALL_MAX_SECS", DEFAULT_LLM_CALL_MAX_SECS),
             human_approval_rules: None,
+            voice_overall_deadline: env_secs_or(
+                "OCTOS_VOICE_LLM_DEADLINE_SECS",
+                DEFAULT_VOICE_LLM_DEADLINE_SECS,
+            ),
+            format_after_edit: false,
         }
     }
 }
@@ -193,6 +226,14 @@ pub struct ConversationResponse {
     /// Exact provider instance provenance for the final assistant reply.
     pub provider_metadata: Option<ProviderMetadata>,
     pub token_usage: TokenUsage,
+    /// Estimated spend for `token_usage`, summed per response with each
+    /// response priced at the model that actually produced it (failover /
+    /// routed slots at their own rate). `None` when no response in the
+    /// turn had catalog pricing. Embedders must persist THIS instead of
+    /// re-pricing `token_usage` at the final `provider_metadata` model —
+    /// a turn that crossed models would re-price earlier responses at
+    /// the final model's rate (codex #1632 P1).
+    pub estimated_spend_usd: Option<f64>,
     pub files_modified: Vec<PathBuf>,
     pub files_to_send: Vec<PathBuf>,
     pub streamed: bool,
@@ -210,11 +251,10 @@ pub struct ConversationResponse {
     /// spawn_only branch in `loop_runner::process_message_inner` (the
     /// "Background work started for `<tool>`. The final result will be
     /// delivered automatically when it is ready." string). When `true`,
-    /// the API persist site tags the corresponding wire envelope with
-    /// `MessagePersistedSource::Background` so dual-negotiated clients
-    /// (those carrying `event.spawn_complete.v1`) suppress it via the
-    /// existing capability filter — collapsing the legacy
-    /// "two bubbles per turn" shape into a single preamble row.
+    /// the API persist site skips the synthesized acknowledgement entirely.
+    /// The real background result persists independently and emits its
+    /// canonical v2 background-child envelope, avoiding a duplicate
+    /// foreground bubble.
     /// Defaults to `false`; only set in the spawn_only synthesis path.
     pub synthesized_from_spawn_only: bool,
     /// Set when a tool call matched a [`AgentConfig::human_approval_rules`]
@@ -259,8 +299,19 @@ pub struct Agent {
     pub(super) memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
     pub(super) embedder: Option<Arc<dyn EmbeddingProvider>>,
-    /// System prompt for this agent (RwLock for hot-reload support).
-    pub(super) system_prompt: RwLock<String>,
+    /// Whether THIS conversation has already saved its episode (#1587
+    /// write side). Set on the first compaction; subsequent compactions
+    /// skip. One conversation episode per session — bounded regardless of
+    /// how many times the session compacts, and no index churn (the hybrid
+    /// index only tombstones on delete, so supersede would bloat it).
+    /// Per-agent = per-session (codex-confirmed).
+    pub(super) conversation_episode_saved: std::sync::atomic::AtomicBool,
+    /// System prompt for this agent, as ordered segments (RwLock for
+    /// hot-reload support). See [`prompt_segments::PromptSegments`].
+    pub(super) system_prompt: RwLock<prompt_segments::PromptSegments>,
+    /// Providers that refresh named prompt segments between turns
+    /// (e.g. the memory block). Run by [`Agent::refresh_prompt_segments`].
+    pub(super) segment_providers: RwLock<Vec<Arc<dyn PromptSegmentProvider>>>,
     /// Agent configuration.
     pub(super) config: AgentConfig,
     /// Progress reporter (RwLock for interior-mutable swap without &mut self).
@@ -341,6 +392,15 @@ pub struct Agent {
     /// sub-agents (pipeline workers, spawn children) reserve and commit
     /// against the same ledger as the parent session.
     pub(super) cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// Session-cumulative usage base shared with the owning session
+    /// actor. The actor seeds it from the persistent usage ledger and
+    /// folds each completed run back in (priced at the model that ran
+    /// it); `emit_cost_update` READS it so the `session_*` figures on
+    /// `ProgressEvent::CostUpdate` cover the whole session — surviving
+    /// per-turn resets, provider failover, and the runtime-cache
+    /// eviction a `profile/llm/select` model switch triggers. `None`
+    /// (chat mode, sub-agents) keeps emissions turn-scoped.
+    pub(super) session_usage_base: Option<crate::session_usage::SharedSessionUsage>,
     /// M8 parity: optional parent session key. When the agent is owned
     /// by a session actor, this carries the session key down through
     /// `ToolContext.parent_session_key` so spawn children / pipeline
@@ -386,6 +446,35 @@ pub struct Agent {
     /// by default so legacy agent loops do not spend verifier calls or write
     /// verifier sidecars unless a caller opts in explicitly.
     pub(super) verifier_config: Option<AgentVerifierConfig>,
+    /// Voice-turn failure projection sink (Task 8). When the agent loop runs
+    /// under [`octos_llm::LlmCallPolicy::FailFast`] and a FOREGROUND LLM call
+    /// fails terminally, the loop emits a single [`crate::TurnFailure`] here so
+    /// the voice closeout (octos-cli) can render a spoken error/empty message.
+    /// `None` keeps pre-Task-8 behaviour byte-for-byte — the original
+    /// `eyre::Report` still flows out of the loop unchanged.
+    pub(super) voice_failure_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::TurnFailure>>,
+    /// Git-backed workspace snapshot store (#1768, opt-in). When present,
+    /// `execute_tools` records a snapshot of the workspace before any
+    /// batch containing a mutating tool so the user can restore
+    /// pre-mutation state later. `None` (the default) disables the
+    /// feature entirely — no git subprocess is ever spawned.
+    pub(super) snapshot_manager: Option<Arc<crate::snapshot::SnapshotManager>>,
+    /// Per-turn pending-input buffer for mid-turn prompt injection
+    /// ("steer") — codex `TurnState.pending_input` parity. The host pushes
+    /// while the turn runs; the conversation loop drains FIFO at the top of
+    /// each iteration (before the next LLM call) and appends each entry as
+    /// a plain `role: user` message with no wrapper text. A steer that
+    /// lands after the model's final answer forces one more round
+    /// (`needs_follow_up = model_wants_more || buffer_nonempty`). `None`
+    /// (the default) keeps the loop byte-identical to pre-steer behaviour.
+    pub(super) steer_buffer: Option<crate::steering::SharedSteerBuffer>,
+    /// Host callback observing each drained steer batch (codex
+    /// `record_user_prompt_and_emit_turn_item` parity): the host persists
+    /// the injected user message + emits its standard persisted
+    /// user-message event. Called inline at the drain point, before the
+    /// next LLM call. When set, drained steer rows stay OUT of the turn
+    /// output log so end-of-turn persistence cannot double-write them.
+    pub(super) steer_drained_callback: Option<crate::steering::SteerDrainedCallback>,
 }
 
 impl Agent {
@@ -429,7 +518,9 @@ impl Agent {
             tools,
             memory,
             embedder: None,
-            system_prompt: RwLock::new(system_prompt),
+            conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
+            system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
+            segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
@@ -450,12 +541,17 @@ impl Agent {
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,
+            session_usage_base: None,
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
             prompt_context_manager: None,
             session_scope: None,
             verifier_config: None,
+            voice_failure_sink: None,
+            snapshot_manager: None,
+            steer_buffer: None,
+            steer_drained_callback: None,
         }
     }
 
@@ -500,7 +596,9 @@ impl Agent {
             tools,
             memory,
             embedder: None,
-            system_prompt: RwLock::new(system_prompt),
+            conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
+            system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
+            segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
@@ -521,12 +619,17 @@ impl Agent {
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,
+            session_usage_base: None,
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
             prompt_context_manager: None,
             session_scope: None,
             verifier_config: None,
+            voice_failure_sink: None,
+            snapshot_manager: None,
+            steer_buffer: None,
+            steer_drained_callback: None,
         }
     }
 
@@ -566,26 +669,14 @@ impl Agent {
         self.profile.clone()
     }
 
-    /// Wire the `activate_tools` tool's back-reference to the shared tool registry.
-    /// Must be called after construction if `ActivateToolsTool` was registered.
-    pub fn wire_activate_tools(&self) {
-        use crate::tools::activate_tools::ActivateToolsTool;
-        if let Some(tool) = self.tools.get("activate_tools") {
-            if let Some(at) = tool.as_any().downcast_ref::<ActivateToolsTool>() {
-                at.set_registry(Arc::downgrade(&self.tools));
-            }
-        }
-    }
-
     /// RFC-1 (issue #1290): wire the `mofa_make` dispatcher + companion
     /// `mofa_describe_content_type` to the shared tool registry. The
     /// dispatcher needs a `Weak<ToolRegistry>` so its `execute` path
     /// can look up the forwarding target by name.
     ///
     /// Idempotent and silent on agents whose registry has no mofa-*
-    /// skills (no dispatcher registered → no-op). Hosts that call
-    /// `wire_activate_tools` after agent construction should call
-    /// this in the same site.
+    /// skills (no dispatcher registered → no-op). Hosts should call
+    /// this after agent construction.
     pub fn wire_mofa_make_dispatcher(&self) {
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&self.tools);
     }
@@ -644,10 +735,10 @@ impl Agent {
         // A poisoned lock means a prior holder panicked, but the String
         // data itself is still valid and overwritten here.
         if let Some(ref wp) = config.worker_prompt {
-            *self
-                .system_prompt
+            self.system_prompt
                 .write()
-                .unwrap_or_else(|e| e.into_inner()) = wp.clone();
+                .unwrap_or_else(|e| e.into_inner())
+                .replace_all(wp.clone());
         }
         self.config = config;
         self
@@ -694,6 +785,46 @@ impl Agent {
     /// Set the shutdown signal.
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = shutdown;
+        self
+    }
+
+    /// Attach the voice-turn failure projection sink (Task 8). When set and the
+    /// loop runs under [`octos_llm::LlmCallPolicy::FailFast`], a single
+    /// [`crate::TurnFailure`] is emitted on terminal foreground-LLM failure
+    /// (empty response or classified LLM error). Hook-deny LLM failures are
+    /// intentionally excluded so the existing permission behaviour is
+    /// preserved.
+    pub fn set_voice_failure_sink(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::TurnFailure>,
+    ) {
+        self.voice_failure_sink = Some(tx);
+    }
+
+    /// Attach the per-turn pending-input buffer for mid-turn prompt
+    /// injection ("steer"). The host keeps a clone and pushes inputs while
+    /// the turn runs; the conversation loop drains FIFO at the top of each
+    /// iteration, before the next LLM call, appending each entry as a plain
+    /// `role: user` message (codex `TurnState.pending_input` parity —
+    /// codex-rs `core/src/session/turn.rs:225-233`). Absent = pre-steer
+    /// behaviour, byte-identical.
+    pub fn with_steer_buffer(mut self, buffer: crate::steering::SharedSteerBuffer) -> Self {
+        self.steer_buffer = Some(buffer);
+        self
+    }
+
+    /// Register the host callback observing each drained steer batch.
+    /// Called inline from the drain point (after the drained texts joined
+    /// the prompt, before the next LLM call) so the host can persist the
+    /// injected user message and emit its standard persisted user-message
+    /// event. When set, the loop keeps drained steer rows OUT of
+    /// `ConversationResponse.messages` — the host owns their persistence,
+    /// and the end-of-turn persist pass must not write them again.
+    pub fn with_steer_drained_callback(
+        mut self,
+        callback: crate::steering::SteerDrainedCallback,
+    ) -> Self {
+        self.steer_drained_callback = Some(callback);
         self
     }
 
@@ -766,6 +897,19 @@ impl Agent {
     /// Access the configured cost accountant, if any.
     pub fn cost_accountant(&self) -> Option<&Arc<crate::cost_ledger::CostAccountant>> {
         self.cost_accountant.as_ref()
+    }
+
+    /// Share a session-cumulative usage base with this agent. The owner
+    /// (session actor) seeds it from the usage ledger and folds completed
+    /// runs; the agent only reads it when emitting cost updates, so the
+    /// wire's `session_*` figures cover the whole session instead of
+    /// resetting every turn. See [`crate::session_usage`].
+    pub fn with_session_usage_base(
+        mut self,
+        usage: crate::session_usage::SharedSessionUsage,
+    ) -> Self {
+        self.session_usage_base = Some(usage);
+        self
     }
 
     /// Record the owning session key so pipeline workers / spawn
@@ -847,6 +991,24 @@ impl Agent {
     pub fn with_harness_event_sink(mut self, sink_path: impl Into<String>) -> Self {
         self.harness_event_sink = Some(sink_path.into());
         self
+    }
+
+    /// Attach a workspace [`crate::snapshot::SnapshotManager`] (#1768).
+    /// When present, `execute_tools` records a snapshot before any batch
+    /// containing a mutating tool (see
+    /// [`crate::snapshot::is_mutating_tool`]) so the user can later
+    /// restore pre-mutation state. `None` (the default) disables
+    /// snapshotting entirely — the feature is opt-in.
+    pub fn with_snapshot_manager(mut self, manager: Arc<crate::snapshot::SnapshotManager>) -> Self {
+        self.snapshot_manager = Some(manager);
+        self
+    }
+
+    /// Returns the attached snapshot manager, if any. Lets hosts (and the
+    /// follow-up UI/RPC surface) list/restore snapshots for this agent's
+    /// workspace.
+    pub fn snapshot_manager(&self) -> Option<Arc<crate::snapshot::SnapshotManager>> {
+        self.snapshot_manager.clone()
     }
 
     /// Set per-session runtime limits for tool execution.
@@ -1009,30 +1171,97 @@ impl Agent {
     }
 
     /// Override the system prompt (e.g. for gateway mode).
+    ///
+    /// Full replace: drops any named segments (re-set them afterwards if
+    /// still wanted).
     pub fn with_system_prompt(self, prompt: String) -> Self {
-        *self.system_prompt.write().unwrap_or_else(|e| {
-            tracing::warn!("system prompt lock was poisoned, recovering");
-            e.into_inner()
-        }) = prompt;
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .replace_all(prompt);
         self
     }
 
     /// Append additional content to the current system prompt (e.g. bootstrap files).
     pub fn append_system_prompt(&self, extra: &str) {
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .append(extra);
+    }
+
+    /// Insert (first call) or replace in place (later calls) a named prompt
+    /// segment such as the memory block. The segment keeps its insertion
+    /// position across replacements, so bootstrap-before / skills-after
+    /// ordering is preserved when the content refreshes.
+    pub fn set_prompt_segment(&self, name: &str, content: String) {
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .set_named(name, content);
+    }
+
+    /// Register a provider that refreshes a named segment between turns.
+    pub fn add_prompt_segment_provider(&self, provider: Arc<dyn PromptSegmentProvider>) {
+        self.segment_providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(provider);
+    }
+
+    /// Run all registered segment providers, applying any changed content.
+    ///
+    /// Called by the conversation loop at turn start; a no-op when no
+    /// providers are registered, and providers keep the unchanged path
+    /// cheap (typically one stat).
+    pub async fn refresh_prompt_segments(&self) {
+        let providers: Vec<Arc<dyn PromptSegmentProvider>> = self
+            .segment_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if providers.is_empty() {
+            return;
+        }
+        let mut updates = Vec::new();
+        for provider in providers {
+            if let Some(content) = provider.refresh().await {
+                updates.push((provider.segment_name().to_string(), content));
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
         let mut guard = self.system_prompt.write().unwrap_or_else(|e| {
             tracing::warn!("system prompt lock was poisoned, recovering");
             e.into_inner()
         });
-        guard.push_str("\n\n");
-        guard.push_str(extra);
+        for (name, content) in updates {
+            guard.set_named(&name, content);
+        }
     }
 
     /// Update the system prompt at runtime (hot-reload).
+    ///
+    /// Full replace: drops any named segments (re-set them afterwards if
+    /// still wanted).
     pub fn set_system_prompt(&self, prompt: String) {
-        *self.system_prompt.write().unwrap_or_else(|e| {
-            tracing::warn!("system prompt lock was poisoned, recovering");
-            e.into_inner()
-        }) = prompt;
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .replace_all(prompt);
     }
 
     /// The LLM model ID in use.
@@ -1103,16 +1332,6 @@ impl Agent {
     /// so we still anchor a fresh registry rather than silently dropping
     /// the request.
     ///
-    /// **Call ordering:** invoke this builder BEFORE
-    /// [`Self::wire_activate_tools`]. `wire_activate_tools` plants a
-    /// `Weak<ToolRegistry>` inside the `ActivateToolsTool` instance; if
-    /// this builder hits the fallback `snapshot_excluding(&[])` branch
-    /// (because the `Arc` was already shared by then), the Weak ref will
-    /// still point at the pre-copy registry and `ActivateToolsTool`
-    /// would observe a stale view. The current `serve.rs`/`session_actor`
-    /// flow calls `wire_activate_tools` strictly later (in
-    /// `session_actor.rs`), so this is fine; future refactors should
-    /// preserve that order or re-wire after copying.
     pub fn with_workspace_root(mut self, cwd: PathBuf) -> Self {
         if let Some(tools) = Arc::get_mut(&mut self.tools) {
             tools.set_workspace_root(cwd);
@@ -1120,8 +1339,7 @@ impl Agent {
             // The Arc is already shared. Fall back to a deep copy so the
             // new workspace_root still wins. ToolRegistry is intentionally
             // not Clone, so use the existing snapshot helper which handles
-            // interior mutex state correctly. See call-ordering note
-            // above re: `wire_activate_tools`.
+            // interior mutex state correctly.
             let mut copy = self.tools.snapshot_excluding(&[]);
             copy.set_workspace_root(cwd);
             self.tools = Arc::new(copy);
@@ -1134,7 +1352,7 @@ impl Agent {
         self.system_prompt
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .render()
     }
 
     /// Whether the loop-detector warning has fired since the last reset.
@@ -1198,21 +1416,21 @@ mod profile_integration_tests {
         Agent::new(AgentId::new("default"), provider, tools, memory)
     }
 
-    async fn agent_with_coding_profile(cwd: &std::path::Path) -> Agent {
+    async fn agent_with_builtin_profile(cwd: &std::path::Path, name: &str) -> Agent {
         use crate::profile::ProfileDefinition;
 
         let memory = Arc::new(
-            EpisodeStore::open(cwd.join("memory-profile"))
+            EpisodeStore::open(cwd.join(format!("memory-profile-{name}")))
                 .await
                 .expect("episode store"),
         );
         let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
 
-        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let profile = ProfileDefinition::builtin(name).expect("builtin profile");
         let mut tools = ToolRegistry::with_builtins(cwd);
-        coding.apply_to_registry(&mut tools);
+        profile.apply_to_registry(&mut tools);
 
-        Agent::new(AgentId::new("coding"), provider, tools, memory).with_profile(Arc::new(coding))
+        Agent::new(AgentId::new(name), provider, tools, memory).with_profile(Arc::new(profile))
     }
 
     fn tool_names(agent: &Agent) -> Vec<String> {
@@ -1227,20 +1445,61 @@ mod profile_integration_tests {
     }
 
     #[tokio::test]
-    async fn coding_profile_matches_default_tool_set() {
+    async fn coding_profile_narrows_default_tool_set() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let base = agent_default(tmp.path()).await;
-        let profiled = agent_with_coding_profile(tmp.path()).await;
+        let profiled = agent_with_builtin_profile(tmp.path(), "coding").await;
 
-        assert_eq!(
-            tool_names(&base),
-            tool_names(&profiled),
-            "coding profile must preserve the default tool set byte-for-byte",
+        let base_names = tool_names(&base);
+        let lean_names = tool_names(&profiled);
+        // Lean default: `coding` narrows the surface to the core coding
+        // loop instead of passing the registry through untouched.
+        assert!(
+            lean_names.len() < base_names.len(),
+            "lean coding profile must narrow the default set \
+             ({} -> {})",
+            base_names.len(),
+            lean_names.len(),
         );
+        assert!(
+            lean_names.iter().all(|n| base_names.contains(n)),
+            "lean set must be a subset of the default set",
+        );
+        for kept in ["read_file", "shell", "edit_file", "grep"] {
+            assert!(
+                lean_names.contains(&kept.to_string()),
+                "core-loop tool {kept} missing from lean set: {lean_names:?}",
+            );
+        }
+        for dropped in ["web_search", "browser", "image_generation"] {
+            assert!(
+                !lean_names.contains(&dropped.to_string()),
+                "non-core tool {dropped} must be filtered by the lean coding profile",
+            );
+        }
 
         // The profiled agent also exposes the recorded profile handle.
         let prof = profiled.profile().expect("profile handle present");
         assert_eq!(prof.name, "coding");
+        assert_eq!(prof.version, 1);
+    }
+
+    #[tokio::test]
+    async fn coding_full_profile_matches_default_tool_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = agent_default(tmp.path()).await;
+        let profiled = agent_with_builtin_profile(tmp.path(), "coding-full").await;
+
+        // The byte-for-byte parity contract moved from `coding` to the
+        // `coding-full` escape hatch when the lean default landed.
+        assert_eq!(
+            tool_names(&base),
+            tool_names(&profiled),
+            "coding-full profile must preserve the default tool set byte-for-byte",
+        );
+
+        let prof = profiled.profile().expect("profile handle present");
+        assert_eq!(prof.name, "coding-full");
         assert_eq!(prof.version, 1);
     }
 

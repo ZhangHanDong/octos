@@ -27,12 +27,14 @@
       "workspace_diff",
       "recall_memory",
       "save_memory",
+      "record_memory_use",
       "search",
       "synthesize_research",
       "message",
       "activate_tools",
       "configure_tool",
-      "manage_skills"
+      "manage_skills",
+      "run_pipeline"
     ]
   },
   "mcp_servers": [],

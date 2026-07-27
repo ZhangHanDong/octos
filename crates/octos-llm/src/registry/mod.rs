@@ -19,6 +19,7 @@ mod gemini;
 mod groq;
 mod minimax;
 mod moonshot;
+mod moonshot_coding;
 mod nvidia;
 mod ollama;
 mod openai;
@@ -27,6 +28,7 @@ mod r9s;
 mod vertex;
 mod vllm;
 mod zai;
+mod zai_coding;
 mod zhipu;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -69,6 +71,12 @@ pub struct ProviderEntry {
     pub default_model: Option<&'static str>,
     /// Environment variable holding the API key. `None` = no key required.
     pub api_key_env: Option<&'static str>,
+    /// Additional accepted API-key env var names for this provider, beyond
+    /// `api_key_env` (e.g. Moonshot accepts both `MOONSHOT_API_KEY` and
+    /// `KIMI_API_KEY`). Only consulted when the configured key var is already
+    /// one of the provider's known names — an arbitrary custom `api_key_env`
+    /// override stays exclusive and never falls back to these.
+    pub key_env_aliases: &'static [&'static str],
     /// Default base URL. `None` = must be provided by user.
     pub default_base_url: Option<&'static str>,
     /// Whether construction fails without an API key.
@@ -81,6 +89,25 @@ pub struct ProviderEntry {
     pub detect_patterns: &'static [&'static str],
     /// Factory function with full control over provider construction.
     pub create: fn(CreateParams) -> Result<Arc<dyn LlmProvider>>,
+}
+
+impl ProviderEntry {
+    /// Every API-key env var name this provider accepts: the primary
+    /// `api_key_env` plus any declared `key_env_aliases`.
+    pub fn key_env_names(&self) -> impl Iterator<Item = &'static str> {
+        self.api_key_env
+            .into_iter()
+            .chain(self.key_env_aliases.iter().copied())
+    }
+
+    /// Whether `name` is one of this provider's declared key env var names.
+    /// Comparison is case-SENSITIVE: environment variable names are
+    /// case-sensitive on Unix, so a genuinely custom `kimi_api_key` must NOT be
+    /// treated as the declared `KIMI_API_KEY` (doing so would let a missing
+    /// custom override fall back to an ambient sibling credential).
+    pub fn is_known_key_env(&self, name: &str) -> bool {
+        self.key_env_names().any(|k| k == name)
+    }
 }
 
 // ── Master list ─────────────────────────────────────────────────────────────
@@ -96,9 +123,13 @@ static ALL: &[ProviderEntry] = &[
     openrouter::ENTRY,
     deepseek::ENTRY,
     groq::ENTRY,
+    // Coding-plan families FIRST so an explicit `moonshot-coding` / `zai-coding`
+    // resolves to the coding endpoint before the base family's name/aliases.
+    moonshot_coding::ENTRY,
     moonshot::ENTRY,
     dashscope::ENTRY,
     minimax::ENTRY,
+    zai_coding::ENTRY,
     zhipu::ENTRY,
     zai::ENTRY,
     nvidia::ENTRY,
@@ -205,7 +236,32 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 16);
+        assert_eq!(all_entries().len(), 18);
+    }
+
+    /// The coding-plan families resolve to their coding endpoints + default
+    /// models, distinct from the regular families, and their name/alias lookups
+    /// don't shadow the base families.
+    #[test]
+    fn coding_plan_families_resolve_to_coding_endpoints() {
+        // Kimi coding plan: OpenAI-compat, api.kimi.com/coding/v1, default k3.
+        let mc = lookup("moonshot-coding").expect("moonshot-coding registered");
+        assert_eq!(mc.default_model, Some("k3"));
+        assert_eq!(mc.default_base_url, Some("https://api.kimi.com/coding/v1"));
+        assert!(mc.is_known_key_env("KIMI_API_KEY"));
+        assert_eq!(
+            lookup("kimi-coding").map(|e| e.name),
+            Some("moonshot-coding")
+        );
+
+        // Z.AI GLM coding plan: Anthropic-compat coding endpoint.
+        let zc = lookup("zai-coding").expect("zai-coding registered");
+        assert_eq!(zc.default_base_url, Some("https://api.z.ai/api/anthropic"));
+        assert_eq!(lookup("z.ai-coding").map(|e| e.name), Some("zai-coding"));
+
+        // The base families are unshadowed by the coding families.
+        assert_eq!(lookup("kimi").map(|e| e.name), Some("moonshot"));
+        assert_eq!(lookup("z.ai").map(|e| e.name), Some("zai"));
     }
 
     #[test]

@@ -24,44 +24,106 @@ static CATALOG: RwLock<Option<HashMap<String, CatalogModel>>> = RwLock::new(None
 /// Called once at startup by the gateway after loading the catalog.
 /// The `entries` parameter is a list of (provider_slash_model, context_window, max_output).
 pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
+    *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(build_catalog_map(entries));
+}
+
+/// The provider/host prefix of a catalog key: everything before the first `/`
+/// (or the whole key when unqualified). Used to break bare-alias ties on the
+/// native HOST rather than the raw key, so a `zai-coding/…` re-host cannot
+/// out-sort the native `zai/…` row just because `-` sorts before `/`. Shared
+/// with `pricing::seed_pricing_catalog` so the two catalogs agree.
+pub(crate) fn provider_prefix(key: &str) -> &str {
+    key.split_once('/').map(|(prefix, _)| prefix).unwrap_or(key)
+}
+
+/// Build the runtime catalog lookup map from `(provider/model, ctx, max_out)`
+/// entries. Pure (touches no global state) so the alias-selection rules below
+/// are unit-testable without racing the shared `CATALOG`.
+fn build_catalog_map(entries: &[(String, u64, u64)]) -> HashMap<String, CatalogModel> {
     let mut map = HashMap::new();
+    // See `pricing::seed_pricing_catalog`: a bare model id can be shared by the
+    // native provider and its re-hosts, so award the bare alias to the row with
+    // the FEWEST path segments (most canonical/native), deterministically. On an
+    // EQUAL segment count the more-native HOST wins: compare the provider prefix
+    // (the segment before the first `/`) FIRST, then the full lowercased key. A
+    // plain full-key comparison is wrong when one host is a lexical prefix of
+    // another — `zai-coding/glm-5.2` (200K) sorts BEFORE `zai/glm-5.2` (1M)
+    // because `-` (0x2D) < `/` (0x2F), so the coding-plan re-host would steal the
+    // bare `glm-5.2` alias from the native `zai` row. Splitting on the separator
+    // makes `zai` < `zai-coding` (the shorter native prefix wins), keeping the
+    // 1M window for a bare `glm-5.2` lookup. `minimax/MiniMax-M3` still beats
+    // `r9s/minimax-m3` (both one slash), so the bare alias stays order-independent.
+    let mut bare_owner: HashMap<String, (usize, String)> = HashMap::new();
     for (key, ctx, max_out) in entries {
         // Store by full key ("dashscope/qwen3.5-plus") and by model name alone ("qwen3.5-plus")
+        let key_lower = key.to_lowercase();
         map.insert(
-            key.to_lowercase(),
+            key_lower.clone(),
             CatalogModel {
                 context_window: *ctx,
                 max_output: *max_out,
             },
         );
         if let Some(model) = key.split('/').next_back() {
-            map.insert(
-                model.to_lowercase(),
-                CatalogModel {
-                    context_window: *ctx,
-                    max_output: *max_out,
-                },
-            );
+            let bare = model.to_lowercase();
+            let segments = key.matches('/').count();
+            let take = match bare_owner.get(&bare) {
+                None => true,
+                Some((owned_seg, owner_key)) => {
+                    segments < *owned_seg
+                        || (segments == *owned_seg
+                            && (provider_prefix(&key_lower), key_lower.as_str())
+                                < (provider_prefix(owner_key), owner_key.as_str()))
+                }
+            };
+            if take {
+                map.insert(
+                    bare.clone(),
+                    CatalogModel {
+                        context_window: *ctx,
+                        max_output: *max_out,
+                    },
+                );
+                bare_owner.insert(bare, (segments, key_lower));
+            }
         }
     }
-    *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(map);
+    map
 }
 
 /// Look up a value from the runtime catalog by model ID.
 fn catalog_lookup(model_id: &str) -> Option<(u64, u64)> {
     let guard = CATALOG.read().ok()?;
     let map = guard.as_ref()?;
+    catalog_lookup_in(map, model_id)
+}
+
+/// Pure catalog matcher over a supplied map (no global state), so the matching
+/// rules are unit-testable without racing the shared `CATALOG`.
+fn catalog_lookup_in(map: &HashMap<String, CatalogModel>, model_id: &str) -> Option<(u64, u64)> {
     let m = model_id.to_lowercase();
-    // Try exact match first, then substring match
+    // Try exact match first, then substring match.
     if let Some(entry) = map.get(&m) {
         return Some((entry.context_window, entry.max_output));
     }
-    for (key, entry) in map {
-        if m.contains(key) || key.contains(&m) {
-            return Some((entry.context_window, entry.max_output));
-        }
+    // Deterministic substring match, mirroring pricing.rs so both agree:
+    //   1. Among keys the model id CONTAINS (families the id extends), the
+    //      LONGEST (most specific) wins.
+    //   2. Otherwise, among keys that CONTAIN the model id, the SHORTEST is the
+    //      closest match.
+    // Ties break lexicographically so equal-length keys stay stable. Returning
+    // the first HashMap hit (as before) was nondeterministic across processes.
+    if let Some((_, entry)) = map
+        .iter()
+        .filter(|(key, _)| m.contains(key.as_str()))
+        .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
+    {
+        return Some((entry.context_window, entry.max_output));
     }
-    None
+    map.iter()
+        .filter(|(key, _)| key.contains(&m))
+        .min_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .map(|(_, entry)| (entry.context_window, entry.max_output))
 }
 
 // ── Public API ────────────────────────────────────────────────
@@ -75,9 +137,18 @@ pub fn context_window_tokens(model_id: &str) -> u32 {
     }
     // Model-specific defaults for known long-context models when the catalog
     // is unavailable or lacks the exact variant (e.g. deepseek-v4-flash, which
-    // has no dedicated catalog lane). DeepSeek V4 and MiniMax M3 are 1M-context.
+    // has no dedicated catalog lane). DeepSeek V4, MiniMax M3 and Kimi K3 are
+    // 1M-context.
+    // The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
+    // ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3` — match them
+    // too so the `ctx N%` gauge shows K3's real ~1M window, not the 128K default.
     let m = model_id.to_lowercase();
-    if m.contains("deepseek-v4") || m.contains("minimax-m3") {
+    if m.contains("deepseek-v4")
+        || m.contains("minimax-m3")
+        || m.contains("kimi-k3")
+        || m == "k3"
+        || m.starts_with("kimi-for-coding")
+    {
         return 1_048_576;
     }
     // Conservative default for unknown models
@@ -98,7 +169,9 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
     // substring branches below (e.g. minimax-m3 before the generic minimax).
     if m.contains("deepseek-v4") {
         384_000
-    } else if m.contains("minimax-m3") {
+    } else if m.contains("minimax-m3") || m.contains("kimi-k3") {
+        // kimi-k3 default max completion is 131072 (settable up to 1M);
+        // must win over the broader "kimi" branch below.
         131_072
     } else if m.contains("kimi") || m.contains("qwen") || m.contains("gemini") {
         65_535
@@ -174,6 +247,26 @@ mod tests {
     }
 
     #[test]
+    fn should_use_1m_context_for_kimi_k3_when_not_in_catalog() {
+        // kimi-k3 is never seeded by the unit-test catalog fixtures, so this
+        // exercises the hardcoded fallbacks regardless of CATALOG state:
+        // 1M window and 131072 default max completion, checked before the
+        // broader "kimi" substring branch (65_535).
+        assert_eq!(context_window_tokens("kimi-k3"), 1_048_576);
+        assert_eq!(context_window_tokens("moonshot/kimi-k3"), 1_048_576);
+        assert_eq!(max_output_tokens("kimi-k3"), 131_072);
+        assert_eq!(max_output_tokens("moonshot/kimi-k3"), 131_072);
+        // The coding plan's bare `k3` / `kimi-for-coding*` ids are also 1M.
+        assert_eq!(context_window_tokens("k3"), 1_048_576);
+        assert_eq!(
+            context_window_tokens("kimi-for-coding-highspeed"),
+            1_048_576
+        );
+        // Guard: a substring `k3` in an unrelated model is NOT the coding plan.
+        assert_eq!(context_window_tokens("mock-k3000"), 128_000);
+    }
+
+    #[test]
     fn test_catalog_seed_and_lookup() {
         // Hold the write lock across seed + verify to prevent races with
         // parallel tests that also touch the global CATALOG.
@@ -211,6 +304,153 @@ mod tests {
 
         // Clean up
         *guard = None;
+    }
+
+    #[test]
+    fn should_deterministically_match_by_substring_mirroring_pricing() {
+        // Regression: the substring fallback returned the first HashMap hit, so
+        // the winner depended on nondeterministic iteration order. Test the pure
+        // matcher over a LOCAL map (no shared CATALOG race), using model ids that
+        // are NOT exact keys so lookup goes through the substring path.
+        let mut map = HashMap::new();
+        for (key, ctx, out) in [
+            ("gpt", 8_000u64, 1_000u64),
+            ("gpt-4o-mini", 128_000, 16_000),
+        ] {
+            map.insert(
+                key.to_string(),
+                CatalogModel {
+                    context_window: ctx,
+                    max_output: out,
+                },
+            );
+        }
+
+        // Branch 1 (model id EXTENDS a family): "gpt-4o-mini-2024-07-18" is not a
+        // key; it contains both "gpt" and "gpt-4o-mini" — the LONGEST wins.
+        // Repeated to shake out any iteration-order dependence.
+        for _ in 0..20 {
+            assert_eq!(
+                catalog_lookup_in(&map, "gpt-4o-mini-2024-07-18"),
+                Some((128_000, 16_000))
+            );
+        }
+        // Branch 2 (a catalog key EXTENDS the model id): "4o-mini" contains no
+        // key, but the key "gpt-4o-mini" contains it, so branch 2 picks that
+        // (shortest containing key).
+        assert_eq!(catalog_lookup_in(&map, "4o-mini"), Some((128_000, 16_000)));
+        // Exact key still short-circuits via map.get.
+        assert_eq!(
+            catalog_lookup_in(&map, "gpt-4o-mini"),
+            Some((128_000, 16_000))
+        );
+    }
+
+    #[test]
+    fn should_break_equal_length_substring_ties_deterministically() {
+        // Two equal-length keys both contained in the model id: length can't
+        // decide, so the lexical tie-break must pick a stable winner (matching
+        // pricing.rs). Repeated to shake out HashMap iteration-order dependence.
+        let mut map = HashMap::new();
+        map.insert(
+            "m-aaa".to_string(),
+            CatalogModel {
+                context_window: 111,
+                max_output: 1,
+            },
+        );
+        map.insert(
+            "m-bbb".to_string(),
+            CatalogModel {
+                context_window: 222,
+                max_output: 2,
+            },
+        );
+        // "x-m-aaa-m-bbb-y" contains both equal-length keys; the lex-smaller
+        // "m-aaa" wins deterministically.
+        for _ in 0..20 {
+            assert_eq!(catalog_lookup_in(&map, "x-m-aaa-m-bbb-y"), Some((111, 1)));
+        }
+    }
+
+    #[test]
+    fn build_catalog_map_awards_bare_alias_to_native_then_lexicographically() {
+        // A deeper re-host loses the bare alias to the fewest-segments native
+        // row regardless of order.
+        let native = build_catalog_map(&[
+            ("rehost/vendor/mdeep-9".to_string(), 111, 1), // 2 seg, listed first
+            ("native/mdeep-9".to_string(), 1_000_000, 8_192), // 1 seg (native) wins
+        ]);
+        let bare = native.get("mdeep-9").unwrap();
+        assert_eq!(bare.context_window, 1_000_000);
+        assert_eq!(bare.max_output, 8_192);
+        // Deeper re-host still resolves under its own fully-qualified key.
+        assert_eq!(
+            native.get("rehost/vendor/mdeep-9").unwrap().context_window,
+            111
+        );
+
+        // EQUAL depth (both one segment): segment count can't break the tie, so
+        // the lexicographically-smaller lowercased key wins deterministically —
+        // mirrors `minimax/MiniMax-M3` vs `r9s/minimax-m3`. Larger key first to
+        // prove order-independence.
+        let tie = build_catalog_map(&[
+            ("zeta/mtie-9".to_string(), 500_000, 4_096), // larger key, first
+            ("alpha/mtie-9".to_string(), 1_000_000, 8_192), // smaller key wins
+        ]);
+        let bare = tie.get("mtie-9").unwrap();
+        assert_eq!(
+            bare.context_window, 1_000_000,
+            "equal-depth bare alias resolves to the lexicographically-smaller key"
+        );
+        assert_eq!(bare.max_output, 8_192);
+    }
+
+    #[test]
+    fn build_catalog_map_prefers_native_host_over_prefix_rehost() {
+        // Regression (#k3-ctx): a `zai-coding/…` re-host must NOT steal the bare
+        // alias from the native `zai/…` row. A raw full-key compare picks
+        // `zai-coding/glm-5.2` because `-` (0x2D) sorts before `/` (0x2F), which
+        // mislabelled a bare `glm-5.2` lookup as a 200K window instead of the
+        // native Z.AI 1M window. The provider-prefix tie-break (`zai` <
+        // `zai-coding`) keeps the alias on the native row, regardless of order.
+        for entries in [
+            [
+                ("zai/glm-5.2".to_string(), 1_000_000u64, 131_072u64),
+                ("zai-coding/glm-5.2".to_string(), 200_000, 131_072),
+            ],
+            [
+                ("zai-coding/glm-5.2".to_string(), 200_000, 131_072),
+                ("zai/glm-5.2".to_string(), 1_000_000, 131_072),
+            ],
+        ] {
+            let map = build_catalog_map(&entries);
+            assert_eq!(
+                map.get("glm-5.2").unwrap().context_window,
+                1_000_000,
+                "bare glm-5.2 must resolve to native zai/glm-5.2 (1M), not the \
+                 zai-coding re-host (200K)"
+            );
+            // The re-host still resolves to its 200K window under its full key.
+            // (`map.get("glm-5.2")` is exactly what `catalog_lookup` /
+            // `context_window_tokens` hit for a bare `glm-5.2` request, so this
+            // covers the public path without racing the shared CATALOG.)
+            assert_eq!(
+                map.get("zai-coding/glm-5.2").unwrap().context_window,
+                200_000
+            );
+        }
+    }
+
+    #[test]
+    fn provider_prefix_splits_on_first_slash() {
+        assert_eq!(provider_prefix("zai/glm-5.2"), "zai");
+        assert_eq!(provider_prefix("zai-coding/glm-5.2"), "zai-coding");
+        assert_eq!(
+            provider_prefix("openrouter/moonshotai/kimi-k2.5"),
+            "openrouter"
+        );
+        assert_eq!(provider_prefix("glm-5.2"), "glm-5.2");
     }
 
     #[test]

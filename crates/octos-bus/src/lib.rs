@@ -52,7 +52,7 @@ pub mod whatsapp_channel;
 pub use bus::{AgentHandle, BusPublisher, create_bus};
 pub use channel::{Channel, ChannelHealth, ChannelManager};
 pub use cli_channel::CliChannel;
-pub use cron_service::CronService;
+pub use cron_service::{CronService, write_cron_json_atomic};
 pub use cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
 pub use dedup::MessageDedup;
 pub use heartbeat::HeartbeatService;
@@ -63,9 +63,9 @@ pub use resume_policy::{
     reconstruct_content_replacement_state,
 };
 pub use session::{
-    ActiveSessionStore, MessageCommitObserver, Session, SessionHandle, SessionListEntry,
-    SessionManager, persist_message_through_canonical_path, set_message_commit_observer,
-    validate_topic_name,
+    ActiveSessionStore, AnalysisFile, AnalysisSession, MessageCommitObserver, Session,
+    SessionHandle, SessionListEntry, SessionManager, persist_message_through_canonical_path,
+    set_message_commit_observer, validate_topic_name,
 };
 
 #[cfg(feature = "api")]

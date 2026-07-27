@@ -52,7 +52,18 @@ use octos_core::MAIN_PROFILE_ID;
 use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
+const CLI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+// `large_enum_variant`: the `Inbound` variant carries an
+// `octos_core::InboundMessage`, which holds `serde_json::Value` fields. When a
+// workspace crate enables serde_json's `preserve_order` feature (the `octos acp`
+// bridge's `agent-client-protocol` dependency requires it, and Cargo unifies
+// features workspace-wide), `Value::Object` switches from `BTreeMap` to
+// `IndexMap` and this enum grows past the lint threshold. This event is
+// constructed once per inbound message on a channel-bounded path where the size
+// delta is immaterial; boxing would churn every construction/match site for no
+// real benefit, so we allow it.
+#[allow(clippy::large_enum_variant)]
 enum GatewayLoopEvent {
     Wake,
     Shutdown,
@@ -168,11 +179,15 @@ pub(super) struct GatewayRuntime {
     actor_registry: ActorRegistry,
     session_dispatcher: crate::gateway_dispatcher::GatewayDispatcher,
     profile_factory_builder: Option<ProfileActorFactoryBuilder>,
+    /// Background memory-refresh sweep; must live on the runtime so the
+    /// flock + loop survive past construction (drop stops the sweep).
+    #[allow(dead_code)]
+    memory_refresh: Option<crate::memory_refresh::MemoryRefreshService>,
     profile_store: Option<Arc<crate::profiles::ProfileStore>>,
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
 
     // Config / hot-reload
-    system_prompt: Arc<std::sync::RwLock<String>>,
+    system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     max_history: Arc<AtomicUsize>,
     config_rx: tokio::sync::watch::Receiver<Option<ConfigChange>>,
     tool_config: Arc<octos_agent::ToolConfigStore>,
@@ -319,9 +334,31 @@ impl GatewayRuntime {
         // resolves --data-dir > $OCTOS_HOME > ~/.octos).
         let effective_octos_home = cmd.octos_home.clone().unwrap_or_else(|| data_dir.clone());
         let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
-            crate::profiles::ProfileStore::open(&effective_octos_home)
+            crate::profiles::ProfileStore::open_unified(&effective_octos_home)
                 .ok()
                 .map(Arc::new);
+
+        // FIX 2 (single shared runtime-profile resolver): in profile-mode,
+        // resolve the profile ONCE up front — parent/sub-account inheritance
+        // AND the store's global `profile-defaults.json` base — and thread the
+        // resolved config into the flattened `Config` so EVERY downstream read
+        // of profile config (sandbox ~L699, hooks ~L1253, plugin signing
+        // ~L1387, memory, approvals) sees the inherited base. This runs
+        // regardless of `cli_llm_override`, so the CLI-override path (which
+        // skips the `ProfileRuntime` bootstrap below) still applies
+        // inheritance. Absent store / parent / defaults ⇒ no change.
+        if let (Some(store), Some(profile)) = (profile_store.as_ref(), resolved_profile.as_mut()) {
+            let resolved = store.resolve_runtime_profile(profile);
+            config.sandbox = resolved.config.sandbox.clone();
+            config.hooks = resolved.config.hooks.clone();
+            config.memory = resolved.config.memory.clone();
+            config.approval_policy = resolved.config.approval_policy.clone();
+            // OR-merge signing so neither the env-forced host policy (already
+            // merged into `config.plugins` above) nor a defaults signing floor
+            // is dropped.
+            config.plugins.require_signed |= resolved.config.plugins.require_signed;
+            *profile = resolved;
+        }
 
         #[allow(unused_variables)] // used by feature-gated channel registration
         let media_dir = data_dir.join("media");
@@ -367,13 +404,21 @@ impl GatewayRuntime {
             // for the `--config` path. We forward `config.plugins` here
             // and `bootstrap_with_host_plugins` then OR-merges it onto
             // the profile-derived config, closing the loop.
+            //
+            // `profile` (from `resolved_profile`) already carries the resolved
+            // runtime config — parent/sub-account inheritance + the store's
+            // global `profile-defaults.json` base were applied ONCE up front
+            // (see the `resolve_runtime_profile` block above), matching
+            // `octos serve`. No per-bootstrap re-resolution needed.
+            let effective_profile = profile.clone();
             match ProfileRuntime::bootstrap_with_host_plugins(
-                profile,
+                &effective_profile,
                 &data_dir,
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
                 Some(&config.plugins),
                 config.voice.as_ref(),
+                config.memory.as_ref(),
             )
             .await
             {
@@ -569,17 +614,22 @@ impl GatewayRuntime {
         // Gateway-specific composition stacks ON TOP — gateway
         // architecture, not redundant assembly: `SwappableProvider`,
         // `provider_router`, `SwitchModelTool`, gateway top-level MCP,
-        // admin tools, auto-defer, `pipeline_factory`,
-        // `ManageSkillsTool`, `SynthesizeResearchTool`,
-        // `ActivateToolsTool`, base-tool pin extension for gateway-
-        // only tools.
+        // admin tools, `pipeline_factory`, `ManageSkillsTool`,
+        // `SynthesizeResearchTool` for gateway-only tools.
         //
         // Non-profile paths (config.json-only / CLI overrides) keep
         // the existing inline assembly because `ProfileRuntime::bootstrap`
         // is profile-driven by design.
 
         // Customer-installed skills are strictly account-scoped.
-        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
+        // Skill layering v1: inherit the resolved profile's skill selection.
+        // `None` ⇒ no skills layer ⇒ every discovered skill loads (as before).
+        let skill_filter = resolved_profile
+            .as_ref()
+            .and_then(|p| p.config.skills.as_ref())
+            .map(|s| s.to_agent_filter());
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir)
+            .with_skill_filter(skill_filter.clone());
 
         // Create message bus (before publisher is consumed by channel manager)
         let (agent_handle, publisher) = create_bus();
@@ -633,7 +683,12 @@ impl GatewayRuntime {
         // are NOT registered in the base registry — they are created per-session
         // by the ActorFactory to eliminate the set_context() race condition.
 
-        // Store config needed for per-session tool creation
+        // Store config needed for per-session tool creation.
+        // Resolve the gateway's embedding provider ONCE; the pipeline
+        // factory and the ActorFactory share this handle (codex P3:
+        // duplicate resolves doubled keychain lookups and logs).
+        let gateway_embedder =
+            create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
         let provider_policy_for_factory: Option<octos_agent::ToolPolicy>;
         let worker_prompt_for_factory: Option<String>;
         let provider_router_for_factory: Option<Arc<ProviderRouter>>;
@@ -790,7 +845,7 @@ impl GatewayRuntime {
                 plugin_result = octos_agent::PluginLoadResult::default();
                 if !plugin_dirs.is_empty() {
                     let synthesis_config = build_synthesis_config(&config, &provider_name);
-                    match octos_agent::PluginLoader::load_into_with_options(
+                    match octos_agent::PluginLoader::load_into_with_options_and_filter(
                         &mut tools,
                         &plugin_dirs,
                         &plugin_env,
@@ -804,6 +859,7 @@ impl GatewayRuntime {
                             require_signed: config.plugins.require_signed,
                             verified_cache_dir: None,
                         },
+                        skill_filter.as_ref(),
                     ) {
                         Ok(result) => plugin_result = result,
                         Err(e) => warn!("plugin loading failed: {e}"),
@@ -1045,7 +1101,10 @@ impl GatewayRuntime {
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
-                    fn create(&self) -> Arc<dyn octos_agent::Tool> {
+                    fn create(
+                        &self,
+                        sandbox: &octos_agent::SandboxConfig,
+                    ) -> Arc<dyn octos_agent::Tool> {
                         let mut pt = octos_pipeline::RunPipelineTool::new(
                             self.llm.clone(),
                             self.memory.clone(),
@@ -1055,6 +1114,10 @@ impl GatewayRuntime {
                         .with_provider_policy(self.policy.clone())
                         .with_plugin_dirs(self.plugin_dirs.clone())
                         .with_plugin_require_signed(self.plugin_require_signed)
+                        // #1607 (codex round 4): confine pipeline command
+                        // validators to the SESSION-effective sandbox handed in
+                        // by the actor factory.
+                        .with_sandbox(sandbox.clone())
                         // BLOCKER 2: unconditional — registers
                         // <octos_home>/{skills,pipelines} (installed) and
                         // <octos_home>/bundled-pipelines (bundled, last).
@@ -1074,8 +1137,7 @@ impl GatewayRuntime {
                 // recall the gateway's own session agent gets via
                 // `ActorFactory::embedder` -> `with_embedder` (see
                 // session_actor.rs).
-                let embedder_c =
-                    create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+                let embedder_c = gateway_embedder.clone();
 
                 pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
                     llm: llm_c,
@@ -1088,6 +1150,9 @@ impl GatewayRuntime {
                     octos_home: octos_home_c,
                     plugin_require_signed: plugin_require_signed_c,
                     embedder: embedder_c,
+                    // #1607 (codex round 4): the session sandbox is now handed to
+                    // `create()` by the actor factory (`self.sandbox_config`), so
+                    // no per-factory field is needed.
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }
@@ -1095,6 +1160,10 @@ impl GatewayRuntime {
             // Memory bank tools
             tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
             tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+            tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
+            if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
+                tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+            }
 
             // Runtime model switching tool
             tools.register(crate::tools::SwitchModelTool::new(
@@ -1122,26 +1191,54 @@ impl GatewayRuntime {
         }
 
         // Build system prompt (always the full prompt with persona, memory, skills)
+        let max_inject_tokens =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+
+        // Background memory-refresh sweep: the flock arbitrates when a
+        // serve daemon also owns this profile dir. Stored on the runtime
+        // struct — a local binding would drop (and kill the sweep) the
+        // moment construction returns.
+        let memory_refresh = if memory_refresh_enabled {
+            let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
+            crate::memory_refresh::MemoryRefreshService::try_start(
+                data_dir.clone(),
+                memory_store.clone(),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.extract_model.as_deref()),
+                ),
+                crate::memory_refresh::resolve_refresh_provider(
+                    &config,
+                    llm.clone(),
+                    refresh_cfg.and_then(|r| r.consolidate_model.as_deref()),
+                ),
+                crate::config::MemoryRefreshConfig::knobs(config.memory.as_ref()),
+            )
+        } else {
+            None
+        };
+
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
             &data_dir,
             &project_dir,
-            &memory_store,
             &skills_loader,
             &tool_config,
         )
         .await;
 
-        // Append skill prompt fragments
-        let system_prompt = if plugin_result.prompt_fragments.is_empty() {
-            system_prompt
-        } else {
-            let mut prompt = system_prompt;
+        // Append skill prompt fragments (post-memory tail: fragments came
+        // after the memory slot pre-refactor too).
+        let system_prompt = {
+            let mut parts = system_prompt;
             for fragment in &plugin_result.prompt_fragments {
-                prompt.push_str("\n\n");
-                prompt.push_str(fragment);
+                parts.post_memory.push_str("\n\n");
+                parts.post_memory.push_str(fragment);
             }
-            prompt
+            parts
         };
 
         // Shared system prompt for hot-reload (factory reads this at actor spawn time)
@@ -1170,6 +1267,8 @@ impl GatewayRuntime {
                 .approval_policy
                 .as_ref()
                 .map(|policy| policy.to_runtime_rules()),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
 
@@ -1192,63 +1291,17 @@ impl GatewayRuntime {
             None
         };
 
-        // Mark base tools that should never be auto-evicted by LRU.
-        tools.set_base_tools([
-            "run_pipeline",
-            "search",
-            "deep_crawl",
-            "web_search",
-            "web_fetch",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "shell",
-            "list_dir",
-            "glob",
-            "grep",
-            "message",
-            "send_file",
-            "spawn",
-            "activate_tools",
-        ]);
-        // Pin all plugin/skill tools as base so they are never auto-evicted.
-        if !plugin_result.tool_names.is_empty() {
-            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
-        }
-
-        // Auto-defer non-core tool groups when tool count is high to prevent
-        // overwhelming weaker LLMs (e.g. GLM) that return empty responses
-        // when too many tool definitions are present.
-        let visible = tools.specs().len();
-        if visible > 15 {
-            // Keep research (deep_search, deep_crawl) active — users
-            // often call these directly. Defer rarely-used groups only.
-            for group in &[
-                "group:admin",
-                "group:sessions",
-                "group:web",
-                "group:runtime",
-                "group:media", // mofa_comic, mofa_slides, mofa_infographic, mofa_cards, fm_tts
-            ] {
-                tools.defer_group(group);
-            }
-            let after = tools.specs().len();
-            info!(
-                before = visible,
-                after, "auto-deferred tool groups to reduce tool count"
-            );
-        }
-        // Register activate_tools (wired per-session in session_actor)
-        if tools.has_deferred() {
-            tools.register(octos_agent::ActivateToolsTool::new());
-        }
+        // RFC-0 (#1289): LRU tool deferral + the `activate_tools` meta-tool
+        // were removed. Every enabled tool is now emitted every turn (full
+        // schema), so the base-tool pin list and the auto-defer-non-core
+        // -groups pass are gone.
 
         // PR #688 follow-up — codex finding (post-MEDIUM #4):
         // re-apply tool_policy AFTER all base-registry tools have been
         // registered. The first pass at line ~684 above ran before
         // `ManageSkillsTool`, `SynthesizeResearchTool`,
-        // `RecallMemoryTool`, `SaveMemoryTool`, `SwitchModelTool`, and
-        // `ActivateToolsTool` were registered, so a `tool_policy.deny`
+        // `RecallMemoryTool`, `SaveMemoryTool`, and `SwitchModelTool`
+        // were registered, so a `tool_policy.deny`
         // entry targeting any of those names was silently bypassed at
         // the base level. The per-session re-apply in
         // `ActorFactory::spawn` is still required for `run_pipeline`
@@ -1299,6 +1352,8 @@ impl GatewayRuntime {
             llm: llm.clone(),
             llm_for_compaction: llm_for_compaction.clone(),
             memory: memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: system_prompt.clone(),
             hooks,
             hook_context_template,
@@ -1326,7 +1381,7 @@ impl GatewayRuntime {
             tool_policy: config.tool_policy.clone(),
             worker_prompt: worker_prompt_for_factory,
             provider_router: provider_router_for_factory,
-            embedder: create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>),
+            embedder: gateway_embedder.clone(),
             active_sessions: active_sessions.clone(),
             pending_messages: pending_messages.clone(),
             queue_mode: gw_config.queue_mode,
@@ -1402,6 +1457,10 @@ impl GatewayRuntime {
                     // plugin policy so child profiles inherit the
                     // strict-signing gate even when their JSON omits it.
                     host_plugins: config.plugins.clone(),
+                    // The gateway's own config already encodes the correct
+                    // host precedence (explicit config beats the
+                    // ProcessManager env var via merge_env_memory_policy).
+                    host_memory: config.memory.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1430,7 +1489,15 @@ impl GatewayRuntime {
             paths
         };
         let (config_tx, config_rx) = tokio::sync::watch::channel(None);
-        let _watcher_handle = ConfigWatcher::new(watch_paths, config.clone(), config_tx).spawn();
+        let mut watcher = ConfigWatcher::new(watch_paths, config.clone(), config_tx);
+        // FIX 3: in profile-mode also watch the store's global
+        // `profile-defaults.json` so an edit to the shared base layer triggers
+        // the same reload path as a profile edit.
+        if cmd.profile.is_some() {
+            watcher =
+                watcher.with_profile_defaults(effective_octos_home.join("profile-defaults.json"));
+        }
+        let _watcher_handle = watcher.spawn();
 
         // Create channel manager and register channels.
         // If --api-port is passed but no Api channel is configured (serve mode
@@ -1505,6 +1572,7 @@ impl GatewayRuntime {
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
+                shutdown_notify: &shutdown_notify,
                 on_session_deleted: Some(Arc::new(move |id: &str| {
                     let _ = delete_tx.send(id.to_string());
                 })),
@@ -1578,7 +1646,7 @@ impl GatewayRuntime {
         eprintln!("[gateway] ready");
         println!(
             "{}",
-            "Gateway ready. Type a message or /quit to exit.".dimmed()
+            "Gateway ready. Type a message, quit, exit, /quit, or /exit.".dimmed()
         );
         println!();
 
@@ -1609,7 +1677,6 @@ impl GatewayRuntime {
             let base_prompt = gw_config.system_prompt.clone();
             let data_dir_p = data_dir.clone();
             let project_dir_p = project_dir.clone();
-            let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
             persona_service.start(
@@ -1618,13 +1685,12 @@ impl GatewayRuntime {
                     let base = base_prompt.clone();
                     let dd = data_dir_p.clone();
                     let pd = project_dir_p.clone();
-                    let ms = memory_store_p.clone();
                     let tc = tool_config_p.clone();
                     let prompt_lock = system_prompt_for_persona.clone();
                     tokio::spawn(async move {
                         let sl = crate::skills_scope::build_account_skills_loader(&dd);
                         let new_prompt =
-                            build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
+                            build_system_prompt(base.as_deref(), &dd, &pd, &sl, &tc).await;
                         *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;
                         info!("system prompt updated with new persona");
                     });
@@ -1657,6 +1723,7 @@ impl GatewayRuntime {
             pending_messages.clone(),
             out_tx.clone(),
         )
+        .with_session_delete_tx(session_delete_tx.clone())
         .with_data_dir(data_dir.clone());
 
         // Drop the original out_tx — factory and registry hold their own clones.
@@ -1676,6 +1743,7 @@ impl GatewayRuntime {
             actor_registry,
             session_dispatcher,
             profile_factory_builder,
+            memory_refresh,
             profile_store,
             active_sessions,
             system_prompt,
@@ -1737,10 +1805,13 @@ impl GatewayRuntime {
                             max_history: new_max,
                         } => {
                             if let Some(prompt) = system_prompt {
-                                *self
-                                    .system_prompt
+                                // A hot-reloaded config prompt replaces the
+                                // PRE-memory half only; the built post half
+                                // (skills/tool prefs) stays.
+                                self.system_prompt
                                     .write()
-                                    .unwrap_or_else(|e| e.into_inner()) = prompt;
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .pre_memory = prompt;
                                 info!(
                                     "System prompt updated via hot-reload (new actors will use it)"
                                 );
@@ -2121,12 +2192,14 @@ impl GatewayRuntime {
         // Timeout prevents hung actors from blocking the entire sequence.
         // CLI shutdown should return control to the terminal promptly.
         // Hung actors will be abandoned and then torn down by runtime shutdown.
-        let shutdown_timeout = Duration::from_secs(1);
-        if tokio::time::timeout(shutdown_timeout, self.actor_registry.shutdown_all())
+        if tokio::time::timeout(CLI_SHUTDOWN_TIMEOUT, self.actor_registry.shutdown_all())
             .await
             .is_err()
         {
-            warn!("actor shutdown timed out after {shutdown_timeout:?}, forcing exit");
+            warn!(
+                "actor shutdown timed out after {:?}, forcing exit",
+                CLI_SHUTDOWN_TIMEOUT
+            );
         }
 
         // Stop background services concurrently
@@ -2147,6 +2220,11 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn cli_shutdown_timeout_stays_prompt() {
+        assert!(CLI_SHUTDOWN_TIMEOUT <= Duration::from_secs(1));
+    }
 
     fn make_inbound(content: &str) -> octos_core::InboundMessage {
         octos_core::InboundMessage {

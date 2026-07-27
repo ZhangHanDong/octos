@@ -2,13 +2,14 @@
 
 ## Overview
 
-octos is a 15-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 27-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
-**Workspace members**:
-- **6 core crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli
-- **1 pipeline crate**: octos-pipeline
-- **7 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather
-- **1 platform-skill crate**: asr
+**Workspace members** (from `Cargo.toml`):
+- **Layered core** (7): `octos-core` (shared types) → `octos-memory` + `octos-llm` → `octos-agent` (agent loop, tools, sandbox, MCP, compaction) → `octos-cli` (commands, config, serve/API), plus `octos-bus` (14 channels, sessions, coalescing, cron) and `octos-diagnostics` (powers `octos doctor`).
+- **Agent-adjacent** (5): `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-dora-mcp`.
+- **Bundled skill crates** (15): each app skill under `crates/app-skills/` is its own crate — `news`, `deep-search`, `deep-crawl`, `send-email`, `account-manager`, `time`, `weather`, `smart-home`, `wechat-bridge`, `skill-evolve`, and the `harness-starter-{generic,report,audio,coding}` templates — plus `platform-skills/voice` (ASR/TTS).
+
+(The web SPA and terminal client live in the separate `octos-web` and `octos-tui` repositories and talk to `octos serve` over the UI Protocol.)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -128,6 +129,8 @@ pub enum AgentMessage {           // tagged: "type", snake_case
     ContextResponse { task_id: TaskId, context: Vec<Message> },
 }
 ```
+
+This tagged enum is the **sub-agent** coordination channel. **Peers** coordinate differently — through sovereign sessions and a file blackboard rather than in-band messages; see [Sub-Agents & Peers](#sub-agents--peers).
 
 ### Error System
 
@@ -250,7 +253,7 @@ pub struct CreateParams {
 
 | Provider | Aliases | Base URL | Default Model | API Key Env |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
 
 ### ModelHints (OpenAI provider)
 
@@ -1166,11 +1169,21 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 | Route | Method | Description |
 |---|---|---|
-| `/api/chat` | POST | Send message → response (sync; streaming runs over WS) |
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 (chat stream + `session/list`, `session/messages_page`, `system/status.get`, ...) |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the primary **HTTP** chat + control-plane endpoint (legacy `POST /api/chat` retired). The same protocol is also served over `octos serve --stdio`. See below. |
 | `/health` | GET | Liveness probe (was `/api/status`; data plane moved to WS `system/status.get` in M12 Phase D-5) |
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
+
+**UI Protocol v1 method families** (`/api/ui-protocol/ws`, JSON-RPC 2.0): the WS endpoint is far more than a chat stream — it is the full control plane the web/TUI clients drive:
+
+- **Session/turn**: `session/open`, `session/hydrate`, `session/list`, `session/messages_page`, `session/status/read`, `turn/start`, `turn/interrupt`, `session/rollback`, `session/snapshot`.
+- **Autonomy**: `session/goal/set|get|clear` (goals) and `loop/create|list|pause|resume|delete` (recurring loops) — see [Autonomy & Session Control](./advanced.md#autonomy--session-control).
+- **Tasks**: `task/list`, `task/cancel`, `task/restart_from_node`, `task/output/read`, `task/artifact/list`.
+- **Approvals & questions**: `approval/respond`, `approval/scopes/list`, `user_question/respond`, `diff/preview/get`.
+- **Config/profile**: `profile/llm/*`, `profile/skills/*`, `permission/profile/*`, `content/list`, `config/capabilities/list`.
+- **Notifications** (server→client): `message/delta`, `message/persisted`, `tool/*`, `turn/spawn_complete`, `session/goal/updated`, `loop/fired`, `context/compaction_started`, etc.
+
+Many methods are gated by a **negotiated capability flag** (~22 `*.v1` tokens such as `coding.goal_runtime.v1`, `harness.task_control.v1`, `auxiliary.rest_to_ws.v1`) advertised at connect time — over WebSocket via `ui_feature`/`X-Octos-Ui-Features`, or over `serve --stdio` via `client_hello`'s `supported_features`. Core chat/turn/session methods are always available; the autonomy, task-artifact, and auxiliary groups sit behind flags. The exact **advertised-versus-callable** rules are intricate: a method can appear in the default capability list yet still require its flag to actually be *called* (e.g. the `auxiliary.rest_to_ws.v1` methods and `user_question/respond`), so a client should rely on the negotiated capability list and handle `method_not_supported` defensively rather than assume callability from advertisement alone.
 
 **Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 
@@ -1424,7 +1437,11 @@ LLM response: [web_search, read_file, send_email]
                     Next LLM call
 ```
 
-### Sub-Agent Modes (spawn tool)
+### Sub-Agents & Peers
+
+octos supports two multi-agent shapes with opposite ownership models.
+
+**Sub-agents** (`spawn` tool) are children of the current turn:
 
 | Aspect | Sync | Background |
 |--------|------|------------|
@@ -1434,6 +1451,8 @@ LLM response: [web_search, read_file, send_email]
 | Use case | Sequential pipelines | Fire-and-forget long tasks |
 
 Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy).
+
+**Peers** (`peer_handoff` / `peer_send_input` / `peer_gather` / `peer_list` / `peer_close` tools) are *sovereign sessions*, not children: a peer has its own durable brief, workspace, `session/open` + `turn/start` lifecycle, and `peers/<slug>/result.md` output, and it survives the originating turn (closing only on client disconnect). Peers are staged on disk (`peer/prepare` stages a 1–8 fleet), tracked live in a process-global peer wire registry (`{profile}:peer:{slug}` → session), and coordinate only through the file blackboard read by `peer_gather` — they never share context in-band. `peer_send_input` reaches a running peer through the gateway actor inbox (gateway) or a durable, persisted **continuation queue** drained ~2 s per-connection / 5 s globally (serve); delivery is **best-effort, single-user**, guarded by an originator check (fail-closed), a depth-1 rail (peers cannot hand off or inject), a 4-handoff-per-turn cap, and a redelivery cap (5 attempts, sequence-advanced so a stuck injection cannot starve newer work). See [Multi-Agent Orchestration](./multi-agent.md) for the full model, delivery path, and known limitations.
 
 ### Multi-Tenant Dashboard
 
@@ -1452,7 +1471,7 @@ Each profile has its own LLM provider, API keys, channels, data directory, and `
 
 ## Testing
 
-1300+ tests across all crates. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
+5,000+ tests across the workspace. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
 
 - **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction, coalescing, BM25 scoring, L2 normalization, SSE parsing
 - **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing (19 tests)

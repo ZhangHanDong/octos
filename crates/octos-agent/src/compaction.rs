@@ -20,13 +20,15 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use octos_core::{Message, MessageRole};
+use octos_llm::ChatConfig;
 use octos_llm::LlmProvider;
 use octos_llm::context::{estimate_message_tokens, estimate_tokens};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::abi_schema::COMPACTION_POLICY_SCHEMA_VERSION;
 use crate::harness_events::{HarnessEvent, write_event_to_sink};
@@ -287,6 +289,10 @@ pub struct CompactionOutcome {
     pub tokens_after: u32,
     /// Which summarizer flavour handled the pass.
     pub summarizer_kind: &'static str,
+    /// The summary text folded into the compacted prompt, when a pass
+    /// produced one. Exposed so a conversational loop can persist it as a
+    /// searchable episode (#1587 write side).
+    pub summary: Option<String>,
 }
 
 /// Result of the preservation check — which declared artifacts/invariants were
@@ -567,13 +573,19 @@ impl CompactionRunner {
             tokens_before,
             tokens_after: 0,
             summarizer_kind: self.summarizer.kind(),
+            summary: None,
         };
 
-        if tokens_before <= budget {
+        // Budget decision uses the POST-prune estimate: when placeholder
+        // pruning alone brought the conversation under budget, summarizing
+        // old messages would discard context for no budget reason.
+        // `tokens_before` (pre-prune) is preserved on the outcome for
+        // reporting.
+        let tokens_after_prune: u32 = messages.iter().map(estimate_message_tokens).sum();
+        if tokens_after_prune <= budget {
             // Nothing to summarise — only the pruning step ran.
-            let tokens_after: u32 = messages.iter().map(estimate_message_tokens).sum();
-            outcome.tokens_after = tokens_after;
-            self.emit_phase_event(phase, "complete", tokens_after);
+            outcome.tokens_after = tokens_after_prune;
+            self.emit_phase_event(phase, "complete", tokens_after_prune);
             return outcome;
         }
 
@@ -647,6 +659,7 @@ impl CompactionRunner {
             }
         };
 
+        outcome.summary = Some(summary_text.clone());
         messages.drain(1..split);
         messages.insert(
             1,
@@ -933,10 +946,196 @@ pub fn repo_label_from_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// System prompt for LLM context compaction (codex-style handoff summary).
+const LLM_COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a long conversation so it fits the model's \
+context window. Produce a CONTEXT CHECKPOINT: a concise handoff summary another LLM can use to seamlessly \
+continue the task. Include the current goal, key decisions made, progress completed and what remains, and \
+any critical constraints, data, file paths, or references. Be structured and factual — no preamble, no \
+questions, no commentary.";
+
+/// Default timeout for a single LLM compaction call. The provider's own
+/// default (~300s) is far too coarse for a per-turn operation — a slow or hung
+/// summary must fall back to the heuristic quickly rather than stall the turn.
+pub const DEFAULT_LLM_COMPACTION_TIMEOUT_SECS: u64 = 60;
+
+/// Render a message slice as a plain `ROLE: content` transcript for the
+/// summarization prompt.
+fn render_transcript(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        out.push_str(msg.role.as_str());
+        out.push_str(": ");
+        out.push_str(msg.content.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// One-shot LLM context-compaction summary: prompts the model for a handoff
+/// summary of `messages`, bounded by the model's max output and `timeout`. Returns
+/// `None` on ANY error, timeout, empty content, or unsupported runtime so the
+/// caller falls back to the deterministic [`compact_messages`] heuristic —
+/// compaction must never block or fail a turn.
+///
+/// Requires a **multi-threaded** Tokio runtime. The async→sync bridge relies on
+/// `block_in_place`, which keeps the runtime's I/O + timer drivers alive on
+/// other workers while this thread parks; on a single-worker `current_thread`
+/// runtime that same worker would be parked while the summary future needs the
+/// very same runtime to drive its network call and 60s timeout — which can hang
+/// indefinitely. AppUI (`octos serve`), `chat`, and `acp` all run multi-threaded
+/// (`new_multi_thread`), so the LLM path always applies there; anywhere else
+/// (tests, exotic embeddings, no runtime at all) we degrade to the heuristic.
+pub fn llm_compaction_summary(
+    provider: &Arc<dyn LlmProvider>,
+    messages: &[Message],
+    timeout: Duration,
+) -> Option<String> {
+    if messages.is_empty() {
+        return None;
+    }
+    // Bail to the heuristic unless we're on a multi-threaded runtime (see the
+    // doc comment): `block_in_place` is only hang-safe there.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {}
+        _ => {
+            debug!("llm compaction unavailable off a multi-threaded runtime; using heuristic");
+            return None;
+        }
+    }
+    let provider = Arc::clone(provider);
+    let transcript = render_transcript(messages);
+    crate::summarizer::run_llm_call_blocking(async move {
+        // Give the call the model's FULL output budget, not a small
+        // summary-size heuristic. Reasoning models spend tokens on
+        // `reasoning_content` before emitting the summary `content`; capping at
+        // a small budget starves the summary and returns empty content (a
+        // silent heuristic fallback). Mirrors codex, which sets no output cap on
+        // its compaction turn — the system prompt keeps the summary concise.
+        let config = ChatConfig {
+            max_tokens: Some(provider.max_output_tokens()),
+            // Low but non-zero: a factual handoff summary, lightly deterministic.
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let request = vec![
+            Message::system(LLM_COMPACTION_SYSTEM_PROMPT),
+            Message::user(transcript),
+        ];
+        match tokio::time::timeout(timeout, provider.chat(&request, &[], &config)).await {
+            Ok(Ok(response)) => response
+                .content
+                .map(|content| content.trim().to_string())
+                .filter(|content| !content.is_empty()),
+            Ok(Err(error)) => {
+                warn!(%error, "llm compaction summary failed; falling back to heuristic");
+                None
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "llm compaction summary timed out; falling back to heuristic"
+                );
+                None
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use octos_core::ToolCall;
+    use std::time::Duration;
+
+    struct CompactionMockProvider {
+        result: std::result::Result<String, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CompactionMockProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            match &self.result {
+                Ok(content) => Ok(octos_llm::ChatResponse {
+                    content: Some(content.clone()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                }),
+                Err(message) => Err(eyre::eyre!("{message}")),
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatStream> {
+            unimplemented!("mock does not stream")
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-compaction"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn llm_compaction_summary_returns_model_output() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
+            result: Ok("Goal: X. Done: Y. Next: Z.".into()),
+        });
+        let messages = vec![Message::user("do X"), Message::assistant("did Y")];
+        let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
+        assert_eq!(out.as_deref(), Some("Goal: X. Done: Y. Next: Z."));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn llm_compaction_summary_returns_none_on_provider_error() {
+        // The caller falls back to the heuristic on None — a failing provider
+        // must NEVER break or block the turn.
+        let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
+            result: Err("provider down".into()),
+        });
+        let messages = vec![Message::user("do X")];
+        let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn llm_compaction_summary_none_for_empty_messages() {
+        // Short-circuits before any blocking call, so needs no runtime.
+        let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
+            result: Ok("unused".into()),
+        });
+        assert!(llm_compaction_summary(&provider, &[], Duration::from_secs(5)).is_none());
+    }
+
+    #[tokio::test] // current_thread runtime (the default, no `flavor`)
+    async fn llm_compaction_summary_degrades_to_heuristic_on_current_thread() {
+        // The async→sync bridge is only hang-safe on a multi-threaded runtime,
+        // so on a current_thread runtime the LLM path must be skipped entirely
+        // (caller falls back to the heuristic) rather than risk a hang.
+        let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
+            result: Ok("should not be used on current_thread".into()),
+        });
+        let messages = vec![Message::user("do X")];
+        let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
+        assert!(
+            out.is_none(),
+            "current_thread runtime must degrade to the heuristic, not run the LLM path"
+        );
+    }
 
     fn user_msg(content: &str) -> Message {
         Message {
@@ -1254,6 +1453,61 @@ mod tests {
         let mut messages = vec![user_msg("hi")];
         let outcome = runner.run(&mut messages, CompactionPhase::OnDemand);
         assert!(!outcome.performed);
+    }
+
+    /// When the tool-result pruning pass alone brings the conversation under
+    /// the token budget, the runner must not go on to summarize/drop old
+    /// messages based on the stale pre-prune estimate — that discards
+    /// conversational context for no budget reason.
+    #[test]
+    fn runner_skips_summary_when_prune_brings_under_budget() {
+        let policy = CompactionPolicy {
+            token_budget: 1_000,
+            prune_tool_results_after_turns: Some(1),
+            ..Default::default()
+        };
+        let runner = CompactionRunner::new(policy);
+        let mut messages = vec![system_msg("sys prompt")];
+        // Turn 1 carries a huge, stale tool result (pruned to a placeholder).
+        messages.push(user_msg("old question"));
+        messages.push(assistant_tool_call("shell", "tc_old"));
+        messages.push(tool_result("tc_old", &"x".repeat(8_000)));
+        // 6 more modest turns so the post-prune total sits between
+        // budget/2 and budget (the recent-boundary walk engages, so a
+        // stale over-budget decision WOULD summarize old turns).
+        for index in 0..6 {
+            messages.push(user_msg(&format!(
+                "question {index} {}",
+                "detail ".repeat(30)
+            )));
+            messages.push(assistant_msg(&format!(
+                "answer {index} {}",
+                "reply ".repeat(30)
+            )));
+        }
+        let message_count_before = messages.len();
+
+        let outcome = runner.run(&mut messages, CompactionPhase::OnDemand);
+
+        assert!(
+            outcome.tool_results_replaced >= 1,
+            "the stale tool result should be pruned"
+        );
+        assert_eq!(
+            outcome.messages_dropped, 0,
+            "pruning already satisfied the budget; no messages may be summarized away"
+        );
+        assert_eq!(
+            messages.len(),
+            message_count_before,
+            "no summary row should be inserted and no messages drained"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("Conversation Summary")),
+            "no extractive summary should be generated"
+        );
     }
 
     #[test]

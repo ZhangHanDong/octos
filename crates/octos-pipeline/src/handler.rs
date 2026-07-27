@@ -345,6 +345,15 @@ pub struct CodergenHandler {
     /// per-process tempdir (`cfg(test)` inside octos-agent). Tests
     /// pass a tempdir here to isolate from the user's cache.
     plugin_verified_cache_dir: Option<PathBuf>,
+    /// #1607 (codex round 4): the session sandbox threaded from
+    /// `ExecutorConfig.sandbox` via [`PipelineExecutor::build_codergen`].
+    /// Each per-node worker registry is built with
+    /// `with_builtins_and_sandbox(&working_dir, create_sandbox(&sandbox))`
+    /// so the worker Agent's own project-root validator pass confines a
+    /// workspace-declared `ValidatorSpec::Command` to this sandbox instead of
+    /// running it directly on the host from a sandboxed pipeline. Defaults to
+    /// `SandboxConfig::default()`; a no-op backend runs the argv directly.
+    sandbox: octos_agent::SandboxConfig,
 }
 
 impl CodergenHandler {
@@ -371,7 +380,18 @@ impl CodergenHandler {
             plugin_cache: Arc::new(OnceLock::new()),
             embedder: None,
             plugin_verified_cache_dir: None,
+            sandbox: octos_agent::SandboxConfig::default(),
         }
+    }
+
+    /// #1607 (codex round 4): thread the session sandbox onto every per-node
+    /// worker registry this handler builds, so a workspace-declared `Command`
+    /// validator run by the worker Agent's project-root validator pass is
+    /// confined to the session sandbox instead of executing on the host.
+    /// `PipelineExecutor::build_codergen` calls this with `ExecutorConfig.sandbox`.
+    pub fn with_sandbox(mut self, sandbox: octos_agent::SandboxConfig) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Override where plugin verified-exe copies live. Production
@@ -577,22 +597,34 @@ impl CodergenHandler {
     /// automatically falls back to another provider with sufficient max_output_tokens.
     fn resolve_provider(&self, model: Option<&str>) -> Result<Arc<dyn LlmProvider>> {
         match (model, &self.provider_router) {
-            (Some(model_key), Some(router)) => {
-                let primary = router.resolve(model_key)?;
-                let fallbacks = router.compatible_fallbacks(model_key);
-                if !fallbacks.is_empty() {
-                    info!(
-                        model = model_key,
-                        fallback_count = fallbacks.len(),
-                        "pipeline node provider resolved with fallbacks"
-                    );
+            (Some(model_key), Some(router)) => match router.resolve(model_key) {
+                Ok(primary) => {
+                    let fallbacks = router.compatible_fallbacks(model_key);
+                    if !fallbacks.is_empty() {
+                        info!(
+                            model = model_key,
+                            fallback_count = fallbacks.len(),
+                            "pipeline node provider resolved with fallbacks"
+                        );
+                    }
+                    Ok(octos_llm::FallbackProvider::wrap_with_router(
+                        primary,
+                        fallbacks,
+                        router.clone(),
+                    ))
                 }
-                Ok(octos_llm::FallbackProvider::wrap_with_router(
-                    primary,
-                    fallbacks,
-                    router.clone(),
-                ))
-            }
+                // The pipeline references a model key (e.g. `cheap`/`strong`)
+                // that this profile's router doesn't define — degrade to the
+                // shared coding provider instead of failing the node, so a
+                // partially-configured (or absent) research lane still runs.
+                Err(_) => {
+                    warn!(
+                        model = model_key,
+                        "pipeline node model not in provider router; using default provider"
+                    );
+                    Ok(self.llm.clone())
+                }
+            },
             (Some(model_key), None) => {
                 warn!(
                     model = model_key,
@@ -627,7 +659,31 @@ impl Handler for CodergenHandler {
         };
 
         // Build tool registry (same pattern as SpawnTool sync, spawn.rs:269-278)
-        let mut tools = octos_agent::ToolRegistry::with_builtins(&self.working_dir);
+        //
+        // #1607 (codex round 4): carry the session sandbox so the worker
+        // Agent's own project-root validator pass confines a workspace-declared
+        // `ValidatorSpec::Command` to it (the Agent-internal validator path
+        // reads `self.tools.sandbox()`). `with_builtins` would store `NoSandbox`,
+        // letting such a command validator escape to the host from a sandboxed
+        // pipeline. A no-op backend runs the argv directly (unchanged).
+        // Research review (BLOCKER): the worker registry MUST inherit the
+        // session's write permission, not hardcode workspace_write.
+        // `with_builtins_and_sandbox` pins `EffectivePermissions::workspace_write()`,
+        // so once the Fanout palette grants `write_file`, a worker in a READ-ONLY
+        // session could write files (a permission escalation — worse because
+        // search workers run web_search/web_fetch on untrusted pages that can
+        // prompt-inject a write). Derive permissions from the session sandbox so a
+        // read-only session's workers get read-only file access.
+        let permissions = if self.sandbox.workspace_write {
+            octos_agent::EffectivePermissions::workspace_write()
+        } else {
+            octos_agent::EffectivePermissions::read_only()
+        };
+        let mut tools = octos_agent::ToolRegistry::with_builtins_and_permissions(
+            &self.working_dir,
+            octos_agent::create_sandbox(&self.sandbox),
+            permissions,
+        );
 
         // Backend bug #1: load plugin tools from a process-shared cache.
         // The cache is populated on the first node's execute() call (or
@@ -711,7 +767,14 @@ impl Handler for CodergenHandler {
         // to a file in ONE call and return a concise executive summary as text.
         // Without explicit "single call" instruction, some models (e.g. kimi-k2.5)
         // chunk output into ~4K token pieces across many iterations, causing timeouts.
-        if node.tools.iter().any(|t| t == "write_file") {
+        //
+        // Only genuine final-report nodes get this. Fan-out workers (synthetic id
+        // `<parent>_task_<i>`) now also carry write_file, but they follow their own
+        // deliverable prompt (write `findings-<label>.md`, return a short summary);
+        // the generic report injection (descriptive filename, ~1000-word body,
+        // "delivered to the user") would contradict it and let a worker write an
+        // arbitrarily-named file the analyze node can't find.
+        if node.tools.iter().any(|t| t == "write_file") && !node.id.contains("_task_") {
             system_prompt.push_str(
                 "\n\nIMPORTANT: You MUST do two things:\n\
                  1. Save your COMPLETE report in ONE SINGLE write_file call (choose a descriptive \
@@ -1259,6 +1322,8 @@ mod tests {
                 node_reporter.report(ProgressEvent::CostUpdate {
                     session_input_tokens: 320,
                     session_output_tokens: 110,
+                    turn_input_tokens: 320,
+                    turn_output_tokens: 110,
                     response_cost: Some(0.0008),
                     session_cost: Some(0.0008),
                     model: Some("claude-sonnet".into()),
@@ -1285,6 +1350,70 @@ mod tests {
             forwarded.contains("320") && forwarded.contains("110"),
             "forwarded message should carry the per-node token totals; got {forwarded:?}"
         );
+    }
+
+    /// A minimal provider whose only observable trait is its `model_id`, used to
+    /// assert WHICH provider `resolve_provider` returns. `chat` is never reached
+    /// (resolve_provider only touches the router + `self.llm`).
+    struct NamedMock(&'static str);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NamedMock {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("resolve_provider must not call chat()")
+        }
+        fn model_id(&self) -> &str {
+            self.0
+        }
+        fn provider_name(&self) -> &str {
+            self.0
+        }
+    }
+
+    /// A pipeline node whose model key is NOT in the profile's sub-provider
+    /// router (a `cheap`/`strong` deep_research node on a profile with no — or a
+    /// partial — research lane) must gracefully fall back to the shared coding
+    /// provider instead of erroring the node. A key that IS present must resolve
+    /// to the research lane, never the coding default.
+    #[tokio::test]
+    async fn resolve_provider_falls_back_to_coding_llm_when_key_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
+        let router = Arc::new(ProviderRouter::new());
+        router.register("strong", Arc::new(NamedMock("research-strong")));
+
+        let handler = CodergenHandler::new(
+            Arc::new(NamedMock("coding-default")),
+            memory,
+            dir.path().to_path_buf(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .with_provider_router(router);
+
+        // Absent key ("cheap" not registered) → coding default, node still runs.
+        let fallback = handler.resolve_provider(Some("cheap")).unwrap();
+        assert_eq!(
+            fallback.model_id(),
+            "coding-default",
+            "an unresolved node model key must degrade to the coding provider, not error"
+        );
+
+        // Present key ("strong") → the research lane, NOT the coding default.
+        let resolved = handler.resolve_provider(Some("strong")).unwrap();
+        assert_ne!(
+            resolved.model_id(),
+            "coding-default",
+            "a resolvable node model key must use the research lane, not the coding default"
+        );
+
+        // No model key → the shared coding provider (unchanged behavior).
+        let default = handler.resolve_provider(None).unwrap();
+        assert_eq!(default.model_id(), "coding-default");
     }
 
     /// Codex round-5 P2: GateHandler must evaluate its predicate against

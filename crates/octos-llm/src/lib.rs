@@ -7,6 +7,7 @@
 //! - Ollama (local models)
 
 pub mod adaptive;
+mod call_policy;
 mod config;
 pub mod content_classifier;
 pub mod context;
@@ -49,6 +50,7 @@ pub use adaptive::{
     SharedMetrics, SharedPolicy, SharedProviderMetrics, StatusCallback, derive_cold_start_catalog,
     with_router_context,
 };
+pub use call_policy::{LlmCallPolicy, current_llm_call_policy, with_llm_call_policy};
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ReasoningEffort, ResponseFormat, ToolChoice};
 pub use content_classifier::{
@@ -85,6 +87,6 @@ pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use throttle::SemaphoreThrottledProvider;
 pub use types::{
-    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
-    strip_think_tags,
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, ThinkTagStreamSplitter,
+    TokenUsage, ToolSpec, strip_think_tags,
 };

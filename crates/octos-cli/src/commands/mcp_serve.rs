@@ -7,8 +7,8 @@
 //! # Transports
 //!
 //! - `stdio` (default): JSON-RPC over stdin/stdout. Parent-trust auth.
-//! - `http`: minimal HTTP/1.1 JSON-RPC endpoint. Requires a bearer token
-//!   supplied via the `OCTOS_MCP_SERVER_TOKEN` environment variable.
+//! - `http`: MCP Streamable HTTP served by the rmcp SDK. Requires a bearer
+//!   token supplied via the `OCTOS_MCP_SERVER_TOKEN` environment variable.
 //!
 //! # Session dispatch (M7.2a)
 //!
@@ -33,6 +33,7 @@
 //! `contract_failed:`, `artifact_missing:`, `session_failed:`) so outer
 //! orchestrators can branch on category without scraping English text.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,7 +49,10 @@ use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::validators::{
     ValidatorInvocation, ValidatorPhase, ValidatorRunner, run_workspace_validators,
 };
-use octos_agent::{Agent, AgentConfig, HarnessEvent, ToolRegistry};
+use octos_agent::{
+    Agent, AgentConfig, ApprovalPolicy, EffectivePermissions, HarnessEvent, SandboxConfig,
+    SandboxMode, ToolPolicy, ToolRegistry, create_sandbox,
+};
 use octos_core::{AgentId, Task, TaskContext, TaskKind};
 use octos_llm::LlmProvider;
 use octos_memory::EpisodeStore;
@@ -118,12 +122,38 @@ impl McpServeCommand {
             Config::load_with_context(&cwd, &ctx)?
         };
 
+        // Capture the sandbox + tool-policy config before `config` is moved into
+        // the LLM factory. The per-session tool registry uses the sandbox to
+        // confine shell/exec/file tools to the workspace and the policies so an
+        // external caller gets no looser a tool surface than local chat (see the
+        // security note on `RealSessionDispatch`).
+        let sandbox = config.sandbox.clone();
+        let tool_policy = config.tool_policy.clone();
+        let tool_policy_by_provider = config.tool_policy_by_provider.clone();
+        // Resolved for the per-provider policy fallback (model id wins at
+        // session time). Matches chat: explicit `provider`, else inferred from
+        // the configured model.
+        let provider_name = config
+            .provider
+            .clone()
+            .or_else(|| {
+                config
+                    .model
+                    .as_deref()
+                    .and_then(crate::config::detect_provider)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
         let factory = AgentLlmFactory::from_config(config)
             .wrap_err("failed to build LLM factory from config")?;
         let dispatch_config = SessionDispatchConfig {
             cwd: cwd.clone(),
             data_dir: data_dir.clone(),
             max_iterations: 20,
+            sandbox,
+            tool_policy,
+            tool_policy_by_provider,
+            provider_name,
         };
         let dispatch: Arc<dyn McpSessionDispatch> =
             Arc::new(RealSessionDispatch::new(dispatch_config, factory));
@@ -161,20 +191,126 @@ impl McpServeCommand {
     }
 }
 
-/// Spawn the HTTP listener on `bind`, using the bearer token for authentication.
+/// Maximum accepted HTTP request body for the MCP transport (1 MiB), restoring
+/// the explicit cap the hand-rolled endpoint enforced. The auth middleware
+/// bounds every body before rmcp reads it, so a bearer-holding client cannot
+/// exhaust memory with a large or chunked POST.
+#[cfg(feature = "api")]
+const MAX_HTTP_BODY_BYTES: usize = 1_048_576;
+
+/// rmcp tower service (from octos-agent) behind a bearer-token gate. Extracted
+/// from [`serve_http`] so the gate can be exercised by an integration test
+/// without binding a well-known port.
+///
+/// Returns the [`CancellationToken`](tokio_util::sync::CancellationToken) that
+/// tears down live SSE sessions; [`serve_http`] cancels it on shutdown.
+#[cfg(feature = "api")]
+fn mcp_http_router(
+    server: McpServer,
+    token: String,
+    allow_non_loopback: bool,
+) -> (axum::Router, tokio_util::sync::CancellationToken) {
+    use std::sync::Arc;
+
+    use axum::extract::{Request, State};
+    use axum::http::StatusCode;
+    use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH};
+    use axum::middleware::{self, Next};
+    use axum::response::{IntoResponse, Response};
+    use axum::{Router, body::Body};
+
+    /// Single gate in front of the rmcp service: reject a missing/wrong bearer
+    /// token (401) before touching the body, then bound the body. A *declared*
+    /// oversized `Content-Length` is rejected (413) before any bytes are read;
+    /// otherwise the body is buffered with a cap — which also makes an
+    /// over-limit *chunked* body (no `Content-Length`) surface as 413 instead of
+    /// the 500 rmcp would map a mid-read length-limit error to.
+    async fn gate(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
+        let provided = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        let authorized = octos_agent::mcp_server::parse_bearer_token(provided)
+            .is_some_and(|candidate| octos_agent::mcp_server::constant_time_eq(&candidate, &token));
+        if !authorized {
+            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        }
+        // Fast-reject a *declared* oversized body before reading any of it, so a
+        // bearer holder cannot pin a connection open by announcing a huge
+        // `Content-Length` and then trickling (or never sending) the body.
+        let declared_over_limit = request
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|len| len > MAX_HTTP_BODY_BYTES);
+        if declared_over_limit {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+        }
+        // Chunked / unknown-length bodies are still bounded during the read.
+        let (parts, body) = request.into_parts();
+        match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
+            Ok(bytes) => {
+                next.run(Request::from_parts(parts, Body::from(bytes)))
+                    .await
+            }
+            Err(_) => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
+        }
+    }
+
+    let (service, cancel) = server.streamable_http_service(allow_non_loopback);
+    let router = Router::new()
+        .fallback_service(service)
+        .layer(middleware::from_fn_with_state(Arc::new(token), gate));
+    (router, cancel)
+}
+
+/// Serve the MCP Streamable HTTP transport on `bind`, gating every request
+/// behind the bearer token. The rmcp tower service (built in octos-agent) is
+/// mounted in axum here; bearer auth is an axum middleware in front of it.
+/// Requires the `api` feature (axum); the canonical install includes it.
+#[cfg(feature = "api")]
 async fn serve_http(server: McpServer, bind: SocketAddr, token: String) -> Result<()> {
-    let handle = server
-        .serve_http(bind, token)
+    // A loopback bind keeps rmcp's DNS-rebinding Host guard. An explicit
+    // non-loopback bind opts into cross-host exposure, so disable the guard —
+    // the bearer token is then the sole authenticator.
+    let allow_non_loopback = !bind.ip().is_loopback();
+    if allow_non_loopback {
+        tracing::warn!(
+            %bind,
+            "octos mcp-serve http bound to a non-loopback address; the DNS-rebinding Host \
+             guard is disabled and the bearer token is the only authenticator"
+        );
+    }
+
+    let (app, cancel) = mcp_http_router(server, token, allow_non_loopback);
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
         .wrap_err_with(|| format!("failed to bind MCP server on {bind}"))?;
-    tracing::info!(addr = %handle.addr(), "octos mcp-serve http bound");
-    // Block on Ctrl+C or SIGTERM so the listener stays up for the process lifetime.
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    ctrl_c.await;
-    handle.shutdown().await;
+    let addr = listener.local_addr().unwrap_or(bind);
+    tracing::info!(%addr, "octos mcp-serve http bound (streamable HTTP, bearer required)");
+
+    // Serve until Ctrl+C / SIGTERM. On shutdown, cancel the rmcp service so live
+    // SSE sessions terminate immediately — otherwise axum's graceful drain would
+    // block on those long-lived streams.
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            cancel.cancel();
+        })
+        .await
+        .wrap_err("mcp-serve http server error")?;
     Ok(())
+}
+
+/// Builds without the `api` feature lack axum, so the HTTP transport is
+/// unavailable; stdio still works.
+#[cfg(not(feature = "api"))]
+async fn serve_http(_server: McpServer, _bind: SocketAddr, _token: String) -> Result<()> {
+    eyre::bail!(
+        "the http transport for `octos mcp-serve` requires building octos with the `api` \
+         feature (the canonical install includes it); use `--transport stdio` otherwise"
+    )
 }
 
 // ---- M7.2a: real session dispatch ----
@@ -189,6 +325,51 @@ pub struct SessionDispatchConfig {
     pub data_dir: PathBuf,
     /// Maximum number of tool-call iterations per MCP session.
     pub max_iterations: u32,
+    /// Sandbox policy applied to the per-session tool registry. Each MCP call
+    /// runs agent tool calls (shell/exec/file) on behalf of an outer
+    /// orchestrator that is only parent-trusted (stdio) or bearer-token
+    /// authenticated (http) — never fully trusted. Confining shell/exec to the
+    /// workspace via the OS sandbox is what stops `run_octos_session` from
+    /// reading, writing, or executing outside `cwd`. Defaults to
+    /// [`SandboxMode::Auto`](octos_agent::SandboxMode) via
+    /// [`SandboxConfig::default`].
+    pub sandbox: SandboxConfig,
+    /// Operator-configured global tool deny/allow policy. Applied to the
+    /// MCP-served registry so a server that denies e.g. `shell`/`bash` locally
+    /// doesn't re-expose those tools to an external caller (parity with chat).
+    pub tool_policy: Option<ToolPolicy>,
+    /// Full per-provider tool-policy map (config `tool_policy_by_provider`),
+    /// resolved per session against the built provider's `model_id()` — with a
+    /// fallback to [`Self::provider_name`] — so a model-scoped deny is honoured
+    /// even when the config relies on a provider default model.
+    pub tool_policy_by_provider: HashMap<String, ToolPolicy>,
+    /// Configured provider name, the fallback key when resolving the
+    /// per-provider tool policy (model id wins over provider name).
+    pub provider_name: String,
+}
+
+impl SessionDispatchConfig {
+    /// Build the sandbox backend for this session's tool registry, applying the
+    /// MCP approval posture first. Returns the effective [`SandboxConfig`] and
+    /// the constructed backend so the caller can fail closed when a sandbox was
+    /// requested but no backend is available on this host.
+    ///
+    /// The MCP-served agent runs under [`ApprovalPolicy::Never`]: there is no
+    /// interactive approver in server mode, so any tool call that would prompt
+    /// fails at the tool boundary rather than silently proceeding. Auto mode
+    /// resolves to `sandbox-exec` on macOS / `bwrap` on Linux.
+    fn sandbox_backend(&self) -> (SandboxConfig, Box<dyn octos_agent::Sandbox>) {
+        let permissions = self.permissions();
+        let effective = permissions.apply_to_sandbox(&self.sandbox);
+        let backend = create_sandbox(&effective);
+        (effective, backend)
+    }
+
+    /// The MCP-served agent's effective permissions: workspace-write, but with
+    /// a fail-closed approval policy (no interactive approver exists server-side).
+    fn permissions(&self) -> EffectivePermissions {
+        EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never)
+    }
 }
 
 /// Factory that yields a ready-to-use LLM provider for each session.
@@ -263,6 +444,18 @@ impl AgentLlmFactory {
 /// * Emits `Verifying`, resolves the contract artifact (either the
 ///   `expected_artifact` field from the MCP input or the workspace contract's
 ///   primary artifact), and transitions to `Ready`/`Failed`.
+///
+/// # Sandboxing
+///
+/// The per-session [`ToolRegistry`] is built with
+/// [`ToolRegistry::with_builtins_and_sandbox`] using the
+/// [`SessionDispatchConfig::sandbox`] policy (default
+/// [`SandboxMode::Auto`](octos_agent::SandboxMode)). This confines
+/// `shell`/`exec_command`/`bash` and the file tools to the workspace `cwd`,
+/// exactly as `octos chat`/`octos gateway` do. Without it the outer MCP caller
+/// — which is only parent-trusted (stdio) or bearer-authenticated (http) — can
+/// drive `run_octos_session` to read, write, and execute anywhere the octos
+/// process can reach.
 pub struct RealSessionDispatch {
     config: SessionDispatchConfig,
     factory: AgentLlmFactory,
@@ -319,7 +512,54 @@ impl McpSessionDispatch for RealSessionDispatch {
                     ))
                 })?,
         );
-        let tools = Arc::new(ToolRegistry::with_builtins(&self.config.cwd));
+        // Confine shell/exec/file tools to the workspace. `with_builtins`
+        // alone installs `NoSandbox`, which let an outer MCP caller drive
+        // `shell`/`exec_command` to read, write, or execute anywhere the octos
+        // process could (the M7.2 session-dispatch RCE). The OS sandbox
+        // restricts writes to `cwd`.
+        let permissions = self.config.permissions();
+        let (effective_sandbox_config, sandbox) = self.config.sandbox_backend();
+        // Fail closed: unlike local chat/gateway (where the human runs their own
+        // commands), the mcp-serve caller is only parent-trusted (stdio) or
+        // bearer-token authenticated (http). If the operator wanted a sandbox but
+        // this host has no backend (Auto → NoSandbox), refuse the session rather
+        // than silently running an external caller's tools unsandboxed. An
+        // explicit `sandbox.mode = "none"` opt-out is respected.
+        if effective_sandbox_config.enabled
+            && effective_sandbox_config.mode != SandboxMode::None
+            && sandbox.is_noop()
+        {
+            return Err(McpServerError::SessionFailed(
+                "session_failed: no sandbox backend available on this host; refusing to run \
+                 tools unsandboxed on the mcp-serve path (set sandbox.mode = \"none\" to opt out)"
+                    .to_string(),
+            ));
+        }
+        let mut registry =
+            ToolRegistry::with_builtins_and_permissions(&self.config.cwd, sandbox, permissions);
+        // Apply the operator's global tool deny/allow policy (parity with chat)
+        // so a server that denies command tools doesn't re-expose them, then the
+        // model-scoped policy resolved against the provider we actually built
+        // (`llm.model_id()` — not the raw config model, which is empty when only
+        // a provider is configured, so a policy keyed to the provider default
+        // model would otherwise be skipped).
+        if let Some(policy) = &self.config.tool_policy {
+            registry.apply_policy(policy);
+        }
+        let provider_policy = self
+            .config
+            .tool_policy_by_provider
+            .get(llm.model_id())
+            .or_else(|| {
+                self.config
+                    .tool_policy_by_provider
+                    .get(&self.config.provider_name)
+            })
+            .cloned();
+        if let Some(policy) = provider_policy {
+            registry.set_provider_policy(policy);
+        }
+        let tools = Arc::new(registry);
         let agent_config = AgentConfig {
             max_iterations: self.config.max_iterations,
             // Skip episode persistence — MCP sessions are short-lived and
@@ -405,7 +645,13 @@ impl McpSessionDispatch for RealSessionDispatch {
         // defined. Results are surfaced via `validator_results` so MCP
         // callers see the same typed outcomes the local spawn pipeline
         // records in its ledger. Missing policy → empty vec (not an error).
-        let validator_results = run_completion_validators(&self.config.cwd, contract, &tools).await;
+        let validator_results = run_completion_validators(
+            &self.config.cwd,
+            contract,
+            &tools,
+            &effective_sandbox_config,
+        )
+        .await;
 
         // Resolve the contract artifact. Precedence:
         //   1. Explicit `expected_artifact` from the MCP input.
@@ -518,6 +764,7 @@ async fn run_completion_validators(
     workspace_root: &std::path::Path,
     contract: &str,
     tools: &Arc<ToolRegistry>,
+    sandbox: &SandboxConfig,
 ) -> Vec<Value> {
     let Ok(Some(policy)) = octos_agent::read_workspace_policy(workspace_root) else {
         return Vec::new();
@@ -525,7 +772,12 @@ async fn run_completion_validators(
     if policy.validation.validators.is_empty() {
         return Vec::new();
     }
-    let runner = ValidatorRunner::new(tools.clone(), workspace_root);
+    // Run workspace command validators *through* the same sandbox the agent's
+    // tools use — otherwise a workspace-declared completion command would be an
+    // unsandboxed host-exec escape on the mcp-serve path (the validator runner
+    // routes no-op sandboxes to a direct, injection-safe argv exec).
+    let runner = ValidatorRunner::new(tools.clone(), workspace_root)
+        .with_sandbox(Arc::from(create_sandbox(sandbox)));
     let invocation = ValidatorInvocation {
         phase: ValidatorPhase::Completion,
         workspace_root: workspace_root.to_path_buf(),
@@ -609,6 +861,44 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_backend_honors_config_and_defaults_to_auto() {
+        let mk = |sandbox: SandboxConfig| SessionDispatchConfig {
+            cwd: std::env::temp_dir(),
+            data_dir: std::env::temp_dir(),
+            max_iterations: 4,
+            sandbox,
+            tool_policy: None,
+            tool_policy_by_provider: HashMap::new(),
+            provider_name: String::new(),
+        };
+
+        // A disabled policy must produce a pass-through backend, proving the
+        // dispatch reads the configured policy rather than hardcoding one.
+        let disabled = mk(SandboxConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let program = disabled
+            .sandbox_backend()
+            .1
+            .wrap_command("true", std::path::Path::new("."))
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            program == "sh" || program == "cmd",
+            "disabled sandbox must pass through, got {program:?}"
+        );
+
+        // The default policy is enabled + Auto — never NoSandbox by omission,
+        // which was the M7.2 dispatch RCE (`with_builtins` hardcoded NoSandbox).
+        let default = mk(SandboxConfig::default());
+        assert!(default.sandbox.enabled);
+        assert_eq!(default.sandbox.mode, octos_agent::SandboxMode::Auto);
+    }
+
+    #[test]
     fn resolve_artifact_prefers_expected_path_when_supplied() {
         let dir = tempfile::tempdir().unwrap();
         let expected = dir.path().join("out.bin");
@@ -664,5 +954,96 @@ mod tests {
         let path = dir.path().join("small.txt");
         std::fs::write(&path, b"hello").unwrap();
         assert_eq!(read_small_text_artifact(&path).as_deref(), Some("hello"));
+    }
+}
+
+#[cfg(all(test, feature = "api"))]
+mod http_transport_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use octos_agent::mcp_server::{
+        McpServer, McpServerError, McpSessionDispatch, McpSessionOutcome, SessionLifecycleObserver,
+    };
+    use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
+    use serde_json::Value;
+
+    use super::mcp_http_router;
+
+    struct ReadyDispatch;
+
+    #[async_trait]
+    impl McpSessionDispatch for ReadyDispatch {
+        async fn run_session(
+            &self,
+            _contract: &str,
+            _input: &Value,
+            observer: &dyn SessionLifecycleObserver,
+        ) -> Result<McpSessionOutcome, McpServerError> {
+            observer.mark_state(TaskLifecycleState::Ready);
+            Ok(McpSessionOutcome {
+                final_state: TaskLifecycleState::Ready,
+                artifact_path: None,
+                artifact_content: None,
+                validator_results: vec![],
+                cost: serde_json::json!({}),
+                error: None,
+            })
+        }
+    }
+
+    /// Bind the Streamable HTTP router on an ephemeral loopback port and return
+    /// its address. The server task is detached; it stops when the test's
+    /// runtime is dropped.
+    async fn spawn_http_server(token: &str) -> std::net::SocketAddr {
+        let server = McpServer::new(Arc::new(ReadyDispatch), Arc::new(TaskSupervisor::new()));
+        let (app, _cancel) = mcp_http_router(server, token.to_string(), false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        addr
+    }
+
+    /// The bearer gate must reject missing/wrong tokens with 401 before the
+    /// request reaches the rmcp service, and let a correct token through.
+    #[tokio::test]
+    async fn http_transport_gates_on_bearer_token() {
+        let addr = spawn_http_server("super-secret").await;
+        let url = format!("http://{addr}/mcp");
+        let client = reqwest::Client::new();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+        // No Authorization header -> 401.
+        let resp = client.post(&url).body(body).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Wrong token -> 401.
+        let resp = client
+            .post(&url)
+            .header("Authorization", "Bearer nope")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Correct token passes the gate and reaches rmcp. rmcp may reject the
+        // bare body with a 4xx for missing MCP headers/session, but never 401.
+        let resp = client
+            .post(&url)
+            .header("Authorization", "Bearer super-secret")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "a correct bearer token must pass the gate"
+        );
     }
 }

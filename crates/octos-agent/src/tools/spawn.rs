@@ -1,13 +1,14 @@
 //! Spawn tool for background subagent execution.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use metrics::counter;
-use octos_core::{AgentId, InboundMessage, Task, TaskContext, TaskKind, TaskResult};
+use octos_core::{AgentId, InboundMessage, SessionScope, Task, TaskContext, TaskKind, TaskResult};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use regex::Regex;
@@ -24,6 +25,7 @@ use crate::file_state_cache::FileStateCache;
 use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
 use crate::prompt_context::PromptContextManager;
 use crate::role_template::RoleTemplate;
+use crate::sandbox::{SandboxConfig, create_sandbox};
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
 use crate::task_supervisor::{TaskSupervisor, TaskTerminalGuard};
@@ -79,6 +81,407 @@ pub type ChildSessionLifecycleSender = Arc<
 
 pub type ChildToolFactory = Arc<dyn Fn() -> Arc<dyn Tool> + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkerIsolation {
+    #[default]
+    Shared,
+    Worktree,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerWorktree {
+    slug: String,
+    branch: String,
+    path: PathBuf,
+}
+
+impl WorkerWorktree {
+    fn mark_status(&self, status: &str) {
+        if let Err(error) = write_worker_worktree_status(self, status) {
+            warn!(
+                slug = %self.slug,
+                branch = %self.branch,
+                path = %self.path.display(),
+                error = %error,
+                "spawn: failed to update worker worktree status"
+            );
+        }
+    }
+}
+
+/// RAII wrapper around a freshly-allocated [`WorkerWorktree`] (PR #1250
+/// review, finding 1).
+///
+/// `allocate_worker_worktree` necessarily runs before the spawn tool's later
+/// refusal points — provider resolution (`resolve_sub_provider?`), the sync
+/// plugin/tool availability `?` returns, the background fanout-cap refusal —
+/// because both spawn branches need the child working dir up front. Each of
+/// those refusals returns without ever starting a worker; dropping an armed
+/// guard prunes the just-created worktree + branch so a refused spawn leaves
+/// `git worktree list` (and `.octos/work`) unchanged. Leaking instead would
+/// be permanent: the `octos clean` sweep deliberately skips directories that
+/// are still registered as live worktrees. Call [`Self::disarm`] at the real
+/// handoff — the point where the worker actually starts.
+struct WorkerWorktreeGuard {
+    repo_root: PathBuf,
+    worktree: Option<WorkerWorktree>,
+}
+
+impl WorkerWorktreeGuard {
+    fn new(repo_root: PathBuf, worktree: WorkerWorktree) -> Self {
+        Self {
+            repo_root,
+            worktree: Some(worktree),
+        }
+    }
+
+    fn worktree(&self) -> &WorkerWorktree {
+        self.worktree
+            .as_ref()
+            .expect("worker worktree guard is armed until disarmed")
+    }
+
+    /// Hand ownership of the worktree to the worker: after this the guard
+    /// no longer prunes on drop.
+    fn disarm(mut self) -> WorkerWorktree {
+        self.worktree
+            .take()
+            .expect("worker worktree guard disarmed twice")
+    }
+}
+
+impl Drop for WorkerWorktreeGuard {
+    fn drop(&mut self) {
+        if let Some(worktree) = self.worktree.take() {
+            prune_worker_worktree(&self.repo_root, &worktree);
+        }
+    }
+}
+
+/// Best-effort removal of a refused worker's worktree and branch. Failures
+/// are logged, not propagated — this runs on refusal paths (and in `Drop`)
+/// where the spawn refusal itself must surface to the caller.
+fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
+    // `--force` clears the untracked `.octos/worker-worktree.json` status
+    // marker; the checkout is otherwise fresh.
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree.path)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            warn!(
+                path = %worktree.path.display(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "spawn: git worktree remove failed for refused spawn; \
+                 falling back to manual prune"
+            );
+            if worktree.path.exists() {
+                if let Err(error) = std::fs::remove_dir_all(&worktree.path) {
+                    warn!(
+                        path = %worktree.path.display(),
+                        error = %error,
+                        "spawn: failed to remove refused worker worktree directory"
+                    );
+                }
+            }
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .args(["worktree", "prune"])
+                .output();
+        }
+        Err(error) => {
+            warn!(
+                path = %worktree.path.display(),
+                error = %error,
+                "spawn: failed to run git worktree remove for refused spawn"
+            );
+        }
+    }
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["branch", "-D"])
+        .arg(&worktree.branch)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => warn!(
+            branch = %worktree.branch,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "spawn: failed to delete refused worker branch"
+        ),
+        Err(error) => warn!(
+            branch = %worktree.branch,
+            error = %error,
+            "spawn: failed to run git branch -D for refused spawn"
+        ),
+    }
+}
+
+fn validate_worker_worktree_slug(slug: &str) -> Result<(), String> {
+    if slug.is_empty() {
+        return Err("worker worktree slug must not be empty".to_string());
+    }
+    if slug.len() > 64 {
+        return Err("worker worktree slug must be at most 64 characters".to_string());
+    }
+    if slug.starts_with('/') || slug.starts_with('\\') || slug.contains('\\') {
+        return Err("worker worktree slug must be relative and use '/' separators".to_string());
+    }
+    for segment in slug.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err("worker worktree slug contains an unsafe path segment".to_string());
+        }
+        if !segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        {
+            return Err(format!(
+                "worker worktree slug segment {segment:?} contains unsupported characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .wrap_err_with(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(eyre::eyre!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet", refname])
+        .status()
+        .wrap_err("failed to run git show-ref")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(eyre::eyre!("git show-ref exited with {status}")),
+    }
+}
+
+/// Allocate a dedicated git worktree for a spawned worker.
+///
+/// Validation runs BEFORE `git worktree add` (PR #1250 review, finding 2):
+/// the `.octos` / `.octos/work` components must not be symlinks and the
+/// created work root must canonically resolve under the canonical repository
+/// root — this holds even when the caller carries no [`SessionScope`] at
+/// all. When a parent scope IS present, the planned worktree path must
+/// additionally pass [`SessionScope::with_workspace`] before creation, so a
+/// scope refusal never leaves a checkout behind (let alone one outside the
+/// session root).
+///
+/// Returns the allocation armed inside a [`WorkerWorktreeGuard`] (finding 1)
+/// plus the child scope precomputed from the validated path. The caller must
+/// [`WorkerWorktreeGuard::disarm`] at the real worker handoff; any earlier
+/// refusal drops the guard and prunes the worktree + branch.
+/// Whether `dir` is inside a git work tree. Used to preflight worktree
+/// isolation so a non-git workspace produces a clear, actionable error instead
+/// of leaking git's raw `fatal: not a git repository`. Any failure to run git
+/// (missing binary, permissions) resolves to `false` here — the caller's error
+/// message covers "not a git repository" as the actionable remedy, and a truly
+/// missing git surfaces its own error on the subsequent `git worktree add`.
+fn is_inside_git_work_tree(dir: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
+fn allocate_worker_worktree(
+    parent_working_dir: &Path,
+    worker_id: &AgentId,
+    parent_scope: Option<&Arc<SessionScope>>,
+) -> Result<(WorkerWorktreeGuard, Option<Arc<SessionScope>>)> {
+    // Preflight: worktree isolation is only possible inside a git repository.
+    // Without this, a non-git workspace fell straight into
+    // `git rev-parse --show-toplevel` and surfaced the raw
+    // `fatal: not a git repository` — cryptic, and the model wasted a spawn
+    // round reverse-engineering the remedy. Give it an actionable message so it
+    // re-dispatches with `isolation: shared`/`none` on the first try.
+    if !is_inside_git_work_tree(parent_working_dir) {
+        return Err(eyre::eyre!(
+            "worktree isolation requires the workspace ({}) to be a git repository, but it is not. \
+             Re-dispatch the spawn with isolation: shared (or none), or start the session inside a git repo.",
+            parent_working_dir.display()
+        ));
+    }
+    let repo_root = PathBuf::from(git_stdout(
+        parent_working_dir,
+        &["rev-parse", "--show-toplevel"],
+    )?);
+    let canonical_repo_root = std::fs::canonicalize(&repo_root).wrap_err_with(|| {
+        format!(
+            "failed to canonicalize repository root {}",
+            repo_root.display()
+        )
+    })?;
+    let base_slug = worker_id.to_string();
+    let work_root = repo_root.join(".octos").join("work");
+    // Finding 2: refuse symlinked components BEFORE creating anything. A
+    // symlinked `.octos` or `.octos/work` would make `create_dir_all` (for a
+    // dangling link) and `git worktree add` write outside the repository —
+    // and thus outside the session root — before any validation ran.
+    for component in [repo_root.join(".octos"), work_root.clone()] {
+        let is_symlink = component
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        if is_symlink {
+            return Err(eyre::eyre!(
+                "worker worktree root component {} is a symlink; refusing to \
+                 create worker worktrees through it",
+                component.display()
+            ));
+        }
+    }
+    // Finding 2: session-scope validation BEFORE any write — even the
+    // `.octos/work` root itself must sit inside the session root, or the
+    // spawn is refused with nothing created at all (not even the empty
+    // directory chain `create_dir_all` would otherwise leave behind). The
+    // per-attempt validation inside the loop below then binds the actual
+    // worker path.
+    scoped_child_session_scope(parent_scope, &work_root).map_err(|error| {
+        eyre::eyre!(
+            "worker worktree root {} rejected by session scope: {error}",
+            work_root.display()
+        )
+    })?;
+    std::fs::create_dir_all(&work_root).wrap_err_with(|| {
+        format!(
+            "failed to create worker worktree root {}",
+            work_root.display()
+        )
+    })?;
+    // Post-create re-verification: the canonical work root must stay under
+    // the canonical repository root. This closes the check/create race (a
+    // symlink swapped in between the check above and `create_dir_all`) and
+    // catches any resolution surprise a lexical join would hide.
+    let canonical_work_root = std::fs::canonicalize(&work_root).wrap_err_with(|| {
+        format!(
+            "failed to canonicalize worker worktree root {}",
+            work_root.display()
+        )
+    })?;
+    if !canonical_work_root.starts_with(&canonical_repo_root) {
+        return Err(eyre::eyre!(
+            "worker worktree root {} resolves to {}, outside the repository root {}; \
+             refusing symlink escape",
+            work_root.display(),
+            canonical_work_root.display(),
+            canonical_repo_root.display()
+        ));
+    }
+
+    for attempt in 0..=32 {
+        let slug = if attempt == 0 {
+            base_slug.clone()
+        } else {
+            format!("{base_slug}-{attempt}")
+        };
+        validate_worker_worktree_slug(&slug).map_err(eyre::Report::msg)?;
+        let branch = format!("octos/worker/{slug}");
+        let refname = format!("refs/heads/{branch}");
+        // Plan against the canonical work root so the scope check below,
+        // `git worktree add`, and every later status write all target the
+        // same verified physical location.
+        let path = canonical_work_root.join(&slug);
+        if path.exists() || git_ref_exists(&repo_root, &refname)? {
+            continue;
+        }
+        // Finding 2: session-scope validation BEFORE creation.
+        // `SessionScope::with_workspace` requires the planned path under the
+        // scope root by canonical form; a worktree that would land outside
+        // the session root is refused here, with nothing created. (The path
+        // only varies by slug suffix across attempts, so the first rejection
+        // is authoritative — no point retrying other slugs.)
+        let child_scope = scoped_child_session_scope(parent_scope, &path).map_err(|error| {
+            eyre::eyre!(
+                "worker worktree path {} rejected by session scope: {error}",
+                path.display()
+            )
+        })?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "add", "-b"])
+            .arg(&branch)
+            .arg(&path)
+            .arg("HEAD")
+            .output()
+            .wrap_err("failed to run git worktree add")?;
+        if !output.status.success() {
+            return Err(eyre::eyre!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let allocation = WorkerWorktree { slug, branch, path };
+        allocation.mark_status("spawned");
+        return Ok((WorkerWorktreeGuard::new(repo_root, allocation), child_scope));
+    }
+
+    Err(eyre::eyre!(
+        "could not allocate a unique worker worktree slug for {base_slug:?}"
+    ))
+}
+
+fn write_worker_worktree_status(worktree: &WorkerWorktree, status: &str) -> Result<()> {
+    let state_dir = worktree.path.join(".octos");
+    std::fs::create_dir_all(&state_dir)?;
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "agent_id": worktree.slug,
+        "branch": worktree.branch,
+        "path": worktree.path,
+        "status": status,
+    });
+    std::fs::write(
+        state_dir.join("worker-worktree.json"),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    Ok(())
+}
+
+fn scoped_child_session_scope(
+    parent_scope: Option<&Arc<SessionScope>>,
+    working_dir: &Path,
+) -> Result<Option<Arc<SessionScope>>> {
+    parent_scope
+        .map(|scope| {
+            scope
+                .as_ref()
+                .clone()
+                .with_workspace(working_dir.to_path_buf())
+                .map(Arc::new)
+                .map_err(|error| eyre::eyre!(error))
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundResultKind {
     Notification,
@@ -90,30 +493,23 @@ pub struct BackgroundResultPayload {
     pub task_label: String,
     pub content: String,
     pub kind: BackgroundResultKind,
-    /// Media to attach to the persisted ledger row that mirrors this
-    /// completion (legacy `message/persisted` shape). For the
-    /// `NotConfigured` `send_file` fallback this stays `vec![]` because
-    /// each file already has its own per-file `message/persisted` row
-    /// — adding the same paths here would double-render attachments on
-    /// old clients that don't negotiate `event.spawn_complete.v1`.
-    /// For the `Satisfied` workspace-contract path it carries
-    /// `output_files` directly (no separate per-file rows on that path).
+    /// Media to retain on the durable transcript row for this completion.
+    /// For the `NotConfigured` `send_file` fallback this stays `vec![]`
+    /// because each file already has its own per-file transcript companion.
+    /// For the `Satisfied` workspace-contract path it carries `output_files`
+    /// directly (no separate per-file rows on that path).
     pub media: Vec<String>,
-    /// M10 Phase 5a: media to surface ONLY on the `turn/spawn_complete`
-    /// envelope, never on the persisted row.
+    /// M10 Phase 5a: media to surface on the canonical v2
+    /// background-child envelope, independently of the transcript row.
     ///
-    /// Why two fields: dual-negotiated clients (capability
-    /// `event.spawn_complete.v1`) receive the envelope; the
-    /// per-file `message/persisted` companions are filtered as
-    /// `MessagePersistedSource::Background`. So the envelope MUST
-    /// carry the file URLs or the new client renders a text-only bubble.
-    /// Old clients DO see the per-file rows; if the envelope's media
-    /// also leaked into the persisted row they'd double-render.
-    /// Splitting persist-media from envelope-media keeps the two wire
-    /// shapes independent.
+    /// Why two fields: the per-file companions remain durable transcript
+    /// data but are suppressed from UI projection; the child envelope MUST
+    /// carry the file URLs or the completion renders as text-only. Splitting
+    /// transcript media from projection media keeps the durable record and
+    /// canonical presentation independent.
     ///
-    /// Empty `Vec` (default) means "no envelope-only attachments";
-    /// the envelope falls back to `media` for compatibility with the
+    /// Empty `Vec` (default) means "no projection-only attachments";
+    /// the canonical child envelope falls back to `media` for the
     /// `Satisfied` path. Populated explicitly only by the
     /// `NotConfigured` success branch in `execution.rs`.
     pub envelope_media: Vec<String>,
@@ -311,6 +707,216 @@ fn background_result_kind_label(kind: BackgroundResultKind) -> &'static str {
     }
 }
 
+/// Frame a child's task with an unambiguous sub-agent identity so a weaker
+/// model does not adopt the parent's perspective from the forked
+/// conversation context (#1704). Leads with WHO the child is and that the
+/// surrounding history is background, then the task itself.
+fn frame_subagent_task(label: &str, task: &str) -> String {
+    format!(
+        "You are a delegated SUB-AGENT named \"{label}\". Any conversation \
+         history in your context is BACKGROUND from the parent that spawned \
+         you — do NOT respond to it, summarize it, or adopt its point of \
+         view. Your ONE job is the task below; execute it and produce its \
+         deliverable.\n\n=== YOUR TASK ===\n{task}"
+    )
+}
+
+/// Detect a role/task capability mismatch (#1704 item 3, #1707 follow-up):
+/// a read-only role (its allow-list has no write/exec surface) paired with a
+/// task that demands writing a file or running a command. Returns a note to
+/// append to the child's instructions so it delivers findings as its final
+/// TEXT instead of silently "completing" without the impossible artifact
+/// (mini4: `role:"reviewer"` children asked to "clone and write a review"
+/// burned whole runs, then the parent hallucinated a fix).
+///
+/// `effective_tools` is the post-role, post-manifest allow-list. An empty
+/// list means "all builtins" — no restriction — so no mismatch.
+fn role_task_capability_warning(effective_tools: &[String], task: &str) -> Option<String> {
+    if effective_tools.is_empty() {
+        return None; // unconstrained: has everything
+    }
+    let has = |names: &[&str]| {
+        effective_tools.iter().any(|t| {
+            names.contains(&t.as_str())
+                || t == "group:fs"
+                || t == "group:runtime"
+                || t.contains('*')
+        })
+    };
+    let can_write = has(&["write_file", "edit_file", "apply_patch", "diff_edit"]);
+    let can_exec = has(&["shell", "bash", "exec_command"]);
+    let lower = task.to_lowercase();
+    let wants_write = [
+        "write ",
+        "save ",
+        "create ",
+        "emit ",
+        "produce ",
+        ".md",
+        "report to",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    let wants_exec = ["clone", "git ", "run ", "install", "build", "compile"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    let mut gaps = Vec::new();
+    if wants_write && !can_write {
+        gaps.push("write files (no write_file/edit_file)");
+    }
+    if wants_exec && !can_exec {
+        gaps.push("run shell commands such as `git clone` (no shell/bash)");
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "CAPABILITY NOTE: your task implies actions you cannot perform — you cannot {}. \
+         Do NOT pretend to; instead do everything your tools DO allow (read, search, \
+         fetch) and deliver your full result as your FINAL TEXT ANSWER so the parent \
+         can capture it. State plainly which steps you could not perform.",
+        gaps.join(" and ")
+    ))
+}
+
+/// Streams a background spawn child's transcript — assistant text, tool
+/// starts/completions, file modifications — into the parent's
+/// [`SubAgentOutputRouter`] file for its task.
+///
+/// Without this the detached child runs with the default `SilentReporter`
+/// and its entire transcript is dropped: the router file only ever received
+/// spawn_only TOOL output (`execution.rs`), never a spawn CHILD's loop
+/// events, so `read_task_output` on a running child read an absent file and
+/// the agent view could show status but no work (mini4 re-review forensic,
+/// 2026-07-17). The router enforces per-task and total byte caps, so a
+/// chatty child is bounded.
+///
+/// The `router_session_id` must mirror `read_task_output`'s lookup:
+/// `agent:{task.tool_call_id}` where the spawn registers with
+/// `tool_call_id = "spawn-{worker_id}"`.
+///
+/// When an `on_stream_chunk` callback is set, live `StreamChunk` events are
+/// forwarded there so the caller (the WS/serve layer) can emit
+/// `agent/output/delta` directly — bypassing the heavy `on_change` path
+/// (which persists a snapshot on every fire). This gives the TUI agent dock
+/// live streaming output for running background children without per-token
+/// persistence overhead (codex plan review: "the proposed per-token
+/// persistence/on_change fan-out is too heavy"). The WS layer emits via
+/// `send_notification_ephemeral(UiNotification::AgentOutputDelta(...))`.
+/// Live child-stream callback: `(agent_id, start_offset, text_delta)` —
+/// `start_offset` is the cumulative streamed-bytes offset BEFORE the delta
+/// (the window's first byte), `u64` end to end to match
+/// `OutputCursor::offset` on the wire.
+type ChildStreamCallback = Arc<dyn Fn(&str, u64, &str) + Send + Sync>;
+
+struct SpawnChildTranscriptReporter {
+    router: Arc<SubAgentOutputRouter>,
+    router_session_id: String,
+    task_id: String,
+    /// Cumulative byte count of streamed text so far. Incremented per
+    /// `StreamChunk`; the callback receives the value from BEFORE the
+    /// increment, i.e. the START offset of the delta's window — the same
+    /// convention every other `cursor` producer uses
+    /// (`TaskOutputDeltaTracker`, the agent_orchestrator read RPCs all
+    /// report `cursor` = window start). Monotonic, so clients can detect
+    /// gaps / reorder if chunks ever arrive out of order (e.g. across
+    /// reconnects). Atomic because `report(&self)` is `&self` and the
+    /// reporter is shared across the child's tokio task(s). `u64` end to
+    /// end so no lossy narrowing hides between here and
+    /// `OutputCursor::offset` (`u64`) on the wire.
+    stream_offset: AtomicU64,
+    /// Optional callback for live `StreamChunk` forwarding. Called directly
+    /// from the reporter thread with `(agent_id, cursor_offset, text_delta)`
+    /// — the caller owns the emit path (e.g. emitting
+    /// `agent/output/delta` via `send_notification_ephemeral` with a
+    /// properly-formed `AgentOutputDeltaEvent` keyed on the child's
+    /// `agent_id`). The `agent_id` is the spawn's `task_id` (the same id
+    /// surfaced via `TurnSpawnCompleteEvent` / the agent dock).
+    /// `cursor_offset` is the cumulative byte offset BEFORE this chunk
+    /// (i.e. the start-offset of this delta's window) — matches the
+    /// start-offset convention of every sibling `OutputCursor` producer.
+    on_stream_chunk: Option<ChildStreamCallback>,
+}
+
+impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
+    fn report(&self, event: crate::progress::ProgressEvent) {
+        use crate::progress::ProgressEvent;
+        let line = match event {
+            ProgressEvent::Response { content, .. } => {
+                if content.trim().is_empty() {
+                    return;
+                }
+                format!("{content}\n")
+            }
+            ProgressEvent::ToolStarted { name, .. } => format!("[tool] {name}\n"),
+            ProgressEvent::ToolCompleted {
+                name,
+                success,
+                output_preview,
+                ..
+            } => {
+                let status = if success { "ok" } else { "FAILED" };
+                let first = output_preview.lines().next().unwrap_or_default();
+                let first = octos_core::truncated_utf8(first, 200, "…");
+                format!("[tool {status}] {name} — {first}\n")
+            }
+            ProgressEvent::FileModified { path } => format!("[file modified] {path}\n"),
+            // StreamChunk: live text goes ONLY to the direct
+            // on_stream_chunk callback (if set) so the WS layer can emit
+            // agent/output/delta WITHOUT going through on_change (which
+            // persists a snapshot on every fire — too heavy per-token per
+            // codex review). Deliberately NO router append here: the
+            // Response arm below already appends each iteration's full
+            // text, so writing the same bytes per-chunk would land every
+            // child message TWICE in `<task_id>.out` (this exact
+            // duplication is what the original drop-comment on this arm
+            // warned about). The router file stays the Response-based
+            // durable record; `task/output/delta` is produced from
+            // supervisor progress events, not router appends, so no live
+            // consumer loses anything.
+            //
+            // Delivery note (codex review): a fast LLM child can fire
+            // this 100+ times/sec. There is no per-token coalescing here,
+            // and the ephemeral WS send is LOSSY: `try_enqueue` onto the
+            // bounded channel drops the frame on full (BackpressureDrop)
+            // rather than blocking the producer. Dropped deltas are
+            // acceptable for a live tail (the durable record is the
+            // Response append); if loss under N parallel children proves
+            // user-visible, add a ~16ms coalescing debounce at the
+            // callback site.
+            ProgressEvent::StreamChunk { text, .. } => {
+                if !text.is_empty() {
+                    // `fetch_add` returns the PREVIOUS value: the
+                    // cumulative streamed-bytes offset BEFORE this chunk,
+                    // i.e. the START offset of the delta's window —
+                    // matching every sibling `cursor` producer
+                    // (TaskOutputDeltaTracker, the agent_orchestrator
+                    // read RPCs). Monotonic, so clients can detect gaps /
+                    // reorder on reconnect.
+                    let start_offset = self
+                        .stream_offset
+                        .fetch_add(text.len() as u64, Ordering::Relaxed);
+                    if let Some(ref cb) = self.on_stream_chunk {
+                        // Pass `(task_id, cursor_offset, text)` so the WS
+                        // layer can construct a properly-keyed
+                        // `AgentOutputDeltaEvent` (the dock correlates live
+                        // output with the spawned agent by `task_id`).
+                        cb(self.task_id.as_str(), start_offset, text.as_str());
+                    }
+                }
+                return;
+            }
+            // Thinking/LlmStatus/etc. are cadence noise for a transcript.
+            _ => return,
+        };
+        // Best-effort: a full router (byte caps) or IO error must never
+        // disturb the child's run.
+        let _ = self
+            .router
+            .append(&self.router_session_id, &self.task_id, line.as_bytes());
+    }
+}
+
 fn record_result_delivery(path: &'static str, outcome: &'static str, kind: BackgroundResultKind) {
     counter!(
         "octos_result_delivery_total",
@@ -344,6 +950,9 @@ async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPay
         HookResult::Modified(_) => {
             warn!(event = ?event, "lifecycle hook attempted to modify payload; ignoring");
         }
+        // Context injection is a `user_prompt_submit`-only outcome; a spawn
+        // lifecycle event never produces it, but the match must be exhaustive.
+        HookResult::Context(_) => {}
         HookResult::Deny(reason) => {
             warn!(
                 event = ?event,
@@ -403,6 +1012,9 @@ async fn run_before_spawn_verify_hook(
     match hooks.run(event, &payload).await {
         HookResult::Allow => Ok(default_files),
         HookResult::Modified(modified) => parse_modified_spawn_verify_output_files(modified),
+        // `before_spawn_verify` never yields context injection (that is a
+        // `user_prompt_submit`-only outcome); treat it like a plain allow.
+        HookResult::Context(_) => Ok(default_files),
         HookResult::Deny(reason) => Err(reason),
         HookResult::Error(error) => {
             warn!(
@@ -456,6 +1068,15 @@ pub struct SpawnTool {
     task_ledger_path: Option<PathBuf>,
     /// Optional agent config inherited from the parent session.
     worker_config: Option<AgentConfig>,
+    /// Parent's embedding provider, propagated onto worker Agents.
+    ///
+    /// Without this the spawn path was the only production surface that
+    /// both saves episodes (`AgentConfig::default().save_episodes`) and
+    /// lacked an embedder — workers stored episodes UNEMBEDDED and their
+    /// `build_initial_messages` recall silently skipped (the same NEW-06
+    /// class of gap `RunPipelineTool::with_embedder` closed for
+    /// pipeline workers).
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     /// Optional MCP-backed sub-agent used when callers pick
     /// `backend == "agent_mcp"`. Parent context stays small because the
     /// sub-agent's internal messages never leak back — only the final
@@ -478,6 +1099,11 @@ pub struct SpawnTool {
     /// the child Agent's spawn_only background tools route output
     /// through the same on-disk log the dashboard tails.
     parent_subagent_output_router: Option<Arc<SubAgentOutputRouter>>,
+    /// Optional callback for live stream-chunk forwarding. When set, the
+    /// spawn child's `ProgressEvent::StreamChunk` text is forwarded here so
+    /// the WS/serve layer can emit `agent/output/delta` directly (bypassing
+    /// the heavy `on_change` + per-token persistence path — per codex review).
+    child_stream_callback: Option<ChildStreamCallback>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
@@ -494,6 +1120,32 @@ pub struct SpawnTool {
     /// `None` keeps the pre-fix behaviour for callers that opted out
     /// (e.g. legacy tests not exercising the gate).
     dispatch_policy: Option<crate::dispatch_policy::DispatchPolicy>,
+    /// #1607 (codex-review follow-up): the session's sandbox config, carried
+    /// so the spawn/agent_mcp child completion path can confine `Command`
+    /// validators declared by an untrusted workspace `workspace_policy.toml`
+    /// to the same backend as the parent's shell/exec tools. Before this
+    /// field, the two validator registries in `execute_with_context`'s
+    /// `agent_mcp` branch were built with `ToolRegistry::with_builtins`
+    /// (hardcoded `NoSandbox`), so `run_project_root_validators` /
+    /// `run_declared_validators` executed a workspace-authored `Command`
+    /// validator directly on the host even when the session was sandboxed —
+    /// a second construction site for the exact escape #1607 closed on the
+    /// `build_validator_runner` chokepoint. Defaults to
+    /// `SandboxConfig::default()`; the real session wiring threads the same
+    /// config the parent `ToolRegistry` was built with via
+    /// [`Self::with_sandbox`]. A no-op backend (`NoSandbox`, or a helper that
+    /// is unavailable) has nothing to escape, so `ValidatorRunner` runs the
+    /// argv directly there — behaviour is unchanged on hosts without a real
+    /// backend.
+    sandbox: SandboxConfig,
+    /// Optional host-owned root for spawned-worker deliverables. When absent,
+    /// retain the legacy `<working_dir>/.octos/spawn-deliverables` location.
+    deliverable_root: Option<PathBuf>,
+    /// Whether Octos itself may create workspace-local state such as a git
+    /// worktree. Agent file access is enforced elsewhere; this covers the
+    /// host-side control plane so a read-only session cannot create
+    /// `.octos/work` before a tool sandbox applies.
+    workspace_write_access: bool,
 }
 
 impl SpawnTool {
@@ -525,14 +1177,19 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            embedder: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
+            child_stream_callback: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
+            sandbox: SandboxConfig::default(),
+            deliverable_root: None,
+            workspace_write_access: true,
         }
     }
 
@@ -567,14 +1224,99 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            embedder: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
+            child_stream_callback: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
+            sandbox: SandboxConfig::default(),
+            deliverable_root: None,
+            workspace_write_access: true,
+        }
+    }
+
+    /// Reconstruct an equivalent `SpawnTool` for a spawned child's own
+    /// registry, rebased on the child's working directory.
+    ///
+    /// Registering the returned tool under the name `spawn` triggers the
+    /// [`ToolRegistry::register`] swap that binds `spawn_agent` + `delegate`
+    /// behind it, so a subagent can nest a further spawn (bounded by
+    /// [`MAX_SPAWN_DEPTH`] via the child worker's incremented
+    /// `ToolContext::spawn_depth`). Without this the child registry carries
+    /// only the delegate-less builtin `spawn_agent`, and any nested spawn
+    /// fails with "No native Octos spawn tool is bound behind spawn_agent in
+    /// this ToolRegistry." — orphaning the child task with empty outputs.
+    ///
+    /// Every wired field (routers, factories, supervisor, sandbox, plugin
+    /// dirs, policies, …) is carried forward by `Arc`/value clone so nesting
+    /// works identically at each level; `worker_count` restarts at 0 because
+    /// each instance numbers only its own direct children, and `origin` is
+    /// snapshotted from the parent's current value.
+    fn child_spawn_clone(&self, working_dir: PathBuf, child_id: &AgentId) -> SpawnTool {
+        SpawnTool {
+            llm: self.llm.clone(),
+            memory: self.memory.clone(),
+            working_dir,
+            inbound_tx: self.inbound_tx.clone(),
+            origin: std::sync::Mutex::new(
+                self.origin
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            worker_count: AtomicU32::new(0),
+            provider_policy: self.provider_policy.clone(),
+            provider_router: self.provider_router.clone(),
+            worker_prompt: self.worker_prompt.clone(),
+            background_result_sender: self.background_result_sender.clone(),
+            child_session_sender: self.child_session_sender.clone(),
+            hooks: self.hooks.clone(),
+            hook_context_template: self.hook_context_template.clone(),
+            plugin_dirs: self.plugin_dirs.clone(),
+            plugin_extra_env: self.plugin_extra_env.clone(),
+            plugin_require_signed: self.plugin_require_signed,
+            child_tool_factories: self.child_tool_factories.clone(),
+            task_supervisor: self.task_supervisor.clone(),
+            session_key: self.session_key.clone(),
+            task_ledger_path: self.task_ledger_path.clone(),
+            worker_config: self.worker_config.clone(),
+            embedder: self.embedder.clone(),
+            mcp_agent_backend: self.mcp_agent_backend.clone(),
+            mcp_agent_tool_name: self.mcp_agent_tool_name.clone(),
+            cost_accountant: self.cost_accountant.clone(),
+            parent_file_state_cache: self.parent_file_state_cache.clone(),
+            parent_subagent_output_router: self.parent_subagent_output_router.clone(),
+            child_stream_callback: self.child_stream_callback.clone(),
+            parent_subagent_summary_generator: self.parent_subagent_summary_generator.clone(),
+            // Depth-1-only wiring, deliberately DROPPED for grandchildren: the
+            // AppUI context-fork factory captures the ORIGINAL parent session's
+            // context and keys the fork by worker_id. Carried to a grandchild
+            // it would (a) fork from the wrong ancestor and (b) collide keys
+            // when worker_count restarts at 0 per level — sync children pass
+            // child_session_key=None, so the fallback key is
+            // `{base}#spawn-{worker_id}` and `subagent-0`'s grandchild reuses
+            // `subagent-0`, overwriting the child's own forked ledger. A
+            // grandchild instead runs with a fresh context.
+            child_prompt_context_manager_factory: None,
+            dispatch_policy: self.dispatch_policy.clone(),
+            // NB: `task_supervisor` is carried from the parent here but the
+            // caller MUST overwrite it with the child registry's own
+            // `tools.supervisor()` before registering, so it matches the
+            // `ctx.task_supervisor` a nested `spawn_agent` reads. See the two
+            // registration sites in `execute_with_context`.
+            sandbox: self.sandbox.clone(),
+            // A child starts its direct worker numbering at `subagent-0`, so
+            // give nested spawns a distinct descendant root.
+            deliverable_root: self
+                .deliverable_root
+                .as_ref()
+                .map(|root| root.join(child_id.to_string()).join("children")),
+            workspace_write_access: self.workspace_write_access,
         }
     }
 
@@ -608,6 +1350,53 @@ impl SpawnTool {
     pub fn with_provider_policy(mut self, policy: Option<ToolPolicy>) -> Self {
         self.provider_policy = policy;
         self
+    }
+
+    /// #1607 (codex-review follow-up): inherit the session's sandbox config so
+    /// the spawn/agent_mcp child completion path confines workspace-declared
+    /// `Command` validators to the same backend as the parent's shell/exec
+    /// tools. Real session wiring passes the exact `SandboxConfig` the parent
+    /// `ToolRegistry` was built with; callers that don't set it keep the
+    /// host-independent `SandboxConfig::default()` (which resolves to a no-op
+    /// backend when no helper is present, so validators run the argv directly).
+    pub fn with_sandbox(mut self, sandbox: SandboxConfig) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// Direct host-created deliverables outside the agent workspace. This is
+    /// used by read-only chat sessions so Octos bookkeeping cannot create a
+    /// `.octos` directory in the reviewed repository.
+    pub fn with_deliverable_root(mut self, root: PathBuf) -> Self {
+        self.deliverable_root = Some(root);
+        self
+    }
+
+    /// Control host-side workspace state such as git worktree allocation.
+    /// This must track the parent session's file-write capability; it is
+    /// separate from the child tool sandbox because allocation happens before
+    /// the child registry exists. When disabled, a spawn that requests a
+    /// deliverable must also use [`Self::with_deliverable_root`].
+    pub fn with_workspace_write_access(mut self, allowed: bool) -> Self {
+        self.workspace_write_access = allowed;
+        self
+    }
+
+    fn deliverable_output_dir(
+        &self,
+        worker_id: &AgentId,
+    ) -> std::result::Result<PathBuf, &'static str> {
+        if let Some(root) = &self.deliverable_root {
+            return Ok(root.join(worker_id.to_string()));
+        }
+        if !self.workspace_write_access {
+            return Err("read-only spawn requires an external deliverable root");
+        }
+        Ok(self
+            .working_dir
+            .join(".octos")
+            .join("spawn-deliverables")
+            .join(worker_id.to_string()))
     }
 
     /// Set a provider router for multi-model sub-agent support.
@@ -661,6 +1450,28 @@ impl SpawnTool {
     }
 
     /// Inherit the parent agent configuration for spawned workers.
+    /// Propagate the parent's embedding provider onto every spawned
+    /// worker Agent (embed-on-save + hybrid scored/filtered recall).
+    pub fn with_embedder(mut self, embedder: Arc<dyn octos_llm::EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Test-only visibility: whether an embedder was threaded through.
+    pub fn embedder_for_test(&self) -> Option<&Arc<dyn octos_llm::EmbeddingProvider>> {
+        self.embedder.as_ref()
+    }
+
+    /// Like [`Self::with_embedder`] but tolerates `None` — call-site
+    /// sugar for optional parent embedders.
+    pub fn with_optional_embedder(
+        mut self,
+        embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    ) -> Self {
+        self.embedder = embedder.or(self.embedder);
+        self
+    }
+
     pub fn with_agent_config(mut self, config: AgentConfig) -> Self {
         self.worker_config = Some(config);
         self
@@ -733,6 +1544,29 @@ impl SpawnTool {
     /// through the same on-disk log the parent dashboard tails.
     pub fn with_parent_subagent_output_router(mut self, router: Arc<SubAgentOutputRouter>) -> Self {
         self.parent_subagent_output_router = Some(router);
+        self
+    }
+
+    /// Set a callback that receives live `StreamChunk` text deltas from a
+    /// spawned background child. The WS/serve layer uses this to emit
+    /// `agent/output/delta` directly — bypassing the per-token `on_change`
+    /// persistence path (codex plan review: "per-token persistence/on_change
+    /// fan-out is too heavy"). The callback receives
+    /// `(agent_id, cursor_offset, text)`:
+    /// - `agent_id` is the spawn's `task_id` (the same id surfaced via
+    ///   `TurnSpawnCompleteEvent` and the agent dock).
+    /// - `cursor_offset` is the cumulative byte offset BEFORE this chunk —
+    ///   the START of the delta's window, matching every sibling
+    ///   `OutputCursor` producer (`TaskOutputDeltaTracker`, the
+    ///   agent_orchestrator read RPCs). Monotonic; lets clients detect
+    ///   gaps/reorder on reconnect. `u64` end to end so no lossy cast
+    ///   hides between here and `OutputCursor::offset` on the wire.
+    /// - `text` is the delta text.
+    pub fn with_child_stream_callback(
+        mut self,
+        cb: impl Fn(&str, u64, &str) + Send + Sync + 'static,
+    ) -> Self {
+        self.child_stream_callback = Some(Arc::new(cb));
         self
     }
 
@@ -942,6 +1776,39 @@ impl SpawnTool {
     }
 }
 
+/// Upper bound for a spawn's `max_iterations` override. A repo-scale review or
+/// deep research legitimately needs well over the interactive default 50
+/// one-tool-call-at-a-time steps, but an unbounded value is a runaway-loop /
+/// cost footgun, so the caller-supplied value is clamped to this ceiling.
+const MAX_SPAWN_MAX_ITERATIONS: u32 = 300;
+
+/// Default iteration budget for a spawned sub-agent when the caller does not set
+/// `max_iterations`. The bare `AgentConfig` default (50) is tuned for a snappy
+/// *interactive* turn; a background sub-agent does bounded-but-substantive work
+/// (a from-scratch repo review runs ~100–150 one-tool-call-at-a-time steps), so
+/// blindly inheriting 50 starved real work (agents capped on their first
+/// exploration pass, producing nothing). The token budget and loop detection
+/// remain the real runaway guards; the iteration cap is a secondary backstop, so
+/// a more generous spawn default trades a little worst-case runaway headroom for
+/// first-try success on the common substantive-task case. Callers can still
+/// raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it explicitly.
+const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
+
+/// The whole point of the constant above is that it exceeds the interactive
+/// default of 50 (`AgentConfig::max_iterations`). Asserted at compile time:
+/// both sides are consts, so a runtime `assert!` in a test is really a
+/// `clippy::assertions_on_constants` — and this way an edit that breaks the
+/// invariant fails the build instead of a test run.
+const _: () = assert!(DEFAULT_SPAWN_MAX_ITERATIONS > 50);
+
+/// Resolve the effective iteration budget for a spawn: a caller-supplied value
+/// clamped into `[1, MAX]`, or [`DEFAULT_SPAWN_MAX_ITERATIONS`] when unset.
+fn resolve_spawn_max_iterations(requested: Option<u32>) -> u32 {
+    requested
+        .map(|value| value.clamp(1, MAX_SPAWN_MAX_ITERATIONS))
+        .unwrap_or(DEFAULT_SPAWN_MAX_ITERATIONS)
+}
+
 #[derive(Clone, Deserialize)]
 struct Input {
     task: String,
@@ -950,7 +1817,14 @@ struct Input {
     /// "background" (default) or "sync".
     #[serde(default = "default_mode")]
     mode: String,
-    /// Tool names the subagent is allowed to use. Empty = all builtins.
+    /// Worker filesystem isolation strategy. Shared preserves legacy behavior;
+    /// worktree gives the child a dedicated git worktree under `.octos/work`.
+    #[serde(default)]
+    isolation: WorkerIsolation,
+    /// Tool names the subagent is allowed to use. Empty = all builtins. A
+    /// narrowed list that omits `write_file` leaves the child unable to write a
+    /// deliverable except via a shell redirect (which is only captured when a
+    /// `deliverable` glob is set) — see the JSON-schema `description`.
     #[serde(default)]
     allowed_tools: Vec<String>,
     /// Extra context injected as a system-level prefix.
@@ -962,6 +1836,11 @@ struct Input {
     /// Override context window size (tokens) for the sub-agent.
     #[serde(default)]
     context_window: Option<u32>,
+    /// Override the sub-agent's tool-call iteration budget (default 50).
+    /// Clamped to [`MAX_SPAWN_MAX_ITERATIONS`]. Raise it for repo-scale reviews
+    /// / research that need many one-tool-call-at-a-time steps.
+    #[serde(default)]
+    max_iterations: Option<u32>,
     /// Additional instructions appended to the subagent's system prompt.
     /// These are added after the parent's worker prompt, never replacing it.
     #[serde(default, alias = "system_prompt")]
@@ -989,6 +1868,19 @@ struct Input {
     /// Inline always wins.
     #[serde(default)]
     agent_definition_id: Option<String>,
+    /// Glob (relative to a dedicated per-task output directory) matching the
+    /// deliverable file(s) this spawn is expected to produce. When set, the
+    /// child runs in a FRESH output directory seeded with a workspace-contract
+    /// artifact declaration and is told to write its deliverable there; any
+    /// matching file it leaves — written by ANY means, including a raw `shell`
+    /// heredoc that reports no `file_modified` — is surfaced as the task's
+    /// `output_files` via the existing workspace-contract artifact resolver.
+    /// Empty string is treated as `*` (top-level files). Absent = legacy
+    /// behaviour: `output_files` come only from `write_file`/`edit_file` tool
+    /// records, so a shell-written deliverable would not surface (issue: the
+    /// mini4 code reviews wrote via shell and reported no output_files).
+    #[serde(default)]
+    deliverable: Option<String>,
 }
 
 fn default_backend() -> String {
@@ -1009,12 +1901,24 @@ fn default_mode() -> String {
 /// Returns an error when the id is set but does not exist in the registry —
 /// that's almost always a typo, and silently ignoring it would erase the
 /// manifest's safety envelope.
+///
+/// Returns the manifest's `disallowed_tools` (empty when there is no manifest
+/// or it declares none). The caller feeds this to
+/// [`build_subagent_tool_policy`] as a **deny-list**, which is the ONLY
+/// correct way to enforce it: removing entries from `allowed_tools` (the
+/// prior approach) breaks two ways — an allow-list pruned to empty is read by
+/// [`ToolPolicy`] as "allow every tool not denied" (a privilege INVERSION),
+/// and a one-time prune cannot cover tools a role template adds afterwards
+/// (a role could re-introduce a manifest-forbidden tool). A deny entry wins
+/// over any allow (including role-provided ones) and never empties the
+/// allow-list, so `allow:[shell] + deny:[shell]` → no tools (correct) and
+/// `allow:[] + deny:[shell]` → all-except-shell (correct).
 fn apply_agent_definition(
     input: &mut Input,
     registry: &crate::agents::AgentDefinitions,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let Some(id) = input.agent_definition_id.as_deref() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let def = registry.get(id).ok_or_else(|| {
         eyre::eyre!(
@@ -1024,19 +1928,14 @@ fn apply_agent_definition(
         )
     })?;
 
-    // Tool allow-list: manifest provides the default; inline takes
-    // precedence when it is non-empty. Manifest deny-list is merged into
-    // the inline `allowed_tools` as a removal step so a manifest that
-    // marks `shell` as disallowed cannot be re-enabled silently by
-    // inheriting the parent's default allow set.
+    // Tool allow-list: manifest provides the default; inline takes precedence
+    // when it is non-empty. The manifest's `disallowed_tools` is NOT applied
+    // here — it is returned and enforced as a policy deny-list so it also
+    // covers tools a role template contributes later (see the doc comment).
     if input.allowed_tools.is_empty() {
         input.allowed_tools = def.tools.clone();
     }
-    if !def.disallowed_tools.is_empty() {
-        input
-            .allowed_tools
-            .retain(|name| !def.disallowed_tools.contains(name));
-    }
+    let disallowed_tools = def.disallowed_tools.clone();
 
     // Option-typed fields: manifest only applies when the inline slot is
     // None.
@@ -1067,7 +1966,7 @@ fn apply_agent_definition(
         );
     }
 
-    Ok(())
+    Ok(disallowed_tools)
 }
 
 fn append_role_instructions(existing: Option<String>, role_prefix: &str) -> Option<String> {
@@ -1447,8 +2346,48 @@ async fn maybe_generate_inline_research_podcast(
     }
 }
 
+/// The EFFECTIVE allow-list for the two consumers that cannot apply the local
+/// [`ToolPolicy`] deny-list: `allowed_tools` with every manifest-`disallowed`
+/// tool removed.
+///
+/// - The `agent_mcp` dispatch payload — the REMOTE agent runs its own tool
+///   loop and only ever sees this list, so an unfiltered list would grant it a
+///   manifest-forbidden tool (the local deny-list never reaches it).
+/// - The availability preflight — a manifest-forbidden tool must not gate the
+///   spawn on host availability, since the policy denies it regardless.
+///
+/// The in-process ToolPolicy path deliberately keeps the FULL `allowed_tools`
+/// and relies on deny-wins, so this helper must NOT be used to build that
+/// policy — doing so would lose the "deny also covers role-refilled tools"
+/// guarantee.
+fn effective_allowed_tools(allowed_tools: &[String], disallowed_tools: &[String]) -> Vec<String> {
+    if disallowed_tools.is_empty() {
+        return allowed_tools.to_vec();
+    }
+    // Deny entries carry the same wildcard (`podcast_*`) and group
+    // (`group:runtime`) semantics ToolPolicy enforces locally — prune with a
+    // deny-only policy (empty allow = allow everything not denied) so the
+    // effective set agrees with what the local policy would actually deny.
+    let deny_only = ToolPolicy {
+        deny: disallowed_tools.to_vec(),
+        ..Default::default()
+    };
+    allowed_tools
+        .iter()
+        // Exact-contains AND policy matching: the allow-list may itself carry
+        // a group/wildcard entry, and `entry_matches` expands a denied group
+        // only against CONCRETE member names (the group string is not a member
+        // of itself) — so `group:runtime` denied verbatim would survive pure
+        // policy filtering. Contains catches identical entries; the policy
+        // catches concrete tools covered by a group/wildcard deny.
+        .filter(|tool| !disallowed_tools.contains(tool) && deny_only.is_allowed(tool))
+        .cloned()
+        .collect()
+}
+
 fn build_subagent_tool_policy(
     allowed_tools: Vec<String>,
+    disallowed_tools: Vec<String>,
     workflow: Option<&WorkflowMetadata>,
 ) -> ToolPolicy {
     let mut deny = vec!["spawn".to_string()];
@@ -1458,6 +2397,12 @@ fn build_subagent_tool_policy(
         // cannot double-deliver slides/site artifacts.
         deny.push("send_file".to_string());
     }
+    // A manifest's `disallowed_tools` is enforced here as a DENY-list. Deny
+    // wins over allow (see `ToolPolicy::evaluate`), so a forbidden tool is
+    // blocked even if it appears in `allow` (inline/manifest) OR was added by
+    // a role template — and, unlike an allow-list prune, this can never empty
+    // the allow-list into an accidental "allow all".
+    deny.extend(disallowed_tools);
     ToolPolicy {
         allow: allowed_tools,
         deny,
@@ -1465,26 +2410,50 @@ fn build_subagent_tool_policy(
     }
 }
 
+/// Preflight the child's allow-list against what is actually registered.
+///
+/// `strict` distinguishes who asked for the tools:
+/// - `true`  — the CALLER named them explicitly (inline `allowed_tools`). An
+///   absent one is a hard error (a typo, or the wrong host): return `Err`.
+/// - `false` — a role template or manifest SUGGESTED them (they only fill the
+///   allow-list when the caller left it empty). Some are runtime-gated — e.g.
+///   the `reviewer` role lists `recall_memory` / `synthesize_research`, which
+///   need a memory-store / research provider — so an unwired one must be
+///   dropped-with-a-warning, not fail the whole spawn (the mini4 reviewer-role
+///   failure: the role required tools that aren't wired on that host).
 fn ensure_subagent_tools_available(
     tools: &ToolRegistry,
     allowed_tools: &[String],
+    strict: bool,
 ) -> std::result::Result<(), String> {
-    for tool_name in allowed_tools {
-        tools.activate(tool_name);
-    }
-
+    // RFC-0 (#1289): tool deferral was removed — every registered tool is
+    // available. Verify the requested CONCRETE tools are present. Skip policy
+    // EXPRESSIONS — `group:*` named groups and `*` wildcards — which are
+    // allow-list patterns that expand against whatever is registered rather
+    // than concrete tool names: `tools.get("group:fs")` is always None, so a
+    // caller / role template using group tokens would otherwise be falsely
+    // rejected as "not available on this host" (#1689).
     let missing = allowed_tools
         .iter()
+        .filter(|entry| !entry.starts_with("group:") && !entry.contains('*'))
         .filter(|tool_name| tools.get(tool_name).is_none())
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {
         Ok(())
-    } else {
+    } else if strict {
         Err(format!(
             "required tool(s) not available on this host: {}",
             missing.join(", ")
         ))
+    } else {
+        // Role-/manifest-suggested tools that aren't wired here: drop and run
+        // with whatever IS available rather than failing the spawn.
+        warn!(
+            dropped = %missing.join(", "),
+            "subagent role/manifest suggested tools not available on this host; dropping them and proceeding"
+        );
+        Ok(())
     }
 }
 
@@ -1594,6 +2563,137 @@ fn resolve_contract_workspace_root(
             working_dir.display()
         )),
     }
+}
+
+/// Glob used when a spawn requests deliverable collection with an empty
+/// pattern: top-level files only (not `**/*`, which would also sweep up a
+/// repository the worker cloned into its output dir).
+const DEFAULT_DELIVERABLE_GLOB: &str = "*";
+
+/// Appended to the worker's system prompt when a `deliverable` is declared, so
+/// the child writes its output where the seeded contract will find it. Kept
+/// tool-agnostic on purpose: the whole point is that a `shell` heredoc into the
+/// CWD works just as well as `write_file`.
+const DELIVERABLE_WORKER_DIRECTIVE: &str = "DELIVERABLE — IMPORTANT: your job is to WRITE a deliverable FILE into the CURRENT WORKING DIRECTORY, not to explore forever. Do a focused amount of exploration, then WRITE the file EARLY (a solid first draft) and refine it if you have budget left — do NOT run dozens of shell/read commands before writing anything. Anything you leave in the cwd is automatically collected as this task's output; you do NOT need a write_file tool — a shell redirect or heredoc into the cwd (e.g. `cat > report.md <<'EOF'`) works. Do NOT write your deliverable outside the cwd (e.g. not under /tmp). If you finish your run without a written file, your work is LOST — so writing the file is the single most important step, more important than completeness.";
+
+/// A child's final text must be at least this many bytes to be worth
+/// salvaging into its declared-but-unwritten deliverable file. Filters out
+/// terse "done"/status replies while catching real inline deliveries.
+const DELIVERABLE_AUTOMATERIALIZE_MIN_BYTES: usize = 400;
+
+/// Derive a concrete deliverable filename from the declared glob and the
+/// task label, for the auto-materialize salvage. The result must MATCH the
+/// glob so [`resolve_deliverable_terminal_files`] then surfaces it.
+///
+/// - single-`*` glob (`*-review.md`, `*.md`, `report-*.txt`) → replace `*`
+///   with a slug of the label's first word (`octos-web review` → `octos-web`
+///   → `octos-web-review.md`);
+/// - literal filename (no `*`) → use it verbatim;
+/// - anything else → `<slug>-review.md` (matches the common `*-review.md` /
+///   `*.md` review globs).
+fn derive_deliverable_filename(glob: &str, label: &str) -> String {
+    let slug: String = label
+        .split_whitespace()
+        .next()
+        .unwrap_or("output")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = if slug.trim_matches('-').is_empty() {
+        "output".to_string()
+    } else {
+        slug
+    };
+    if glob.matches('*').count() == 1 {
+        glob.replacen('*', &slug, 1)
+    } else if !glob.contains('*') && glob.contains('.') && !glob.contains('/') {
+        glob.to_string()
+    } else {
+        format!("{slug}-review.md")
+    }
+}
+
+/// Normalize a caller-supplied `deliverable` value into an artifact glob, or
+/// `None` when the spawn did not request deliverable collection. An empty
+/// string means "collect the top-level files I leave behind".
+fn deliverable_artifact_glob(deliverable: Option<&str>) -> Option<String> {
+    deliverable.map(|glob| {
+        let trimmed = glob.trim();
+        if trimmed.is_empty() {
+            DEFAULT_DELIVERABLE_GLOB.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    })
+}
+
+/// Seed a minimal workspace-contract policy in `output_dir` declaring a single
+/// `primary` artifact matching `artifact_glob`.
+///
+/// This reuses the existing workspace-contract harness rather than inventing a
+/// bespoke scan: [`resolve_workspace_contract_artifact_paths`] reads this
+/// policy's declared glob and resolves matches on disk — the SAME artifact
+/// resolver the slides/sites contracts use — so a deliverable written by ANY
+/// means (a `shell` heredoc, `write_file`, a plugin) is surfaced, not just
+/// files reported through a tracked write tool. The seeded policy is `Session`
+/// kind with no validators or git auto-init: we want the artifact-glob
+/// resolution, not the slides/sites content validators (which would reject a
+/// plain document) or `inspect_workspace_contract_at_root`'s project-kind gate.
+fn seed_deliverable_contract(output_dir: &Path, artifact_glob: &str) -> Result<()> {
+    use crate::workspace_policy::{
+        ValidationPolicy, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
+        WorkspacePolicyWorkspace, WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy,
+        WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider, write_workspace_policy,
+    };
+    use std::collections::BTreeMap;
+
+    std::fs::create_dir_all(output_dir).wrap_err_with(|| {
+        format!(
+            "failed to create deliverable output dir {}",
+            output_dir.display()
+        )
+    })?;
+
+    let policy = WorkspacePolicy {
+        schema_version: crate::abi_schema::WORKSPACE_POLICY_SCHEMA_VERSION,
+        workspace: WorkspacePolicyWorkspace {
+            kind: WorkspacePolicyKind::Session,
+        },
+        version_control: WorkspaceVersionControlPolicy {
+            provider: WorkspaceVersionControlProvider::Git,
+            auto_init: false,
+            trigger: WorkspaceSnapshotTrigger::TurnEnd,
+            fail_on_error: false,
+        },
+        tracking: WorkspaceTrackingPolicy { ignore: Vec::new() },
+        validation: ValidationPolicy::default(),
+        artifacts: WorkspaceArtifactsPolicy {
+            entries: BTreeMap::from([(
+                PRIMARY_CONTRACT_ARTIFACT.to_string(),
+                artifact_glob.to_string(),
+            )]),
+        },
+        spawn_tasks: BTreeMap::new(),
+        compaction: None,
+    };
+    write_workspace_policy(output_dir, &policy)
+        .wrap_err("failed to seed deliverable workspace contract")
+}
+
+/// Resolve the files a deliverable spawn produced by consulting the seeded
+/// workspace contract in `output_dir`. Returns whatever matches the declared
+/// `primary` artifact glob on disk — independent of which tool (if any) wrote
+/// them. Because the output dir is created fresh per task, no mtime baseline is
+/// needed: every match is something the worker left behind this run.
+fn resolve_deliverable_terminal_files(output_dir: &Path) -> Vec<PathBuf> {
+    resolve_workspace_contract_artifact_paths(output_dir, PRIMARY_CONTRACT_ARTIFACT)
+        .unwrap_or_default()
 }
 
 fn resolve_background_terminal_files(
@@ -1869,10 +2969,16 @@ impl Tool for SpawnTool {
                     "description": "background: returns immediately, result announced later. sync: waits and returns the result.",
                     "default": "background"
                 },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["shared", "worktree"],
+                    "description": "Filesystem isolation for builtin subagents. shared uses the parent workspace; worktree creates a dedicated git worktree under .octos/work.",
+                    "default": "shared"
+                },
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Tool names the subagent may use. Empty = all builtins."
+                    "description": "Tool names the subagent may use. Empty = all builtins (the recommended default). CAUTION: if you narrow this list AND the subagent must PRODUCE A FILE (a report, review, generated code, any deliverable), you MUST include `write_file` (and usually `edit_file`) here — OR set the top-level `deliverable` glob. A subagent given `shell` but not `write_file` and no `deliverable` can only write via a shell redirect, and any file it writes outside the working tree (e.g. under /tmp) is LOST (never collected as output_files). When in doubt, leave this empty."
                 },
                 "role": {
                     "type": "string",
@@ -1887,6 +2993,11 @@ impl Tool for SpawnTool {
                 "context_window": {
                     "type": "integer",
                     "description": "Override the context window size (tokens) for the subagent."
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Override the subagent's tool-call iteration budget (default 50). Raise it for repo-scale reviews or research that need many read/shell steps one at a time; a broad from-scratch review often needs ~100-150. Clamped to a safe ceiling to prevent runaway loops."
                 },
                 "additional_instructions": {
                     "type": "string",
@@ -1934,6 +3045,10 @@ impl Tool for SpawnTool {
                 "agent_definition_id": {
                     "type": "string",
                     "description": "Optional id of an AgentDefinition manifest (see crates/octos-agent/src/agents). The manifest's fields (tools, model, max_turns, etc.) become defaults for this spawn; any inline field on the spawn args overrides the manifest (inline wins)."
+                },
+                "deliverable": {
+                    "type": "string",
+                    "description": "Glob for the file(s) this spawn should produce (e.g. '*-review.md', 'report.md'). When set, the child runs in a fresh output directory and is told to write its deliverable there; whatever matches the glob is collected as this task's output_files — even if the worker wrote it with a shell heredoc rather than write_file. Empty string means '*' (top-level files). Use a PRECISE glob (avoid '**/*') so a repo the worker clones into its output dir is not swept in."
                 }
             },
             "required": ["task"]
@@ -1981,13 +3096,33 @@ impl Tool for SpawnTool {
             });
         }
 
-        let mut input: Input =
-            serde_json::from_value(args.clone()).wrap_err("invalid spawn tool input")?;
+        // #1690: surface the serde detail AND the schema so the model can
+        // self-repair next turn, and return a typed `ToolInputError` — a
+        // no-side-effect failure that must NOT cancel well-formed sibling
+        // spawns in a serial batch (see the M8.8 cascade in `execution.rs`).
+        let mut input: Input = serde_json::from_value(args.clone()).map_err(|e| {
+            super::ToolInputError::new(format!(
+                "invalid spawn tool input: {e}. Required: `task` (string — the \
+                 worker's instructions). Optional: `allowed_tools` (string[], \
+                 e.g. [\"group:fs\",\"shell\"]), `role`, `mode` \
+                 (\"background\"|\"sync\"), `context`, `model`, `label`."
+            ))
+        })?;
+        // Bug A (reviewer-role preflight): capture whether the CALLER named the
+        // tools before a manifest / role template can fill the allow-list (they
+        // only fill it when it is empty). A caller-explicit tool that is absent
+        // hard-fails the spawn; a role-/manifest-suggested one that is unwired
+        // is dropped with a warning (see `ensure_subagent_tools_available`).
+        let allow_list_is_caller_explicit = !input.allowed_tools.is_empty();
         // M8.2: if the caller referenced an AgentDefinition manifest by id,
         // layer the manifest's fields onto the inline Input with "inline
         // wins" semantics. Unknown ids are a hard error — silently ignoring
         // them would let a typo erase the manifest's safety envelope.
-        apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
+        // The manifest's `disallowed_tools` becomes a policy DENY-list (below),
+        // not an allow-list prune — so it also covers tools a role template
+        // adds and can never invert an emptied allow-list into "allow all".
+        let manifest_disallowed_tools =
+            apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
         let role_template = apply_role_template(&mut input)?;
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
@@ -1997,15 +3132,72 @@ impl Tool for SpawnTool {
             .unwrap_or_else(|| input.task.chars().take(60).collect());
 
         // Build the task prompt (optionally prepend context)
-        let task_desc = match &input.context {
+        let raw_task = match &input.context {
             Some(ctx) => format!("{ctx}\n\n{}", input.task),
             None => input.task.clone(),
         };
+        // #1704: the child's forked context is the parent's whole
+        // conversation with this task appended LAST. A weaker model
+        // pattern-matches the dominant conversation and answers AS THE
+        // PARENT (mini4: a reviewer child's first token was "The user is
+        // asking me to check on the status of two agents…" — it ran ls
+        // probes and delivered a status table instead of cloning/reviewing).
+        // Lead the task with an unambiguous identity + "the history is
+        // background, do only this" directive so the actual objective wins.
+        let task_desc = frame_subagent_task(&label, &raw_task);
 
+        // An inline list, a manifest (`apply_agent_definition`), and a role
+        // template (`apply_role_template`) have each had their chance to fill
+        // `allowed_tools`. Empty here means the caller deliberately left the
+        // worker unconstrained (every builtin) — honor that; do not synthesize
+        // a default surface (tool count is not what makes a worker fail —
+        // see the benchmark refutation on #1689).
         let allowed_tools = input.allowed_tools.clone();
+        // Effective allow-list = `allowed_tools` minus the manifest's
+        // `disallowed_tools`, for the two consumers that cannot apply the local
+        // deny-list policy: the `agent_mcp` dispatch payload (codex P1) and the
+        // availability preflight (codex P2). See [`effective_allowed_tools`].
+        // The local ToolPolicy path below keeps the FULL `allowed_tools` and
+        // relies on deny-wins.
+        let effective_allowed_tools =
+            effective_allowed_tools(&allowed_tools, &manifest_disallowed_tools);
+        // #1704 item 3: a read-only role (e.g. "reviewer") handed a
+        // clone-and-write task cannot succeed. Warn, and tell the child to
+        // deliver findings as text rather than silently failing to produce
+        // an impossible artifact.
+        if let Some(note) = role_task_capability_warning(&effective_allowed_tools, &input.task) {
+            warn!(
+                worker = %worker_id,
+                role = input.role.as_deref().unwrap_or("<none>"),
+                "spawn role/task capability mismatch; injecting deliver-as-text note"
+            );
+            input.additional_instructions = Some(match input.additional_instructions.take() {
+                Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{note}"),
+                _ => note,
+            });
+        }
         let workflow = input.workflow.clone();
         let is_sync = input.mode == "sync";
         let is_agent_mcp = input.backend == "agent_mcp";
+        if is_agent_mcp && input.isolation == WorkerIsolation::Worktree {
+            return Ok(ToolResult {
+                output: "Status: FAILED\nworktree isolation is currently supported only for builtin subagents".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        // `deliverable` already gives the child a dedicated, scanned output
+        // directory. Combined with worktree isolation the child's session scope
+        // would be rooted at the worktree while its cwd is the deliverable dir,
+        // so the scope would reject the very writes we want to collect. Reject
+        // the combination rather than silently drop the deliverable.
+        if input.deliverable.is_some() && input.isolation == WorkerIsolation::Worktree {
+            return Ok(ToolResult {
+                output: "Status: FAILED\n`deliverable` collection is not supported with worktree isolation; it already provides an isolated output directory".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
 
         info!(
             worker_id = %worker_id,
@@ -2043,7 +3235,14 @@ impl Tool for SpawnTool {
                 "task": task_desc,
                 "label": label,
                 "role": input.role,
-                "allowed_tools": allowed_tools,
+                // The remote agent runs its own tool loop and never sees the
+                // local ToolPolicy, so hand it the already-pruned allow-list
+                // (deny-list applied) rather than the raw `allowed_tools`.
+                // Also forward `disallowed_tools` so a remote that honors an
+                // explicit deny-list can enforce it even if a role template
+                // there re-expands the allow-list.
+                "allowed_tools": effective_allowed_tools,
+                "disallowed_tools": manifest_disallowed_tools,
                 "workflow": workflow.clone(),
                 "additional_instructions": input.additional_instructions,
             });
@@ -2330,8 +3529,27 @@ impl Tool for SpawnTool {
                     crate::workspace_policy::read_workspace_policy(&self.working_dir)
                 {
                     if !policy.validation.validators.is_empty() {
-                        let registry_for_validators =
-                            ToolRegistry::with_builtins(&self.working_dir);
+                        // #1607 (codex-review follow-up): build this
+                        // session-scope validator registry with the session's
+                        // sandbox so a workspace-authored `Command` validator
+                        // runs confined, not directly on the host. `with_builtins`
+                        // hardcodes `NoSandbox`, so `tools.sandbox()` inside
+                        // `build_validator_runner` would be a no-op here even
+                        // when the parent session is sandboxed. A no-op backend
+                        // (no helper present) still runs the argv directly, so
+                        // hosts without a real sandbox are unaffected.
+                        let validator_sandbox: std::sync::Arc<dyn crate::sandbox::Sandbox> =
+                            std::sync::Arc::from(create_sandbox(&self.sandbox));
+                        let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
+                            &self.working_dir,
+                            create_sandbox(&self.sandbox),
+                        );
+                        // Honour the parent's provider tool policy in the validator
+                        // registry too, so a workspace `ToolCall` validator can't
+                        // invoke a tool the policy denies (#1607 codex round 2).
+                        if let Some(policy) = self.provider_policy.clone() {
+                            registry_for_validators.set_provider_policy(policy);
+                        }
                         if let Err(reason) = crate::workspace_contract::run_declared_validators(
                             &registry_for_validators,
                             &self.working_dir,
@@ -2339,6 +3557,7 @@ impl Tool for SpawnTool {
                             "spawn-agent-mcp",
                             crate::validators::ValidatorPhase::Completion,
                             None,
+                            validator_sandbox,
                         )
                         .await
                         {
@@ -2363,12 +3582,32 @@ impl Tool for SpawnTool {
             // branch closes the same bypass.
             if mcp_success {
                 let expected_kind = workflow.as_ref().and_then(workflow_contract_project_kind);
-                let registry_for_validators = ToolRegistry::with_builtins(&self.working_dir);
+                // #1607 (codex-review follow-up): same rationale as the
+                // session-scope block above — the project-root validator pass
+                // runs `Command` validators declared by an untrusted
+                // `slides/<slug>` or `sites/<slug>` `workspace_policy.toml`, so
+                // it MUST inherit the session sandbox instead of `with_builtins`'
+                // hardcoded `NoSandbox`. This is the child mirror of the
+                // `build_validator_runner` chokepoint fix; without it the
+                // agent_mcp branch is a second unsandboxed construction site.
+                let validator_sandbox: std::sync::Arc<dyn crate::sandbox::Sandbox> =
+                    std::sync::Arc::from(create_sandbox(&self.sandbox));
+                let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
+                    &self.working_dir,
+                    create_sandbox(&self.sandbox),
+                );
+                // Honour the parent's provider tool policy in the validator
+                // registry too, so a workspace `ToolCall` validator can't invoke
+                // a tool the policy denies (#1607 codex round 2).
+                if let Some(policy) = self.provider_policy.clone() {
+                    registry_for_validators.set_provider_policy(policy);
+                }
                 let report = crate::workspace_contract::run_project_root_validators(
                     &registry_for_validators,
                     &self.working_dir,
                     expected_kind,
                     &response.files_to_send,
+                    validator_sandbox,
                 )
                 .await;
                 if let Some(reason) = report.first_failure_reason() {
@@ -2434,6 +3673,100 @@ impl Tool for SpawnTool {
             });
         }
 
+        // PR #1250 review, findings 1+2: `allocate_worker_worktree` validates
+        // the planned path — canonical `.octos/work` containment under the
+        // repo root, plus `SessionScope::with_workspace` when a scope is
+        // present — BEFORE `git worktree add`, and returns the allocation
+        // armed inside an RAII guard. Any refusal or `?` return between here
+        // and the worker handoff drops the guard, which prunes the worktree
+        // and its branch; the guard is disarmed at the two handoff points
+        // (right before the sync task run / right before the background
+        // `tokio::spawn`).
+        //
+        // Only worktree isolation rebinds the session scope. A shared spawn
+        // runs in the parent's workspace, so rebasing the scope onto
+        // `self.working_dir` — which in gateway/session-actor wiring is the
+        // factory cwd, outside the per-profile scope root — would wrongly
+        // fail the default (shared) spawn. Shared keeps the parent scope.
+        let (mut worker_worktree_guard, child_session_scope) = match input.isolation {
+            WorkerIsolation::Shared => (None, ctx.session_scope.clone()),
+            WorkerIsolation::Worktree => {
+                if !self.workspace_write_access {
+                    return Ok(ToolResult {
+                        output: "Status: FAILED\nworktree isolation is unavailable in a read-only workspace; use shared isolation for a review-only worker".to_string(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                match allocate_worker_worktree(
+                    &self.working_dir,
+                    &worker_id,
+                    ctx.session_scope.as_ref(),
+                ) {
+                    Ok((guard, scope)) => (Some(guard), scope),
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            output: format!(
+                                "Status: FAILED\nfailed to allocate worker git worktree: {error}"
+                            ),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        };
+        // Deliverable contract (option 2): when a spawn declares a
+        // `deliverable` glob, give the child a FRESH per-task output directory
+        // seeded with a workspace-contract artifact declaration, tell it to
+        // write its deliverable into that directory, and surface whatever
+        // matches on completion — even a raw `shell` heredoc that reports no
+        // `file_modified`. This reuses the workspace-contract artifact resolver
+        // (`resolve_workspace_contract_artifact_paths`) rather than the
+        // tool-record-only path, which is blind to shell writes.
+        let deliverable_glob = deliverable_artifact_glob(input.deliverable.as_deref());
+        if deliverable_glob.is_some() {
+            input.additional_instructions = Some(match input.additional_instructions.take() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing}\n\n{DELIVERABLE_WORKER_DIRECTIVE}")
+                }
+                _ => DELIVERABLE_WORKER_DIRECTIVE.to_string(),
+            });
+        }
+        let child_working_dir = match deliverable_glob.as_deref() {
+            Some(glob) => {
+                let out = match self.deliverable_output_dir(&worker_id) {
+                    Ok(out) => out,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            output: format!("Status: FAILED\n{error}"),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                };
+                // worker_id ("subagent-N") can repeat across turns, so start
+                // from a clean directory — otherwise a stale deliverable from a
+                // prior run would be surfaced (the output dir has no mtime
+                // baseline because it is meant to be fresh).
+                let _ = std::fs::remove_dir_all(&out);
+                if let Err(error) = seed_deliverable_contract(&out, glob) {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Status: FAILED\nfailed to seed deliverable output dir: {error}"
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                out
+            }
+            None => worker_worktree_guard
+                .as_ref()
+                .map(|guard| guard.worktree().path.clone())
+                .unwrap_or_else(|| self.working_dir.clone()),
+        };
+
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
 
         // Review A F-004: snapshot the parent workspace policy once so both the
@@ -2457,7 +3790,21 @@ impl Tool for SpawnTool {
 
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
-            let mut tools = ToolRegistry::with_builtins(&self.working_dir);
+            //
+            // #1607 (codex-review follow-up): build the child registry with the
+            // SESSION sandbox, not the hardcoded `NoSandbox` that
+            // `with_builtins` stores. The child's `child_tools_handle` feeds
+            // `run_declared_validators` / `run_project_root_validators` below,
+            // and `build_validator_runner` confines `ValidatorSpec::Command`
+            // validators to `tools.sandbox()`. A `NoSandbox` registry there
+            // would let an untrusted `workspace_policy.toml` command validator
+            // execute directly on the host from a sandboxed session. On hosts
+            // without a real backend `create_sandbox` yields `NoSandbox` and
+            // the validator runs the argv directly (unchanged).
+            let mut tools = ToolRegistry::with_builtins_and_sandbox(
+                &child_working_dir,
+                create_sandbox(&self.sandbox),
+            );
             // Load plugin tools so subagents can use fm_tts, etc.
             // Section B (codex review P1.1): honour the parent's
             // require_signed policy so unsigned plugins are rejected here
@@ -2468,7 +3815,7 @@ impl Tool for SpawnTool {
                     &self.plugin_dirs,
                     &self.plugin_extra_env,
                     crate::plugins::PluginLoadOptions {
-                        work_dir: Some(&self.working_dir),
+                        work_dir: Some(&child_working_dir),
                         synthesis_config: None,
                         require_signed: self.plugin_require_signed,
                         verified_cache_dir: None,
@@ -2485,6 +3832,38 @@ impl Tool for SpawnTool {
             for factory in &self.child_tool_factories {
                 tools.register_arc(factory());
             }
+            // Bind the child's OWN native `spawn` delegate. Registering a
+            // tool named "spawn" triggers the `ToolRegistry` swap that binds
+            // `spawn_agent` + `delegate` behind it, so a subagent can nest a
+            // further spawn instead of hitting the delegate-less builtin
+            // ("No native Octos spawn tool is bound…"). `MAX_SPAWN_DEPTH`
+            // (via the child worker's incremented `ctx.spawn_depth`) bounds
+            // the recursion, and the subagent policy still denies DIRECT
+            // `spawn` (deny is exact-match, so `spawn_agent` stays allowed).
+            //
+            // The spawn tool and the registry it lives in MUST share one
+            // supervisor (the top level wires `with_task_supervisor(
+            // tool_registry.supervisor())`). Bind the clone to THIS child
+            // registry's OWN supervisor — the one `ctx.task_supervisor`
+            // exposes — so `SpawnAgentTool`'s before/after task lookup finds
+            // the task the delegate registers; otherwise `spawn_agent` returns
+            // no `agent_id` and `delegate` fails with "did not register a task".
+            //
+            // This keeps each spawned subtree's nested tasks in its OWN
+            // (private, per-child) supervisor rather than the shared session
+            // one — a deliberate isolation choice. Sharing the session
+            // supervisor would (a) let `newest_spawned_task` mis-correlate
+            // across CONCURRENT sibling spawners racing the same map,
+            // (b) give the child's task-control aliases (wait/close/resume)
+            // session-wide reach, and (c) leak a child's own `run_pipeline`
+            // node tasks into the persisted session ledger. The trade-off:
+            // grandchildren are not surfaced in the session task/list and the
+            // fan-out cap is per-subtree, not global. The grandchild's RESULT
+            // still flows back via the inherited result sender / inline
+            // output; only its task-tracking row stays subtree-local.
+            let mut child_spawn = self.child_spawn_clone(child_working_dir.clone(), &worker_id);
+            child_spawn.task_supervisor = Some(tools.supervisor());
+            tools.register(child_spawn);
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
@@ -2495,9 +3874,20 @@ impl Tool for SpawnTool {
             // tool; routing through a dispatcher adds latency without
             // value once we are already in a spawned context.
             tools.clear_internal_hidden();
-            ensure_subagent_tools_available(&tools, &allowed_tools)
-                .map_err(|error| eyre::eyre!(error))?;
-            let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
+            // Preflight against the EFFECTIVE (post-deny) allow-list: a tool
+            // the manifest forbids must not gate the spawn on availability,
+            // since the policy below denies it regardless (codex P2).
+            ensure_subagent_tools_available(
+                &tools,
+                &effective_allowed_tools,
+                allow_list_is_caller_explicit,
+            )
+            .map_err(|error| eyre::eyre!(error))?;
+            let policy = build_subagent_tool_policy(
+                allowed_tools,
+                manifest_disallowed_tools,
+                workflow.as_ref(),
+            );
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
@@ -2512,17 +3902,22 @@ impl Tool for SpawnTool {
             // parent's scope into the child Agent so the child's tools
             // (shell, read_file, write_file, edit_file, plugin tool,
             // pipeline workers) all see the same filesystem contract.
-            // The child runs in a sub-session of the same parent — for
-            // now it shares the parent's workspace; a future enhancement
-            // can carve out per-child subdirs if isolation is required.
-            if let Some(scope) = ctx.session_scope.as_ref() {
+            // Worktree-isolated children inherit the same root/mode policy
+            // with their workspace rebound to the worker worktree.
+            if let Some(scope) = child_session_scope.as_ref() {
                 worker = worker.with_session_scope(scope.clone());
             }
             // Keep an Arc handle to the child's tool registry so we can run
             // declared validators against it after `run_task` returns.
             let child_tools_handle = worker.tool_registry().clone();
-            if let Some(ref config) = self.worker_config {
-                worker = worker.with_config(config.clone());
+            // Apply the worker config plus the spawn's iteration budget: the
+            // caller's `max_iterations` (clamped) or the generous spawn default
+            // (`DEFAULT_SPAWN_MAX_ITERATIONS`) — a sub-agent does more than an
+            // interactive turn, so it must not inherit the bare 50 default.
+            {
+                let mut config = self.worker_config.clone().unwrap_or_default();
+                config.max_iterations = resolve_spawn_max_iterations(input.max_iterations);
+                worker = worker.with_config(config);
             }
             if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
                 if let Some(manager) = factory(ChildPromptContextRequest {
@@ -2549,6 +3944,12 @@ impl Tool for SpawnTool {
             }
             if let Some(ref summary_gen) = self.parent_subagent_summary_generator {
                 worker = worker.with_subagent_summary_generator(summary_gen.clone());
+            }
+            // Embed-on-save + recall parity: workers save episodes by
+            // default, so without the parent's embedder those episodes
+            // are stored vectorless and worker recall skips entirely.
+            if let Some(ref embedder) = self.embedder {
+                worker = worker.with_embedder(embedder.clone());
             }
 
             // Review A F-004: propagate the parent's declarative compaction
@@ -2592,16 +3993,24 @@ impl Tool for SpawnTool {
                     files: vec![],
                 },
                 TaskContext {
-                    working_dir: self.working_dir.clone(),
+                    working_dir: child_working_dir.clone(),
                     ..Default::default()
                 },
             );
+
+            // PR #1250 finding 1: every refusal point is behind us — the
+            // worker starts now. Disarm the prune guard; from here the
+            // worktree's lifecycle is owned by its status marker
+            // (completed/failed) and the `octos clean` sweep.
+            let worker_worktree = worker_worktree_guard
+                .take()
+                .map(WorkerWorktreeGuard::disarm);
 
             // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
             // M8.9 recovery so the synchronous spawn path mirrors the
             // session-actor recovery contract.
             let result = run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await;
-            match result {
+            let tool_result = match result {
                 Ok(r) => {
                     // Review A F-004: run declared completion-phase validators
                     // against the child's artifacts before surfacing success.
@@ -2615,11 +4024,12 @@ impl Tool for SpawnTool {
                             if !policy.validation.validators.is_empty() {
                                 match crate::workspace_contract::run_declared_validators(
                                     child_tools_handle.as_ref(),
-                                    &self.working_dir,
+                                    &child_working_dir,
                                     &policy.validation.validators,
                                     "spawn",
                                     crate::validators::ValidatorPhase::Completion,
                                     None,
+                                    std::sync::Arc::from(create_sandbox(&self.sandbox)),
                                 )
                                 .await
                                 {
@@ -2652,9 +4062,10 @@ impl Tool for SpawnTool {
                             workflow.as_ref().and_then(workflow_contract_project_kind);
                         let report = crate::workspace_contract::run_project_root_validators(
                             child_tools_handle.as_ref(),
-                            &self.working_dir,
+                            &child_working_dir,
                             expected_kind,
                             &r.files_to_send,
+                            std::sync::Arc::from(create_sandbox(&self.sandbox)),
                         )
                         .await;
                         if let Some(reason) = report.first_failure_reason() {
@@ -2665,19 +4076,27 @@ impl Tool for SpawnTool {
                         }
                     }
 
-                    Ok(ToolResult {
+                    ToolResult {
                         output,
                         success,
                         tokens_used: Some(r.token_usage),
                         ..Default::default()
-                    })
+                    }
                 }
-                Err(e) => Ok(ToolResult {
+                Err(e) => ToolResult {
                     output: format!("Subagent failed: {e}"),
                     success: false,
                     ..Default::default()
-                }),
+                },
+            };
+            if let Some(worktree) = worker_worktree.as_ref() {
+                worktree.mark_status(if tool_result.success {
+                    "completed"
+                } else {
+                    "failed"
+                });
             }
+            Ok(tool_result)
         } else {
             // Background mode: fire-and-forget
             let (origin_channel, origin_chat_id) = self
@@ -2697,6 +4116,30 @@ impl Tool for SpawnTool {
                     task_ledger_path.as_deref(),
                 )
             });
+            // Cap refusal: `register_with_lineage` signals a per-session
+            // child-fanout rejection with an empty-string sentinel. Spawning
+            // anyway would run a detached worker that is invisible to
+            // `task/list` and uncancellable (`cancel("")` no-ops), and the
+            // terminal guard below would be armed under `""`. Refuse the
+            // spawn synchronously so the LLM sees the cap instead of a fake
+            // "started in background" handle. (`None` = no supervisor at all —
+            // the legacy untracked path — which stays allowed.)
+            if tracked_task_id.as_deref() == Some("") {
+                tracing::error!(
+                    label = %label,
+                    "background spawn register refused (child fanout cap); not spawning"
+                );
+                return Ok(ToolResult {
+                    output: format!(
+                        "[TASK LIMIT] Cannot spawn background subagent '{label}': this \
+                         session reached its background-task fanout cap. Wait for \
+                         running tasks to finish (or cancel them) before spawning more. \
+                         Do not retry immediately."
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
             let tracked_child_session_key = tracked_task_id.as_ref().and_then(|task_id| {
                 self.task_supervisor
                     .as_ref()
@@ -2742,11 +4185,40 @@ impl Tool for SpawnTool {
                 };
             let llm = sub_llm;
             let memory = self.memory.clone();
-            let working_dir = self.working_dir.clone();
+            let working_dir = child_working_dir.clone();
+            // When a deliverable contract was seeded, `working_dir` IS the
+            // per-task output dir; surface its declared artifacts on completion.
+            let deliverable_declared = deliverable_glob.is_some();
+            // Kept for the completion-time auto-materialize salvage (below).
+            let deliverable_glob_for_completion = deliverable_glob.clone();
             let inbound_tx = self.inbound_tx.clone();
             let wid = worker_id.clone();
+            // Fix 3 (mini4 re-review): the child's transcript reporter needs
+            // the PARENT's output router and the exact router session id
+            // `read_task_output` derives (`agent:{tool_call_id}` with
+            // `tool_call_id = "spawn-{worker_id}"` from the register above).
+            let parent_output_router = self.parent_subagent_output_router.clone();
+            let child_stream_callback = self.child_stream_callback.clone();
+            let child_router_session_id = format!("agent:spawn-{worker_id}");
+            // PR #1250 finding 1: the fanout-cap refusal above was the last
+            // refusal point on the background path — the detached worker is
+            // definitely dispatched below. Disarm the prune guard and move
+            // the worktree handle into the background task.
+            let detached_worker_worktree = worker_worktree_guard
+                .take()
+                .map(WorkerWorktreeGuard::disarm);
             let provider_policy = self.provider_policy.clone();
+            // #1607 (codex-review follow-up): capture the session sandbox so the
+            // detached background child registry can be built with it (see the
+            // `with_builtins_and_sandbox` call inside the closure). Without this
+            // the background child's validator registry stored `NoSandbox`, so a
+            // workspace-declared command validator could escape to the host.
+            let child_sandbox = self.sandbox.clone();
             let additional_instructions = input.additional_instructions;
+            // Spawn iteration budget (caller's clamped value or the generous
+            // spawn default), captured for the detached closure (`input` is not
+            // `'static`/available inside it).
+            let bg_max_iters = resolve_spawn_max_iterations(input.max_iterations);
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
             let child_session_sender = self.child_session_sender.clone();
@@ -2755,8 +4227,19 @@ impl Tool for SpawnTool {
             let plugin_extra_env = self.plugin_extra_env.clone();
             let plugin_require_signed = self.plugin_require_signed;
             let child_tool_factories = self.child_tool_factories.clone();
+            // Detached path: `self` is not available inside the `tokio::spawn`
+            // closure below, so pre-build the child's native `spawn` delegate
+            // HERE (foreground) and move it in. Same purpose as the sync path —
+            // registering it under "spawn" binds the child's `spawn_agent` /
+            // `delegate` so a nested spawn resolves instead of hitting the
+            // delegate-less builtin. Kept concrete (not `Arc<dyn Tool>`) so the
+            // closure can align its supervisor with the child registry before
+            // registering (see the sync-path rationale).
+            let child_spawn_template =
+                self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
+            let worker_embedder = self.embedder.clone();
             let workflow_metadata = workflow.clone();
             let parent_session_key = self.session_key.clone();
             let worker_hooks = self.hooks.clone();
@@ -2831,11 +4314,9 @@ impl Tool for SpawnTool {
             let child_spawn_depth = ctx.spawn_depth.saturating_add(1);
             // Phase 2-D of the SessionScope migration: snapshot the
             // parent's scope before crossing into the detached
-            // `tokio::spawn` task. The background child shares the
-            // parent workspace — same contract as the sync branch above
-            // — so subprocesses spawned by the child's shell tool see
-            // the same CWD the foreground would.
-            let child_session_scope = ctx.session_scope.clone();
+            // `tokio::spawn` task. Worktree-isolated children get a
+            // precomputed scope with the same policy and a worker CWD.
+            let child_session_scope = child_session_scope.clone();
 
             tokio::spawn(async move {
                 // codex round-5: the terminal guard was armed in the
@@ -2933,7 +4414,17 @@ impl Tool for SpawnTool {
                 };
                 let harness_event_sink_path = harness_event_sink.as_ref().map(|sink| sink.uri());
 
-                let mut tools = ToolRegistry::with_builtins(&working_dir);
+                // #1607 (codex-review follow-up): build the detached child
+                // registry with the SESSION sandbox rather than the hardcoded
+                // `NoSandbox` `with_builtins` stores. Its `child_tools_handle`
+                // feeds `run_declared_validators` / `run_project_root_validators`
+                // below, and `build_validator_runner` confines command
+                // validators to `tools.sandbox()`. On hosts without a real
+                // backend `create_sandbox` yields `NoSandbox` (unchanged).
+                let mut tools = ToolRegistry::with_builtins_and_sandbox(
+                    &working_dir,
+                    create_sandbox(&child_sandbox),
+                );
                 // Load plugin tools so subagents can use fm_tts, etc.
                 // Section B (codex review P1.1): inherit the parent's
                 // require_signed gate.
@@ -2971,6 +4462,17 @@ impl Tool for SpawnTool {
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());
                 }
+                // Bind the detached child's OWN native `spawn` delegate (see
+                // the foreground `child_spawn_template` build). Mirrors the
+                // sync path: bind the template to THIS child registry's own
+                // (private, per-child) supervisor — the one that backs the
+                // child's `ctx.task_supervisor` — so the nested spawn_agent's
+                // before/after lookup resolves against the same map the
+                // delegate registers into (see the sync-path rationale for the
+                // isolation trade-off).
+                let mut child_spawn_template = child_spawn_template;
+                child_spawn_template.task_supervisor = Some(tools.supervisor());
+                tools.register(child_spawn_template);
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
@@ -2979,9 +4481,20 @@ impl Tool for SpawnTool {
                 // dispatcher targets directly without going through
                 // `mofa_make`.
                 tools.clear_internal_hidden();
-                let availability_check = ensure_subagent_tools_available(&tools, &allowed_tools)
-                    .map_err(|error| eyre::eyre!(error));
-                let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());
+                // Preflight against the EFFECTIVE (post-deny) allow-list —
+                // mirror the sync path so a manifest-forbidden tool that is
+                // absent from this registry does not fail the spawn (codex P2).
+                let availability_check = ensure_subagent_tools_available(
+                    &tools,
+                    &effective_allowed_tools,
+                    allow_list_is_caller_explicit,
+                )
+                .map_err(|error| eyre::eyre!(error));
+                let policy = build_subagent_tool_policy(
+                    allowed_tools,
+                    manifest_disallowed_tools,
+                    workflow_metadata.as_ref(),
+                );
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
                     tools.set_provider_policy(pp);
@@ -2990,11 +4503,32 @@ impl Tool for SpawnTool {
                 // Agent takes ownership so it can also back an LLM-iterative
                 // compaction summarizer if the parent policy requests one.
                 let child_llm_for_compaction = llm.clone();
+                // Fix 3 (mini4 re-review): stream the child's transcript into
+                // the parent's router so `read_task_output` is a LIVE window
+                // into the running child. Default was `SilentReporter` — the
+                // child's assistant text and tool activity were dropped, and
+                // the agent view could only ever show status.
+                let child_transcript_reporter: Option<Arc<dyn crate::progress::ProgressReporter>> =
+                    match (parent_output_router.as_ref(), tracked_task_id.as_ref()) {
+                        (Some(router), Some(task_id)) => {
+                            Some(Arc::new(SpawnChildTranscriptReporter {
+                                router: router.clone(),
+                                router_session_id: child_router_session_id.clone(),
+                                task_id: task_id.clone(),
+                                stream_offset: AtomicU64::new(0),
+                                on_stream_chunk: child_stream_callback.clone(),
+                            }))
+                        }
+                        _ => None,
+                    };
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory)
                     // Guard C (issue #607): inherit the parent's spawn
                     // nesting depth + 1 so the detached child sees the
                     // higher value when its own spawn calls run.
                     .with_spawn_depth(child_spawn_depth);
+                if let Some(reporter) = child_transcript_reporter {
+                    worker = worker.with_reporter(reporter);
+                }
                 // Phase 2-D: inherit the parent's SessionScope so the
                 // detached child sees the same filesystem contract as
                 // the sync spawn path (see `child_session_scope`
@@ -3007,6 +4541,7 @@ impl Tool for SpawnTool {
                 let child_tools_handle = worker.tool_registry().clone();
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
+                effective_config.max_iterations = bg_max_iters;
                 worker = worker.with_config(effective_config);
                 // M8 Runtime Parity W2.B1: apply parent caches to the
                 // detached background child before it consumes any
@@ -3020,6 +4555,13 @@ impl Tool for SpawnTool {
                 }
                 if let Some(ref summary_gen) = parent_subagent_summary_generator {
                     worker = worker.with_subagent_summary_generator(summary_gen.clone());
+                }
+                // Embed-on-save + recall parity (codex P1): the DEFAULT
+                // background mode builds its own worker inside this
+                // detached closure — mirror the sync-path propagation or
+                // background subagents keep storing vectorless episodes.
+                if let Some(ref embedder) = worker_embedder {
+                    worker = worker.with_embedder(embedder.clone());
                 }
                 if let Some(ref sink_path) = harness_event_sink_path {
                     worker = worker.with_harness_event_sink(sink_path.clone());
@@ -3125,6 +4667,7 @@ impl Tool for SpawnTool {
                             "spawn",
                             crate::validators::ValidatorPhase::Completion,
                             None,
+                            std::sync::Arc::from(create_sandbox(&child_sandbox)),
                         )
                         .await
                         {
@@ -3158,6 +4701,7 @@ impl Tool for SpawnTool {
                         &working_dir,
                         expected_kind,
                         bg_files_to_send,
+                        std::sync::Arc::from(create_sandbox(&child_sandbox)),
                     )
                     .await;
                     if let Some(reason) = report.first_failure_reason() {
@@ -3193,6 +4737,56 @@ impl Tool for SpawnTool {
                     }
                     _ => Vec::new(),
                 };
+                // Deliverable contract: surface whatever the worker left in its
+                // seeded output dir, however it was written (a `shell` heredoc
+                // reports no `file_modified`, so the tool-record path above
+                // misses it). `working_dir` IS that output dir when a
+                // deliverable was declared. Only on success.
+                if deliverable_declared && matches!(&result, Ok(task_result) if task_result.success)
+                {
+                    for path in resolve_deliverable_terminal_files(&working_dir) {
+                        if !terminal_files.contains(&path) {
+                            terminal_files.push(path);
+                        }
+                    }
+                    // Auto-materialize salvage: the child declared a deliverable
+                    // but wrote NO matching file, yet returned substantial final
+                    // text — it delivered the work INLINE instead of to a file
+                    // (mini4 live soak: a MiniMax reviewer returned a 14 KB
+                    // review as its final answer, files_modified=0; another
+                    // explore-looped to the iteration cap). Write that text to
+                    // the declared deliverable path so the artifact exists and
+                    // the parent's output pipeline surfaces it, instead of the
+                    // work being lost.
+                    if terminal_files.is_empty() {
+                        if let Ok(task_result) = &result {
+                            let body = task_result.output.trim();
+                            if body.len() >= DELIVERABLE_AUTOMATERIALIZE_MIN_BYTES {
+                                let name = derive_deliverable_filename(
+                                    deliverable_glob_for_completion.as_deref().unwrap_or("*.md"),
+                                    &task_label,
+                                );
+                                let path = working_dir.join(&name);
+                                match std::fs::write(&path, task_result.output.as_bytes()) {
+                                    Ok(()) => {
+                                        info!(
+                                            worker = %wid,
+                                            file = %path.display(),
+                                            bytes = body.len(),
+                                            "auto-materialized deliverable from child final output"
+                                        );
+                                        terminal_files.push(path);
+                                    }
+                                    Err(error) => warn!(
+                                        worker = %wid,
+                                        %error,
+                                        "failed to auto-materialize deliverable from final output"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }
                 let workflow_kind = workflow_metadata
                     .as_ref()
                     .map(|workflow| workflow.workflow_kind.clone());
@@ -3294,6 +4888,14 @@ impl Tool for SpawnTool {
                 } else {
                     classify_child_session_lifecycle_kind(&result)
                 };
+                if let Some(worktree) = detached_worker_worktree.as_ref() {
+                    worktree.mark_status(match terminal_kind {
+                        ChildSessionLifecycleKind::Completed => "completed",
+                        ChildSessionLifecycleKind::RetryableFailed
+                        | ChildSessionLifecycleKind::TerminalFailed => "failed",
+                        ChildSessionLifecycleKind::Spawned => "spawned",
+                    });
+                }
 
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
@@ -3498,6 +5100,18 @@ impl Tool for SpawnTool {
                     ),
                     (Err(e), _) => format!("Status: FAILED\nError: {e}"),
                 };
+                // Durably record the child's FULL result on the task record
+                // before any delivery preview/truncation downstream. This is
+                // what `read_task_output` falls back to for spawn children
+                // (whose transcript never flows through the output router) —
+                // without it, the parent's only copies were a truncated
+                // announce and an empty router read, and models concluded
+                // the child's result "was lost" (mini4 re-review forensic).
+                if let (Some(supervisor), Some(task_id)) =
+                    (task_supervisor.as_ref(), tracked_task_id.as_ref())
+                {
+                    supervisor.record_final_output(task_id, &content);
+                }
                 let (result_kind, result_media) = match (&result, contract_failure.as_ref()) {
                     (Ok(_), Some(_)) => {
                         record_terminal_result_reason(
@@ -3627,2090 +5241,5 @@ impl Tool for SpawnTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{HookConfig, HookEvent};
-
-    #[test]
-    fn role_template_selection_applies_prompt_and_tool_budget() {
-        let mut input: Input = serde_json::from_value(serde_json::json!({
-            "task": "review this diff",
-            "role": crate::ROLE_REVIEWER,
-            "additional_instructions": "Focus on API behavior."
-        }))
-        .expect("input parses");
-
-        let template = apply_role_template(&mut input)
-            .expect("role template resolves")
-            .expect("template");
-
-        assert_eq!(template.name, crate::ROLE_REVIEWER);
-        assert_eq!(
-            input.allowed_tools,
-            template.allowed_tools_vec(),
-            "empty allowed_tools should resolve from the backend-owned role template"
-        );
-        let instructions = input
-            .additional_instructions
-            .as_deref()
-            .expect("instructions");
-        assert!(
-            instructions.starts_with(template.prompt_prefix),
-            "role prompt prefix must be prepended by the runtime factory"
-        );
-        assert!(instructions.contains("Focus on API behavior."));
-    }
-
-    #[test]
-    fn role_template_selection_rejects_unknown_role() {
-        let mut input: Input = serde_json::from_value(serde_json::json!({
-            "task": "do something",
-            "role": "planner"
-        }))
-        .expect("input parses");
-
-        let error = apply_role_template(&mut input).expect_err("unknown role is rejected");
-        assert!(error.to_string().contains("unknown role template"));
-    }
-
-    #[cfg(unix)]
-    fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
-        HookConfig {
-            event,
-            command: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                r#"payload=$(cat); printf "%s\n" "$payload" >> "$1""#.into(),
-                "sh".into(),
-                log_path.to_string_lossy().into_owned(),
-            ],
-            timeout_ms: 5000,
-            tool_filter: vec![],
-            path_filter: vec![],
-            requires_bin: None,
-        }
-    }
-
-    #[cfg(unix)]
-    fn rewrite_output_files_hook(replacement_path: &std::path::Path) -> HookConfig {
-        HookConfig {
-            event: HookEvent::BeforeSpawnVerify,
-            command: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                r#"cat >/dev/null; printf '{"output_files":["%s"]}\n' "$1"; exit 2"#.into(),
-                "sh".into(),
-                replacement_path.to_string_lossy().into_owned(),
-            ],
-            timeout_ms: 5000,
-            tool_filter: vec![],
-            path_filter: vec![],
-            requires_bin: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_spawn_returns_immediately() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-
-        // We can't easily create a real LLM + EpisodeStore for unit tests,
-        // so just test the worker count and basic input parsing.
-        let tool = SpawnTool {
-            llm: Arc::new(MockProvider),
-            memory: Arc::new(create_test_store().await),
-            working_dir: PathBuf::from("/tmp"),
-            inbound_tx: in_tx,
-            origin: std::sync::Mutex::new(("cli".into(), "test".into())),
-            worker_count: AtomicU32::new(0),
-            provider_policy: None,
-            provider_router: None,
-            worker_prompt: None,
-            background_result_sender: None,
-            child_session_sender: None,
-            hooks: None,
-            hook_context_template: None,
-            plugin_dirs: Vec::new(),
-            plugin_extra_env: Vec::new(),
-            plugin_require_signed: false,
-            child_tool_factories: Vec::new(),
-            task_supervisor: None,
-            session_key: None,
-            task_ledger_path: None,
-            worker_config: None,
-            mcp_agent_backend: None,
-            mcp_agent_tool_name: None,
-            cost_accountant: None,
-            parent_file_state_cache: None,
-            parent_subagent_output_router: None,
-            parent_subagent_summary_generator: None,
-            child_prompt_context_manager_factory: None,
-            dispatch_policy: None,
-        };
-
-        assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
-
-        // Invalid input test
-        let result = tool.execute(&serde_json::json!({})).await;
-        assert!(result.is_err());
-
-        // Worker count should not increment on invalid input
-        assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn test_background_spawn_tracks_supervisor_lifecycle() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let supervisor = Arc::new(TaskSupervisor::new());
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            PathBuf::from("/tmp"),
-            in_tx,
-        )
-        .with_task_supervisor(
-            supervisor.clone(),
-            "api:test-session",
-            PathBuf::from("/tmp/tasks.jsonl"),
-        );
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "task": "Write a short answer",
-                "label": "Deep research",
-                "mode": "background",
-                "allowed_tools": []
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-
-        let started = std::time::Instant::now();
-        loop {
-            let tasks = supervisor.get_tasks_for_session("api:test-session");
-            if let Some(task) = tasks.first() {
-                if task.status == crate::task_supervisor::TaskStatus::Completed {
-                    assert_eq!(task.tool_name, "Deep research");
-                    break;
-                }
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "background spawn task did not complete in time"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    #[ignore = "Pre-migration test: the SpawnOnlyFiles-source MagicBytes validator \
-                (post-#997 round-3) rejects no-files-emitted tasks at the project-scope \
-                gate, so this test's `ShellThenEndProvider`-driven shell tool (which \
-                doesn't emit `files_to_send`) can no longer simulate a successful \
-                slides spawn — the deck-on-disk fallback the old Glob validator \
-                provided is gone by design. Re-enable by replacing `ShellThenEndProvider` \
-                with a stub plugin tool that returns the staged deck path in \
-                `tool_result.files_to_send`."]
-    #[tokio::test]
-    async fn test_background_spawn_uses_contract_selected_slides_artifact_for_persistence() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let temp = tempfile::tempdir().unwrap();
-        let repo_root = temp.path().join("slides/demo");
-        let ledger = temp.path().join("tasks.jsonl");
-        std::fs::create_dir_all(repo_root.join("output")).unwrap();
-        crate::write_workspace_policy(
-            &repo_root,
-            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
-        )
-        .unwrap();
-        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
-        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
-        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        // octos #997 (round-2): real PPTX magic bytes ONLY. The spawn loop
-        // itself runs the slides-kind project-scope validator at the project
-        // root after `run_task` succeeds — that production wiring writes the
-        // Pass row into `slides/demo/.octos/validator_outcomes.jsonl`, which
-        // the contract-gated terminal delivery step then reads. Pre-round-2
-        // this fixture manually seeded the Pass via `ledger.append(...)`,
-        // masking the gap codex flagged. No manual seeding here.
-        let mut pptx = vec![0x50, 0x4B, 0x03, 0x04];
-        pptx.extend_from_slice(b"final");
-        std::fs::write(repo_root.join("output/deck.pptx"), pptx).unwrap();
-        std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
-
-        let supervisor = Arc::new(TaskSupervisor::new());
-        supervisor.enable_persistence(&ledger).unwrap();
-        let tool = SpawnTool::new(
-            Arc::new(ShellThenEndProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            }),
-            Arc::new(create_test_store().await),
-            temp.path().to_path_buf(),
-            in_tx,
-        )
-        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone());
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "task": "Acknowledge the request and stop.",
-                "label": "Slides deliverable",
-                "mode": "background",
-                "allowed_tools": ["shell"],
-                "workflow": {
-                    "workflow_kind": "slides",
-                    "current_phase": "design",
-                    "allowed_tools": ["shell"],
-                    "terminal_output": {
-                        "deliver_final_artifact_only": true,
-                        "forbid_intermediate_files": true,
-                        "required_artifact_kind": "presentation"
-                    }
-                }
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-
-        let started = std::time::Instant::now();
-        loop {
-            let tasks = supervisor.get_tasks_for_session("api:test-session");
-            if let Some(task) = tasks.first() {
-                if task.status == crate::task_supervisor::TaskStatus::Completed {
-                    assert_eq!(
-                        task.output_files,
-                        vec![
-                            repo_root
-                                .join("output/deck.pptx")
-                                .to_string_lossy()
-                                .to_string()
-                        ]
-                    );
-                    break;
-                }
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "background spawn task did not complete in time"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        let restored = TaskSupervisor::new();
-        restored.enable_persistence(&ledger).unwrap();
-        let tasks = restored.get_tasks_for_session("api:test-session");
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(
-            tasks[0].status,
-            crate::task_supervisor::TaskStatus::Completed
-        );
-        assert_eq!(
-            tasks[0].output_files,
-            vec![
-                repo_root
-                    .join("output/deck.pptx")
-                    .to_string_lossy()
-                    .to_string()
-            ]
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_before_spawn_verify_hook_can_replace_output_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let replacement = temp.path().join("final-reviewed.pptx");
-        std::fs::write(&replacement, "reviewed").unwrap();
-
-        let hooks = Arc::new(HookExecutor::new(vec![rewrite_output_files_hook(
-            &replacement,
-        )]));
-        let payload = HookPayload::before_spawn_verify(
-            "task-1",
-            "Slides deliverable",
-            "api:test-session",
-            "api:test-session:child",
-            Some("slides"),
-            Some("verify_outputs"),
-            Some("candidate terminal outputs resolved"),
-            vec!["/tmp/original-deck.pptx".to_string()],
-            Some(&HookContext {
-                session_id: Some("api:test-session".to_string()),
-                profile_id: Some("test-profile".to_string()),
-            }),
-        );
-
-        let modified_files = run_before_spawn_verify_hook(Some(&hooks), payload)
-            .await
-            .unwrap();
-
-        assert_eq!(modified_files, vec![replacement]);
-    }
-
-    #[tokio::test]
-    async fn test_background_spawn_fails_when_contract_owned_workflow_is_not_ready() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let temp = tempfile::tempdir().unwrap();
-        let repo_root = temp.path().join("slides/demo");
-        let ledger = temp.path().join("tasks.jsonl");
-        std::fs::create_dir_all(&repo_root).unwrap();
-        crate::write_workspace_policy(
-            &repo_root,
-            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
-        )
-        .unwrap();
-        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
-        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
-        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-
-        let supervisor = Arc::new(TaskSupervisor::new());
-        supervisor.enable_persistence(&ledger).unwrap();
-        let tool = SpawnTool::new(
-            Arc::new(ShellThenEndProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            }),
-            Arc::new(create_test_store().await),
-            temp.path().to_path_buf(),
-            in_tx,
-        )
-        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger);
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "task": "Acknowledge the request and stop.",
-                "label": "Slides deliverable",
-                "mode": "background",
-                "allowed_tools": ["shell"],
-                "workflow": {
-                    "workflow_kind": "slides",
-                    "current_phase": "design",
-                    "allowed_tools": ["shell"],
-                    "terminal_output": {
-                        "deliver_final_artifact_only": true,
-                        "forbid_intermediate_files": true,
-                        "required_artifact_kind": "presentation"
-                    }
-                }
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-
-        let started = std::time::Instant::now();
-        loop {
-            let tasks = supervisor.get_tasks_for_session("api:test-session");
-            if let Some(task) = tasks.first() {
-                if task.status == crate::task_supervisor::TaskStatus::Failed {
-                    let error = task.error.as_deref().unwrap_or_default();
-                    assert!(error.contains("workspace contract"), "{error}");
-                    return;
-                }
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "background spawn task did not fail in time"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_background_spawn_emits_failure_hook_for_contract_failure() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let temp = tempfile::tempdir().unwrap();
-        let repo_root = temp.path().join("slides/demo");
-        let ledger = temp.path().join("tasks.jsonl");
-        let hook_log = temp.path().join("spawn-failure-hooks.jsonl");
-        std::fs::create_dir_all(&repo_root).unwrap();
-        crate::write_workspace_policy(
-            &repo_root,
-            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
-        )
-        .unwrap();
-        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
-        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
-        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-
-        let supervisor = Arc::new(TaskSupervisor::new());
-        supervisor.enable_persistence(&ledger).unwrap();
-        let hooks = Arc::new(HookExecutor::new(vec![capture_hook(
-            HookEvent::OnSpawnFailure,
-            &hook_log,
-        )]));
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            temp.path().to_path_buf(),
-            in_tx,
-        )
-        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger)
-        .with_hooks(hooks)
-        .with_hook_context(HookContext {
-            session_id: Some("api:test-session".to_string()),
-            profile_id: Some("test-profile".to_string()),
-        });
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "task": "Build the deck",
-                "label": "Slides deliverable",
-                "mode": "background",
-                "allowed_tools": ["mofa_slides"],
-                "workflow": {
-                    "workflow_kind": "slides",
-                    "current_phase": "design",
-                    "allowed_tools": ["mofa_slides"],
-                    "terminal_output": {
-                        "deliver_final_artifact_only": true,
-                        "forbid_intermediate_files": true,
-                        "required_artifact_kind": "presentation"
-                    }
-                }
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-
-        let started = std::time::Instant::now();
-        loop {
-            let tasks = supervisor.get_tasks_for_session("api:test-session");
-            let hook_lines = std::fs::read_to_string(&hook_log).unwrap_or_default();
-            if let Some(task) = tasks.first() {
-                if task.status == crate::task_supervisor::TaskStatus::Failed
-                    && hook_lines.contains("\"event\":\"on_spawn_failure\"")
-                {
-                    assert!(hook_lines.contains("\"failure_action\":\"escalate\""));
-                    assert!(hook_lines.contains("\"workflow_kind\":\"slides\""));
-                    assert!(hook_lines.contains("\"result\":\""));
-                    return;
-                }
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "background spawn failure hook did not arrive in time"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    #[test]
-    fn workflow_terminal_output_prefers_final_audio_and_skips_intermediates() {
-        let workflow = WorkflowMetadata {
-            workflow_kind: "research_podcast".to_string(),
-            current_phase: "generate_audio".to_string(),
-            allowed_tools: vec!["podcast_generate".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "audio".to_string(),
-            }),
-            progress: None,
-        };
-
-        let files_to_send = vec![
-            PathBuf::from("/tmp/podcast_part_1.mp3"),
-            PathBuf::from("/tmp/research_report.md"),
-            PathBuf::from("/tmp/podcast_full_final.mp3"),
-        ];
-        let files_modified = vec![PathBuf::from("/tmp/script.md")];
-
-        let selected =
-            select_workflow_terminal_files(&files_to_send, &files_modified, Some(&workflow))
-                .unwrap();
-
-        assert_eq!(selected, vec![PathBuf::from("/tmp/podcast_full_final.mp3")]);
-    }
-
-    #[test]
-    fn workflow_terminal_output_accepts_audio_from_modified_files_when_explicit_send_missing() {
-        let workflow = WorkflowMetadata {
-            workflow_kind: "research_podcast".to_string(),
-            current_phase: "generate_audio".to_string(),
-            allowed_tools: vec!["podcast_generate".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "audio".to_string(),
-            }),
-            progress: None,
-        };
-
-        let files_modified = vec![
-            PathBuf::from("/tmp/podcast_script.md"),
-            PathBuf::from("/tmp/podcast_full_final.mp3"),
-        ];
-
-        let selected =
-            select_workflow_terminal_files(&[], &files_modified, Some(&workflow)).unwrap();
-
-        assert_eq!(selected, vec![PathBuf::from("/tmp/podcast_full_final.mp3")]);
-    }
-
-    #[test]
-    fn workflow_terminal_output_requires_required_audio_artifact() {
-        let temp = tempfile::tempdir().unwrap();
-        let workflow = WorkflowMetadata {
-            workflow_kind: "research_podcast".to_string(),
-            current_phase: "deliver_result".to_string(),
-            allowed_tools: vec!["podcast_generate".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "audio".to_string(),
-            }),
-            progress: None,
-        };
-
-        let error = resolve_background_terminal_files(temp.path(), &[], &[], Some(&workflow))
-            .expect_err("research_podcast must not complete without audio");
-
-        assert!(error.contains("required audio terminal artifact"));
-    }
-
-    #[test]
-    fn workflow_terminal_output_prefers_final_presentation_and_skips_scratch_files() {
-        let workflow = WorkflowMetadata {
-            workflow_kind: "slides".to_string(),
-            current_phase: "deliver_result".to_string(),
-            allowed_tools: vec!["mofa_slides".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "presentation".to_string(),
-            }),
-            progress: None,
-        };
-
-        let files_to_send = vec![
-            PathBuf::from("/tmp/output/slide-01.png"),
-            PathBuf::from("/tmp/output/deck.pptx"),
-            PathBuf::from("/tmp/output/notes.txt"),
-        ];
-
-        let selected =
-            select_workflow_terminal_files(&files_to_send, &[], Some(&workflow)).unwrap();
-
-        assert_eq!(selected, vec![PathBuf::from("/tmp/output/deck.pptx")]);
-    }
-
-    #[test]
-    fn workflow_terminal_output_prefers_site_entrypoint_and_skips_assets() {
-        let workflow = WorkflowMetadata {
-            workflow_kind: "site".to_string(),
-            current_phase: "deliver_result".to_string(),
-            allowed_tools: vec!["shell".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "site".to_string(),
-            }),
-            progress: None,
-        };
-
-        let files_to_send = vec![
-            PathBuf::from("/tmp/site/dist/assets/logo.png"),
-            PathBuf::from("/tmp/site/dist/index.html"),
-            PathBuf::from("/tmp/site/dist/about.html"),
-        ];
-
-        let selected =
-            select_workflow_terminal_files(&files_to_send, &[], Some(&workflow)).unwrap();
-
-        assert_eq!(selected, vec![PathBuf::from("/tmp/site/dist/index.html")]);
-    }
-
-    #[test]
-    fn contract_owned_workflow_denies_send_file_in_subagent_policy() {
-        let workflow = WorkflowMetadata {
-            workflow_kind: "slides".to_string(),
-            current_phase: "deliver_result".to_string(),
-            allowed_tools: vec!["mofa_slides".to_string(), "send_file".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "presentation".to_string(),
-            }),
-            progress: None,
-        };
-
-        let policy = build_subagent_tool_policy(workflow.allowed_tools.clone(), Some(&workflow));
-
-        assert!(policy.deny.contains(&"spawn".to_string()));
-        assert!(policy.deny.contains(&"send_file".to_string()));
-    }
-
-    #[test]
-    fn workflow_phase_progress_is_coarse_but_non_null_and_monotonic() {
-        // Initial phases of every workflow family — research_runtime path
-        // names them differently per family; the helper must seed a small
-        // non-null fraction for each so `runtime_detail.progress` is never
-        // null on the first phase transition.
-        for initial_phase in &["research", "design", "scaffold", "outline"] {
-            let value = workflow_phase_progress(initial_phase);
-            assert!(
-                value > 0.0 && value <= 0.5,
-                "initial phase {initial_phase} should map to a small non-null fraction, got {value}"
-            );
-        }
-
-        // The terminal-ish phases must produce values strictly greater
-        // than initial-phase values so the dashboard sees forward motion.
-        let initial = workflow_phase_progress("research");
-        let verifying = workflow_phase_progress("verify_outputs");
-        let deliver = workflow_phase_progress("deliver_result");
-        assert!(
-            verifying > initial,
-            "verify_outputs ({verifying}) must exceed initial ({initial})"
-        );
-        assert!(
-            deliver > verifying,
-            "deliver_result ({deliver}) must exceed verify_outputs ({verifying})"
-        );
-        assert!(
-            deliver < 1.0,
-            "deliver_result ({deliver}) must stay strictly under 1.0 — terminal completion is signalled by lifecycle state, not by a synthesized progress sentinel"
-        );
-    }
-
-    #[test]
-    fn subagent_tool_preflight_activates_deferred_allowed_tool() {
-        let mut tools = ToolRegistry::with_builtins("/tmp");
-        tools.defer(["shell".to_string()]);
-        assert!(tools.specs().iter().all(|spec| spec.name != "shell"));
-
-        ensure_subagent_tools_available(&tools, &[String::from("shell")]).unwrap();
-
-        assert!(tools.specs().iter().any(|spec| spec.name == "shell"));
-    }
-
-    #[test]
-    fn subagent_tool_preflight_reports_missing_allowed_tool() {
-        let tools = ToolRegistry::with_builtins("/tmp");
-
-        let error = ensure_subagent_tools_available(&tools, &[String::from("podcast_generate")])
-            .unwrap_err();
-
-        assert!(error.contains("required tool(s) not available on this host"));
-        assert!(error.contains("podcast_generate"));
-    }
-
-    struct StaticTestTool {
-        name: &'static str,
-    }
-
-    #[async_trait]
-    impl Tool for StaticTestTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            "test child tool"
-        }
-
-        fn input_schema(&self) -> serde_json::Value {
-            serde_json::json!({ "type": "object", "properties": {} })
-        }
-
-        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
-            Ok(ToolResult {
-                output: "ok".to_string(),
-                success: true,
-                ..Default::default()
-            })
-        }
-    }
-
-    fn write_mock_podcast_plugin(root: &std::path::Path, script_seen: &std::path::Path) -> PathBuf {
-        let plugin_root = root.join("plugins");
-        let plugin_dir = plugin_root.join("mofa-podcast");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        std::fs::write(
-            plugin_dir.join("manifest.json"),
-            r#"{
-  "name": "mofa-podcast",
-  "version": "0.0.0-test",
-  "tools": [
-    {
-      "name": "podcast_generate",
-      "spawn_only": true,
-      "description": "mock podcast generator",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "script": { "type": "string" }
-        }
-      }
-    }
-  ]
-}"#,
-        )
-        .unwrap();
-        let main = plugin_dir.join("main");
-        std::fs::write(
-            &main,
-            format!(
-                r#"#!/usr/bin/env bash
-set -euo pipefail
-INPUT="$(cat)"
-SCRIPT_SEEN="{script_seen}"
-OCTOS_PLUGIN_INPUT="$INPUT" SCRIPT_SEEN="$SCRIPT_SEEN" python3 - <<'PY'
-import json
-import os
-
-payload = json.loads(os.environ.get("OCTOS_PLUGIN_INPUT") or "{{}}")
-with open(os.environ["SCRIPT_SEEN"], "w", encoding="utf-8") as handle:
-    handle.write(str(payload.get("script") or ""))
-
-base = os.environ.get("OCTOS_WORK_DIR") or os.getcwd()
-out_dir = os.path.join(base, "skill-output", "mofa-podcast")
-os.makedirs(out_dir, exist_ok=True)
-out = os.path.join(out_dir, "podcast_full_test.mp3")
-with open(out, "wb") as handle:
-    handle.write(b"0" * 8192)
-
-print(json.dumps({{"output": f"Podcast generated successfully: {{out}}", "success": True, "files_to_send": [out]}}))
-PY
-"#,
-                script_seen = script_seen.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        plugin_root
-    }
-
-    #[tokio::test]
-    async fn test_sync_spawn_registers_child_tool_factory_before_preflight() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            PathBuf::from("/tmp"),
-            in_tx,
-        )
-        .with_child_tool_factory(Arc::new(|| {
-            Arc::new(StaticTestTool {
-                name: "run_pipeline",
-            })
-        }));
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "task": "Use the injected pipeline tool if needed",
-                "label": "Deep research",
-                "mode": "sync",
-                "allowed_tools": ["run_pipeline"]
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert_eq!(result.output, "done");
-    }
-
-    #[test]
-    fn contract_terminal_output_prefers_declared_slides_deck_name_over_newer_draft() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo_root = temp.path().join("slides/demo");
-        std::fs::create_dir_all(repo_root.join("output")).unwrap();
-        crate::write_workspace_policy(
-            &repo_root,
-            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
-        )
-        .unwrap();
-        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
-        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
-        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        // octos #997: real PPTX magic bytes so the slides-kind project-scope
-        // `MagicBytes` validator does not block delivery on a fake-bytes deck.
-        let mut pptx_final = vec![0x50, 0x4B, 0x03, 0x04];
-        pptx_final.extend_from_slice(b"final");
-        std::fs::write(repo_root.join("output/deck.pptx"), pptx_final).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut pptx_draft = vec![0x50, 0x4B, 0x03, 0x04];
-        pptx_draft.extend_from_slice(b"draft");
-        std::fs::write(repo_root.join("output/deck-draft.pptx"), pptx_draft).unwrap();
-        std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
-        // octos #997 (round-2): exercise the production project-root
-        // validator helper so `inspect_workspace_contract_at_root` sees a
-        // real `Pass` row in the project ledger. Pre-round-2 this fixture
-        // manually `ledger.append(...)`ed a Pass — codex flagged that as
-        // masking the gap (the validator was declared but never RUN at the
-        // project root in production).
-        {
-            let registry = std::sync::Arc::new(crate::ToolRegistry::new());
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build tokio runtime for fixture validator run");
-            let files_to_send = vec![repo_root.join("output/deck.pptx")];
-            runtime.block_on(async {
-                let _ = crate::workspace_contract::run_project_root_validators(
-                    &registry,
-                    temp.path(),
-                    Some(crate::WorkspaceProjectKind::Slides),
-                    &files_to_send,
-                )
-                .await;
-            });
-        }
-
-        let workflow = WorkflowMetadata {
-            workflow_kind: "slides".to_string(),
-            current_phase: "deliver_result".to_string(),
-            allowed_tools: vec!["mofa_slides".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "presentation".to_string(),
-            }),
-            progress: None,
-        };
-
-        let selected = resolve_contract_terminal_files(&repo_root, Some(&workflow))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(selected, vec![repo_root.join("output/deck.pptx")]);
-    }
-
-    #[test]
-    fn contract_terminal_output_fails_when_site_entrypoint_is_missing() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo_root = temp.path().join("sites/news");
-        std::fs::create_dir_all(&repo_root).unwrap();
-        crate::write_workspace_policy(
-            &repo_root,
-            &crate::WorkspacePolicy::for_site_build_output("out"),
-        )
-        .unwrap();
-        std::fs::write(repo_root.join("mofa-site-session.json"), "{}").unwrap();
-        std::fs::write(repo_root.join("site-plan.json"), "{}").unwrap();
-        std::fs::write(repo_root.join("optimized-prompt.md"), "# prompt").unwrap();
-
-        let workflow = WorkflowMetadata {
-            workflow_kind: "site".to_string(),
-            current_phase: "deliver_result".to_string(),
-            allowed_tools: vec!["shell".to_string()],
-            terminal_output: Some(WorkflowTerminalOutputPolicy {
-                deliver_final_artifact_only: true,
-                forbid_intermediate_files: true,
-                required_artifact_kind: "site".to_string(),
-            }),
-            progress: None,
-        };
-
-        let error = resolve_contract_terminal_files(&repo_root, Some(&workflow)).unwrap_err();
-        assert!(error.contains("workspace contract"));
-        assert!(error.contains("out/index.html"));
-    }
-    #[tokio::test]
-    async fn test_background_spawn_persists_workflow_phase_transitions() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let temp = tempfile::tempdir().unwrap();
-        let ledger = temp.path().join("tasks.jsonl");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let script_seen = temp.path().join("script_seen.md");
-        let plugin_root = write_mock_podcast_plugin(temp.path(), &script_seen);
-        let payloads = Arc::new(std::sync::Mutex::new(Vec::<BackgroundResultPayload>::new()));
-        let payloads_for_sender = Arc::clone(&payloads);
-        let sender: BackgroundResultSender = Arc::new(move |payload| {
-            let payloads_for_sender = Arc::clone(&payloads_for_sender);
-            Box::pin(async move {
-                payloads_for_sender
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .push(payload);
-                true
-            })
-        });
-        let supervisor = Arc::new(TaskSupervisor::new());
-        supervisor.enable_persistence(&ledger).unwrap();
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            workspace.clone(),
-            in_tx,
-        )
-        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
-        .with_background_result_sender(sender)
-        .with_plugin_dirs(vec![plugin_root], vec![]);
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "task": "Produce a short podcast. Script: [杨幂 - clone:yangmi, professional] 大家好。 [窦文涛 - clone:douwentao, professional] 这里是测试播客。",
-                "label": "Research podcast",
-                "mode": "background",
-                "allowed_tools": ["podcast_generate"],
-                "workflow": {
-                    "workflow_kind": "research_podcast",
-                    "current_phase": "research",
-                    "allowed_tools": ["podcast_generate"],
-                    "terminal_output": {
-                        "deliver_final_artifact_only": true,
-                        "forbid_intermediate_files": true,
-                        "required_artifact_kind": "audio"
-                    }
-                }
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-
-        let started = std::time::Instant::now();
-        loop {
-            let tasks = supervisor.get_tasks_for_session("api:test-session");
-            if let Some(task) = tasks.first() {
-                if task.status == crate::task_supervisor::TaskStatus::Completed {
-                    assert_eq!(task.output_files.len(), 1);
-                    assert!(task.output_files[0].ends_with(".mp3"));
-                    assert!(PathBuf::from(&task.output_files[0]).starts_with(&workspace));
-                    break;
-                }
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "background spawn task did not complete in time"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        let details: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|record| {
-                record
-                    .get("task")
-                    .and_then(|task| task.get("runtime_detail"))
-                    .and_then(|detail| detail.as_str())
-                    .and_then(|detail| serde_json::from_str::<serde_json::Value>(detail).ok())
-            })
-            .collect();
-
-        assert!(details.iter().any(|detail| {
-            detail.get("workflow_kind").and_then(|v| v.as_str()) == Some("research_podcast")
-                && detail.get("current_phase").and_then(|v| v.as_str()) == Some("research")
-        }));
-        assert!(details.iter().any(|detail| {
-            detail.get("workflow_kind").and_then(|v| v.as_str()) == Some("research_podcast")
-                && detail.get("current_phase").and_then(|v| v.as_str()) == Some("deliver_result")
-        }));
-
-        // The workflow_runtime path must seed `progress` on every phase
-        // transition so dashboards (and the e2e live-progress gate) never
-        // see `runtime_detail.progress == null` for workflows whose
-        // internal tools do not emit per-event progress. The exact values
-        // are coarse — a small starting fraction at the initial phase and
-        // a near-terminal fraction once `deliver_result` is reached.
-        let initial_progress = details
-            .iter()
-            .find(|detail| detail.get("current_phase").and_then(|v| v.as_str()) == Some("research"))
-            .and_then(|detail| detail.get("progress"))
-            .and_then(|v| v.as_f64())
-            .expect("research phase must populate progress");
-        assert!(
-            (0.0..=0.5).contains(&initial_progress),
-            "research-phase progress should be small but non-null, got {initial_progress}"
-        );
-        let deliver_progress = details
-            .iter()
-            .find(|detail| {
-                detail.get("current_phase").and_then(|v| v.as_str()) == Some("deliver_result")
-            })
-            .and_then(|detail| detail.get("progress"))
-            .and_then(|v| v.as_f64())
-            .expect("deliver_result phase must populate progress");
-        assert!(
-            (0.85..=1.0).contains(&deliver_progress),
-            "deliver_result progress should be near-terminal, got {deliver_progress}"
-        );
-        assert!(
-            deliver_progress > initial_progress,
-            "progress must monotonically advance from research ({initial_progress}) to deliver_result ({deliver_progress})"
-        );
-
-        let script =
-            std::fs::read_to_string(&script_seen).expect("podcast_generate should receive script");
-        assert!(script.contains("大家好"));
-
-        let payloads = payloads.lock().unwrap_or_else(|error| error.into_inner());
-        let media = payloads
-            .iter()
-            .flat_map(|payload| payload.media.iter())
-            .collect::<Vec<_>>();
-        assert_eq!(media.len(), 1);
-        assert!(media[0].ends_with(".mp3"));
-    }
-
-    #[tokio::test]
-    async fn test_direct_background_result_short_circuits_legacy_fallback() {
-        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let called_clone = Arc::clone(&called);
-        let sender: BackgroundResultSender = Arc::new(move |_payload| {
-            let called_clone = Arc::clone(&called_clone);
-            Box::pin(async move {
-                called_clone.store(true, Ordering::SeqCst);
-                true
-            })
-        });
-
-        let payload = BackgroundResultPayload {
-            task_label: "child-task".to_string(),
-            content: "done".to_string(),
-            kind: BackgroundResultKind::Notification,
-            media: vec!["/tmp/output.mp3".to_string()],
-            envelope_media: vec![],
-            originating_thread_id: None,
-            task_id: None,
-            originating_client_message_id: None,
-            tool_call_id: None,
-            terminal_status: None,
-        };
-
-        assert!(deliver_background_result(Some(sender), payload.clone()).await);
-        assert!(called.load(Ordering::SeqCst));
-        assert!(
-            !deliver_background_result(None, payload).await,
-            "fallback should only be used when the direct sender is absent or rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_background_spawn_emits_child_session_lifecycle_events() {
-        let memory = Arc::new(create_test_store().await);
-        let llm = Arc::new(MockProvider);
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        let supervisor = Arc::new(TaskSupervisor::new());
-        let temp = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let ledger = temp.path().join("tasks.jsonl");
-        let events = Arc::new(std::sync::Mutex::new(
-            Vec::<ChildSessionLifecyclePayload>::new(),
-        ));
-        let events_ref = Arc::clone(&events);
-        let sender: ChildSessionLifecycleSender = Arc::new(move |payload| {
-            let events_ref = Arc::clone(&events_ref);
-            Box::pin(async move {
-                events_ref
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(payload);
-                true
-            })
-        });
-
-        let tool = SpawnTool::with_context(
-            llm,
-            memory,
-            temp.path().to_path_buf(),
-            tx,
-            "api",
-            "test-chat",
-        )
-        .with_task_supervisor(supervisor.clone(), "api:test-session".to_string(), ledger)
-        .with_child_session_sender(sender);
-
-        let args = serde_json::json!({
-            "task": "Draft the report",
-            "mode": "background",
-            "allowed_tools": []
-        });
-        let result = tool.execute(&args).await.unwrap();
-        assert!(result.success);
-
-        let started = std::time::Instant::now();
-        loop {
-            let events = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if events.len() >= 2 {
-                assert_eq!(events[0].kind, ChildSessionLifecycleKind::Spawned);
-                assert_eq!(events[1].kind, ChildSessionLifecycleKind::Completed);
-                assert_eq!(events[0].parent_session_key, "api:test-session");
-                assert_eq!(events[1].parent_session_key, "api:test-session");
-                assert_eq!(events[0].child_session_key, events[1].child_session_key);
-                assert_eq!(events[0].task_id, events[1].task_id);
-                return;
-            }
-
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "child-session lifecycle events did not arrive in time"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_background_spawn_emits_verify_and_complete_hooks() {
-        let memory = Arc::new(create_test_store().await);
-        let llm = Arc::new(MockProvider);
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        let supervisor = Arc::new(TaskSupervisor::new());
-        let temp = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let ledger = temp.path().join("tasks.jsonl");
-        let hook_log = temp.path().join("spawn-hooks.jsonl");
-        let hooks = Arc::new(HookExecutor::new(vec![
-            capture_hook(HookEvent::OnSpawnVerify, &hook_log),
-            capture_hook(HookEvent::OnSpawnComplete, &hook_log),
-        ]));
-
-        let tool = SpawnTool::with_context(
-            llm,
-            memory,
-            temp.path().to_path_buf(),
-            tx,
-            "api",
-            "test-chat",
-        )
-        .with_task_supervisor(supervisor, "api:test-session".to_string(), ledger)
-        .with_hooks(hooks)
-        .with_hook_context(HookContext {
-            session_id: Some("api:test-session".to_string()),
-            profile_id: Some("test-profile".to_string()),
-        });
-
-        let args = serde_json::json!({
-            "task": "Draft the report",
-            "mode": "background",
-            "allowed_tools": []
-        });
-        let result = tool.execute(&args).await.unwrap();
-        assert!(result.success);
-
-        let started = std::time::Instant::now();
-        loop {
-            let lines = std::fs::read_to_string(&hook_log)
-                .ok()
-                .map(|contents| {
-                    contents
-                        .lines()
-                        .map(str::to_string)
-                        .filter(|line| !line.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            if lines.len() >= 2 {
-                assert!(
-                    lines
-                        .iter()
-                        .any(|line| line.contains("\"event\":\"on_spawn_verify\""))
-                );
-                assert!(
-                    lines
-                        .iter()
-                        .any(|line| line.contains("\"event\":\"on_spawn_complete\""))
-                );
-                assert!(
-                    lines
-                        .iter()
-                        .all(|line| line.contains("\"session_id\":\"api:test-session\""))
-                );
-                return;
-            }
-
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "spawn lifecycle hooks did not arrive in time"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    #[test]
-    fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
-        let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
-            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
-            success: false,
-            output: "Token budget exceeded (120 of 100).".to_string(),
-            files_modified: vec![],
-            files_to_send: vec![],
-            subtasks: vec![],
-            token_usage: Default::default(),
-        });
-
-        assert_eq!(
-            classify_child_session_lifecycle_kind(&result),
-            ChildSessionLifecycleKind::RetryableFailed
-        );
-    }
-
-    #[test]
-    fn child_session_failure_action_matches_terminal_kind() {
-        assert_eq!(
-            child_session_failure_action(ChildSessionLifecycleKind::Completed),
-            None
-        );
-        assert_eq!(
-            child_session_failure_action(ChildSessionLifecycleKind::RetryableFailed),
-            Some(ChildSessionFailureAction::Retry)
-        );
-        assert_eq!(
-            child_session_failure_action(ChildSessionLifecycleKind::TerminalFailed),
-            Some(ChildSessionFailureAction::Escalate)
-        );
-    }
-
-    #[tokio::test]
-    async fn child_session_lifecycle_dispatch_defaults_to_not_joined_without_sender() {
-        let joined = dispatch_child_session_lifecycle(
-            None,
-            ChildSessionLifecyclePayload {
-                kind: ChildSessionLifecycleKind::Spawned,
-                task_id: "task-123".to_string(),
-                task_label: "Child task".to_string(),
-                instruction: "Do work".to_string(),
-                parent_session_key: "api:parent".to_string(),
-                child_session_key: "api:parent#child-task-123".to_string(),
-                workflow_kind: Some("deep_research".to_string()),
-                current_phase: Some("execute".to_string()),
-                output_files: Vec::new(),
-                failure_action: None,
-                error: None,
-            },
-        )
-        .await;
-
-        assert!(!joined);
-    }
-
-    // Minimal mock provider for testing
-    struct MockProvider;
-
-    struct ShellThenEndProvider {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait]
-    impl LlmProvider for MockProvider {
-        async fn chat(
-            &self,
-            _messages: &[octos_core::Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> Result<octos_llm::ChatResponse> {
-            Ok(octos_llm::ChatResponse {
-                content: Some("done".into()),
-                reasoning_content: None,
-                tool_calls: vec![],
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: octos_llm::TokenUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    ..Default::default()
-                },
-                provider_index: None,
-            })
-        }
-
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-
-        fn provider_name(&self) -> &str {
-            "mock"
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for ShellThenEndProvider {
-        async fn chat(
-            &self,
-            _messages: &[octos_core::Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> Result<octos_llm::ChatResponse> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                return Ok(octos_llm::ChatResponse {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: vec![octos_core::ToolCall {
-                        id: "call_shell".into(),
-                        name: "shell".into(),
-                        arguments: serde_json::json!({
-                            "command": "printf ready",
-                        }),
-                        metadata: None,
-                    }],
-                    stop_reason: octos_llm::StopReason::ToolUse,
-                    usage: octos_llm::TokenUsage::default(),
-                    provider_index: None,
-                });
-            }
-
-            Ok(octos_llm::ChatResponse {
-                content: Some("done".into()),
-                reasoning_content: None,
-                tool_calls: vec![],
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: octos_llm::TokenUsage::default(),
-                provider_index: None,
-            })
-        }
-
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-
-        fn provider_name(&self) -> &str {
-            "mock"
-        }
-    }
-
-    async fn create_test_store() -> EpisodeStore {
-        let dir = tempfile::tempdir().unwrap();
-        // Leak the dir so it stays alive for the test
-        let dir = Box::leak(Box::new(dir));
-        EpisodeStore::open(dir.path()).await.unwrap()
-    }
-
-    /// Build a minimal `Input` from a JSON value with the defaults the
-    /// tests expect. Centralising this keeps the M8.2 manifest tests below
-    /// independent of future serde changes.
-    fn parse_spawn_input(value: serde_json::Value) -> Input {
-        serde_json::from_value(value).expect("input parses")
-    }
-
-    #[test]
-    fn should_resolve_manifest_in_spawn_tool() {
-        // Spawn args reference `research-worker`; the manifest's `tools`
-        // list must flow into the resolved `Input.allowed_tools`. Inline
-        // `allowed_tools` is empty so the manifest fills it in.
-        let registry = crate::agents::AgentDefinitions::with_builtins();
-        let mut input = parse_spawn_input(serde_json::json!({
-            "task": "research this topic",
-            "agent_definition_id": "research-worker"
-        }));
-        apply_agent_definition(&mut input, &registry).expect("apply");
-
-        // Research-worker manifest lists deep_search + web_fetch + web_search.
-        for expected in ["search", "web_fetch", "web_search"] {
-            assert!(
-                input.allowed_tools.contains(&expected.to_string()),
-                "manifest tool {expected} did not flow into allowed_tools"
-            );
-        }
-        // Manifest's disallowed_tools (shell/write/edit) must not appear.
-        for forbidden in ["shell", "write_file", "edit_file"] {
-            assert!(
-                !input.allowed_tools.contains(&forbidden.to_string()),
-                "manifest disallowed_tool {forbidden} leaked into allowed_tools"
-            );
-        }
-    }
-
-    #[test]
-    fn should_let_inline_fields_override_manifest() {
-        // Inline `model` must beat the manifest's `model`. The manifest
-        // sets no model on `research-worker`, so we use a local manifest
-        // that has one to make the override visible.
-        let mut registry = crate::agents::AgentDefinitions::new();
-        registry.insert(
-            "with-model",
-            crate::agents::AgentDefinition::from_json_str(
-                r#"{
-                    "name": "with-model",
-                    "version": 1,
-                    "tools": ["read_file"],
-                    "model": "manifest-model"
-                }"#,
-            )
-            .expect("parse"),
-        );
-
-        let mut input = parse_spawn_input(serde_json::json!({
-            "task": "do it",
-            "agent_definition_id": "with-model",
-            "model": "inline-model"
-        }));
-        apply_agent_definition(&mut input, &registry).expect("apply");
-
-        // Inline wins for model.
-        assert_eq!(input.model.as_deref(), Some("inline-model"));
-    }
-
-    #[test]
-    fn should_let_inline_allowed_tools_override_manifest_allowed_tools() {
-        // When inline `allowed_tools` is non-empty it replaces the manifest
-        // list outright. The manifest's disallowed_tools still prune the
-        // result so a manifest cannot be silently bypassed.
-        let mut registry = crate::agents::AgentDefinitions::new();
-        registry.insert(
-            "example",
-            crate::agents::AgentDefinition::from_json_str(
-                r#"{
-                    "name": "example",
-                    "version": 1,
-                    "tools": ["read_file", "shell"],
-                    "disallowed_tools": ["shell"]
-                }"#,
-            )
-            .expect("parse"),
-        );
-
-        let mut input = parse_spawn_input(serde_json::json!({
-            "task": "do it",
-            "agent_definition_id": "example",
-            "allowed_tools": ["shell", "grep"]
-        }));
-        apply_agent_definition(&mut input, &registry).expect("apply");
-
-        // Inline list is kept, but manifest's disallow pruned `shell`.
-        assert!(input.allowed_tools.contains(&"grep".to_string()));
-        assert!(!input.allowed_tools.contains(&"shell".to_string()));
-    }
-
-    #[test]
-    fn should_error_when_agent_definition_id_unknown() {
-        // Typos in the id are a hard error so a silent-typo cannot erase
-        // the manifest's safety envelope.
-        let registry = crate::agents::AgentDefinitions::with_builtins();
-        let mut input = parse_spawn_input(serde_json::json!({
-            "task": "do it",
-            "agent_definition_id": "no-such-manifest"
-        }));
-        let err = apply_agent_definition(&mut input, &registry).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("no-such-manifest"), "message: {msg}");
-    }
-
-    #[test]
-    fn should_not_mutate_input_when_agent_definition_id_missing() {
-        // No id means no resolution. This preserves the fast path for
-        // callers that never touch manifests.
-        let registry = crate::agents::AgentDefinitions::with_builtins();
-        let mut input = parse_spawn_input(serde_json::json!({
-            "task": "plain spawn",
-            "allowed_tools": ["shell"]
-        }));
-        let before = input.clone();
-        apply_agent_definition(&mut input, &registry).expect("apply");
-
-        assert_eq!(input.allowed_tools, before.allowed_tools);
-        assert_eq!(input.model, before.model);
-    }
-
-    // ────────── M8 Runtime Parity W2.B1 wiring tests ──────────
-
-    /// A SpawnTool built without explicit parent caches must keep the
-    /// pre-W2 default — `None` on every parent introspection helper —
-    /// so unrelated callers don't pay any cost from the new optional
-    /// fields.
-    #[tokio::test]
-    async fn spawn_tool_default_has_no_parent_caches() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            PathBuf::from("/tmp"),
-            in_tx,
-        );
-        assert!(tool.parent_file_state_cache().is_none());
-        assert!(tool.parent_subagent_output_router().is_none());
-        assert!(tool.parent_subagent_summary_generator().is_none());
-    }
-
-    // ────────── M8 Runtime Parity W2.B2 recovery prompt helper ──────────
-
-    #[test]
-    fn build_spawn_recovery_prompt_includes_task_and_error_text() {
-        let prompt = build_spawn_recovery_prompt(
-            "Generate a 5-slide deck on AI",
-            "validator rejected child artifact: deck.pptx missing",
-        );
-        assert!(prompt.contains("[system-internal]"));
-        assert!(prompt.contains("Generate a 5-slide deck on AI"));
-        assert!(
-            prompt.contains("validator rejected child artifact: deck.pptx missing"),
-            "recovery prompt must surface the verbatim failure: {prompt}"
-        );
-        assert!(
-            prompt.contains("different strategy") || prompt.contains("smaller scope"),
-            "recovery prompt must direct the LLM toward an alternative"
-        );
-    }
-
-    #[test]
-    fn build_spawn_recovery_prompt_handles_empty_task_desc() {
-        let prompt = build_spawn_recovery_prompt("", "boom");
-        assert!(prompt.contains("Original task: "));
-        assert!(prompt.contains("Failure: boom"));
-    }
-
-    /// Provider that returns a hard `Err` on the first call and a
-    /// successful EndTurn on every subsequent call. Used to drive the
-    /// M8.9 recovery wrapper.
-    struct FailThenSucceedProvider {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait]
-    impl LlmProvider for FailThenSucceedProvider {
-        async fn chat(
-            &self,
-            _messages: &[octos_core::Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> Result<octos_llm::ChatResponse> {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                return Err(eyre::eyre!("simulated provider failure"));
-            }
-            Ok(octos_llm::ChatResponse {
-                content: Some("recovered".into()),
-                reasoning_content: None,
-                tool_calls: vec![],
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: octos_llm::TokenUsage::default(),
-                provider_index: None,
-            })
-        }
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-        fn provider_name(&self) -> &str {
-            "mock"
-        }
-    }
-
-    #[tokio::test]
-    async fn run_task_with_m8_9_recovery_retries_once_after_initial_failure() {
-        let provider = Arc::new(FailThenSucceedProvider {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let calls_ref = provider.calls.load(Ordering::SeqCst);
-        assert_eq!(calls_ref, 0);
-
-        let memory = Arc::new(create_test_store().await);
-        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
-        let worker = Agent::new(
-            AgentId::new("test-worker"),
-            provider.clone(),
-            registry,
-            memory,
-        );
-        let subtask = Task::new(
-            TaskKind::Code {
-                instruction: "Recover me".into(),
-                files: vec![],
-            },
-            TaskContext {
-                working_dir: PathBuf::from("/tmp"),
-                ..Default::default()
-            },
-        );
-
-        let result = run_task_with_m8_9_recovery(&worker, &subtask, "Recover me").await;
-        let task_result = result.expect("recovery succeeds");
-        assert!(task_result.success, "recovery turn must succeed");
-        assert!(
-            provider.calls.load(Ordering::SeqCst) >= 2,
-            "recovery must invoke the provider at least twice (one fail + one retry); got {}",
-            provider.calls.load(Ordering::SeqCst)
-        );
-    }
-
-    /// Provider whose every call hard-fails. Drives the
-    /// "recovery still fails -> bubble up" branch.
-    struct AlwaysFailProvider;
-
-    #[async_trait]
-    impl LlmProvider for AlwaysFailProvider {
-        async fn chat(
-            &self,
-            _messages: &[octos_core::Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> Result<octos_llm::ChatResponse> {
-            Err(eyre::eyre!("simulated permanent failure"))
-        }
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-        fn provider_name(&self) -> &str {
-            "mock"
-        }
-    }
-
-    #[tokio::test]
-    async fn run_task_with_m8_9_recovery_bubbles_up_when_recovery_also_fails() {
-        let provider = Arc::new(AlwaysFailProvider);
-        let memory = Arc::new(create_test_store().await);
-        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
-        let worker = Agent::new(AgentId::new("test-worker"), provider, registry, memory);
-        let subtask = Task::new(
-            TaskKind::Code {
-                instruction: "do".into(),
-                files: vec![],
-            },
-            TaskContext {
-                working_dir: PathBuf::from("/tmp"),
-                ..Default::default()
-            },
-        );
-
-        let result = run_task_with_m8_9_recovery(&worker, &subtask, "do").await;
-        assert!(result.is_err(), "permanent failure must bubble up");
-    }
-
-    /// Once wired with parent caches the SpawnTool must surface the
-    /// same `Arc` instances back through its introspection helpers —
-    /// session_actor / tests rely on identity to assert the parent
-    /// cache reaches the spawned child.
-    #[tokio::test]
-    async fn spawn_tool_propagates_parent_caches_via_builders() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let cache = Arc::new(crate::FileStateCache::new());
-        let router = Arc::new(crate::SubAgentOutputRouter::new(std::env::temp_dir().join(
-            format!(
-                "octos-w2-router-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0),
-            ),
-        )));
-        let supervisor = TaskSupervisor::new();
-        let summary_gen = Arc::new(crate::AgentSummaryGenerator::new(
-            Arc::new(MockProvider),
-            router.clone(),
-            supervisor,
-        ));
-
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            PathBuf::from("/tmp"),
-            in_tx,
-        )
-        .with_parent_file_state_cache(cache.clone())
-        .with_parent_subagent_output_router(router.clone())
-        .with_parent_subagent_summary_generator(summary_gen.clone());
-
-        // `Arc::ptr_eq` is the cheapest identity check that proves the
-        // child observed the same instance the parent wired in — not a
-        // freshly-built one.
-        assert!(Arc::ptr_eq(
-            tool.parent_file_state_cache().expect("cache wired"),
-            &cache,
-        ));
-        assert!(Arc::ptr_eq(
-            tool.parent_subagent_output_router().expect("router wired"),
-            &router,
-        ));
-        assert!(Arc::ptr_eq(
-            tool.parent_subagent_summary_generator()
-                .expect("summary generator wired"),
-            &summary_gen,
-        ));
-    }
-
-    /// Guard C regression: a spawn invocation at depth 4 must refuse
-    /// before any backend dispatch, surfacing a structured tool failure
-    /// the LLM can react to. The depth gate fires before
-    /// argument parsing — even invalid JSON returns the depth-limit
-    /// error rather than the legacy "invalid spawn tool input" path.
-    #[tokio::test]
-    async fn spawn_refuses_at_depth_4() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            PathBuf::from("/tmp"),
-            in_tx,
-        );
-
-        // Build a ToolContext at the depth cap. The spawn tool reads
-        // `ctx.spawn_depth` and refuses before parsing args.
-        let mut ctx = super::super::ToolContext::zero();
-        ctx.spawn_depth = MAX_SPAWN_DEPTH;
-
-        let result = tool
-            .execute_with_context(
-                &ctx,
-                &serde_json::json!({
-                    "task": "do something deeply nested"
-                }),
-            )
-            .await;
-        let tool_result = match result {
-            Ok(r) => r,
-            Err(error) => panic!("depth refusal should return Ok(failed) rather than Err: {error}"),
-        };
-        assert!(!tool_result.success, "spawn at the cap must report failure");
-        assert!(
-            tool_result
-                .output
-                .contains(&format!("spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded")),
-            "structured reason missing from output: {}",
-            tool_result.output
-        );
-        assert!(
-            tool_result.output.contains("refusing further nesting"),
-            "structured reason missing from output: {}",
-            tool_result.output
-        );
-
-        // Sanity: at depth 0 the tool keeps working (no early refusal).
-        let mut ctx0 = super::super::ToolContext::zero();
-        ctx0.spawn_depth = 0;
-        // We pass an empty input so the legacy validation path runs. A
-        // zero-depth spawn does NOT short-circuit with the depth-limit
-        // refusal — it falls through into the regular pipeline (which
-        // surfaces an unrelated error for the empty input).
-        let baseline = tool
-            .execute_with_context(&ctx0, &serde_json::json!({}))
-            .await;
-        match baseline {
-            Ok(r) => {
-                assert!(
-                    !r.output.contains("spawn depth limit"),
-                    "below-cap spawn must not emit the depth-limit refusal: {}",
-                    r.output
-                );
-            }
-            Err(error) => {
-                let err_msg = format!("{error}");
-                assert!(
-                    !err_msg.contains("spawn depth limit"),
-                    "below-cap spawn must not emit the depth-limit refusal: {err_msg}"
-                );
-            }
-        }
-    }
-
-    /// Guard C boundary: depth 3 (one less than the cap) is still
-    /// allowed; the gate fires on depth 4 only.
-    #[tokio::test]
-    async fn spawn_allows_depth_below_cap() {
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let tool = SpawnTool::new(
-            Arc::new(MockProvider),
-            Arc::new(create_test_store().await),
-            PathBuf::from("/tmp"),
-            in_tx,
-        );
-
-        let mut ctx = super::super::ToolContext::zero();
-        ctx.spawn_depth = MAX_SPAWN_DEPTH - 1;
-
-        // An empty input still trips the legacy validation path; the
-        // important invariant is that depth-3 does NOT short-circuit
-        // with the structured "spawn depth limit" message.
-        let result = tool
-            .execute_with_context(&ctx, &serde_json::json!({}))
-            .await;
-        match result {
-            Ok(tool_result) => {
-                assert!(
-                    !tool_result.output.contains("spawn depth limit"),
-                    "depth below cap must not emit the depth-limit refusal: {}",
-                    tool_result.output
-                );
-            }
-            Err(error) => {
-                let err_msg = format!("{error}");
-                assert!(
-                    !err_msg.contains("spawn depth limit"),
-                    "depth below cap must not emit the depth-limit refusal: {err_msg}"
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase 2-D: SessionScope propagation tests for SpawnTool.
-    //
-    // The migrated spawn tool reads `ctx.session_scope` and threads it
-    // onto the child Agent via `Agent::with_session_scope`. The child
-    // Agent's execution loop then plants the same scope onto every
-    // child `ToolContext` (see `agent/execution.rs`). These tests
-    // exercise that path end-to-end by mounting a recording tool on the
-    // child registry and asserting on what `execute_with_context` sees.
-    // -----------------------------------------------------------------------
-
-    /// Test-only tool that records the `session_scope.workspace()` it
-    /// observes on its `ToolContext`. Used by the Phase 2-D propagation
-    /// tests to capture what the child Agent's execution loop hands to
-    /// migrated tools. Lives only inside `#[cfg(test)]`.
-    struct ScopeRecordingTool {
-        observed: Arc<std::sync::Mutex<Option<PathBuf>>>,
-    }
-
-    #[async_trait]
-    impl Tool for ScopeRecordingTool {
-        fn name(&self) -> &str {
-            "scope_probe"
-        }
-
-        fn description(&self) -> &str {
-            "test-only tool that records the session_scope it observes"
-        }
-
-        fn input_schema(&self) -> serde_json::Value {
-            serde_json::json!({ "type": "object", "properties": {} })
-        }
-
-        async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-            self.execute_with_context(&super::super::ToolContext::zero(), args)
-                .await
-        }
-
-        async fn execute_with_context(
-            &self,
-            ctx: &super::super::ToolContext,
-            _args: &serde_json::Value,
-        ) -> Result<ToolResult> {
-            let observed = ctx
-                .session_scope
-                .as_ref()
-                .map(|scope| scope.workspace().to_path_buf());
-            *self.observed.lock().unwrap_or_else(|e| e.into_inner()) = observed;
-            Ok(ToolResult {
-                output: "ok".to_string(),
-                success: true,
-                ..Default::default()
-            })
-        }
-    }
-
-    /// Mock provider that calls `scope_probe` once and then ends — drives
-    /// the child Agent through exactly one tool execution so the
-    /// recording tool sees the migrated `ToolContext`.
-    struct ScopeProbeProvider;
-
-    #[async_trait]
-    impl LlmProvider for ScopeProbeProvider {
-        async fn chat(
-            &self,
-            messages: &[octos_core::Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> Result<octos_llm::ChatResponse> {
-            // First call → invoke scope_probe; second call (after the
-            // probe's tool_result lands) → end the turn.
-            let probe_already_run = messages
-                .iter()
-                .any(|msg| matches!(msg.role, octos_core::MessageRole::Tool));
-            if probe_already_run {
-                Ok(octos_llm::ChatResponse {
-                    content: Some("done".into()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    stop_reason: octos_llm::StopReason::EndTurn,
-                    usage: octos_llm::TokenUsage::default(),
-                    provider_index: None,
-                })
-            } else {
-                Ok(octos_llm::ChatResponse {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: vec![octos_core::ToolCall {
-                        id: "call_scope_probe".into(),
-                        name: "scope_probe".into(),
-                        arguments: serde_json::json!({}),
-                        metadata: None,
-                    }],
-                    stop_reason: octos_llm::StopReason::ToolUse,
-                    usage: octos_llm::TokenUsage::default(),
-                    provider_index: None,
-                })
-            }
-        }
-
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-
-        fn provider_name(&self) -> &str {
-            "mock"
-        }
-    }
-
-    #[tokio::test]
-    async fn spawn_propagates_scope_to_sub_agent() {
-        // When the parent `ToolContext` carries a `SessionScope`, the
-        // sync-mode sub-agent's tools must see the same scope on their
-        // own `ToolContext`. Without this, a session's filesystem
-        // contract is forgotten the moment work is delegated to a
-        // sub-agent.
-        let scope_dir = tempfile::tempdir().unwrap();
-        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
-            .expect("scope construction");
-
-        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
-        let observed_for_factory = observed.clone();
-
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let tool = SpawnTool::new(
-            Arc::new(ScopeProbeProvider),
-            Arc::new(create_test_store().await),
-            scope_dir.path().to_path_buf(),
-            in_tx,
-        )
-        .with_child_tool_factory(Arc::new(move || {
-            Arc::new(ScopeRecordingTool {
-                observed: observed_for_factory.clone(),
-            })
-        }));
-
-        let mut ctx = super::super::ToolContext::zero();
-        ctx.session_scope = Some(Arc::new(scope));
-
-        let result = tool
-            .execute_with_context(
-                &ctx,
-                &serde_json::json!({
-                    "task": "probe the scope",
-                    "mode": "sync",
-                    "allowed_tools": ["scope_probe"]
-                }),
-            )
-            .await
-            .expect("spawn returns Ok");
-        assert!(
-            result.success,
-            "expected sync spawn success: {}",
-            result.output
-        );
-
-        let captured = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let captured = captured.expect(
-            "scope_probe must observe a SessionScope on its ToolContext — \
-             without Phase 2-D propagation the child Agent runs scope-less",
-        );
-        let canonical_expected =
-            std::fs::canonicalize(scope_dir.path()).expect("canonicalise scope dir");
-        let canonical_observed =
-            std::fs::canonicalize(&captured).expect("canonicalise observed workspace");
-        assert_eq!(
-            canonical_observed, canonical_expected,
-            "child Agent's session_scope.workspace() must match the parent's"
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_sub_agent_inherits_workspace_cwd() {
-        // The sync-mode child Agent's `working_dir` (passed via
-        // `TaskContext`) and the scope's workspace agree when the
-        // SpawnTool was constructed with `working_dir == scope.workspace()`.
-        // This is the production wiring (`runtime/session.rs` builds
-        // `SpawnTool::new(... working_dir == scope.workspace())`), and
-        // it's the property the Phase 2-D contract relies on: the child
-        // workspace CWD == the parent's scoped workspace, so any shell
-        // tool the child invokes runs with the right CWD even without
-        // the scope plumb.
-        let scope_dir = tempfile::tempdir().unwrap();
-        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
-            .expect("scope construction");
-
-        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
-        let observed_for_factory = observed.clone();
-
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        // SpawnTool's working_dir matches scope.workspace() — this is
-        // the production case.
-        let tool = SpawnTool::new(
-            Arc::new(ScopeProbeProvider),
-            Arc::new(create_test_store().await),
-            scope_dir.path().to_path_buf(),
-            in_tx,
-        )
-        .with_child_tool_factory(Arc::new(move || {
-            Arc::new(ScopeRecordingTool {
-                observed: observed_for_factory.clone(),
-            })
-        }));
-
-        let mut ctx = super::super::ToolContext::zero();
-        ctx.session_scope = Some(Arc::new(scope));
-
-        let result = tool
-            .execute_with_context(
-                &ctx,
-                &serde_json::json!({
-                    "task": "probe",
-                    "mode": "sync",
-                    "allowed_tools": ["scope_probe"]
-                }),
-            )
-            .await
-            .expect("spawn ok");
-        assert!(result.success);
-
-        let captured = observed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .expect("scope_probe ran");
-        let canonical_workspace = std::fs::canonicalize(&captured).expect("canonicalise");
-        let canonical_spawn_cwd =
-            std::fs::canonicalize(scope_dir.path()).expect("canonicalise spawn cwd");
-        assert_eq!(
-            canonical_workspace, canonical_spawn_cwd,
-            "child workspace must equal the spawn cwd when SpawnTool::new \
-             was given `scope.workspace()` as its `working_dir`"
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_falls_back_to_legacy_cwd_when_no_scope() {
-        // No scope on the parent context — the child Agent must keep
-        // its pre-Phase-2D behaviour byte-for-byte: `session_scope ==
-        // None`. The recording tool sees no scope. The legacy
-        // `working_dir` continues to drive every other code path
-        // (`ToolRegistry::with_builtins`, `TaskContext`).
-        let working = tempfile::tempdir().unwrap();
-        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
-        let observed_for_factory = observed.clone();
-
-        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-        let tool = SpawnTool::new(
-            Arc::new(ScopeProbeProvider),
-            Arc::new(create_test_store().await),
-            working.path().to_path_buf(),
-            in_tx,
-        )
-        .with_child_tool_factory(Arc::new(move || {
-            Arc::new(ScopeRecordingTool {
-                observed: observed_for_factory.clone(),
-            })
-        }));
-
-        let ctx = super::super::ToolContext::zero();
-        assert!(
-            ctx.session_scope.is_none(),
-            "precondition: parent ctx has no scope"
-        );
-
-        let result = tool
-            .execute_with_context(
-                &ctx,
-                &serde_json::json!({
-                    "task": "probe",
-                    "mode": "sync",
-                    "allowed_tools": ["scope_probe"]
-                }),
-            )
-            .await
-            .expect("spawn ok");
-        assert!(result.success);
-
-        let captured = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        assert!(
-            captured.is_none(),
-            "without a parent scope the child Agent must NOT synthesise one; observed={:?}",
-            captured
-        );
-    }
-}
+#[path = "spawn_tests.rs"]
+mod tests;

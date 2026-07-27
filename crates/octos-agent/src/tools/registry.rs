@@ -18,10 +18,10 @@ use super::{
     ApplyPatchTool, AskUserQuestionTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool,
     ConfigureToolTool, DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool,
     ImageGenerationTool, ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool,
-    SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore,
-    ToolLifecycle, ToolResult, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
-    WaitAgentTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
-    WorkspaceShowTool, WriteFileTool, WriteStdinTool,
+    SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolResult,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
+    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
+    WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -29,6 +29,13 @@ fn policy_equivalent_tool_names(name: &str) -> Vec<&str> {
     match name {
         "spawn_agent" => vec!["spawn_agent", "spawn"],
         "wait_agent" => vec!["wait_agent", "read_task_output"],
+        // #1607 (codex round 2): `shell`/`bash`/`exec_command` are the same
+        // command capability (the `bash`/`exec_command` names are codex-compat
+        // aliases that share the shell policy — see `register`). A provider
+        // policy naming any one must apply to all three: otherwise `deny=["shell"]`
+        // is trivially bypassed via `bash`, and `allow=["shell"]` wrongly drops a
+        // `ToolCall` validator that uses `bash`/`exec_command`.
+        "shell" | "bash" | "exec_command" => vec!["shell", "bash", "exec_command"],
         _ => vec![name],
     }
 }
@@ -122,11 +129,6 @@ pub struct ToolRegistry {
     context_filter: Option<Vec<String>>,
     /// Cached specs output, invalidated on registry mutations.
     cached_specs: std::sync::Mutex<Option<Vec<ToolSpec>>>,
-    /// Deferred tools: registered but hidden from specs() until activated.
-    /// Uses interior mutability so activate() can work through Arc<ToolRegistry>.
-    deferred: std::sync::Mutex<HashSet<String>>,
-    /// LRU lifecycle manager for auto-eviction of idle tools.
-    lifecycle: std::sync::Mutex<ToolLifecycle>,
     /// Tool names that came from plugin binaries (for auto-send hook filtering).
     plugin_tools: HashSet<String>,
     /// Tools whose execution is auto-redirected to a background tokio task
@@ -135,21 +137,9 @@ pub struct ToolRegistry {
     /// callable by the LLM — the LLM's tool call is intercepted at execute
     /// time and converted into a background spawn that returns immediately.
     ///
-    /// Fix #3a (2026-05-10): spawn_only tools are protected from LRU
-    /// eviction in `auto_evict()` so they stay visible to the LLM for the
-    /// life of the session. The previous behaviour (eviction after
-    /// `idle_threshold` idle iterations) hid them from `specs()` and the
-    /// LLM correctly reported "I don't have that tool available" — see
-    /// the live mini1 incident on 2026-05-10 where `fm_tts` got LRU-pruned
-    /// and the agent fell back to shell-investigation.
-    ///
-    /// Note: a tool can be in `spawn_only` AND `deferred` simultaneously
-    /// if it was manually deferred via `defer()` / `defer_group()` (e.g.
-    /// an operator hiding it, or a group-level deferral that happens to
-    /// include some spawn_only members). The standard `activate_tools`
-    /// flow can re-activate such a tool — the `spawn_only` marker only
-    /// changes how the call is EXECUTED (auto-redirected to a background
-    /// task), not whether it is VISIBLE in `specs()`.
+    /// RFC-0 (#1289): LRU tool deferral was removed, so spawn_only tools are
+    /// always visible in `specs()` for the life of the session — there is no
+    /// longer any recency-based eviction path that could hide them.
     spawn_only: HashSet<String>,
     /// Custom messages for spawn_only tools returned to the LLM after auto-backgrounding.
     spawn_only_messages: HashMap<String, String>,
@@ -186,23 +176,24 @@ pub struct ToolRegistry {
     /// RFC-1 fixup (codex P1): tool names that are registered for
     /// **internal** dispatch only — callable through `get()` /
     /// `get_tool()` so internal forwarders (e.g. the `mofa_make`
-    /// dispatcher routing to its target) can reach them, but invisible
-    /// to:
+    /// dispatcher routing to its target) can reach them, but excluded
+    /// from `specs()` so the LLM never sees them in its tool list.
     ///
-    /// - `specs()` — the LLM never sees them in its tool list
-    /// - `activate_tools` enumeration — the deferred-list description
-    ///   in `activate_tools` spec does NOT advertise them, so the LLM
-    ///   has no signal that they exist
-    /// - `activate()` — calling `activate("<name>")` on an internal
-    ///   hidden tool is a no-op; the name cannot be promoted into the
-    ///   LLM-visible spec set
-    ///
-    /// Unlike `deferred`, names in this set are NOT recoverable via
-    /// `activate_tools`. This is the right semantic for `mofa_make`'s
-    /// hidden targets (`mofa_slides`, `mofa_cards`, ...): the
-    /// dispatcher is the ONLY supported LLM entry-point; allowing the
-    /// LLM to re-promote a sibling defeats the RFC-1 consolidation.
+    /// This is the right semantic for `mofa_make`'s hidden targets
+    /// (`mofa_slides`, `mofa_cards`, ...): the dispatcher is the ONLY
+    /// supported LLM entry-point.
     internal_hidden: HashSet<String>,
+    /// #1607: the session sandbox handed to the shell/exec/bash tools at
+    /// construction. Stored (not just handed off and dropped) so the
+    /// Agent-internal project-root validator path
+    /// (`workspace_contract::build_validator_runner`) can thread the same
+    /// sandbox into its `ValidatorRunner` and confine
+    /// `ValidatorSpec::Command` validators declared by an untrusted
+    /// workspace policy. Defaults to `Arc::new(NoSandbox)` (a no-op sandbox
+    /// whose `is_noop()==true`), so on the plain `with_builtins`/`Default`
+    /// path — and on any host without a real backend — command validators
+    /// run the argv directly and behavior is unchanged.
+    sandbox: Arc<dyn Sandbox>,
 }
 
 /// Default per-tool execution-timeout backstop (seconds) for the registry
@@ -228,8 +219,6 @@ impl ToolRegistry {
             provider_policy: None,
             context_filter: None,
             cached_specs: std::sync::Mutex::new(None),
-            deferred: std::sync::Mutex::new(HashSet::new()),
-            lifecycle: std::sync::Mutex::new(ToolLifecycle::default()),
             plugin_tools: HashSet::new(),
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
@@ -241,7 +230,23 @@ impl ToolRegistry {
             output_dir_hint: None,
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
             internal_hidden: HashSet::new(),
+            // #1607: default to a no-op sandbox. Constructors that receive a
+            // real sandbox (`with_builtins_and_permissions`,
+            // `rebind_cwd_with_permissions`) overwrite this below.
+            sandbox: Arc::new(NoSandbox),
         }
+    }
+
+    /// #1607: the session sandbox stored on this registry. Threaded into the
+    /// Agent-internal project-root validator runner
+    /// (`workspace_contract::build_validator_runner`) so
+    /// `ValidatorSpec::Command` validators declared by an untrusted workspace
+    /// policy are confined to the same sandbox as the shell/exec tools instead
+    /// of running unsandboxed on the host. A no-op sandbox
+    /// (`NoSandbox`, or a backend whose helper is unavailable) has nothing to
+    /// escape, so `ValidatorRunner` runs the argv directly there.
+    pub fn sandbox(&self) -> Arc<dyn Sandbox> {
+        self.sandbox.clone()
     }
 
     /// Set the global per-tool execution-timeout backstop (seconds) enforced
@@ -608,49 +613,27 @@ impl ToolRegistry {
     /// Codex round 2 P2: visibility-aware tool lookup.
     ///
     /// Returns `true` only if `name` is registered AND would be exposed to
-    /// the LLM by `specs()` — i.e. it is not deferred, not denied by the
-    /// provider policy, and (when a context filter is set) carries a
+    /// the LLM by `specs()` — i.e. it is not internal-hidden, not denied by
+    /// the provider policy, and (when a context filter is set) carries a
     /// matching tag. Used by the spawn_only intercept to decide whether
     /// the LLM can actually call `read_task_output` before it advertises
     /// the new `task_handle` envelope.
     pub fn is_tool_visible(&self, name: &str) -> bool {
-        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-        if deferred.contains(name) {
-            return false;
-        }
-        drop(deferred);
-        // RFC-1 fixup (codex P1): internal-hidden tools are also
-        // invisible to the LLM. They are callable only via internal
-        // forwarders (e.g. `mofa_make`), never through the LLM's tool
-        // list.
+        // RFC-1 fixup (codex P1): internal-hidden tools are invisible to
+        // the LLM. They are callable only via internal forwarders (e.g.
+        // `mofa_make`), never through the LLM's tool list.
         if self.internal_hidden.contains(name) {
             return false;
         }
         self.is_tool_visible_post_activation(name)
     }
 
-    /// Same as [`is_tool_visible`] but skips the `deferred` check. Used by
-    /// `activate_tools` to predict which deferred names would actually
-    /// become callable after a successful `activate()`: removing from
-    /// `deferred` doesn't help if `provider_policy` or `context_filter`
-    /// still hide the tool.
-    ///
-    /// Codex round-2 BLOCK (PR #865): the activate_tools output paths
-    /// (no-args listing and activated_now / already_active formatting)
-    /// printed raw deferred names without applying the same visibility
-    /// checks that `specs()` would apply post-activation. That advertised
-    /// policy-denied or context-hidden tools as "available to load" or
-    /// "Loaded …", even though calling `activate()` on them would leave
-    /// them still invisible. Filter both paths through this predicate so
-    /// the LLM never sees a name it can't actually call.
+    /// Visibility predicate shared with [`is_tool_visible`] that applies the
+    /// `provider_policy` + `context_filter` checks.
     pub fn is_tool_visible_post_activation(&self, name: &str) -> bool {
         let Some(tool) = self.tools.get(name) else {
             return false;
         };
-        // RFC-1 fixup (codex P1): an internal-hidden tool cannot be
-        // surfaced via `activate()`, so the post-activation predicate
-        // must report it as not visible — otherwise `activate_tools`
-        // would advertise a name it can never actually reach.
         if self.internal_hidden.contains(name) {
             return false;
         }
@@ -675,11 +658,14 @@ impl ToolRegistry {
             return specs.clone();
         }
 
-        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-        let specs: Vec<ToolSpec> = self
+        // RFC-0 (#1289): every enabled tool is emitted every turn. The only
+        // exclusions remaining are internal-hidden tools (mofa_make
+        // dispatcher targets), provider-policy denials, and context-filter
+        // misses. There is no longer any recency-based (LRU) deferral nor an
+        // `activate_tools` meta-tool description to inject.
+        let mut specs: Vec<ToolSpec> = self
             .tools
             .values()
-            .filter(|t| !deferred.contains(t.name()))
             // RFC-1 fixup (codex P1): exclude internal-hidden tools from
             // the LLM-visible spec set. They remain callable via `get()`
             // for internal forwarders (e.g. `mofa_make`).
@@ -697,88 +683,21 @@ impl ToolRegistry {
                         || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
                 })
             })
-            .map(|t| {
-                let mut description = t.description().to_string();
-                // Fix #3c (2026-05-10, codex round-2): surface the list of
-                // currently deferred tools in the `activate_tools` spec
-                // description so the LLM has explicit discovery info
-                // instead of guessing names. Without this, after the LRU
-                // evicted (or the loader manually deferred) some tools,
-                // the LLM saw only that the tool was gone and reported
-                // "I don't have <tool> available", with no hint that
-                // calling `activate_tools(["<tool>"])` would bring it
-                // back.
-                //
-                // Codex round-1 BLOCK: filter the displayed names
-                // through the same `provider_policy` + `context_filter`
-                // visibility checks that the post-activation `specs()`
-                // would apply. Without this, a deferred tool that is
-                // also policy-denied or context-hidden would be falsely
-                // advertised as "available to load" — calling
-                // `activate_tools` on it would remove it from
-                // `deferred` but it would still be invisible/
-                // unexecutable because of the other filters, leaving
-                // the LLM with no recourse.
-                //
-                // `auto_evict()` / `defer()` / `defer_group()` /
-                // `activate()` / `retain()` / `execute_with_context()`
-                // all invalidate the cached specs, so the next call to
-                // `specs()` rebuilds this list freshly.
-                if t.name() == "activate_tools" && !deferred.is_empty() {
-                    let mut visible: Vec<String> = deferred
-                        .iter()
-                        .filter_map(|name| {
-                            let tool = self.tools.get(name)?;
-                            // RFC-1 fixup (codex round 2 P2):
-                            // internal-hidden tools must never appear
-                            // in the LLM-facing `activate_tools` hint
-                            // — calling activate() on them is a no-op
-                            // anyway, so advertising them would be a
-                            // misleading dead-end. Defensive belt:
-                            // even though `defer` / `defer_group` now
-                            // skip internal-hidden names, an older
-                            // call site or future regression that
-                            // mutates `deferred` directly should not
-                            // leak names through this hint.
-                            if self.internal_hidden.contains(name) {
-                                return None;
-                            }
-                            if let Some(ref policy) = self.provider_policy {
-                                if !provider_policy_allows_equivalent_with_tags(
-                                    policy,
-                                    name,
-                                    tool.tags(),
-                                ) {
-                                    return None;
-                                }
-                            }
-                            if let Some(ref tags) = self.context_filter {
-                                let tool_tags = tool.tags();
-                                if !tool_tags.is_empty()
-                                    && !tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
-                                {
-                                    return None;
-                                }
-                            }
-                            Some(name.clone())
-                        })
-                        .collect();
-                    if !visible.is_empty() {
-                        visible.sort();
-                        description.push_str(&format!(
-                            "\n\nCurrently deferred tools available to load: {}. \
-                             Call this tool with `tools: [\"<name>\"]` to load them.",
-                            visible.join(", ")
-                        ));
-                    }
-                }
-                ToolSpec {
-                    name: t.name().to_string(),
-                    description,
-                    input_schema: t.input_schema(),
-                }
+            .map(|t| ToolSpec {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
             })
             .collect();
+
+        // Deterministic order: `self.tools` is a HashMap, so `.values()`
+        // iteration order varies per process and per registry rebuild.
+        // Providers replay this array verbatim into the LLM prompt prefix, so
+        // a shuffled order made requests nondeterministic AND busted
+        // provider-side prompt caches (the tool array is the first segment of
+        // the cached prefix — e.g. Anthropic `cache_control`) on every
+        // rebuild. Sort by name so identical tool sets serialize identically.
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
 
         *cache = Some(specs.clone());
         specs
@@ -811,32 +730,18 @@ impl ToolRegistry {
     /// Retain only tools whose names satisfy the predicate.
     ///
     /// Also prunes parallel side state (`spawn_only`,
-    /// `spawn_only_messages`, `deferred`) for any names that were
-    /// dropped. Without this, stale entries survive an `apply_policy`
-    /// deny and produce confusing downstream behaviour:
-    ///
-    /// - A stale `spawn_only` marker fools the agent's spawn_only
-    ///   intercept in `execution.rs` into treating an evicted tool as
-    ///   background-eligible. The intercept falls through to
-    ///   `bg_tools.execute_with_context` which fails async because the
-    ///   tool itself is gone from the registry — so the foreground turn
-    ///   observes a fake "started successfully". See PR #688 follow-up
-    ///   MEDIUM #3.
-    /// - A stale `deferred` entry would let `activate_tools` /
-    ///   `has_deferred()` advertise a name that was already evicted by
-    ///   policy. See PR #688 follow-up codex review (round 2).
+    /// `spawn_only_messages`, `internal_hidden`) for any names that were
+    /// dropped. Without this, a stale `spawn_only` marker fools the agent's
+    /// spawn_only intercept in `execution.rs` into treating an evicted tool
+    /// as background-eligible. The intercept falls through to
+    /// `bg_tools.execute_with_context` which fails async because the tool
+    /// itself is gone from the registry — so the foreground turn observes a
+    /// fake "started successfully". See PR #688 follow-up MEDIUM #3.
     pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
         self.tools.retain(|name, _| f(name));
         self.spawn_only.retain(|name| self.tools.contains_key(name));
         self.spawn_only_messages
             .retain(|name, _| self.tools.contains_key(name));
-        // Stale `deferred` entries are interior-mutable; lock and prune
-        // here so a subsequent `activate(...)` cannot resurrect a tool
-        // that policy has already removed.
-        {
-            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-            deferred.retain(|name| self.tools.contains_key(name));
-        }
         // RFC-1 fixup: prune stale internal-hidden markers symmetrically.
         self.internal_hidden
             .retain(|name| self.tools.contains_key(name));
@@ -994,6 +899,27 @@ impl ToolRegistry {
         self.provider_policy.as_ref()
     }
 
+    /// #1607 (P2): whether the active **provider policy** permits dispatching
+    /// the named tool. Applies the exact deny-wins-then-allow semantics that
+    /// [`Self::execute_with_context`] enforces at the dispatch boundary
+    /// (including alias equivalence, e.g. `bash`/`shell`/`exec_command`), but
+    /// unlike [`Self::is_tool_visible`] does NOT apply the `context_filter` or
+    /// internal-hidden markers — it answers only "would the provider policy
+    /// let the model call this tool".
+    ///
+    /// Used by [`crate::validators::MapToolDispatcher::from_registry`] to keep
+    /// project-root `ToolCall` validators from reaching a tool the provider
+    /// policy denies. With no provider policy set every tool is permitted (the
+    /// default), so this is a no-op on the common path.
+    pub fn provider_policy_permits(&self, name: &str) -> bool {
+        self.provider_policy.as_ref().is_none_or(|policy| {
+            matches!(
+                evaluate_provider_policy_equivalent(policy, name),
+                policy::PolicyDecision::Allow
+            )
+        })
+    }
+
     /// Set a context-based tag filter. Only tools whose tags overlap with these
     /// values will appear in `specs()`. Tools with no tags always pass through.
     pub fn set_context_filter(&mut self, tags: Vec<String>) {
@@ -1017,20 +943,6 @@ impl ToolRegistry {
             .filter(|(name, _)| !exclude.contains(&name.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let deferred = self
-            .deferred
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let parent = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        let lifecycle = ToolLifecycle {
-            last_used: HashMap::new(),
-            iteration: 0,
-            base_tools: parent.base_tools.clone(),
-            max_active: parent.max_active,
-            idle_threshold: parent.idle_threshold,
-        };
-        drop(parent);
 
         let mut snapshot = Self {
             tools,
@@ -1038,8 +950,6 @@ impl ToolRegistry {
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
             cached_specs: std::sync::Mutex::new(None),
-            deferred: std::sync::Mutex::new(deferred),
-            lifecycle: std::sync::Mutex::new(lifecycle),
             plugin_tools: self.plugin_tools.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
@@ -1053,8 +963,15 @@ impl ToolRegistry {
             // RFC-1 fixup (codex P1): propagate internal-hidden markers
             // onto per-turn snapshots so the per-turn registry observes
             // the same invariants as the parent (mofa_make targets stay
-            // hidden from `specs()` and unreachable via `activate`).
+            // hidden from `specs()`).
             internal_hidden: self.internal_hidden.clone(),
+            // #1607: carry the parent's sandbox onto the snapshot so a
+            // snapshot-derived registry (used by `rebind_cwd_with_permissions`)
+            // keeps a real sandbox by default. `rebind_cwd_with_permissions`
+            // overwrites it below with the sandbox for the rebound cwd, but a
+            // plain `snapshot_excluding` caller still observes the same
+            // confinement as the parent.
+            sandbox: self.sandbox.clone(),
         };
         // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
         // Arcs still point to the PARENT's catalog cell. Re-register
@@ -1074,233 +991,6 @@ impl ToolRegistry {
         snapshot
     }
 
-    // -- Deferred tool activation -------------------------------------------
-
-    /// Mark tools as deferred (hidden from specs until activated).
-    /// Call during setup before wrapping in Arc.
-    ///
-    /// RFC-1 fixup (codex round 2 P2): names already in
-    /// `internal_hidden` are silently skipped — they are unconditionally
-    /// invisible / non-promotable, putting them in `deferred` too
-    /// would only leak them through the `activate_tools` description
-    /// enumeration without changing observable LLM visibility.
-    pub fn defer(&mut self, names: impl IntoIterator<Item = String>) {
-        let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
-        for name in names {
-            if self.tools.contains_key(&name) && !self.internal_hidden.contains(&name) {
-                deferred.insert(name);
-            }
-        }
-        self.invalidate_cache();
-    }
-
-    /// Defer all tools in a named group (e.g. "group:web").
-    ///
-    /// RFC-1 fixup (codex round 2 P2): internal-hidden tools in the
-    /// group are skipped (same rationale as [`Self::defer`]).
-    pub fn defer_group(&mut self, group: &str) {
-        if let Some(info) = policy::tool_group_info(group) {
-            let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
-            for &tool in info.tools {
-                if self.tools.contains_key(tool) && !self.internal_hidden.contains(tool) {
-                    deferred.insert(tool.to_string());
-                }
-            }
-            self.invalidate_cache();
-        }
-    }
-
-    /// Activate a deferred tool group or individual tool. Works through `&self`
-    /// (interior mutability) so it can be called during the agent loop via Arc.
-    /// Returns the names of tools that were activated.
-    ///
-    /// RFC-1 fixup (codex P1): internal-hidden tools (registered via
-    /// [`Self::mark_internal_hidden`]) are NOT promotable — calls to
-    /// `activate("mofa_slides")` etc. cannot lift them into the
-    /// LLM-visible spec set. This preserves the RFC-1 invariant that
-    /// dispatcher targets are only reachable through their dispatcher.
-    pub fn activate(&self, group_or_name: &str) -> Vec<String> {
-        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-        let mut activated = Vec::new();
-
-        if let Some(info) = policy::tool_group_info(group_or_name) {
-            for &tool in info.tools {
-                // Refuse to promote internal-hidden names even if they
-                // somehow appear in a tool group definition.
-                if self.internal_hidden.contains(tool) {
-                    continue;
-                }
-                if deferred.remove(tool) {
-                    activated.push(tool.to_string());
-                }
-            }
-        } else if !self.internal_hidden.contains(group_or_name) && deferred.remove(group_or_name) {
-            activated.push(group_or_name.to_string());
-        }
-
-        if !activated.is_empty() {
-            drop(deferred);
-            self.invalidate_cache_shared();
-        }
-        activated
-    }
-
-    /// Returns info about currently deferred tool groups for the activate_tools tool.
-    ///
-    /// RFC-1 fixup (codex round 2 P2): internal-hidden tools are
-    /// filtered out so they are never enumerated in `activate_tools`
-    /// output. This is belt-and-suspenders alongside `defer` /
-    /// `defer_group` which already refuse to add them.
-    pub fn deferred_groups(&self) -> Vec<(String, String, usize)> {
-        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-        if deferred.is_empty() {
-            return Vec::new();
-        }
-
-        let mut groups = Vec::new();
-        for info in policy::TOOL_GROUPS {
-            let count = info
-                .tools
-                .iter()
-                .filter(|&&t| deferred.contains(t) && !self.internal_hidden.contains(t))
-                .count();
-            if count > 0 {
-                groups.push((info.name.to_string(), info.description.to_string(), count));
-            }
-        }
-
-        // Also list individually deferred tools not in any group
-        let grouped: HashSet<&str> = policy::TOOL_GROUPS
-            .iter()
-            .flat_map(|g| g.tools.iter().copied())
-            .collect();
-        for name in deferred.iter() {
-            if !grouped.contains(name.as_str()) && !self.internal_hidden.contains(name) {
-                groups.push((name.clone(), "Plugin tool".to_string(), 1));
-            }
-        }
-        groups
-    }
-
-    /// Whether any tools are currently deferred.
-    pub fn has_deferred(&self) -> bool {
-        !self
-            .deferred
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-    }
-
-    /// Names of tools currently in the deferred set. Deferred tools are
-    /// registered but filtered out of `specs()` (typically because the
-    /// auto-eviction step removed them to keep the LLM tool-count low).
-    /// They remain recoverable via the `activate_tools` tool, so AppUI
-    /// surfaces (e.g. the M14 coding tool contract) should treat them as
-    /// available rather than missing. Sorted for deterministic output.
-    pub fn deferred_tool_names(&self) -> Vec<String> {
-        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-        let mut names: Vec<String> = deferred.iter().cloned().collect();
-        names.sort();
-        names
-    }
-
-    // -- LRU auto-eviction --------------------------------------------------
-
-    /// Mark a set of tool names as "base" -- never auto-evicted.
-    pub fn set_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.lifecycle
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_base_tools(names);
-    }
-
-    /// Add more tool names to the base set (extends, does not replace).
-    pub fn add_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.lifecycle
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .add_base_tools(names);
-    }
-
-    /// Record that a tool was used (called from execute()).
-    fn record_usage(&self, name: &str) {
-        self.lifecycle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .record_usage(name);
-    }
-
-    /// Advance the iteration counter. Called before each LLM call.
-    pub fn tick(&self) {
-        self.lifecycle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .tick();
-    }
-
-    /// Auto-evict idle non-base tools if active count exceeds threshold.
-    /// Returns the names of evicted tools (for logging).
-    ///
-    /// Lock ordering: lifecycle -> deferred (consistent with record_usage
-    /// which only takes lifecycle, never both).
-    pub fn auto_evict(&self) -> Vec<String> {
-        // 1. Compute eviction candidates (lifecycle lock only).
-        //
-        // Fix #3a (2026-05-10): exclude spawn_only tools from the active
-        // set passed to `find_evictable`. CLAUDE.md documents
-        // "spawn_only tools cannot be evicted" as the design invariant,
-        // but the underlying lifecycle filter only checks `base_tools`,
-        // not `spawn_only`. Because the plugin loader pushes only
-        // non-spawn_only plugin names into `result.tool_names` (the
-        // pinning input for `add_base_tools`), spawn_only plugin tools
-        // (e.g. `fm_tts`, `fm_voice_save`, `fm_voice_list`) end up
-        // outside `base_tools` and become LRU-evictable after
-        // `idle_threshold` iterations of disuse. The deployed symptom
-        // was the chat agent reporting "I don't have fm_tts available"
-        // on iteration 6+ because the LRU had silently moved it into
-        // `deferred`. The eviction also defeats the
-        // execution-loop's auto-redirect-to-background mechanism: once
-        // the tool is hidden from `specs()`, the LLM can no longer
-        // emit a tool-call that the interceptor could pick up. Filter
-        // them out here so the documented invariant holds.
-        let to_evict = {
-            let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-            let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-            let active: Vec<&str> = self
-                .tools
-                .keys()
-                .filter(|n| !deferred.contains(n.as_str()))
-                .filter(|n| !self.spawn_only.contains(n.as_str()))
-                // RFC-1 fixup (codex round 4 P2): internal-hidden tools
-                // are invisible to the LLM and cannot be re-promoted via
-                // `activate_tools`. Counting them in the LRU "active"
-                // set would inflate the count past `max_active` and
-                // force eviction of LLM-visible tools (activate_tools,
-                // memory tools, …) when several `mofa_*` targets are
-                // pinned as base tools by the gateway / profile.
-                .filter(|n| !self.internal_hidden.contains(n.as_str()))
-                .map(|n| n.as_str())
-                .collect();
-            lifecycle.find_evictable(&active)
-            // Both locks dropped here
-        };
-
-        if to_evict.is_empty() {
-            return Vec::new();
-        }
-
-        // 2. Apply evictions (deferred lock only)
-        {
-            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-            for name in &to_evict {
-                deferred.insert(name.clone());
-            }
-        }
-        self.invalidate_cache_shared();
-
-        to_evict
-    }
-
     // -- Cache management ---------------------------------------------------
 
     /// Clear the cached specs (called by mutation methods with &mut self).
@@ -1315,14 +1005,6 @@ impl ToolRegistry {
         // mutation. Every existing mutation site already calls
         // `invalidate_cache`, so threading the refresh through here
         // covers all of them in one shot.
-        self.refresh_live_catalog();
-    }
-
-    /// Clear the cached specs through &self (for interior-mutability callers).
-    fn invalidate_cache_shared(&self) {
-        *self.cached_specs.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // #1148 codex P2: refresh the live catalog cell. See the
-        // `&mut self` variant above.
         self.refresh_live_catalog();
     }
 
@@ -1358,37 +1040,6 @@ impl ToolRegistry {
             }
         }
 
-        // Auto-activate deferred tools on first use -- no need for the LLM
-        // to call activate_tools first. This prevents the retry loop where
-        // the LLM keeps calling a deferred tool and getting errors.
-        {
-            let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-            if deferred.contains(name) {
-                drop(deferred);
-                // Find which group this tool belongs to and activate the whole group
-                let group = policy::TOOL_GROUPS
-                    .iter()
-                    .find(|g| g.tools.contains(&name))
-                    .map(|g| g.name);
-                if let Some(group_name) = group {
-                    let activated = self.activate(group_name);
-                    tracing::info!(
-                        tool = name,
-                        group = group_name,
-                        activated = %activated.join(", "),
-                        "auto-activated deferred tool on first use"
-                    );
-                } else {
-                    // Not in any group -- activate individually
-                    let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-                    deferred.remove(name);
-                    drop(deferred);
-                    self.invalidate_cache_shared();
-                    tracing::info!(tool = name, "auto-activated deferred tool (no group)");
-                }
-            }
-        }
-
         // Reject oversized arguments (1 MB limit).
         const MAX_ARGS_SIZE: usize = 1_048_576;
         let args_size = estimate_json_size(args);
@@ -1405,9 +1056,6 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| eyre::eyre!("unknown tool: {}", name))?;
-
-        // Track usage for LRU auto-eviction
-        self.record_usage(name);
 
         // Layer 2 (mini5 soak): isolate a tool panic at this single dispatch
         // boundary. A panic inside a tool used to unwind through the session
@@ -1523,6 +1171,11 @@ impl ToolRegistry {
         let mut registry = Self::new();
         registry.workspace_root = Some(cwd.to_path_buf());
         let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
+        // #1607: store the session sandbox so the Agent-internal project-root
+        // validator path can confine command validators to it (see
+        // `Self::sandbox`). Kept in lockstep with the shell/exec/bash tools
+        // registered just below.
+        registry.sandbox = sandbox.clone();
         registry.register(
             ShellTool::new(cwd)
                 .with_shared_sandbox(sandbox.clone())
@@ -1594,6 +1247,11 @@ impl ToolRegistry {
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
+        // #1772 (lite): project static-check with compact diagnostics.
+        // Shares the session sandbox with shell/exec/bash — `cargo check`
+        // executes build.rs/proc-macros (project-controlled code), so it
+        // must be confined like any shell command (#1607).
+        registry.register(super::CheckTool::new(cwd).with_shared_sandbox(registry.sandbox.clone()));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1635,10 +1293,8 @@ impl ToolRegistry {
     /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
     /// against the effective coding tool contract.
     pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
-        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         self.tools
             .values()
-            .filter(|tool| !deferred.contains(tool.name()))
             // RFC-1 fixup (codex P1): exclude internal-hidden tools from
             // tool_search / tool_suggest discovery too — the LLM cannot
             // call them directly, advertising them would be misleading.
@@ -1706,6 +1362,10 @@ impl ToolRegistry {
         "workspace_log",
         "workspace_show",
         "workspace_diff",
+        // #1772 (lite): `check` detects the project (Cargo.toml / tsconfig /
+        // go.mod) at its bound workspace root and runs the checker there, so
+        // a re-scoped session must re-register it against the new root.
+        "check",
         // #972 / M14-B P1: `view_image` reads files from the workspace and
         // must follow `rebind_cwd` so a session targeting a new project root
         // does not leak previously bound paths.
@@ -1739,6 +1399,11 @@ impl ToolRegistry {
         let mut registry = self.snapshot_excluding(&exclude);
         registry.workspace_root = Some(cwd.to_path_buf());
         let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
+        // #1607: store the sandbox for the rebound cwd (overwriting the
+        // parent's, carried by `snapshot_excluding`) so the project-root
+        // validator path confines command validators to the same sandbox as
+        // the shell/exec/bash tools re-registered just below.
+        registry.sandbox = sandbox.clone();
         // Re-register cwd-bound tools with the new workspace
         registry.register(
             ShellTool::new(cwd)
@@ -1789,6 +1454,11 @@ impl ToolRegistry {
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
+        // #1772 (lite): `check` detects the project type from the workspace
+        // root, so it must follow `rebind_cwd` like the other cwd-bound
+        // tools — and it re-binds to the NEW session sandbox stored just
+        // above, in lockstep with the shell/exec/bash re-registrations.
+        registry.register(super::CheckTool::new(cwd).with_shared_sandbox(registry.sandbox.clone()));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1806,6 +1476,13 @@ impl ToolRegistry {
         registry.register(ToolSearchTool::new(catalog_cell.clone()));
         registry.register(ToolSuggestTool::new(catalog_cell));
         registry.refresh_live_catalog();
+        // yolo GAP #2: plugin tools are carried across the snapshot unchanged,
+        // so thread the session approval context into them here — the same
+        // permissions the built-in shell/coding tools were just re-registered
+        // with above. Under a `never`/DangerFullAccess session this makes the
+        // manifest risk gate honor `ApprovalPolicy` instead of always
+        // prompting.
+        registry.apply_permissions_to_plugin_tools(permissions);
         registry
     }
 
@@ -1823,6 +1500,43 @@ impl ToolRegistry {
                 tool.as_any()
                     .downcast_ref::<PluginTool>()
                     .map(|pt| (name.clone(), pt.clone_with_work_dir(work_dir.to_path_buf())))
+            })
+            .collect();
+        for (name, new_tool) in replacements {
+            self.tools.insert(name, Arc::new(new_tool));
+        }
+    }
+
+    /// yolo GAP #2: thread the session's approval context into every
+    /// `PluginTool` so the manifest risk gate honors `ApprovalPolicy` the
+    /// same way the shell/coding tools do.
+    ///
+    /// `rebind_cwd_with_permissions` re-registers built-in tools with the
+    /// session `EffectivePermissions`, but plugin tools are carried across
+    /// the snapshot unchanged — so a `high`/`critical`-risk plugin would
+    /// otherwise still prompt in a `never`/DangerFullAccess session. This
+    /// pass replaces each plugin tool with a copy that carries:
+    ///   * `approval_policy` — under `Never`, the risk gate denies without
+    ///     prompting (parity with shell.rs);
+    ///   * `auto_approve_high_risk` — set from `permissions.is_dangerous()`,
+    ///     so a DangerFullAccess ("yolo") context auto-allows the gate
+    ///     (parity with the shell tools swapping in `AllowAllPolicy`).
+    ///
+    /// Called automatically at the end of `rebind_cwd_with_permissions`.
+    pub fn apply_permissions_to_plugin_tools(&mut self, permissions: EffectivePermissions) {
+        use crate::plugins::PluginTool;
+        let approval_policy = permissions.approval_policy;
+        let auto_approve = permissions.is_dangerous();
+        let replacements: Vec<_> = self
+            .tools
+            .iter()
+            .filter_map(|(name, tool)| {
+                tool.as_any().downcast_ref::<PluginTool>().map(|pt| {
+                    (
+                        name.clone(),
+                        pt.clone_with_permissions(approval_policy, auto_approve),
+                    )
+                })
             })
             .collect();
         for (name, new_tool) in replacements {
@@ -1937,36 +1651,6 @@ mod tag_lookup_tests {
 mod cwd_isolation_tests {
     use super::*;
     use crate::sandbox::NoSandbox;
-
-    /// #970 — when a tool group is deferred at the profile level, the
-    /// session-level registry produced by `rebind_cwd_with_permissions`
-    /// must carry the same deferred names so the M14 coding tool
-    /// contract can still see them as "registered but deferred" rather
-    /// than reporting them as missing.
-    #[test]
-    fn deferred_group_survives_rebind_cwd_to_per_session_registry() {
-        let cwd = std::path::Path::new("/tmp");
-        let mut profile_tools = ToolRegistry::with_builtins_and_sandbox(cwd, Box::new(NoSandbox));
-        profile_tools.defer_group("group:runtime");
-
-        let session_tools = profile_tools.rebind_cwd(cwd, Box::new(NoSandbox));
-        let deferred = session_tools.deferred_tool_names();
-        assert!(
-            deferred.contains(&"shell".to_string()),
-            "shell should remain deferred after session rebind; deferred={:?}",
-            deferred
-        );
-        assert!(
-            deferred.contains(&"exec_command".to_string()),
-            "exec_command should remain deferred after session rebind; deferred={:?}",
-            deferred
-        );
-        assert!(
-            deferred.contains(&"write_stdin".to_string()),
-            "write_stdin should remain deferred after session rebind; deferred={:?}",
-            deferred
-        );
-    }
 
     #[tokio::test]
     async fn test_rebind_cwd_file_tools_reject_outside_paths() {
@@ -2107,6 +1791,87 @@ mod cwd_isolation_tests {
         );
     }
 
+    #[tokio::test]
+    async fn should_register_check_tool_and_rebind_its_cwd() {
+        let initial_cwd = tempfile::tempdir().expect("create temp dir");
+        let registry =
+            ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
+        assert!(
+            registry.get("check").is_some(),
+            "check must be a builtin tool"
+        );
+
+        // `check` is cwd-bound: after a rebind it must detect the project at
+        // the NEW workspace root (the empty new cwd → "no supported project"),
+        // not the old one.
+        let new_cwd = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(initial_cwd.path().join("go.mod"), "module old").unwrap();
+        let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
+        let tr = rebound
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(tr.success, "no-project answer is a success: {}", tr.output);
+        assert!(
+            tr.output.contains("no supported project detected"),
+            "rebound check must look at the NEW cwd: {}",
+            tr.output
+        );
+    }
+
+    /// Review #1772 (high): `check` spawns cargo/tsc/go, which execute
+    /// project-controlled code (build.rs / proc-macros), so BOTH registry
+    /// constructors must hand it the session sandbox — same lockstep as
+    /// shell/exec/bash. The marker sandbox replaces the wrapped command
+    /// with an echo, so the marker in the output proves the checker went
+    /// through `Sandbox::wrap_command` instead of a direct host spawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_confine_check_tool_to_session_sandbox_on_build_and_rebind() {
+        struct MarkerSandbox;
+        impl Sandbox for MarkerSandbox {
+            fn wrap_command(
+                &self,
+                command: &str,
+                cwd: &std::path::Path,
+            ) -> tokio::process::Command {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c")
+                    .arg(format!("echo \"SANDBOX-WRAPPED: {command}\"; exit 7"))
+                    .current_dir(cwd);
+                cmd
+            }
+        }
+
+        // `cargo` resolves from PATH — always present under `cargo test` —
+        // but the marker sandbox substitutes the command, so no real
+        // checker ever runs.
+        let cwd = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(cwd.path().join("Cargo.toml"), b"[package]").unwrap();
+
+        let registry = ToolRegistry::with_builtins_and_sandbox(cwd.path(), Box::new(MarkerSandbox));
+        let tr = registry
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(
+            tr.output.contains("SANDBOX-WRAPPED"),
+            "with_builtins must confine check to the session sandbox: {}",
+            tr.output
+        );
+
+        let rebound = registry.rebind_cwd(cwd.path(), Box::new(MarkerSandbox));
+        let tr = rebound
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(
+            tr.output.contains("SANDBOX-WRAPPED"),
+            "rebind_cwd must re-hand the session sandbox to check: {}",
+            tr.output
+        );
+    }
+
     #[test]
     fn set_workspace_root_records_path_for_session_tool_registry_fallback() {
         let mut reg = ToolRegistry::new();
@@ -2121,408 +1886,19 @@ mod cwd_isolation_tests {
 }
 
 #[cfg(test)]
-mod lifecycle_tests {
+mod registry_dispatch_tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn make_registry(max_active: usize, idle_threshold: u32) -> ToolRegistry {
-        let mut reg = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
-        {
-            let lc = reg.lifecycle.get_mut().unwrap();
-            lc.max_active = max_active;
-            lc.idle_threshold = idle_threshold;
-        }
-        reg
-    }
-
-    fn active_tool_names(reg: &ToolRegistry) -> Vec<String> {
-        let mut names: Vec<String> = reg.specs().iter().map(|s| s.name.clone()).collect();
-        names.sort();
-        names
-    }
-
-    fn deferred_tool_names(reg: &ToolRegistry) -> Vec<String> {
-        let deferred = reg.deferred.lock().unwrap();
-        let mut names: Vec<String> = deferred.iter().cloned().collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn idle_tools_evicted_when_over_threshold() {
-        let mut reg = make_registry(3, 2);
-        reg.set_base_tools(["read_file", "write_file"]);
-
-        let initial_count = reg.specs().len();
-        println!("Initial active tools: {initial_count}");
-        assert!(initial_count > 3, "builtins should exceed threshold");
-
-        for _ in 0..3 {
-            reg.tick();
-            reg.record_usage("read_file");
-            reg.record_usage("write_file");
-        }
-
-        let evicted = reg.auto_evict();
-        println!("Evicted: {evicted:?}");
-        assert!(!evicted.is_empty(), "should evict idle tools");
-
-        let active = active_tool_names(&reg);
-        assert!(
-            active.contains(&"read_file".to_string()),
-            "base tool read_file must survive"
-        );
-        assert!(
-            active.contains(&"write_file".to_string()),
-            "base tool write_file must survive"
-        );
-
-        let deferred = deferred_tool_names(&reg);
-        for name in &evicted {
-            assert!(
-                deferred.contains(name),
-                "{name} should be deferred after eviction"
-            );
-        }
-
-        println!(
-            "After eviction -- active: {}, deferred: {}",
-            active.len(),
-            deferred.len()
-        );
-        assert!(active.len() <= 3, "should be at or under threshold");
-    }
-
-    #[test]
-    fn recently_used_tools_not_evicted() {
-        let mut reg = make_registry(3, 2);
-        reg.set_base_tools(["read_file"]);
-
-        for _ in 0..3 {
-            reg.tick();
-            reg.record_usage("read_file");
-            reg.record_usage("shell");
-        }
-
-        let evicted = reg.auto_evict();
-        println!("Evicted: {evicted:?}");
-
-        assert!(
-            !evicted.contains(&"shell".to_string()),
-            "recently used 'shell' should not be evicted"
-        );
-
-        let active = active_tool_names(&reg);
-        assert!(
-            active.contains(&"shell".to_string()),
-            "shell must remain active"
-        );
-    }
-
-    #[tokio::test]
-    async fn activated_tool_gets_usage_tracking() {
-        let mut reg = make_registry(3, 2);
-        reg.set_base_tools(["read_file", "write_file"]);
-
-        for _ in 0..3 {
-            reg.tick();
-            reg.record_usage("read_file");
-            reg.record_usage("write_file");
-        }
-        let evicted = reg.auto_evict();
-        println!("First eviction: {evicted:?}");
-        assert!(!evicted.is_empty());
-
-        let deferred = deferred_tool_names(&reg);
-        let shell_was_evicted = deferred.contains(&"shell".to_string());
-        println!("shell deferred: {shell_was_evicted}");
-
-        if shell_was_evicted {
-            let activated = reg.activate("group:runtime");
-            println!("Activated: {activated:?}");
-            assert!(activated.contains(&"shell".to_string()));
-
-            reg.tick();
-            reg.record_usage("shell");
-
-            let evicted2 = reg.auto_evict();
-            assert!(
-                !evicted2.contains(&"shell".to_string()),
-                "freshly used shell should survive eviction"
-            );
-            println!("Second eviction (shell survived): {evicted2:?}");
-        }
-    }
-
-    #[test]
-    fn base_tools_never_evicted() {
-        let mut reg = make_registry(2, 1);
-        reg.set_base_tools(["read_file", "write_file", "shell"]);
-
-        for _ in 0..5 {
-            reg.tick();
-        }
-
-        let evicted = reg.auto_evict();
-        println!("Evicted: {evicted:?}");
-
-        for name in &["read_file", "write_file", "shell"] {
-            assert!(
-                !evicted.contains(&name.to_string()),
-                "base tool {name} must never be evicted"
-            );
-        }
-    }
-
-    /// Fix #3a (2026-05-10) regression: a tool marked `spawn_only` must NOT
-    /// be LRU-evicted even when it has never been used and is well past the
-    /// `idle_threshold`. CLAUDE.md states "spawn_only tools cannot be
-    /// evicted" as a design invariant; before this fix the LRU only
-    /// checked `base_tools` and silently pruned spawn_only plugin tools
-    /// (e.g. `fm_tts`) after a few idle iterations, making the LLM
-    /// correctly report "I don't have that tool available" — observed
-    /// live mini1 2026-05-10.
-    ///
-    /// We use `glob` (an already-registered builtin) as the stand-in for a
-    /// spawn_only plugin tool — `mark_spawn_only` only touches the
-    /// `spawn_only` HashSet, so the test focuses on the eviction filter
-    /// rather than the loader plumbing. No base_tools are set, so without
-    /// the spawn_only filter the LRU would evict `glob` after the first
-    /// idle iteration past `idle_threshold`.
-    #[test]
-    fn spawn_only_tools_never_evicted_even_when_idle() {
-        let mut reg = make_registry(2, 1);
-        // No base tools — only the spawn_only marker should protect this
-        // tool from eviction.
-        reg.mark_spawn_only("glob", None);
-
-        // Advance many iterations without touching `glob`. Without the
-        // Fix #3a filter, `glob` would become idle past the threshold
-        // and the LRU would push it into `deferred`.
-        for _ in 0..10 {
-            reg.tick();
-        }
-
-        let evicted = reg.auto_evict();
-        println!("Evicted: {evicted:?}");
-
-        assert!(
-            !evicted.contains(&"glob".to_string()),
-            "spawn_only tool glob must never be evicted per CLAUDE.md invariant. \
-             Evicted set was: {evicted:?}"
-        );
-    }
-
-    /// Companion: a spawn_only tool stays visible in `specs()` after many
-    /// idle iterations + an `auto_evict()` sweep. Verifies the practical
-    /// consequence: the LLM still sees the tool in its function-call menu
-    /// after long stretches of disuse, so it can still emit a tool-call
-    /// that the execution loop intercepts for background spawning.
-    #[test]
-    fn spawn_only_tools_stay_visible_in_specs_after_eviction_sweep() {
-        let mut reg = make_registry(2, 1);
-        reg.mark_spawn_only("glob", None);
-
-        for _ in 0..10 {
-            reg.tick();
-        }
-        let _ = reg.auto_evict();
-
-        let names: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
-        assert!(
-            names.contains(&"glob".to_string()),
-            "spawn_only tool glob must remain in specs() after eviction sweep; specs were: {names:?}"
-        );
-    }
-
-    /// RFC-1 fixup (codex round 4 P2): internal-hidden tools must be
-    /// excluded from the LRU "active" set just like spawn_only tools
-    /// are. If they are counted as active, several `mofa_*` hidden
-    /// targets pinned as base tools by the gateway / profile would
-    /// inflate the active count past `max_active`, forcing eviction
-    /// of LLM-visible tools (activate_tools, memory tools, …).
-    ///
-    /// This test sets `max_active = 1` and registers two
-    /// internal-hidden tools alongside the builtin set. Without the
-    /// fix, the hidden tools count toward the active set and at least
-    /// one LLM-visible tool gets evicted. With the fix, hidden tools
-    /// are ignored and the LRU only evicts visible tools when their
-    /// own count exceeds `max_active`.
-    #[test]
-    fn internal_hidden_excluded_from_lru_active_set() {
-        let mut reg = make_registry(10, 1);
-
-        // Mark two builtin tools as internal-hidden so we don't need
-        // to wire a plugin. The LRU should not count these against
-        // the active budget.
-        reg.mark_internal_hidden("glob");
-        reg.mark_internal_hidden("grep");
-
-        // Advance several ticks; nothing has been used, so all
-        // non-base tools are candidates for eviction once the active
-        // count exceeds max_active. Pin only one base tool so we
-        // depend on the internal_hidden filter to keep
-        // active_count <= max_active.
-        reg.set_base_tools(["read_file"]);
-
-        // Without the round-4 fix, `glob` + `grep` would inflate the
-        // active count and force eviction of unrelated visible tools.
-        // With the fix, they are skipped entirely; eviction only
-        // fires if visible-tool count itself exceeds max_active.
-        for _ in 0..5 {
-            reg.tick();
-        }
-        let evicted = reg.auto_evict();
-
-        // Critical: the LRU MUST NOT evict any visible tool just
-        // because hidden mofa_* targets exist. With `max_active=10`
-        // and ~17 builtin tools, two are hidden, leaving ~15 visible
-        // — still > 10, so SOME visible tool may be evicted. The
-        // important post-condition: `glob` and `grep` are NEITHER
-        // evicted (they are not in the active set at all) NOR
-        // re-promoted into specs.
-        assert!(
-            !evicted.contains(&"glob".to_string()),
-            "internal-hidden glob must not be evicted (it was never in the active set); \
-             evicted={:?}",
-            evicted
-        );
-        assert!(
-            !evicted.contains(&"grep".to_string()),
-            "internal-hidden grep must not be evicted; evicted={:?}",
-            evicted
-        );
-
-        // And they MUST NOT be visible in specs() — internal-hidden
-        // suppresses spec emission regardless of LRU.
-        let visible: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
-        assert!(!visible.contains(&"glob".to_string()));
-        assert!(!visible.contains(&"grep".to_string()));
-    }
-
-    #[test]
-    fn stalest_evicted_first() {
-        let mut reg = make_registry(5, 2);
-        reg.set_base_tools(["read_file"]);
-
-        reg.tick();
-        reg.record_usage("read_file");
-        reg.record_usage("shell");
-        reg.record_usage("write_file");
-        reg.record_usage("edit_file");
-        reg.record_usage("glob");
-        reg.record_usage("grep");
-        reg.record_usage("list_dir");
-
-        for _ in 0..3 {
-            reg.tick();
-            reg.record_usage("shell");
-            reg.record_usage("write_file");
-        }
-
-        let evicted = reg.auto_evict();
-        println!("Evicted: {evicted:?}");
-
-        if !evicted.is_empty() {
-            assert!(
-                !evicted.contains(&"shell".to_string()),
-                "shell (iter 4) should survive over stale tools"
-            );
-            assert!(
-                !evicted.contains(&"write_file".to_string()),
-                "write_file (iter 4) should survive over stale tools"
-            );
-        }
-    }
-
-    #[test]
-    fn no_eviction_when_under_threshold() {
-        let reg = make_registry(100, 1);
-
-        for _ in 0..5 {
-            reg.tick();
-        }
-
-        let evicted = reg.auto_evict();
-        assert!(evicted.is_empty(), "should not evict when under threshold");
-    }
-
-    #[tokio::test]
-    async fn full_session_lifecycle() {
-        let mut reg = make_registry(5, 3);
-        reg.set_base_tools(["read_file", "write_file"]);
-
-        println!("=== Turn 1: Research query ===");
-        reg.tick();
-        reg.record_usage("read_file");
-        reg.record_usage("shell");
-        let active = active_tool_names(&reg);
-        println!("Active ({}): {:?}", active.len(), active);
-
-        println!("\n=== Turns 2-4: Only using read/write ===");
-        for i in 2..=4 {
-            reg.tick();
-            reg.record_usage("read_file");
-            reg.record_usage("write_file");
-            let evicted = reg.auto_evict();
-            if !evicted.is_empty() {
-                println!("Turn {i} evicted: {evicted:?}");
-            }
-        }
-        let active = active_tool_names(&reg);
-        let deferred = deferred_tool_names(&reg);
-        println!(
-            "After turn 4 -- active: {}, deferred: {}",
-            active.len(),
-            deferred.len()
-        );
-
-        println!("\n=== Turn 5: Need shell again -- re-activate ===");
-        if deferred.contains(&"shell".to_string()) {
-            let activated = reg.activate("group:runtime");
-            println!("Activated: {activated:?}");
-        }
-        reg.tick();
-        reg.record_usage("shell");
-        let active = active_tool_names(&reg);
-        println!(
-            "Active after re-activation ({}): {:?}",
-            active.len(),
-            active
-        );
-        assert!(
-            active.contains(&"shell".to_string()),
-            "shell should be active again"
-        );
-
-        println!("\n=== Turn 6-8: Use shell, others go idle ===");
-        for i in 6..=8 {
-            reg.tick();
-            reg.record_usage("read_file");
-            reg.record_usage("shell");
-            let evicted = reg.auto_evict();
-            if !evicted.is_empty() {
-                println!("Turn {i} evicted: {evicted:?}");
-            }
-        }
-        let active = active_tool_names(&reg);
-        let deferred = deferred_tool_names(&reg);
-        println!(
-            "\nFinal state -- active: {}, deferred: {}",
-            active.len(),
-            deferred.len()
-        );
-        println!("Active: {:?}", active);
-        println!("Deferred: {:?}", deferred);
-
-        assert!(active.contains(&"read_file".to_string()));
-        assert!(active.contains(&"write_file".to_string()));
-        assert!(active.contains(&"shell".to_string()));
+    // RFC-0 (#1289): LRU tool-lifecycle deferral was removed, so this helper no
+    // longer carries the old `(max_active, idle_threshold)` tuning knobs.
+    fn make_registry() -> ToolRegistry {
+        ToolRegistry::with_builtins(PathBuf::from("/tmp"))
     }
 
     #[test]
     fn spawn_only_message_uses_runtime_output_dir_hint() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("mofa_slides", None);
         reg.set_output_dir_hint("/tmp/octos-profile/skill-output");
 
@@ -2533,7 +1909,7 @@ mod lifecycle_tests {
 
     #[test]
     fn spawn_only_handle_message_returns_task_handle_envelope() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("search", None);
         reg.set_output_dir_hint("/tmp/octos/skill-output");
 
@@ -2570,7 +1946,7 @@ mod lifecycle_tests {
         // Codex round 2 P2: visibility helper must mirror the same filters
         // `specs()` applies, so the spawn_only intercept does not advertise
         // a tool the provider policy hid from the LLM's tool list.
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         // After make_registry, "shell" exists.
         assert!(reg.is_tool_visible("shell"));
 
@@ -2588,7 +1964,7 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn spawn_agent_execution_policy_is_equivalent_to_spawn_alias() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             deny: vec!["spawn".to_owned()],
             ..Default::default()
@@ -2609,7 +1985,7 @@ mod lifecycle_tests {
         };
         assert!(denied.to_string().contains("denied by provider policy"));
 
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             allow: vec!["spawn".to_owned()],
             ..Default::default()
@@ -2631,15 +2007,103 @@ mod lifecycle_tests {
 
     #[test]
     fn is_tool_visible_returns_false_for_unregistered_tools() {
-        let reg = make_registry(5, 3);
+        let reg = make_registry();
         assert!(!reg.is_tool_visible("nope_does_not_exist"));
+    }
+
+    #[test]
+    fn should_expose_a_noop_sandbox_when_registry_built_without_a_real_backend() {
+        // #1607 (P1): `with_builtins` (and `Default`) install `NoSandbox`, so
+        // the getter the project-root validator path calls must return a no-op
+        // sandbox — `ValidatorRunner` then runs command validators' argv
+        // directly, keeping host behavior unchanged where no backend exists.
+        let reg = make_registry();
+        assert!(
+            reg.sandbox().is_noop(),
+            "registry built without a real sandbox must expose a no-op sandbox"
+        );
+    }
+
+    #[test]
+    fn should_store_the_real_sandbox_handed_to_builtins_and_expose_it() {
+        // #1607 (P1): a real (non-no-op) sandbox handed to the shell/exec/bash
+        // tools must be STORED on the registry and surfaced via `sandbox()`,
+        // not handed off and dropped — that is the handle the project-root
+        // validator runner threads into `.with_sandbox(...)`.
+        struct FakeRealSandbox;
+        impl Sandbox for FakeRealSandbox {
+            fn wrap_command(
+                &self,
+                command: &str,
+                _cwd: &std::path::Path,
+            ) -> tokio::process::Command {
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c").arg(command);
+                c
+            }
+            fn is_noop(&self) -> bool {
+                false
+            }
+        }
+        let reg = ToolRegistry::with_builtins_and_sandbox(
+            PathBuf::from("/tmp"),
+            Box::new(FakeRealSandbox),
+        );
+        assert!(
+            !reg.sandbox().is_noop(),
+            "a real sandbox handed to with_builtins_and_sandbox must be stored, not dropped"
+        );
+    }
+
+    #[test]
+    fn should_permit_all_tools_when_no_provider_policy_is_set() {
+        // #1607 (P2): with no provider policy the permit predicate is a no-op,
+        // so `MapToolDispatcher::from_registry` snapshots every tool.
+        let reg = make_registry();
+        assert!(reg.provider_policy_permits("shell"));
+        assert!(reg.provider_policy_permits("read_file"));
+    }
+
+    #[test]
+    fn should_deny_provider_policy_denied_tools_including_aliases() {
+        // #1607 (P2): the permit predicate must mirror the deny-wins semantics
+        // (with alias equivalence) that `execute` enforces, so a project-root
+        // ToolCall validator can't reach a denied tool via the snapshot.
+        let mut reg = make_registry();
+        reg.set_provider_policy(ToolPolicy {
+            deny: vec!["spawn".to_string()],
+            ..Default::default()
+        });
+        // `spawn_agent` maps to the `spawn` alias, so denying `spawn` denies it.
+        assert!(
+            !reg.provider_policy_permits("spawn_agent"),
+            "alias-equivalent denied tools must not pass the permit predicate"
+        );
+        // A tool outside the deny list still passes (allow list empty => allow).
+        assert!(reg.provider_policy_permits("read_file"));
+    }
+
+    #[test]
+    fn should_permit_only_allowlisted_tools_when_allow_list_is_set() {
+        // #1607 (P2): a non-empty allow list means only listed (or
+        // alias-equivalent) tools are permitted.
+        let mut reg = make_registry();
+        reg.set_provider_policy(ToolPolicy {
+            allow: vec!["read_file".to_string()],
+            ..Default::default()
+        });
+        assert!(reg.provider_policy_permits("read_file"));
+        assert!(
+            !reg.provider_policy_permits("shell"),
+            "tools absent from a non-empty allow list must not pass the permit predicate"
+        );
     }
 
     #[test]
     fn spawn_only_handle_message_payload_stays_under_one_kb() {
         // Phase 4 acceptance criterion: spawn_only tool result in agent
         // context is < 1KB (was 50KB+).
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("search", None);
 
         let payload = reg.spawn_only_handle_message("search", "task_xyz", &[]);
@@ -3193,25 +2657,28 @@ mod profile_filter_tests {
     }
 
     #[test]
-    fn coding_profile_produces_same_registry_as_default_builtins() {
-        // Behaviour parity gate: applying the built-in `coding` profile
-        // to a builtin registry must leave the registry IDENTICAL to
-        // what today's no-flag default path produces. This is the
-        // critical regression guard called out in the M8.3 issue.
+    fn coding_full_profile_produces_same_registry_as_default_builtins() {
+        // Behaviour parity gate: applying the built-in `coding-full`
+        // profile to a builtin registry must leave the registry IDENTICAL
+        // to what the no-flag default path produced before the lean
+        // `coding` default landed. This is the critical regression guard
+        // called out in the M8.3 issue, retargeted at the unfiltered
+        // escape hatch now that `coding` itself carries an allow list
+        // (see `crate::profile::tests` for the lean-narrowing pins).
         use crate::profile::ProfileDefinition;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let reference = ToolRegistry::with_builtins(dir.path());
         let reference_names = builtin_names(&reference);
 
-        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let full = ProfileDefinition::builtin("coding-full").expect("coding-full builtin");
         let mut profiled = ToolRegistry::with_builtins(dir.path());
-        coding.apply_to_registry(&mut profiled);
+        full.apply_to_registry(&mut profiled);
 
         let profiled_names = builtin_names(&profiled);
         assert_eq!(
             reference_names, profiled_names,
-            "coding profile must preserve behaviour parity with the default path",
+            "coding-full profile must preserve behaviour parity with the default path",
         );
     }
 
@@ -3309,17 +2776,12 @@ mod profile_filter_tests {
         }
     }
 
-    /// RFC-1 fixup (codex round 2 P2): when a make_type plugin marks a
-    /// dispatcher target as internal-hidden, subsequent calls to
-    /// `defer` / `defer_group` MUST NOT add that name to `deferred`,
-    /// because `specs()` would otherwise advertise the name in
-    /// `activate_tools`'s description, leaking the hidden target.
-    ///
-    /// Also: even if a name somehow ends up in `deferred` (older code
-    /// path, future regression), the `activate_tools` enumeration in
-    /// `specs()` defensively filters internal-hidden names.
+    /// RFC-1 (issue #1290): a make_type dispatcher target marked
+    /// `mark_internal_hidden` is excluded from the LLM-visible `specs()`
+    /// set but remains callable via `get()` (so the dispatcher can forward
+    /// to it). Non-hidden siblings stay visible.
     #[test]
-    fn defer_group_skips_internal_hidden_targets() {
+    fn internal_hidden_excluded_from_specs_but_callable_via_get() {
         use async_trait::async_trait;
         use eyre::Result;
         use serde_json::Value;
@@ -3342,70 +2804,29 @@ mod profile_filter_tests {
         }
 
         let mut reg = ToolRegistry::new();
-        // Register every tool referenced by group:media so defer_group
-        // would normally find all of them.
-        for name in [
-            "mofa_comic",
-            "mofa_slides",
-            "mofa_infographic",
-            "mofa_cards",
-            "fm_tts",
-            "fm_voice_list",
-        ] {
+        for name in ["mofa_slides", "mofa_cards"] {
             reg.register(FakeTool(name));
         }
-        // Simulate the RFC-1 loader: `mofa_slides` is the dispatcher's
-        // target, so it gets `mark_internal_hidden`. (We mark it
-        // BEFORE the defer_group call to mirror the loader timing.)
+        // `mofa_slides` is the dispatcher's target — hide it from the LLM.
         reg.mark_internal_hidden("mofa_slides");
 
-        // Now an unrelated code path defers the whole media group
-        // (e.g. a profile auto-defer pass run after plugin loading,
-        // mirroring the regression codex flagged).
-        reg.defer_group("group:media");
-
-        // Direct assertion: `mofa_slides` MUST NOT have been added to
-        // `deferred` — adding it would leak the name through the
-        // `activate_tools` spec description.
-        let deferred_names = reg.deferred_tool_names();
+        let visible: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
         assert!(
-            !deferred_names.contains(&"mofa_slides".to_string()),
-            "internal-hidden mofa_slides must not be added to deferred \
-             by defer_group; got {:?}",
-            deferred_names
+            !visible.contains(&"mofa_slides".to_string()),
+            "internal-hidden mofa_slides must NOT appear in specs; got {:?}",
+            visible
         );
-
-        // The other media tools (not internal-hidden) SHOULD be in the
-        // deferred set as usual.
         assert!(
-            deferred_names.contains(&"mofa_cards".to_string()),
-            "non-hidden group members must still be deferred; got {:?}",
-            deferred_names
+            visible.contains(&"mofa_cards".to_string()),
+            "non-hidden mofa_cards must remain visible in specs; got {:?}",
+            visible
         );
-
-        // Belt-and-suspenders: even if we manually force the hidden
-        // name into deferred (bypassing the `defer` skip), `specs()`
-        // must still not leak it through the activate_tools hint.
-        {
-            // Bypass `defer` to simulate a regression / legacy code
-            // path that mutates the deferred set directly.
-            let mut deferred = reg.deferred.lock().unwrap();
-            deferred.insert("mofa_slides".to_string());
-        }
-        // Register a real activate_tools so specs() emits the hint.
-        reg.register(crate::tools::ActivateToolsTool::new());
-        let specs = reg.specs();
-        let activate_spec = specs
-            .iter()
-            .find(|s| s.name == "activate_tools")
-            .expect("activate_tools spec present");
+        // Still reachable via get() for internal dispatcher forwarding.
         assert!(
-            !activate_spec.description.contains("mofa_slides"),
-            "activate_tools description must defensively filter \
-             internal-hidden names even when `deferred` contains them; \
-             got: {:?}",
-            activate_spec.description
+            reg.get("mofa_slides").is_some(),
+            "internal-hidden tool must remain callable via get()"
         );
+        assert!(reg.is_internal_hidden("mofa_slides"));
     }
 
     /// RFC-1 fixup (codex round 4 P2): when `retain` evicts dispatcher
@@ -3815,6 +3236,81 @@ mod profile_filter_tests {
                 .iter()
                 .map(|e| &e.content_type)
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod spec_order_tests {
+    //! `specs()` order determinism: providers replay the tool array verbatim
+    //! into the LLM prompt prefix, so a shuffled order both busts
+    //! provider-side prompt caches (Anthropic `cache_control` breakpoints
+    //! cache the tools+system prefix) and makes requests nondeterministic
+    //! across registry rebuilds. `specs()` must emit tools sorted by name.
+
+    use super::super::{Tool, ToolResult};
+    use super::*;
+    use async_trait::async_trait;
+    use eyre::Result;
+    use serde_json::Value;
+
+    struct NamedTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "test-only"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            Ok(ToolResult {
+                output: String::new(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn registry_with(names: &[&str]) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in names {
+            registry.register(NamedTool {
+                name: (*name).to_string(),
+            });
+        }
+        registry
+    }
+
+    #[test]
+    fn specs_are_sorted_by_name_and_deterministic_across_rebuilds() {
+        let names = [
+            "zeta", "alpha", "mid", "beta", "omega", "kappa", "gamma", "delta",
+        ];
+        let mut reversed = names;
+        reversed.reverse();
+
+        let a = registry_with(&names);
+        let b = registry_with(&reversed);
+
+        let a_names: Vec<String> = a.specs().iter().map(|s| s.name.clone()).collect();
+        let b_names: Vec<String> = b.specs().iter().map(|s| s.name.clone()).collect();
+
+        let mut sorted = a_names.clone();
+        sorted.sort();
+        assert_eq!(
+            a_names, sorted,
+            "specs() must emit tools sorted by name (HashMap order is nondeterministic)"
+        );
+        assert_eq!(
+            a_names, b_names,
+            "two registries with the same tools must serialize identically"
         );
     }
 }

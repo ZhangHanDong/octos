@@ -67,6 +67,19 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub allow_network: bool,
 
+    /// Whether shell/exec commands may write to the workspace cwd
+    /// (default: true).
+    ///
+    /// When `false`, the workspace is mounted/bound read-only for the
+    /// shell sandbox: macOS omits the `file-write*` grant for the cwd,
+    /// bwrap `--ro-bind`s it, and Docker mounts it `ro`. This is what a
+    /// read-only permission profile sets so `--sandbox read-only` stops
+    /// shell writes (`touch newfile`), not just the native file tools.
+    /// The `default_enabled` (true) default preserves backward-compatible
+    /// writable behaviour for configs that never set this field.
+    #[serde(default = "default_enabled")]
+    pub workspace_write: bool,
+
     /// Docker-specific settings (used when mode = "docker").
     #[serde(default)]
     pub docker: DockerConfig,
@@ -99,6 +112,13 @@ pub(crate) const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/tmp",
     "/var/tmp",
     "/etc", // system config (needed for DNS resolution, etc.)
+    // macOS `/etc` is a symlink to `/private/etc`, and SBPL subpath rules match
+    // the CANONICAL path — so the `/etc` entry above never covers a real read of
+    // `/private/etc/...`. Without this, TLS clients that resolve via the symlink
+    // (system `curl`/LibreSSL reading `/etc/ssl/openssl.cnf` + `cert.pem`) fail at
+    // init with a confusing "Operation not permitted" — very visible now that
+    // network is allowed by default. Mirrors the `/tmp` + `/private/tmp` pairing.
+    "/private/etc",
     "/dev/null",
     "/dev/urandom",
     "/dev/random",
@@ -110,6 +130,7 @@ impl Default for SandboxConfig {
             enabled: true,
             mode: SandboxMode::Auto,
             allow_network: false,
+            workspace_write: true,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,
@@ -207,12 +228,39 @@ pub enum SandboxMode {
 pub trait Sandbox: Send + Sync {
     /// Wrap a shell command string into a sandboxed `Command`.
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command;
+
+    /// Whether this sandbox provides no confinement (runs commands directly).
+    /// Lets callers that require confinement (e.g. the `mcp-serve` server path)
+    /// fail closed when `SandboxMode::Auto` resolves to no backend. Real
+    /// backends inherit the default `false`.
+    fn is_noop(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend is the Docker container sandbox.
+    ///
+    /// #1607 (codex-review follow-up): Docker bind-mounts the workspace at a
+    /// fixed in-container path (`/workspace`), but `Command` validators
+    /// interpolate absolute *host* paths (e.g. `${output.patch_path}` ->
+    /// `/host/ws/.../foo.patch`) which don't exist inside the container, so a
+    /// previously-passing required validator would start failing. Before
+    /// #1607, command validators ran on the host and worked. `ValidatorRunner`
+    /// uses this to keep Docker-mode command validators on the pre-#1607 direct
+    /// (host) path rather than silently breaking them. Full in-container path
+    /// translation is a known follow-up. Non-Docker backends inherit `false`.
+    fn is_docker(&self) -> bool {
+        false
+    }
 }
 
 /// No-op sandbox: executes commands directly.
 pub struct NoSandbox;
 
 impl Sandbox for NoSandbox {
+    fn is_noop(&self) -> bool {
+        true
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         #[cfg(windows)]
         {
@@ -240,6 +288,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         SandboxMode::None => Box::new(NoSandbox),
         SandboxMode::Bwrap => Box::new(BwrapSandbox {
             allow_network: config.allow_network,
+            workspace_write: config.workspace_write,
         }),
         SandboxMode::Landlock => {
             #[cfg(target_os = "linux")]
@@ -248,6 +297,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
+                    workspace_write: config.workspace_write,
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -261,6 +311,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         SandboxMode::Macos => Box::new(MacosSandbox {
             allow_network: config.allow_network,
             read_allow_paths: config.read_allow_paths.clone(),
+            workspace_write: config.workspace_write,
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
             config: config.docker.clone(),
@@ -273,6 +324,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
+                    workspace_write: config.workspace_write,
                 })
             }
             #[cfg(not(windows))]
@@ -287,6 +339,43 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     }
 }
 
+/// Which backend [`SandboxMode::Auto`] would select on this host — a stable
+/// human-readable label plus whether that selection actually sandboxes
+/// (`false` = [`NoSandbox`]). Runs the SAME availability probes as
+/// [`create_auto_sandbox`] (on Linux `bwrap_works` actually runs
+/// `bwrap --version`), reported instead of instantiated. Used by
+/// `octos doctor` so its sandbox row reflects the real runtime selection
+/// rather than a PATH existence guess; the boolean keeps callers from
+/// sniffing the label text for status.
+pub fn auto_sandbox_kind() -> (&'static str, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if which_exists("sandbox-exec") {
+            return ("macOS Seatbelt (sandbox-exec)", true);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if bwrap_works() {
+            return ("bubblewrap (bwrap)", true);
+        }
+        if linux_container_sandbox_available() {
+            return ("Linux container helper (Landlock/seccomp)", true);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if has_sandbox_helper() {
+            return ("Windows AppContainer", true);
+        }
+    }
+    if which_exists("docker") {
+        ("Docker", true)
+    } else {
+        ("none — shell commands would run UNSANDBOXED", false)
+    }
+}
+
 fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     #[cfg(target_os = "macos")]
     {
@@ -294,6 +383,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             return Box::new(MacosSandbox {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
+                workspace_write: config.workspace_write,
             });
         }
     }
@@ -303,6 +393,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         if bwrap_works() {
             return Box::new(BwrapSandbox {
                 allow_network: config.allow_network,
+                workspace_write: config.workspace_write,
             });
         }
         if linux_container_sandbox_available() {
@@ -310,6 +401,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
                 profile_name: config.profile_name.clone(),
+                workspace_write: config.workspace_write,
             });
         }
     }
@@ -321,6 +413,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
                 profile_name: config.profile_name.clone(),
+                workspace_write: config.workspace_write,
             });
         }
     }
@@ -597,6 +690,7 @@ mod tests {
             enabled: true,
             mode: SandboxMode::None,
             allow_network: false,
+            workspace_write: true,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,
@@ -609,5 +703,42 @@ mod tests {
         assert_eq!(prog, "cmd");
         #[cfg(not(windows))]
         assert_eq!(prog, "sh");
+    }
+
+    // --- is_noop contract (fail-closed callers depend on this) ---
+
+    #[test]
+    fn no_sandbox_reports_noop() {
+        // The `mcp-serve` fail-closed check and the validator direct-argv path
+        // both key off `is_noop()`. NoSandbox provides zero confinement, so it
+        // must report `true`; the trait default (real backends) is `false`.
+        assert!(
+            NoSandbox.is_noop(),
+            "NoSandbox must report is_noop() == true"
+        );
+    }
+
+    #[test]
+    fn disabled_and_none_modes_yield_noop_sandbox() {
+        // Both an explicitly-disabled sandbox and `mode = none` must resolve to
+        // a no-op backend, so a fail-closed caller can distinguish "operator
+        // opted out" (respect it) from "wanted a sandbox, none available"
+        // (refuse). This is host-independent.
+        for config in [
+            SandboxConfig {
+                enabled: false,
+                ..SandboxConfig::default()
+            },
+            SandboxConfig {
+                enabled: true,
+                mode: SandboxMode::None,
+                ..SandboxConfig::default()
+            },
+        ] {
+            assert!(
+                create_sandbox(&config).is_noop(),
+                "config {config:?} must produce a no-op sandbox"
+            );
+        }
     }
 }

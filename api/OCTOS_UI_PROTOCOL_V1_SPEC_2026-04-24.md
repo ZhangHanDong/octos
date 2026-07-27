@@ -373,8 +373,30 @@ Session, turn, and approval core:
 
 - `session/open`
 - `session/hydrate` (gate `state.session_hydrate.v1`, accepted `UPCR-2026-009`)
+- `session/rollback` (conversation-only rewind; drops the last N user turns and
+  re-projects the trimmed thread exactly like `session/hydrate`; #1516)
+- `session/fork` (branch a session into a new one with copied history; #1613)
+- `session/btw` (quick aside question answered while the current turn runs; #1609)
+- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
+- `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
+- `turn/steer` (mid-turn prompt injection into the ACTIVE turn, codex
+  app-server parity. Params `{session_id, expected_turn_id?, input}`,
+  result `{turn_id, steered}`. With a live turn the text input items are
+  pushed into that turn's pending-input buffer under the active-turns
+  registry lock; the agent loop drains them FIFO at its next iteration
+  boundary — before the next LLM call — as plain `role: user` messages
+  with no wrapper text, persisting each through the canonical session
+  path so the standard v2 `UserMessage` envelope announces the fold-in;
+  a steer landing after the model's final answer forces one more round
+  in the SAME turn. Returns `steered: true` + the ACTIVE turn id. An
+  `expected_turn_id` naming a different turn → `invalid_params`; a live
+  non-steerable turn (review/fixture) → `invalid_request`. With no live
+  turn the call falls back to the ordinary `turn/start` admission and
+  returns `steered: false` + the NEW turn id. Raw server-handled method
+  — session-ingress credentials cannot call it, and steering is NOT an
+  interrupt: `turn/interrupt` stays the separate cancel op)
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
@@ -414,6 +436,19 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `session/workspace.get`, `session/title.set`, `session/delete`
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
+- `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
+
+Launch (per-project session UX, gated `session.workspace_cwd.v1`):
+
+- `launch/resolve`
+
+Smart-home bridge integration (gated `smart_home.v1`; auth-bound — omitted
+from the stdio capability set and reported unsupported per § stdio policy,
+same as `memory/overview` / `cron/list` above):
+
+- `smart_home/status.get`, `smart_home/device.list`,
+  `smart_home/device.command`, `smart_home/camera.stream_start`,
+  `smart_home/camera.stream_stop`
 
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):
@@ -428,6 +463,25 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
   `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
   `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `profile/sub_providers/list`, `profile/sub_providers/upsert`,
+  `profile/sub_providers/remove` (named provider lanes for per-node pipeline
+  routing — e.g. `deep_research`'s isolated `cheap`/`strong` lanes)
+- `snapshot/list`, `snapshot/restore` (#1768 workspace snapshot undo: list
+  the session workspace's pre-mutation undo points; restore rolls the
+  workspace back — refused while a turn is in flight, itself undoable via
+  the automatic pre-restore snapshot)
+- `peer/prepare` (#1800 peer-agent spin-off staging: writes the durable task
+  brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
+  creates a fenced git worktree on branch `peer/<slug>`; returns
+  `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
+  resource staging — the client then opens the peer session and starts the
+  kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
+  adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
+  scalar result fields mirror the first peer and `peers: [...]` carries all)
+- `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
+  latest `result.md` — written server-side on every peer-session turn
+  terminal — with per-field truncation flags and `result_updated_unix`;
+  optional `slugs` filter)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
@@ -446,6 +500,8 @@ Turn, message, and tool lifecycle:
 
 - `turn/started`, `turn/completed`, `turn/error`
 - `message/delta`
+- `message/reasoning_delta` (live LLM reasoning/thinking stream, sibling of
+  `message/delta`; #1502)
 - `message/persisted` (accepted `UPCR-2026-012`)
 - `turn/spawn_complete` (gate `event.spawn_complete.v1`; M10 background-tool completion envelope)
 - `tool/started`, `tool/progress`, `tool/completed`
@@ -463,6 +519,8 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 Task and progress:
 
 - `task/updated`
+- `plan/updated` (gate `plan.todos.v1`; model-authored plan/todo checklist
+  snapshot that replaces any prior plan wholesale; #1622)
 - `task/output/delta`
 - `progress/updated`
 - `warning`
@@ -488,6 +546,25 @@ Voice rich-output visual lifecycle (#1477, ungated; accepted
   the placeholder lifecycle, so the split survives a future
   `projection.envelope.v1` cutover. See § 8.
 
+Voice reply-audio streaming (gate `event.voice_audio.v1`; #1504):
+
+- `voice/audio_chunk` — streamed reply-audio frames (base64) for a voice turn.
+  Delivery is gated by the `event.voice_audio.v1` capability: a client that did
+  not negotiate it is filtered off the chunk stream and instead receives the
+  whole-file audio as a `file/attached` envelope, which is itself gated by
+  `event.file_attached.v1` (the reply audio has no other carrier — a client
+  that negotiated neither capability receives no playable reply audio).
+
+Voice exit intent (ungated; accepted `UPCR-2026-025`):
+
+- `voice/exit` — the voice turn detected an end / goodbye / mute intent
+  (the model appended an in-band `[[EXIT]]` control marker, which the
+  backend strips from every model-/client-facing surface). The client
+  leaves the `/voice` screen and returns home — after the turn's farewell
+  audio finishes playing (navigation is gated client-side on the reply
+  audio draining). Emitted on the same ledger-backed live path as
+  `file/attached`. See § 8.
+
 Router and queue (Wave4-A):
 
 - `router/status`, `router/failover`, `queue/state`
@@ -500,7 +577,24 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
-- `context/compaction_completed`, `context/normalization_reported`
+- `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
+
+Peer staging (#1801 v3, ungated):
+
+- `peer/staged` — agent-initiated peer staging: the model's `peer_handoff`
+  tool staged a sovereign peer session server-side (durable brief + optional
+  fenced worktree), and the client auto-opens the staged session (topic
+  `peer-<slug>`) in the background. `params` carry the ORIGINATING
+  `session_id` plus `topic`, `slug`, `brief`, `brief_path`, `cwd`,
+  `worktree_branch?`, and `profile_id` — the same facts a `peer/prepare`
+  result entry carries. Durable: reconnect replay redelivers it, so clients
+  dedup by existing session for the topic.
+- `peer/closed` — agent-initiated peer teardown: the model's `peer_close`
+  tool retired a staged peer (durable brief and optional fenced worktree
+  evicted), so the client tears down the peer pane it opened (topic
+  `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
+  `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
+  clients dedup by the already-closed peer for the topic.
 
 ## 7. Command Semantics
 
@@ -1522,6 +1616,69 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `invalid_params` on the over-cap guard; `resource_not_found` with
   `data.resource_type = "content"` on REST 404 (collection endpoint).
 
+#### `memory/overview`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/memory`
+- Params type: `MemoryOverviewParams` — `{}` (accepts `params: {}` or
+  `params: null`; the `params` member itself must be present — the
+  shared frame parser rejects a request without one, codex #1621 r5).
+- Result type: `MemoryOverviewResult` — `{ overview: MemoryOverviewResponse }`.
+  `overview` carries the REST panel body whole (`memory_panel.rs`), plus
+  RPC-layer truncation metadata: each document field is capped to a
+  per-field JSON-ESCAPED byte budget (`long_term` 96 KiB, `today`
+  48 KiB, each `recent[]` note 24 KiB) so the result fits one WS text
+  frame; capped fields are clean UTF-8 prefixes DECLARED via
+  `<field>_truncated` + `<field>_total_bytes` beside them (always
+  present) — never spliced with an in-band marker.
+- Errors: `auth_unavailable` (`-32120`) with WS close code
+  `1008 auth_expired` if the connection has no usable identity;
+  `resource_not_found` with `data.resource_type = "memory"` on REST 404
+  (collection-style endpoint — id is empty).
+
+#### `memory/entity`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/memory/entities/{name}`
+- Params type: `MemoryEntityParams` — `{ name: string }` (the entity
+  page stem, as returned in each overview entity summary).
+- Result type: `MemoryEntityResult` — `{ name: string, content: string,
+  content_truncated: bool, content_total_bytes: number }`. `content` is
+  capped at a 384 KiB JSON-ESCAPED budget; when capped it is a clean
+  UTF-8 prefix with the truth declared in the two metadata fields.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `resource_not_found` with `data.resource_type = "memory_entity"` and
+  `data.identifier = <name>` on REST 404.
+
+#### `cron/list`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/cron`
+- Params type: `CronListParams` — `{}` (accepts `params: {}` or
+  `params: null`; the `params` member itself must be present, as above).
+- Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
+  gateway_running: bool }`. Mirrors the REST body minus the redundant
+  `ok` flag; `gateway_running` reports whether a spawned gateway child
+  owns `cron.json` (toggles are refused while it does).
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `resource_not_found` with `data.resource_type = "cron"` on REST 404
+  (collection-style endpoint — id is empty).
+
+#### `cron/toggle`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `PUT /api/my/cron/{job_id}/enabled`
+- Params type: `CronToggleParams` — `{ job_id: string, enabled: bool }`.
+- Result type: `CronToggleResult` — `{ job: CronJobRow }`, rendered
+  exactly as a `cron/list` entry.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`.
+  Refusals forward the REST error body's `reason` as `data.detail` so
+  clients branch on typed fields, not message strings:
+  `data.detail = "gateway_running"` with `data.rest_status = 409` when a
+  spawned gateway owns the store, `resource_not_found` with
+  `data.resource_type = "cron_job"`, `data.identifier = <job_id>`, and
+  `data.detail = "job_not_found"` on a stale row.
+
 ## 8. Event Semantics
 
 ### `turn/started`
@@ -1744,6 +1901,24 @@ these events, NOT off `file/attached`. Payload fields:
 - `visual/failed` — `session_id`, `turn_id` (required); optional `topic`
   and `reason` (failure/timeout/cancel detail).
 
+### `voice/exit`
+
+Typed voice-exit signal introduced by `UPCR-2026-025`. A voice turn may
+append an in-band `[[EXIT]]` control marker after a short spoken farewell
+when the user expresses an end / goodbye / mute intent; the backend strips
+it from every model-/client-facing surface (live `message/delta`, persisted
+`response.content`, assistant carriers) and instead emits this structured
+event, so the client never scrapes the marker out of the assistant text.
+Ungated and emitted on the same ledger-backed live path as `file/attached`
+(durable append → replayed on reconnect).
+
+The client uses it to leave the `/voice` screen and return home, but gates
+the actual navigation on its OWN reply-audio queue draining — so the spoken
+farewell is heard before the screen changes. The event is the trigger; the
+client owns the timing. Payload fields:
+
+- `voice/exit` — `session_id`, `turn_id` (required); optional `topic`.
+
 ### `session/event`
 
 Wrapper envelope introduced by `UPCR-2026-014` (M9-α-9) that bridges
@@ -1850,6 +2025,26 @@ Required fields: `session_id`, `context_state`, `compaction`. Full field
 set, `UiContextState` shape, and `UiContextCompactionRecord` shape
 documented by
 [UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+
+### `context/compaction_started`
+
+Notification that a server-owned context-manager compaction pass is about
+to run. Emitted immediately before the pass with the PRE-compaction
+`context_state` (its `token_estimate` is the "before" size), the `trigger`
+label that the eventual `context/compaction_completed` record repeats, and
+`threshold_tokens` (the context-window-derived limit that tripped the
+pass) so clients can render an honest fullness percentage and an
+in-progress state (spinner/progress bar).
+
+Always followed by `context/compaction_completed` for the same pass.
+Today's serve compaction is synchronous, so both notifications may arrive
+in one delivery batch; clients MUST tolerate a zero-duration window.
+
+Capability gate: `context.lifecycle.v1`.
+
+Required fields: `session_id`, `context_state`, `trigger`,
+`threshold_tokens`. Documented by
+[UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
 
 ### `context/normalization_reported`
 
@@ -2171,11 +2366,16 @@ form).
 
 #### `tool_start`
 Tool invocation begun. The projection opens a tool-call card keyed on
-`tool_call_id`.
+`tool_call_id`. `arguments_preview` (optional) is a compact
+`key: value` echo of the call arguments, server-bounded to 700 chars
+(UTF-8-safe) — display fidelity for the card, not a replayable
+argument record. Omitted for argument-less calls and for envelopes
+persisted before the field existed.
 
 ```json
 { "type": "tool_start",
-  "data": { "tool_call_id": "tc-1", "name": "shell" } }
+  "data": { "tool_call_id": "tc-1", "name": "shell",
+            "arguments_preview": "command: \"cargo test\"" } }
 ```
 
 #### `tool_progress`
@@ -2191,11 +2391,18 @@ the projection appends in `seq` order.
 Tool invocation finished. `error` is set iff `status === "error"`;
 omitted on the wire when null. `reason` is an optional human-readable
 detail field, primarily populated for `skipped` and `aborted` outcomes
-(see below); omitted on the wire when null.
+(see below); omitted on the wire when null. `output_preview` (optional)
+carries the first lines of the tool result, server-bounded to
+2048 chars (UTF-8-safe) — the result excerpt under the tool card; the
+`error` field is bounded the same way. `duration_ms` (optional) is the
+call's wall-clock duration. Both are omitted for envelopes persisted
+before the fields existed.
 
 ```json
 { "type": "tool_end",
-  "data": { "tool_call_id": "tc-1", "status": "complete" } }
+  "data": { "tool_call_id": "tc-1", "status": "complete",
+            "output_preview": "test result: ok. 815 passed",
+            "duration_ms": 4321 } }
 ```
 
 ```json

@@ -48,6 +48,15 @@ pub struct Config {
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
 
+    /// When true, [`Config::get_api_key`] skips the global `AuthStore` lookup so
+    /// an explicitly-supplied key (e.g. the `env_vars`-injected key the
+    /// `octos-ffi` embedding API passes) is authoritative and cannot be silently
+    /// shadowed by a host's `octos auth login` credentials for the same
+    /// provider. Internal, not (de)serialized; default `false` preserves the
+    /// CLI / gateway resolution order.
+    #[serde(skip)]
+    pub bypass_auth_store: bool,
+
     /// Override auto-detected model behavior hints for the OpenAI provider.
     /// Useful for custom/unknown models behind OpenAI-compatible proxies.
     #[serde(default)]
@@ -76,6 +85,15 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
 
+    /// Workspace snapshot-undo configuration (#1768). Opt-in: when
+    /// `snapshots.enabled` is true, the agent records a git-backed
+    /// snapshot of the workspace (into a separate git dir under
+    /// `<data_dir>/snapshots/`, never the user's own `.git`) before each
+    /// mutating tool batch. Absent or `enabled: false` (the default) =
+    /// feature off.
+    #[serde(default)]
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
+
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
     pub tool_policy: Option<octos_agent::ToolPolicy>,
@@ -89,6 +107,10 @@ pub struct Config {
     #[serde(default)]
     pub embedding: Option<EmbeddingConfig>,
 
+    /// Memory subsystem configuration.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
+
     /// Fallback models for provider failover chain.
     /// When the primary provider fails with a retriable error, the next model is tried.
     #[serde(default)]
@@ -97,6 +119,15 @@ pub struct Config {
     /// Maximum agent iterations per message (overridden by --max-iterations).
     #[serde(default)]
     pub max_iterations: Option<u32>,
+
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt) and returns the
+    /// formatted content in the tool result. Formatters run file-scoped with
+    /// a sanitized environment and a hard 5s timeout; a missing binary or a
+    /// formatter failure never fails the edit. Default: false (opt-in).
+    #[serde(default)]
+    pub format_after_edit: bool,
 
     /// Lifecycle hooks for agent events.
     #[serde(default)]
@@ -210,6 +241,21 @@ pub struct Config {
     /// ensuring every shipped skill declares `sha256` in `manifest.json`.
     #[serde(default)]
     pub plugins: PluginsConfig,
+
+    /// Per-subcommand CLI-flag defaults — the "initial startup config".
+    ///
+    /// Keys are subcommand names (`serve`, `gateway`, `chat`); each value is a
+    /// JSON object of snake_case flag id → default value (e.g.
+    /// `{"serve": {"port": 50080, "solo": true}}`). Consulted by the startup
+    /// layering ([`crate::config_layer`]) BELOW an explicit CLI flag / env var
+    /// but ABOVE the built-in clap default, so operators can persist their
+    /// preferred flags without retyping them. Hand-edited in `config.json`.
+    ///
+    /// Unknown command keys round-trip untouched. The block is empty by default
+    /// and omitted from serialization so configs that never used it stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cli: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Plugin loader policy.
@@ -247,10 +293,13 @@ pub struct PluginsConfig {
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
 ///
-/// All fields are optional; an empty `[appui]` section preserves the
-/// historical behavior (no server-side default cwd, every session falls
-/// through Tier-3 of the `session_tool_registry` chain unchanged).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Both fields are optional. `default_session_cwd` defaults to `None` (no
+/// server-side default cwd; sessions fall through Tier-3 of the
+/// `session_tool_registry` chain unchanged), but `sessions_in_cwd` defaults
+/// to `true` — see its field doc for the coexistence trade-off — so an
+/// absent or empty `[appui]` section now enables per-project session storage
+/// for cwd-hinted launches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppUiConfig {
     /// Optional default workspace cwd for AppUi sessions. When set, every
@@ -264,6 +313,51 @@ pub struct AppUiConfig {
     /// `config.json`.
     #[serde(default)]
     pub default_session_cwd: Option<PathBuf>,
+
+    /// Relocate AppUi/stdio "coding-agent" session storage from the global
+    /// per-profile store (`<data_dir>/sessions/`) to a **per-project** store
+    /// at `<cwd>/.octos/sessions/`, so `resume` / `session/list` show the
+    /// conversations that belong to the folder the client launched in.
+    ///
+    /// Scope: only sessions opened with a `cwd`/`workspace_hint` (the
+    /// AppUi/coding-agent path). No-hint web-chat and every gateway session
+    /// stay on the per-profile store regardless of this flag — the
+    /// sessions-root resolver returns `profile.data_dir` when there is no
+    /// hint, so per-cwd storage is inert for those paths by construction.
+    ///
+    /// Default `true`: a bare launch in a folder resumes that folder's own
+    /// conversations, which is the launch-flow contract (`launch/resolve` +
+    /// the sticky `active-profile` marker record their per-project store).
+    /// An operator can still force the legacy global store by setting
+    /// `sessions_in_cwd = false`.
+    ///
+    /// Coexistence trade-off (this flip is NOT a migration): cwd-hinted
+    /// coding sessions created before the default flipped live under the old
+    /// per-profile store and do NOT appear in a per-project `session/list`
+    /// for their folder — their cwd was never persisted, so they cannot be
+    /// relocated. They remain reachable via a no-`cwd` `session/list` (which
+    /// still resolves to `profile.data_dir`). No-hint web-chat and every
+    /// gateway session are unaffected: they never used per-cwd storage, so
+    /// flipping the default is inert for those paths by construction.
+    #[serde(default = "default_sessions_in_cwd")]
+    pub sessions_in_cwd: bool,
+}
+
+/// Default for [`AppUiConfig::sessions_in_cwd`] — `true` so a bare launch in
+/// a folder resumes that folder's own conversations. Kept in sync with the
+/// manual [`Default`] impl below (serde uses this for a present `[appui]`
+/// missing the key; `Default` covers an absent `[appui]` section).
+fn default_sessions_in_cwd() -> bool {
+    true
+}
+
+impl Default for AppUiConfig {
+    fn default() -> Self {
+        Self {
+            default_session_cwd: None,
+            sessions_in_cwd: default_sessions_in_cwd(),
+        }
+    }
 }
 
 /// Top-level credential-pool configuration for `chat` / `serve`. Mirrors
@@ -517,10 +611,191 @@ pub struct EmbeddingConfig {
     /// Custom base URL for the embedding API.
     #[serde(default)]
     pub base_url: Option<String>,
+
+    /// Embedding model id (default: text-embedding-3-small). Set for
+    /// OpenAI-compatible providers with their own catalogs (e.g.
+    /// DashScope `text-embedding-v4`).
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// OpenAI-standard `dimensions` request field. The episodic HNSW
+    /// index is fixed at 1536 dims — set this when the model's native
+    /// output differs or its vectors are dropped to BM25-only.
+    #[serde(default)]
+    pub dimensions: Option<u32>,
+
+    /// Path to the local `.gguf` file for the in-process `llamacpp` provider
+    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
+    /// offload). Any GGUF embedding model works, e.g.
+    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
+    #[serde(default)]
+    pub model_path: Option<String>,
 }
 
 fn default_embedding_provider() -> String {
     "openai".to_string()
+}
+
+/// Memory subsystem configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryConfig {
+    /// Token budget for the memory block injected into the system prompt
+    /// (long-term memory + daily notes + bank summary combined). Defaults to
+    /// [`octos_memory::DEFAULT_MAX_INJECT_TOKENS`]. The budget is spent in
+    /// priority order (MEMORY.md, today's notes, bank abstracts, older daily
+    /// notes) and omissions are disclosed to the model with a marker.
+    #[serde(default)]
+    pub max_inject_tokens: Option<usize>,
+
+    /// Automatic memory refreshing (capture + consolidation pipeline).
+    #[serde(default)]
+    pub refresh: Option<MemoryRefreshConfig>,
+}
+
+/// Automatic memory-refresh settings. Default OFF: when disabled there is
+/// no `memory_note` tool, no capture policy in the prompt, no per-turn
+/// memory re-read, and no background sweep — behavior is identical to
+/// before the feature existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryRefreshConfig {
+    /// Master switch for the capture layer + read-side refresh + the
+    /// background extraction sweep. DEFAULT-ON: `None` means enabled —
+    /// automatic memory is the product behavior; set `false` (or
+    /// `OCTOS_MEMORY_REFRESH_ENABLED=0`) to opt out.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Model key for the extraction pass (unset → the profile's provider).
+    #[serde(default)]
+    pub extract_model: Option<String>,
+    /// Model key for the consolidation pass (unset → profile's provider).
+    #[serde(default)]
+    pub consolidate_model: Option<String>,
+    /// A session must be idle at least this long before it is swept.
+    #[serde(default)]
+    pub min_idle_minutes: Option<u64>,
+    /// Sessions idle longer than this are too old to sweep.
+    #[serde(default)]
+    pub max_session_age_days: Option<u64>,
+    /// Sessions extracted per pass.
+    #[serde(default)]
+    pub max_sessions_per_pass: Option<usize>,
+    /// Daily extraction-call budget per profile.
+    #[serde(default)]
+    pub max_extractions_per_day: Option<u32>,
+    /// Daily consolidation-run budget per profile (used by the
+    /// consolidator; reserved here so the config surface is complete).
+    #[serde(default)]
+    pub max_consolidations_per_day: Option<u32>,
+    /// Daily token budget per profile, shared by extraction+consolidation.
+    #[serde(default)]
+    pub max_daily_tokens: Option<u64>,
+    /// Background tick interval (extraction pass; consolidation piggybacks).
+    #[serde(default)]
+    pub consolidate_interval_minutes: Option<u64>,
+    /// Fast-lane debounce after a user note (consolidator; reserved).
+    #[serde(default)]
+    pub debounce_seconds: Option<u64>,
+    /// Entries unused/unrefreshed this long become archive candidates
+    /// (consolidator; reserved).
+    #[serde(default)]
+    pub unused_days: Option<u32>,
+    /// Durable MEMORY.md size cap enforced at consolidation (reserved).
+    #[serde(default)]
+    pub max_memory_file_tokens: Option<usize>,
+    /// Pending-confirm forget requests expire after this many days
+    /// (consolidator; reserved).
+    #[serde(default)]
+    pub pending_confirm_days: Option<u32>,
+    /// Hard input budget for one extraction call, tokens (CJK-aware
+    /// estimate). Provider metadata does not expose context windows, so
+    /// this is explicit.
+    #[serde(default)]
+    pub max_extract_input_tokens: Option<usize>,
+}
+
+impl MemoryRefreshConfig {
+    /// Resolve the sweep knobs, applying design defaults for unset fields.
+    pub fn knobs(config: Option<&MemoryConfig>) -> crate::memory_refresh::RefreshKnobs {
+        let refresh = config.and_then(|m| m.refresh.as_ref());
+        let get = |f: fn(&MemoryRefreshConfig) -> Option<u64>, default: u64| {
+            refresh.and_then(f).unwrap_or(default)
+        };
+        crate::memory_refresh::RefreshKnobs {
+            min_idle: std::time::Duration::from_secs(60 * get(|r| r.min_idle_minutes, 30)),
+            max_session_age: std::time::Duration::from_secs(
+                60 * 60 * 24 * get(|r| r.max_session_age_days, 10),
+            ),
+            max_sessions_per_pass: refresh.and_then(|r| r.max_sessions_per_pass).unwrap_or(2),
+            max_extractions_per_day: refresh
+                .and_then(|r| r.max_extractions_per_day)
+                .unwrap_or(20),
+            max_daily_tokens: get(|r| r.max_daily_tokens, 200_000),
+            interval: std::time::Duration::from_secs(
+                60 * get(|r| r.consolidate_interval_minutes, 30),
+            ),
+            max_extract_input_tokens: refresh
+                .and_then(|r| r.max_extract_input_tokens)
+                .unwrap_or(24_000),
+            max_inject_tokens: MemoryConfig::effective_max_inject_tokens(config),
+            max_consolidations_per_day: refresh
+                .and_then(|r| r.max_consolidations_per_day)
+                .unwrap_or(12),
+            debounce: std::time::Duration::from_secs(get(|r| r.debounce_seconds, 90)),
+            max_memory_file_tokens: refresh
+                .and_then(|r| r.max_memory_file_tokens)
+                .unwrap_or(8_000),
+            unused_days: refresh.and_then(|r| r.unused_days).unwrap_or(30),
+            pending_confirm_days: refresh.and_then(|r| r.pending_confirm_days).unwrap_or(7),
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// Effective injection budget, applying the default when unset.
+    pub fn effective_max_inject_tokens(config: Option<&MemoryConfig>) -> usize {
+        config
+            .and_then(|m| m.max_inject_tokens)
+            .unwrap_or(octos_memory::DEFAULT_MAX_INJECT_TOKENS)
+    }
+
+    /// Whether automatic memory refreshing (capture + read refresh) is on.
+    /// DEFAULT-ON: an absent memory/refresh block (or an unset `enabled`)
+    /// means enabled; only an explicit `false` opts out.
+    pub fn refresh_enabled(config: Option<&MemoryConfig>) -> bool {
+        config
+            .and_then(|m| m.refresh.as_ref())
+            .and_then(|r| r.enabled)
+            .unwrap_or(true)
+    }
+}
+
+/// Field-level host→profile memory inheritance (in-process runtimes: the
+/// profile bootstrap and the actor factory). A profile that says nothing
+/// inherits the host block wholesale; a profile block present only for
+/// knobs (tri-state `enabled` unset) still inherits the host's
+/// enabled/disabled decision — under DEFAULT-ON semantics dropping it
+/// would bypass a host-level opt-out.
+pub fn merge_host_memory_into_profile(
+    config: &mut Option<MemoryConfig>,
+    host_memory: Option<&MemoryConfig>,
+) {
+    let Some(host) = host_memory else {
+        return;
+    };
+    let mem = config.get_or_insert_with(Default::default);
+    if mem.max_inject_tokens.is_none() {
+        mem.max_inject_tokens = host.max_inject_tokens;
+    }
+    if mem.refresh.is_none() {
+        mem.refresh = host.refresh.clone();
+    } else if let (Some(profile_refresh), Some(host_refresh)) =
+        (mem.refresh.as_mut(), host.refresh.as_ref())
+    {
+        if profile_refresh.enabled.is_none() {
+            profile_refresh.enabled = host_refresh.enabled;
+        }
+    }
 }
 
 /// Email sending configuration for the `send_email` tool.
@@ -561,6 +836,46 @@ pub struct EmailConfig {
     pub feishu_region: Option<String>,
 }
 
+/// Non-secret Volcano (cloud) TTS settings. The **persisted** secret (the API
+/// token) is NEVER stored here — it lives in `env_vars["VOLC_TTS_TOKEN"]` so the
+/// shared masking/restore machinery covers it. The `token` field below is a
+/// runtime-only carrier (`#[serde(skip)]`): `ProfileRuntime::bootstrap` resolves
+/// the token from the profile's `env_vars` and stashes it here so the in-process
+/// `serve` path (which, unlike the gateway worker, does not get `env_vars`
+/// injected into `std::env`) can authenticate. It is never serialized and the
+/// `Debug` impl redacts it. Missing non-secret fields fall back to engine
+/// defaults at resolve time (see `voice_turn::resolve_volcano`).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CloudTtsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Runtime-only resolved API token (from `env_vars["VOLC_TTS_TOKEN"]`).
+    /// Never serialized; redacted in `Debug`.
+    #[serde(skip)]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for CloudTtsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudTtsConfig")
+            .field("appid", &self.appid)
+            .field("voice", &self.voice)
+            .field("cluster", &self.cluster)
+            .field("encoding", &self.encoding)
+            .field("endpoint", &self.endpoint)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Voice (ASR/TTS) configuration for auto-transcription and auto-synthesis.
 /// The OminiX API URL is a platform-wide setting via OMINIX_API_URL env var
 /// (default http://localhost:8080), NOT per-profile.
@@ -582,17 +897,23 @@ pub struct VoiceConfig {
     #[serde(default)]
     pub asr_language: Option<String>,
     /// Which TTS route to use for synthesized replies:
-    /// - `"auto"` (default): cloud Volcano when the `VOLC_TTS_*` env is
-    ///   configured, otherwise the on-device GPT-SoVITS engine.
-    /// - `"volcano"`: force cloud Volcano (falls back to on-device sovits
-    ///   when the env is missing or the request fails).
-    /// - `"sovits"`: force the on-device GPT-SoVITS engine.
-    /// - `"qwen3"`: force the on-device Qwen3-TTS pool.
+    /// - `"auto"` (default): cloud when a token is configured, else on-device.
+    /// - `"local"`: force the on-device ominix-api engine.
+    /// - `"cloud"`: force cloud Volcano (falls back to on-device when the token
+    ///   is missing or the request fails).
     ///
-    /// Cloud credentials always come from `VOLC_TTS_*` env vars (secrets are
-    /// never read from config); this switch only selects the *route*.
+    /// Legacy aliases accepted for back-compat: `"volcano"` → `cloud`;
+    /// `"sovits"` / `"qwen3"` → `local`.
+    ///
+    /// Cloud credentials: the non-secret settings live in `cloud` (CloudTtsConfig);
+    /// the token is read from `VOLC_TTS_TOKEN` (never stored in config).
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String,
+    /// Non-secret cloud (Volcano) TTS settings. `None` → resolve entirely from
+    /// `VOLC_TTS_*` env (back-compat). Per-profile override via
+    /// `ProfileConfig.tts_cloud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudTtsConfig>,
 }
 
 impl Default for VoiceConfig {
@@ -604,6 +925,7 @@ impl Default for VoiceConfig {
             default_voice: default_voice_preset(),
             asr_language: None,
             tts_provider: default_tts_provider(),
+            cloud: None,
         }
     }
 }
@@ -618,6 +940,54 @@ impl VoiceConfig {
         if let Some(v) = override_voice {
             if !v.is_empty() {
                 self.default_voice = v.to_string();
+            }
+        }
+        self
+    }
+
+    /// Apply a per-profile TTS route override (`auto`/`local`/`cloud`). Empty /
+    /// `None` leaves the serve-level route untouched.
+    pub fn with_tts_provider_override(mut self, override_provider: Option<&str>) -> Self {
+        if let Some(p) = override_provider {
+            if !p.is_empty() {
+                self.tts_provider = p.to_string();
+            }
+        }
+        self
+    }
+
+    /// Apply a per-profile cloud-TTS settings override. `None` leaves the
+    /// serve-level (or env-fallback) settings untouched.
+    pub fn with_cloud_override(mut self, override_cloud: Option<&CloudTtsConfig>) -> Self {
+        if let Some(c) = override_cloud {
+            self.cloud = Some(c.clone());
+        }
+        self
+    }
+
+    /// Resolve the cloud-TTS API token from a profile's `env_vars`
+    /// (`VOLC_TTS_TOKEN`, keychain-aware) and stash it on `cloud.token`.
+    ///
+    /// This bridges the gap that the in-process `serve` path does not get the
+    /// profile's `env_vars` injected into `std::env` (only the gateway worker
+    /// does), so `voice_turn::resolve_volcano` can read the token from the
+    /// runtime config instead. No-op when there is no `cloud` config, when the
+    /// token is already set, or when `env_vars` has no (resolvable) token.
+    pub fn with_cloud_token_from_env(
+        mut self,
+        env_vars: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        if let Some(cloud) = self.cloud.as_mut() {
+            if cloud.token.as_deref().unwrap_or("").is_empty() {
+                if let Some(raw) = env_vars.get("VOLC_TTS_TOKEN") {
+                    if let Some(resolved) =
+                        crate::auth::keychain::resolve_value("VOLC_TTS_TOKEN", raw)
+                    {
+                        if !resolved.is_empty() {
+                            cloud.token = Some(resolved);
+                        }
+                    }
+                }
             }
         }
         self
@@ -963,7 +1333,73 @@ impl Config {
 /// processes pick up the policy via env, even when the profile JSON they
 /// load omits the new `plugins` block.
 pub(crate) fn merge_env_plugin_policy_pub(config: &mut Config) {
-    merge_env_plugin_policy(config)
+    merge_env_plugin_policy(config);
+    merge_env_memory_policy(config);
+}
+
+/// Fill `memory.max_inject_tokens` from `OCTOS_MEMORY_MAX_INJECT_TOKENS`
+/// (set by `ProcessManager` from the host config.json) when the loaded
+/// config leaves it unset. Field-level merge: an explicit value in the
+/// loaded config always wins; the env var only fills the gap, so spawned
+/// gateways inherit the host budget even when their profile JSON omits it
+/// (or serializes an empty `memory: {}` block).
+fn merge_env_memory_policy(config: &mut Config) {
+    if config
+        .memory
+        .as_ref()
+        .and_then(|m| m.max_inject_tokens)
+        .is_none()
+    {
+        if let Ok(v) = std::env::var("OCTOS_MEMORY_MAX_INJECT_TOKENS") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                config
+                    .memory
+                    .get_or_insert_with(Default::default)
+                    .max_inject_tokens = Some(n);
+            }
+        }
+    }
+    // Same field-level rule for the refresh switch: the env only fills the
+    // gap when the loaded config says nothing about `memory.refresh.enabled`
+    // (block absent OR the tri-state left unset). With the DEFAULT-ON
+    // semantics the OFF direction matters most: a host that disabled
+    // memory mirrors `OCTOS_MEMORY_REFRESH_ENABLED=0` to spawned
+    // subprocesses, and that must beat the child's default-on. An explicit
+    // `enabled` in the config file still wins over the env.
+    if config
+        .memory
+        .as_ref()
+        .and_then(|m| m.refresh.as_ref())
+        .and_then(|r| r.enabled)
+        .is_none()
+    {
+        if let Ok(v) = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED") {
+            // Recognized values only — an empty or misspelled variable
+            // (easy in shell/Docker) must not silently opt out of the
+            // default-on behavior.
+            let parsed = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                other => {
+                    if !other.is_empty() {
+                        tracing::warn!(
+                            value = %v,
+                            "ignoring unrecognized OCTOS_MEMORY_REFRESH_ENABLED"
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some(on) = parsed {
+                config
+                    .memory
+                    .get_or_insert_with(Default::default)
+                    .refresh
+                    .get_or_insert_with(Default::default)
+                    .enabled = Some(on);
+            }
+        }
+    }
 }
 
 fn merge_env_plugin_policy(config: &mut Config) {
@@ -1167,6 +1603,47 @@ where
     Ok(())
 }
 
+/// Resolve the `config.json` path a command WOULD read/write, using existence
+/// checks only (never parses the file — safe when the config is malformed).
+///
+/// Mirrors [`Config::load_resolved`]'s precedence so `octos config` targets the
+/// exact same file the runtime loads:
+/// 1. `config_override` (an explicit `--config <FILE>`),
+/// 2. (default installs only) project-local `cwd/.octos/config.json`,
+/// 3. `ctx.config_home/config.json`,
+/// 4. (default installs only) legacy `~/.octos/config.json`.
+///
+/// Falls back to the canonical `config_home/config.json` (the write location)
+/// when no file exists yet.
+pub fn resolve_config_file_path(
+    cwd: &Path,
+    ctx: &crate::config_context::ConfigContext,
+    config_override: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = config_override {
+        return path.to_path_buf();
+    }
+    if ctx.is_default {
+        let local = cwd.join(".octos").join("config.json");
+        if local.exists() {
+            return local;
+        }
+    }
+    let home = ctx.config_home.join("config.json");
+    if home.exists() {
+        return home;
+    }
+    if ctx.is_default {
+        if let Some(home_dir) = dirs::home_dir() {
+            let legacy = home_dir.join(".octos").join("config.json");
+            if legacy != home && legacy.exists() {
+                return legacy;
+            }
+        }
+    }
+    home
+}
+
 impl Config {
     /// Path to the runtime config file under the resolved data dir.
     pub fn data_dir_config_path(data_dir: &Path) -> PathBuf {
@@ -1254,6 +1731,7 @@ impl Config {
         tracing::info!("no config.json found, using defaults");
         let mut config = Self::default();
         merge_env_plugin_policy(&mut config);
+        merge_env_memory_policy(&mut config);
         Ok((config, None))
     }
 
@@ -1280,8 +1758,11 @@ impl Config {
         // processes too. `ProcessManager` sets `OCTOS_PLUGINS_REQUIRE_SIGNED=1`
         // when the parent serve was launched with strict signing; we
         // OR-merge that into every Config so a profile JSON that omits
-        // the new block still inherits the strict policy.
+        // the new block still inherits the strict policy. The host memory
+        // budget rides the same mechanism via
+        // `OCTOS_MEMORY_MAX_INJECT_TOKENS`.
         merge_env_plugin_policy(&mut config);
+        merge_env_memory_policy(&mut config);
 
         // Log if migration changed something (don't silently rewrite user's config)
         if migrated {
@@ -1356,6 +1837,80 @@ impl Config {
     }
 
     /// Get the API key: auth store first, then environment variable.
+    /// [`Self::get_api_key`] with an explicit env-var override (e.g. the
+    /// embedding block's `api_key_env`): resolves through the SAME chain —
+    /// secret registration, auth store, `env_vars` (keychain-resolved),
+    /// process env — instead of a bare `std::env::var` read.
+    pub fn get_api_key_with_env(&self, provider: &str, env_var: Option<&str>) -> Result<String> {
+        match env_var {
+            // A CUSTOM var means "use this variable": the provider-scoped
+            // auth store must not win, or a stored `octos auth login -p
+            // openai` token would be sent to the custom OpenAI-compatible
+            // endpoint the override targets. But when the override IS the
+            // provider's default var name (a redundant-but-legal config),
+            // the full provider chain — auth store included — still
+            // applies, preserving pre-existing login-based setups.
+            // A registry-known key name (the provider's `api_key_env` OR any
+            // declared `key_env_aliases`, e.g. KIMI_API_KEY for moonshot) is
+            // NOT a custom override: run the FULL chain (auth store + sibling
+            // expansion) via `resolve_api_key`, so `octos doctor`, the dashboard,
+            // and embedding config agree with what `get_api_key` accepts. Without
+            // this, an init-generated Moonshot config (api_key_env=KIMI_API_KEY)
+            // would be misclassified as custom and skip the MOONSHOT_API_KEY
+            // fallback + auth store.
+            Some(var) if Self::provider_knows_key_env(provider, var) => {
+                self.resolve_api_key(provider, var.to_string())
+            }
+            // A genuinely custom var means "use this variable": the
+            // provider-scoped auth store must not win, or a stored `octos auth
+            // login -p openai` token would be sent to the custom
+            // OpenAI-compatible endpoint the override targets.
+            Some(var) => self.resolve_env_var_only(var),
+            None => self.get_api_key(provider),
+        }
+    }
+
+    /// The env-var name the provider chain would use by default.
+    pub(crate) fn provider_default_env_var(provider: &str) -> Option<String> {
+        Some(
+            octos_llm::registry::lookup(provider)
+                .and_then(|e| e.api_key_env)
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase())),
+        )
+    }
+
+    /// Whether `name` is one of `provider`'s known key env var names — its
+    /// registry `api_key_env` or a declared `key_env_alias`. For a provider not
+    /// in the registry, falls back to the conventional `{PROVIDER}_API_KEY`.
+    /// Case-sensitive (Unix env names are case-sensitive).
+    pub(crate) fn provider_knows_key_env(provider: &str, name: &str) -> bool {
+        match octos_llm::registry::lookup(provider) {
+            Some(entry) => entry.is_known_key_env(name),
+            None => name == format!("{}_API_KEY", provider.to_uppercase()),
+        }
+    }
+
+    /// Resolve a key from an explicit env-var name WITHOUT provider-scoped
+    /// auth-store lookup: secret registration → `env_vars` map (keychain-
+    /// resolved) → process env.
+    fn resolve_env_var_only(&self, env_var: &str) -> Result<String> {
+        octos_agent::register_secret_env_names([env_var]);
+        if let Some(value) = self.env_vars.get(env_var).and_then(|value| {
+            crate::auth::keychain::resolve_value(env_var, value).filter(|value| !value.is_empty())
+        }) {
+            return Ok(value);
+        }
+        // Treat an empty value as unset, matching `resolve_api_key`, so status
+        // reporting and resolution agree and an empty Bearer key is never sent.
+        match std::env::var(env_var) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            _ => Err(eyre::eyre!(
+                "{env_var} not set or empty (explicit embedding api_key_env)"
+            )),
+        }
+    }
+
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         // Resolve the env var name we expect to hold this provider's key, and
         // mark it as a secret FIRST — before any early return — so the
@@ -1373,31 +1928,70 @@ impl Config {
                 .map(String::from)
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
-        octos_agent::register_secret_env_names([env_var.as_str()]);
+        self.resolve_api_key(provider, env_var)
+    }
+
+    /// Shared resolution body: auth store → env_vars (keychain) → process
+    /// env, with the var name secret-registered first.
+    fn resolve_api_key(&self, provider: &str, env_var: String) -> Result<String> {
+        // Candidate env-var names. A provider may declare sibling key vars in
+        // the registry (e.g. Moonshot accepts MOONSHOT_API_KEY or KIMI_API_KEY).
+        // We only expand to those siblings when the configured var is ITSELF one
+        // of the provider's known key names — an arbitrary custom `api_key_env`
+        // override (e.g. a proxy key) stays exclusive so a missing override
+        // never falls back to an unrelated ambient credential.
+        let mut candidates = vec![env_var.clone()];
+        if let Some(entry) = octos_llm::registry::lookup(provider) {
+            // Only expand to sibling key vars when the configured var is itself
+            // a declared key name (case-sensitive — see `is_known_key_env`).
+            if entry.is_known_key_env(&env_var) {
+                for k in entry.key_env_names() {
+                    if !candidates.iter().any(|c| c == k) {
+                        candidates.push(k.to_string());
+                    }
+                }
+            }
+        }
+        octos_agent::register_secret_env_names(candidates.iter());
 
         // Check auth store first. Auth is GLOBAL: it lives under the resolver's
         // `auth_home` (OCTOS_CONFIG_DIR if set, else the XDG default). This is
         // independent of `--data-dir`, so per-profile gateways keep the host's
         // shared `octos auth login` credentials. We resolve the context with no
         // cli_data_dir because auth_home never depends on it.
-        let auth_home = crate::config_context::resolve_config_context(None).auth_home;
-        if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
-            if let Some(cred) = store.get(provider) {
-                if !cred.is_expired() {
-                    return Ok(cred.access_token.clone());
+        //
+        // `bypass_auth_store` opts out (used by octos-ffi): a caller that passed
+        // an explicit key must have it win over any ambient login credential.
+        if !self.bypass_auth_store {
+            let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+            if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
+                if let Some(cred) = store.get(provider) {
+                    if !cred.is_expired() {
+                        return Ok(cred.access_token.clone());
+                    }
                 }
             }
         }
 
-        if let Some(value) = self.env_vars.get(&env_var).and_then(|value| {
-            crate::auth::keychain::resolve_value(&env_var, value).filter(|value| !value.is_empty())
-        }) {
-            return Ok(value);
+        for name in &candidates {
+            if let Some(value) = self.env_vars.get(name).and_then(|value| {
+                crate::auth::keychain::resolve_value(name, value).filter(|value| !value.is_empty())
+            }) {
+                return Ok(value);
+            }
         }
 
-        std::env::var(&env_var).wrap_err_with(|| {
-            format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
-        })
+        for name in &candidates {
+            if let Ok(value) = std::env::var(name) {
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+            }
+        }
+
+        Err(eyre::eyre!(
+            "{env_var} not set or empty. Run `octos auth login -p {provider}` or set the env var"
+        ))
     }
 
     /// Validate the configuration, returning any warnings.
@@ -1548,6 +2142,26 @@ mod tests {
     use crate::config_context::TEST_ENV_LOCK as HOME_ENV_LOCK;
 
     #[test]
+    fn should_parse_snapshots_config_and_default_to_off_when_absent() {
+        // Absent → None (feature off, #1768 opt-in contract).
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.snapshots.is_none());
+
+        let config: Config =
+            serde_json::from_str(r#"{"snapshots": {"enabled": true, "keep_last": 7}}"#).unwrap();
+        let snapshots = config.snapshots.expect("snapshots block parsed");
+        assert!(snapshots.enabled);
+        assert_eq!(snapshots.keep_last, 7);
+
+        // Partial block keeps the documented defaults.
+        let config: Config = serde_json::from_str(r#"{"snapshots": {"enabled": true}}"#).unwrap();
+        assert_eq!(
+            config.snapshots.unwrap().keep_last,
+            octos_agent::DEFAULT_SNAPSHOT_KEEP_LAST
+        );
+    }
+
+    #[test]
     fn write_mutation_creates_file_with_pretty_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -1675,6 +2289,39 @@ mod tests {
         let json = r#"{"channels": [{"type": "cli"}]}"#;
         let gw: GatewayConfig = serde_json::from_str(json).unwrap();
         assert_eq!(gw.max_history, 50);
+    }
+
+    #[test]
+    fn appui_sessions_in_cwd_defaults_on_and_can_be_disabled() {
+        // Absent `[appui]` → the `#[serde(default)]` on the parent field calls
+        // `AppUiConfig::default()` → per-project storage ON.
+        let absent: Config = serde_json::from_str(r#"{"provider": "anthropic"}"#).unwrap();
+        assert!(
+            absent.appui.sessions_in_cwd,
+            "an absent [appui] section must default sessions_in_cwd on",
+        );
+
+        // Present `[appui]` missing the key → the field-level
+        // `#[serde(default = \"default_sessions_in_cwd\")]` path → ON.
+        let empty: Config =
+            serde_json::from_str(r#"{"provider": "anthropic", "appui": {}}"#).unwrap();
+        assert!(
+            empty.appui.sessions_in_cwd,
+            "an empty [appui] section must default sessions_in_cwd on",
+        );
+
+        // Explicit opt-out → the legacy global per-profile store is honored.
+        let disabled: Config = serde_json::from_str(
+            r#"{"provider": "anthropic", "appui": {"sessions_in_cwd": false}}"#,
+        )
+        .unwrap();
+        assert!(
+            !disabled.appui.sessions_in_cwd,
+            "an operator can still force the legacy global store off",
+        );
+
+        // The programmatic Default agrees with both serde paths.
+        assert!(AppUiConfig::default().sessions_in_cwd);
     }
 
     #[test]
@@ -2039,6 +2686,142 @@ mod tests {
         );
     }
 
+    /// Run `f` with HOME pointed at an empty temp dir (so the global auth store
+    /// is empty) and the config/XDG env vars cleared, plus the Moonshot key vars
+    /// the credential tests assert against removed from the ambient process env
+    /// (so a dev machine that happens to export one can't flip the result).
+    /// Serialized on the shared env lock; all vars restored afterwards.
+    #[allow(unsafe_code)]
+    fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = [
+            "HOME",
+            "OCTOS_HOME",
+            "OCTOS_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "MY_PROXY_KEY",
+            "kimi_api_key",
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            for k in &keys[1..] {
+                std::env::remove_var(k);
+            }
+        }
+        let out = f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn custom_api_key_env_override_stays_exclusive() {
+        // Regression: an explicit custom `api_key_env` must NOT fall back to a
+        // provider's sibling key vars — otherwise a missing proxy key would leak
+        // an ambient KIMI_API_KEY to a custom endpoint.
+        with_isolated_home(|| {
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("MY_PROXY_KEY".to_string()),
+                env_vars: std::collections::HashMap::from([(
+                    "KIMI_API_KEY".to_string(),
+                    "ambient-kimi".to_string(),
+                )]),
+                ..Default::default()
+            };
+            // MY_PROXY_KEY is unset; resolution must fail, not return the
+            // unrelated KIMI credential.
+            assert!(cfg.get_api_key("moonshot").is_err());
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn custom_api_key_env_matching_alias_case_insensitively_stays_exclusive() {
+        // Regression (codex P1): env var names are case-sensitive on Unix, so a
+        // genuinely custom `kimi_api_key` (lowercase) is NOT the declared
+        // KIMI_API_KEY and must stay exclusive — it must not fall back to an
+        // ambient MOONSHOT_API_KEY and leak it to a custom endpoint.
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "ambient-moonshot") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("kimi_api_key".to_string()),
+                ..Default::default()
+            };
+            assert!(cfg.get_api_key("moonshot").is_err());
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn moonshot_accepts_either_declared_key_name() {
+        // Regression (symmetry): an init-generated config uses api_key_env =
+        // KIMI_API_KEY, but a user who set MOONSHOT_API_KEY must still resolve,
+        // because both are declared key names for the provider.
+        with_isolated_home(|| {
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("KIMI_API_KEY".to_string()),
+                env_vars: std::collections::HashMap::from([(
+                    "MOONSHOT_API_KEY".to_string(),
+                    "mkey".to_string(),
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(cfg.get_api_key("moonshot").unwrap(), "mkey");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn moonshot_kimi_config_resolves_moonshot_var_from_process_env() {
+        // Regression: the headline scenario — init writes api_key_env=KIMI_API_KEY
+        // but the user exports MOONSHOT_API_KEY in their shell — resolves via the
+        // process-env candidate loop (not the env_vars map).
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "from-shell") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("KIMI_API_KEY".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(cfg.get_api_key("moonshot").unwrap(), "from-shell");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn get_api_key_with_env_alias_agrees_with_get_api_key() {
+        // Regression (codex P1): the explicit-env entry point must treat a
+        // declared alias (KIMI_API_KEY) as a known name and run the full chain,
+        // so doctor/dashboard/embedding agree with chat runtime — resolving the
+        // sibling MOONSHOT_API_KEY rather than misclassifying KIMI as custom.
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "from-shell") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.get_api_key_with_env("moonshot", Some("KIMI_API_KEY"))
+                    .unwrap(),
+                "from-shell"
+            );
+        });
+    }
+
     #[test]
     fn test_embedding_config_deserialize() {
         let json = r#"{
@@ -2086,6 +2869,21 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.tool_policy_by_provider.is_empty());
+    }
+
+    #[test]
+    fn should_default_format_after_edit_to_false_when_absent() {
+        // #1774: post-edit formatting is strictly opt-in.
+        let json = r#"{"provider": "anthropic"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.format_after_edit);
+    }
+
+    #[test]
+    fn should_deserialize_format_after_edit_opt_in() {
+        let json = r#"{"provider": "anthropic", "format_after_edit": true}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.format_after_edit);
     }
 
     #[test]
@@ -2316,11 +3114,14 @@ mod tests {
     fn should_expand_env_vars_in_authorized_approvers() {
         // Use an env var reliably present in the test environment instead of
         // mutating the environment (workspace is `deny(unsafe_code)`, and
-        // std::env::set_var is unsafe under edition 2024).
-        let var = if std::env::var("HOME").is_ok() {
-            "HOME"
-        } else {
+        // std::env::set_var is unsafe under edition 2024). Prefer PATH: other
+        // tests in this module temporarily set_var("HOME", fake_home) and
+        // restore it, so snapshotting HOME here raced them under parallel
+        // test threads (flaky expected-vs-expanded mismatch).
+        let var = if std::env::var("PATH").is_ok() {
             "PATH"
+        } else {
+            "HOME"
         };
         let expected = std::env::var(var).unwrap();
         let mut config = Config {
@@ -2411,5 +3212,396 @@ mod tests {
             base.with_default_voice_override(Some("")).default_voice,
             "doubao"
         );
+    }
+
+    #[test]
+    fn should_override_tts_provider_when_some_nonempty() {
+        let cfg = VoiceConfig::default().with_tts_provider_override(Some("cloud"));
+        assert_eq!(cfg.tts_provider, "cloud");
+    }
+
+    #[test]
+    fn should_keep_tts_provider_when_override_none_or_empty() {
+        let base = VoiceConfig::default();
+        let kept = base.clone().with_tts_provider_override(None);
+        assert_eq!(kept.tts_provider, base.tts_provider);
+        let kept2 = base.clone().with_tts_provider_override(Some(""));
+        assert_eq!(kept2.tts_provider, base.tts_provider);
+    }
+
+    #[test]
+    fn should_override_cloud_when_some() {
+        let cloud = CloudTtsConfig {
+            appid: Some("123".into()),
+            ..Default::default()
+        };
+        let cfg = VoiceConfig::default().with_cloud_override(Some(&cloud));
+        assert_eq!(cfg.cloud.unwrap().appid.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn should_roundtrip_cloud_tts_config_serde() {
+        let json = r#"{ "cloud": { "appid": "a", "voice": "BV700" } }"#;
+        let cfg: VoiceConfig = serde_json::from_str(json).unwrap();
+        let cloud = cfg.cloud.unwrap();
+        assert_eq!(cloud.appid.as_deref(), Some("a"));
+        assert_eq!(cloud.voice.as_deref(), Some("BV700"));
+        assert_eq!(cloud.cluster, None);
+    }
+
+    #[test]
+    fn should_never_serialize_cloud_token() {
+        let cloud = CloudTtsConfig {
+            appid: Some("a".into()),
+            token: Some("supersecret".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cloud).unwrap();
+        assert!(
+            !json.contains("token"),
+            "token key must not serialize: {json}"
+        );
+        assert!(
+            !json.contains("supersecret"),
+            "token value must not leak: {json}"
+        );
+    }
+
+    #[test]
+    fn should_redact_cloud_token_in_debug() {
+        let cloud = CloudTtsConfig {
+            token: Some("supersecret".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{cloud:?}");
+        assert!(
+            !dbg.contains("supersecret"),
+            "Debug must redact token: {dbg}"
+        );
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn should_resolve_cloud_token_from_env_vars() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("VOLC_TTS_TOKEN".to_string(), "T-abc".to_string());
+        let vc = VoiceConfig {
+            cloud: Some(CloudTtsConfig {
+                appid: Some("1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .with_cloud_token_from_env(&env);
+        assert_eq!(vc.cloud.unwrap().token.as_deref(), Some("T-abc"));
+    }
+
+    #[test]
+    fn should_not_resolve_cloud_token_when_no_cloud_config() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("VOLC_TTS_TOKEN".to_string(), "T-abc".to_string());
+        let vc = VoiceConfig::default().with_cloud_token_from_env(&env);
+        assert!(vc.cloud.is_none());
+    }
+
+    #[test]
+    fn should_overlay_profile_tts_provider_over_host_voice() {
+        let host = VoiceConfig {
+            tts_provider: "auto".into(),
+            ..Default::default()
+        };
+        let overridden = host
+            .with_tts_provider_override(Some("cloud"))
+            .with_cloud_override(Some(&CloudTtsConfig {
+                appid: Some("42".into()),
+                ..Default::default()
+            }));
+        assert_eq!(overridden.tts_provider, "cloud");
+        assert_eq!(overridden.cloud.unwrap().appid.as_deref(), Some("42"));
+    }
+
+    // --- memory refresh flag ---
+
+    #[test]
+    fn should_default_refresh_on_when_memory_absent_or_empty() {
+        // DEFAULT-ON: automatic memory is the product behavior; absence of
+        // config means enabled.
+        assert!(MemoryConfig::refresh_enabled(None));
+        let empty: MemoryConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(MemoryConfig::refresh_enabled(Some(&empty)));
+        let refresh_empty: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {}})).unwrap();
+        assert!(MemoryConfig::refresh_enabled(Some(&refresh_empty)));
+    }
+
+    #[test]
+    fn should_disable_refresh_only_when_explicitly_false() {
+        let off: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {"enabled": false}})).unwrap();
+        assert!(!MemoryConfig::refresh_enabled(Some(&off)));
+        let on: MemoryConfig =
+            serde_json::from_value(serde_json::json!({"refresh": {"enabled": true}})).unwrap();
+        assert!(MemoryConfig::refresh_enabled(Some(&on)));
+        // max_inject_tokens keeps its default independently.
+        assert_eq!(
+            MemoryConfig::effective_max_inject_tokens(Some(&on)),
+            octos_memory::DEFAULT_MAX_INJECT_TOKENS
+        );
+    }
+
+    #[test]
+    fn explicit_env_var_skips_provider_auth_store() {
+        // Even with provider-default resolution available, the explicit
+        // override must come from ITS variable only — never the
+        // provider-scoped auth store (codex R2: an OpenAI OAuth token
+        // must not be sent to a custom-endpoint embedder).
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("DASH_EMBED_KEY".to_string(), "dash-key".to_string());
+        // Provider-default path would resolve something else entirely;
+        // the explicit var wins regardless.
+        let key = config
+            .get_api_key_with_env("openai", Some("DASH_EMBED_KEY"))
+            .expect("explicit var resolves");
+        assert_eq!(key, "dash-key");
+        // And a MISSING explicit var is an error — no silent fallback to
+        // the provider chain.
+        assert!(
+            config
+                .get_api_key_with_env("openai", Some("NOPE_MISSING_VAR"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn default_name_override_ignores_top_level_api_key_env() {
+        // Mixed-provider config: primary provider pins the top-level
+        // api_key_env to ITS key; the embedding override naming the
+        // embedding provider's default var must still read THAT var.
+        // Auth-home isolated (codex R5): the default-name path consults
+        // the GLOBAL auth store first, so an ambient `octos auth login
+        // -p openai` on a dev/CI machine would shadow the env_vars
+        // assertion nondeterministically.
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_octos_home = std::env::var_os("OCTOS_HOME");
+        let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::remove_var("OCTOS_HOME");
+            std::env::remove_var("OCTOS_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        let mut config = Config {
+            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            ..Default::default()
+        };
+        config
+            .env_vars
+            .insert("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string());
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "openai-key".to_string());
+        let key = config.get_api_key_with_env("openai", Some("OPENAI_API_KEY"));
+
+        // SAFETY: still inside HOME_ENV_LOCK.
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_octos_home {
+                Some(v) => std::env::set_var("OCTOS_HOME", v),
+                None => std::env::remove_var("OCTOS_HOME"),
+            }
+            match original_octos_config {
+                Some(v) => std::env::set_var("OCTOS_CONFIG_DIR", v),
+                None => std::env::remove_var("OCTOS_CONFIG_DIR"),
+            }
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert_eq!(
+            key.expect("resolves"),
+            "openai-key",
+            "must not read the primary provider's var"
+        );
+    }
+
+    #[test]
+    fn provider_default_env_var_name_keeps_full_chain() {
+        // api_key_env set to the provider's OWN default name is redundant
+        // but legal — it must keep the full provider chain (auth store
+        // included), not the custom-var-only path. Here the chain falls
+        // through to env_vars, same as get_api_key would.
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "from-chain".to_string());
+        let via_override = config
+            .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
+            .expect("resolves");
+        let via_default = config.get_api_key("openai").expect("resolves");
+        assert_eq!(via_override, via_default);
+    }
+
+    #[test]
+    fn get_api_key_with_env_resolves_through_config_env_vars() {
+        // The override var must resolve through the same chain as normal
+        // keys — here via the config's env_vars map, NOT the process env.
+        let mut config = Config::default();
+        config.env_vars.insert(
+            "CUSTOM_EMBED_KEY".to_string(),
+            "from-config-map".to_string(),
+        );
+        let key = config
+            .get_api_key_with_env("openai", Some("CUSTOM_EMBED_KEY"))
+            .expect("resolves via env_vars map");
+        assert_eq!(key, "from-config-map");
+    }
+
+    #[test]
+    fn should_inherit_host_opt_out_when_profile_refresh_is_knobs_only() {
+        // Host explicitly disabled; profile block exists only for knobs.
+        let host = MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut profile = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                min_idle_minutes: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut profile, Some(&host));
+        assert!(
+            !MemoryConfig::refresh_enabled(profile.as_ref()),
+            "knobs-only profile blocks must inherit the host opt-out"
+        );
+        // The profile's own knob survives the merge.
+        assert_eq!(profile.unwrap().refresh.unwrap().min_idle_minutes, Some(5));
+
+        // An explicit profile decision beats the host.
+        let mut explicit = Some(MemoryConfig {
+            refresh: Some(MemoryRefreshConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        merge_host_memory_into_profile(&mut explicit, Some(&host));
+        assert!(MemoryConfig::refresh_enabled(explicit.as_ref()));
+
+        // Absent profile memory inherits the host block wholesale.
+        let mut absent: Option<MemoryConfig> = None;
+        merge_host_memory_into_profile(&mut absent, Some(&host));
+        assert!(!MemoryConfig::refresh_enabled(absent.as_ref()));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_let_env_disable_refresh_when_config_silent() {
+        // Host mirroring: OCTOS_MEMORY_REFRESH_ENABLED=0 must beat the
+        // child's default-on when the config file says nothing.
+        // Serialized: process-env mutation races every parallel test that
+        // loads a Config (same rule as the HOME-mutating tests).
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("OCTOS_MEMORY_REFRESH_ENABLED").ok();
+        unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", "0") };
+
+        let mut config = Config::default();
+        merge_env_memory_policy(&mut config);
+        assert!(!MemoryConfig::refresh_enabled(config.memory.as_ref()));
+
+        // An explicit config value wins over the env.
+        let mut explicit = Config {
+            memory: Some(MemoryConfig {
+                refresh: Some(MemoryRefreshConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        merge_env_memory_policy(&mut explicit);
+        assert!(MemoryConfig::refresh_enabled(explicit.memory.as_ref()));
+
+        // Malformed/empty values leave the default-on untouched.
+        for bad in ["", "banana"] {
+            unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", bad) };
+            let mut silent = Config::default();
+            merge_env_memory_policy(&mut silent);
+            assert!(
+                MemoryConfig::refresh_enabled(silent.memory.as_ref()),
+                "unrecognized env value {bad:?} must not opt out"
+            );
+        }
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", v) },
+            None => unsafe { std::env::remove_var("OCTOS_MEMORY_REFRESH_ENABLED") },
+        }
+    }
+
+    #[test]
+    fn should_round_trip_cli_block() {
+        // The `cli.<cmd>` block survives a deserialize → serialize → deserialize
+        // cycle, including a command key the typed struct doesn't know about.
+        let json = serde_json::json!({
+            "provider": "deepseek",
+            "cli": {
+                "serve": { "port": 50080, "solo": true },
+                "chat": { "sandbox": "workspace-write" },
+                "future_command": { "some_flag": 1 }
+            }
+        });
+        let config: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.cli.get("serve").and_then(|v| v.get("port")),
+            Some(&serde_json::json!(50080))
+        );
+        // A round-trip preserves every command section, including unknown ones.
+        let reserialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            reserialized.get("cli"),
+            Some(&serde_json::json!({
+                "serve": { "port": 50080, "solo": true },
+                "chat": { "sandbox": "workspace-write" },
+                "future_command": { "some_flag": 1 }
+            }))
+        );
+    }
+
+    #[test]
+    fn should_omit_empty_cli_block_from_serialization() {
+        // An empty `cli` map must NOT appear in serialized output, so configs
+        // that never used the feature stay byte-identical.
+        let config = Config::default();
+        let value = serde_json::to_value(&config).unwrap();
+        assert!(
+            value.get("cli").is_none(),
+            "empty cli block must be omitted, got {value:#}"
+        );
+    }
+
+    #[test]
+    fn should_default_cli_block_when_absent() {
+        // A legacy config.json with no `cli` key deserializes to an empty block.
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.cli.is_empty());
     }
 }

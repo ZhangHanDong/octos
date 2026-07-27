@@ -57,7 +57,11 @@ impl BudgetStop {
                      research/multi-step task, ask the agent to use \
                      `run_pipeline` (deep research) which delegates the \
                      work to specialised sub-agents instead of iterating \
-                     one tool call at a time."
+                     one tool call at a time. If this ran as a spawned \
+                     sub-agent (e.g. a repo-scale review), re-spawn it with a \
+                     higher `max_iterations` — the spawn tool accepts a \
+                     `max_iterations` field (up to 300); a broad from-scratch \
+                     review typically needs ~100–150."
                 )
             }
             Self::MaxTokens { used, limit } => {
@@ -74,6 +78,21 @@ impl BudgetStop {
             }
         }
     }
+}
+
+/// Tokens counted against the turn token budget: everything the provider
+/// processed. Per the [`octos_llm::TokenUsage`] contract, cache counts are
+/// DISJOINT from `input_tokens` on every provider (total prompt = input +
+/// cache_read + cache_write; inclusive wire formats are normalized at their
+/// parse boundary), so this sum is exact. Counting only input+output would
+/// let a cache-served Anthropic loop run ~10x past the cap that bounded it
+/// before prompt caching landed.
+fn budget_tokens_used(total_usage: &TokenUsage) -> u32 {
+    total_usage
+        .input_tokens
+        .saturating_add(total_usage.output_tokens)
+        .saturating_add(total_usage.cache_read_tokens)
+        .saturating_add(total_usage.cache_write_tokens)
 }
 
 impl Agent {
@@ -107,7 +126,7 @@ impl Agent {
             }
         }
         if let Some(max_tokens) = self.config.max_tokens {
-            let used = total_usage.input_tokens + total_usage.output_tokens;
+            let used = budget_tokens_used(total_usage);
             if used >= max_tokens {
                 return Some(BudgetStop::MaxTokens {
                     used,
@@ -166,6 +185,29 @@ mod tests {
     use super::super::{AgentConfig, TokenTracker};
 
     // ---------- AgentConfig::default ----------
+
+    #[test]
+    fn budget_counts_cache_tokens_as_used() {
+        // With prompt caching, Anthropic moves most of the prompt out of
+        // input_tokens into cache_read/cache_write — the budget must still
+        // see the full processed volume or the max_tokens gate fires ~10x
+        // late on cache-served loops.
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 4_000,
+            cache_write_tokens: 850,
+            ..Default::default()
+        };
+        assert_eq!(budget_tokens_used(&usage), 5_000);
+
+        let uncached = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        assert_eq!(budget_tokens_used(&uncached), 150);
+    }
 
     #[test]
     fn agent_config_default_values() {
@@ -237,6 +279,13 @@ mod tests {
             msg.contains("run_pipeline"),
             "expected a hint about 'run_pipeline' (the canonical \
              multi-step research path) in: {msg}"
+        );
+        // Self-correcting hint: a capped SPAWNED sub-agent's parent must learn
+        // it can re-spawn with a higher budget — otherwise the `max_iterations`
+        // lever is invisible and the orchestrator keeps starving review lanes.
+        assert!(
+            msg.contains("max_iterations"),
+            "expected the message to point at the `max_iterations` lever: {msg}"
         );
     }
 
@@ -408,6 +457,7 @@ mod tests {
                 output_tokens: 20,
                 ..Default::default()
             },
+            estimated_spend_usd: None,
             files_modified: vec![],
             files_to_send: vec![],
             streamed: false,

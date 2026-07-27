@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 FEATURES="${FEATURES:-api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3}"
-SKILL_CRATES="${SKILL_CRATES:--p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p skill-evolve}"
+SKILL_CRATES="${SKILL_CRATES:--p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home -p skill-evolve}"
 
 usage() {
   cat <<'EOF'
@@ -35,6 +35,21 @@ run_dashboard() {
   # on demand. We just verify the canonical script runs cleanly — there is
   # no committed bundle to diff against. See .gitignore for the rationale.
   ./scripts/build-dashboard.sh
+
+  # providers.json is DERIVED from the canonical model_catalog.json via this
+  # append-only generator. It exits nonzero on an unsupported parity case (a new
+  # catalog family with no env mapping, a lingering web-only model, or a
+  # read/write error); propagate that. A clean run that merely appended catalog
+  # models exits zero, so the git-status diff below catches ordinary drift.
+  if ! python3 scripts/sync-dashboard-providers.py; then
+    echo "sync-dashboard-providers.py reported a parity problem (see the WARNING lines above) — resolve it before merging."
+    exit 1
+  fi
+  if [ -n "$(git status --porcelain -- dashboard/src/providers.json)" ]; then
+    echo "dashboard/src/providers.json is out of date. Run scripts/sync-dashboard-providers.py and commit the result."
+    git status --short -- dashboard/src/providers.json
+    exit 1
+  fi
 }
 
 run_swarm_app() {
@@ -69,6 +84,9 @@ run_hosted_fast() {
   # helpers) is feature-gated, so `cargo test --workspace` above never compiles
   # it. Run the api-gated unit tests explicitly so this coverage is real.
   cargo test -p octos-cli --features api voice_turn -- --nocapture
+  # §6 catalog guard is in the same feature-gated `api` module; run it
+  # explicitly so UI Protocol spec/impl drift is caught here too.
+  cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
   cargo test -p octos-agent --test activate_tools_regression -- --nocapture
   cargo test -p octos-bus --test file_handle_resolve_tool_path -- --nocapture
 }

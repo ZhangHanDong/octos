@@ -1,6 +1,6 @@
 # LLM Providers & Routing
 
-Octos supports 14 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama).
+Octos supports 16 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama and Vertex AI, which uses a service-account JSON).
 
 ## Supported Providers
 
@@ -8,7 +8,8 @@ Octos supports 14 LLM providers out of the box. Each provider needs an API key s
 |----------|-------------|---------------|------------|---------|
 | `anthropic` | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | Native Anthropic | -- |
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | -- |
-| `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | Native Gemini | -- |
+| `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | `google` |
+| `vertex` | `VERTEX_SA_JSON` | gemini-2.5-flash | Vertex AI (Gemini) | `vertex-ai`, `vertexai` |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | -- |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | -- |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | -- |
@@ -16,10 +17,15 @@ Octos supports 14 LLM providers out of the box. Each provider needs an API key s
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | -- |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5 | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Auto (Anthropic/OpenAI) | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | -- |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | -- |
+
+**`vertex`** authenticates with a Google service-account JSON (resolved via `VERTEX_SA_JSON` — keychain marker, config value, or env) instead of an API key; the GCP project is read from the JSON and the region is fixed to `global`. It must be selected explicitly (`provider: "vertex"`) — bare `gemini-*` model names still resolve to the AI Studio `gemini` provider. **`r9s`** is a multi-protocol proxy that auto-detects the Anthropic Messages API for `claude-*` models and OpenAI Chat Completions otherwise.
+
+Any other OpenAI- or Anthropic-compatible endpoint (e.g. `wisemodel`, Together, Fireworks, Azure) is reachable by setting `base_url` on a provider — see [Custom Endpoints](#custom-endpoints).
 
 ## Configuration Methods
 
@@ -39,10 +45,33 @@ The `api_key_env` field overrides the default environment variable name for the 
 
 ### CLI Flags
 
+Every provider setting is also an `octos chat` flag, for one-off runs without touching config:
+
 ```bash
+# Known vendor (shorthand: supplies its default base URL + key env var)
 octos chat --provider deepseek --model deepseek-chat
-octos chat --model gpt-4o  # auto-detects provider from model name
+
+# Auto-detect the provider from the model name
+octos chat --model gpt-4o
+
+# Custom endpoint — name the real vendor, pick the wire protocol explicitly
+octos chat --provider zai --api-type anthropic \
+  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+
+# Full autonomy (bypass approvals + sandbox) alongside model selection
+octos chat --yolo --provider zai --api-type anthropic \
+  --base-url https://api.z.ai/api/anthropic --model glm-5.2
 ```
+
+| Flag | Meaning |
+|---|---|
+| `--provider <name>` | Provider name (`anthropic`, `openai`, `zai`, `deepseek`, …). Supplies its default base URL + API-key env var. |
+| `--model <name>` | Model to use. |
+| `--base-url <url>` | Custom endpoint (overrides the provider default). |
+| `--api-type <type>` (alias `--api-style`) | Wire protocol for `--base-url`: `anthropic`, `openai`, or `responses`. Overrides config's `api_type` — use this instead of overloading `--provider` with a vendor name. |
+| `--yolo` (`--dangerously-bypass-approvals-and-sandbox`) | Full autonomy — no approvals, no sandbox. Local single-user only. |
+
+CLI flags override config, which overrides the built-in default. The **API key is not a CLI flag** — it comes from the auth store, config, or an environment variable (see [Providing the API Key](#providing-the-api-key)).
 
 ### Auth Store
 
@@ -67,6 +96,40 @@ octos auth logout --provider openai
 ```
 
 Credentials are stored in `~/.octos/auth.json` (file mode 0600). The auth store is checked **before** environment variables when resolving API keys.
+
+### Providing the API Key
+
+There is **no `--api-key` flag** — the key is resolved, in order:
+
+1. **Auth store** — `octos auth login --provider <name>` (stored once, in `~/.octos/auth.json`).
+2. **Config** — the `env_vars` map in `config.json` (below), or an `api_key_env` pointing at a variable.
+3. **Environment variable** — whose name is the provider's default: `zai` → `ZAI_API_KEY`, `anthropic` → `ANTHROPIC_API_KEY`, `openai` → `OPENAI_API_KEY`, `deepseek` → `DEEPSEEK_API_KEY`, … (see the [table above](#supported-providers)).
+
+```bash
+# Quickest — export the provider's env var, then run
+export ZAI_API_KEY=<your-key>
+octos chat --provider zai --api-type anthropic \
+  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+
+# Or log in once (no env var afterward)
+octos auth login --provider zai      # prompts: "Paste your API key:"
+octos auth status                    # which providers are logged in
+octos auth keys                      # keys + keychain vs plaintext
+```
+
+Or bake it into `config.json` so nothing is needed at runtime:
+
+```json
+{
+  "provider": "zai",
+  "model": "glm-5.2",
+  "base_url": "https://api.z.ai/api/anthropic",
+  "api_type": "anthropic",
+  "env_vars": { "ZAI_API_KEY": "<your-key>" }
+}
+```
+
+> Passing a secret on the command line would land it in shell history and the process list; prefer `octos auth login`, an env var, or the config `env_vars` map.
 
 ## Auto-Detection
 
@@ -121,18 +184,28 @@ Use `base_url` to point at self-hosted or proxy endpoints:
 
 ### API Type Override
 
-The `api_type` field forces a specific wire format when a provider uses a non-standard protocol:
+`api_type` forces a specific wire protocol when a custom `base_url` speaks a known format under a non-matching provider name — so you name the real vendor with `provider` and pick the protocol with `api_type`, rather than overloading `provider` with a protocol name.
+
+In config:
 
 ```json
 {
   "provider": "zai",
-  "model": "glm-5",
+  "model": "glm-5-turbo",
   "api_type": "anthropic"
 }
 ```
 
+Or on the command line with `--api-type` (alias `--api-style`), which overrides the config value:
+
+```bash
+octos chat --provider zai --api-type anthropic \
+  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+```
+
 - `"openai"` -- OpenAI Chat Completions format (default for most providers)
-- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies)
+- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies, e.g. z.ai/GLM)
+- `"responses"` -- OpenAI Responses API format
 
 ## Fallback Chains
 
@@ -150,7 +223,7 @@ Configure a priority-ordered fallback chain. If the primary provider fails, the 
     },
     {
       "provider": "gemini",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key_env": "GEMINI_API_KEY"
     }
   ]

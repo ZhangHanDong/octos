@@ -209,11 +209,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let my_api = Router::new()
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        .route("/api/my/profile/qr", get(auth_handlers::my_profile_qr))
         // Reply-voice selection: list synthesizable voices + set this user's
         // sticky default. Both need the caller's identity, so they live in the
         // authenticated `my_api` group.
         .route("/api/voices", get(auth_handlers::list_voices))
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
+        // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
+        .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // Memory + Cron panel REST routes retired in favor of the UI Protocol
+        // methods (`memory/overview`, `memory/entity`, `cron/list`,
+        // `cron/toggle`, gated by `auxiliary.rest_to_ws.v1`), which wrap the
+        // SAME `memory_panel::*` / `cron_panel::*` handlers over the WS
+        // transport. `cron/list` is now byte-budget-bounded (row + serialized
+        // caps with a `truncated` signal), matching `memory/overview`, so it is
+        // safe as the sole transport. Mirrors the earlier `/api/my/content` →
+        // `content/*` retirement (M12 Phase D-5): one implementation, one
+        // transport.
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
@@ -494,6 +506,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // System metrics
         .route("/api/admin/system/metrics", get(admin::system_metrics))
+        .route("/api/admin/serve/logs", get(admin::serve_logs))
         .route("/api/admin/operator/summary", get(admin::operator_summary))
         .route("/api/admin/operator/tasks", get(admin::operator_tasks))
         // Monitor control

@@ -78,8 +78,19 @@ impl ModelHints {
         let uses_completion_tokens =
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
-        let fixed_temperature =
-            is_o_series || m.starts_with("gpt-5") || m.contains("kimi-k2") || m == "gpt-4.1-nano";
+        // kimi-k3 pins its sampling params server-side (temperature=1.0,
+        // top_p=0.95, …) and rejects overrides, so never send temperature. The
+        // Kimi *coding plan* (family `moonshot-coding`) exposes the SAME K3
+        // model under the bare ids `k3` / `kimi-for-coding*`, which don't
+        // contain `kimi-k3` — match them too, or the endpoint 400s with
+        // "invalid temperature: only 1 is allowed for this model".
+        let fixed_temperature = is_o_series
+            || m.starts_with("gpt-5")
+            || m.contains("kimi-k2")
+            || m.contains("kimi-k3")
+            || m == "k3"
+            || m.starts_with("kimi-for-coding")
+            || m == "gpt-4.1-nano";
 
         // Vision capability is NO LONGER inferred from the model name. The old
         // allow/deny list wrongly stripped images from vision-capable models —
@@ -102,7 +113,10 @@ impl ModelHints {
         // Reasoning-control style on the chat/completions path. DeepSeek V4
         // (incl. `deepseek-reasoner`, a V4-Flash thinking alias) wants
         // `reasoning_effort` + a `thinking` toggle; OpenAI reasoning models and
-        // grok-4.x take a plain `reasoning_effort`. Everything else emits nothing.
+        // grok-4.x take a plain `reasoning_effort`; Kimi K3 takes a top-level
+        // `reasoning_effort` whose only accepted value is `"max"` (thinking is
+        // always on and K3 rejects the K2.x `thinking` object). Everything else
+        // emits nothing.
         // Effort/thinking is only EMITTED when an operator sets `reasoning_effort`
         // (opt-in), and the style is config-overridable per route — important
         // because the same `deepseek-v4` name fronts endpoints that differ
@@ -111,6 +125,30 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
+        } else if m.contains("kimi-k3") || m == "k3" || m.starts_with("kimi-for-coding") {
+            // K3, incl. the coding plan's bare `k3` and `kimi-for-coding*` ids
+            // (same K3 model, different ids that don't contain `kimi-k3`): per
+            // its quickstart docs `reasoning_effort` accepts low|high|max
+            // (default max); thinking is always on and the K2.x `thinking`
+            // object is rejected. Graded effort IS honored — do NOT collapse
+            // everything to "max". (These ids already pin temperature above;
+            // they must get the graded style too or `/thinking` is a no-op.)
+            ReasoningStyle::EffortLowHighMax
+        } else if m.contains("glm-4.5")
+            || m.contains("glm-4.6")
+            || m.contains("glm-5")
+            || m.contains("glm-z")
+        {
+            // GLM-4.5+/4.6/5.x + the z-reasoning line (Zhipu / Z.ai, e.g.
+            // `glm-5.2`): thinking is a binary `thinking:{"type":"enabled"}`
+            // toggle, no graded effort. Any set effort level enables thinking.
+            // Narrowed from a bare `contains("glm")`: legacy `glm-4`/`glm-4-plus`/
+            // `glm-3` REJECT the thinking object (400), so they must not match.
+            // NOTE: the SHIPPED `glm-5.2` route runs through AnthropicProvider
+            // (Z.ai's Anthropic-compatible endpoint), which maps `/thinking` via
+            // `build_anthropic_thinking`; this arm only governs a GLM added
+            // through an OpenAI-compatible endpoint.
+            ReasoningStyle::ThinkingToggle
         } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
             ReasoningStyle::Effort
         } else {
@@ -143,6 +181,48 @@ pub enum ReasoningStyle {
     Effort,
     /// `reasoning_effort` plus `thinking: {"type": "enabled"}` — DeepSeek V4.
     EffortAndThinkingToggle,
+    /// Top-level `reasoning_effort` whose only accepted value is `"max"`. Legacy
+    /// / manual-override only — retained for configs that pin it; Kimi K3 now uses
+    /// [`ReasoningStyle::EffortLowHighMax`] since K3's docs list `low|high|max`.
+    EffortMaxOnly,
+    /// Top-level `reasoning_effort: "low"|"high"|"max"` (default `"max"`) — Kimi
+    /// K3. Per K3's quickstart docs it accepts exactly those three values, thinking
+    /// is ALWAYS on, and the K2.x `thinking` object must NOT be sent. octos has no
+    /// K3-native "medium" tier, so `Medium` clamps up to `"high"`; `Max` maps to
+    /// `"max"` (NOT clamped to "high" like the Effort style). No effort configured
+    /// ⇒ nothing emitted (K3 still thinks — its server-side `max` default).
+    EffortLowHighMax,
+    /// Binary `thinking: {"type": "enabled"}` toggle with NO `reasoning_effort` —
+    /// GLM-4.5+/5.x (Zhipu / Z.ai), which control thinking via enable/disable and
+    /// do not accept graded effort. Any configured effort level ENABLES thinking;
+    /// no effort configured ⇒ nothing emitted (the model's server-side default).
+    ThinkingToggle,
+}
+
+/// Serialize tool-call arguments for the request wire as a JSON **object**
+/// string. Chat/completions providers validate `function.arguments` and reject
+/// the ENTIRE request with a non-retryable HTTP 400 when it does not decode to
+/// an object — which a tool call recovered from inline/malformed model output
+/// can be (a bare string, or a truncated fragment). Coercing a non-object to
+/// `{}` keeps the request valid; the model then sees an ordinary empty-arg call
+/// and can retry, instead of the whole turn/task dying. Objects pass through
+/// byte-identically, so this is a no-op on the normal path. See #1711.
+fn tool_call_arguments_to_wire(arguments: &serde_json::Value) -> String {
+    if arguments.is_object() {
+        return arguments.to_string();
+    }
+    // Recover a stringified object (e.g. `"{\"command\":\"ls\"}"`).
+    if let serde_json::Value::String(inner) = arguments
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner)
+        && parsed.is_object()
+    {
+        return parsed.to_string();
+    }
+    tracing::warn!(
+        target: "octos::toolcall_repair",
+        "coerced non-object tool-call arguments to empty object at request boundary (#1711)"
+    );
+    "{}".to_string()
 }
 
 /// OpenAI GPT provider.
@@ -325,28 +405,42 @@ impl OpenAIProvider {
                             call_type: "function".to_string(),
                             function: FunctionCall {
                                 name: tc.name.clone(),
-                                arguments: tc.arguments.to_string(),
+                                arguments: tool_call_arguments_to_wire(&tc.arguments),
                             },
                         })
                         .collect()
                 });
-                // Kimi-k2 (and similar thinking models) require reasoning_content
-                // to be present (even empty) on ALL assistant messages when thinking
-                // is enabled. When omitted, the API returns 400 "reasoning_content
-                // is missing in assistant tool call message".
-                // Only synthesize a stub for models that actually need it (detected
-                // via fixed_temperature + model name containing "kimi-k2").
-                // NOTE: deepseek-v4's official API was verified NOT to enforce this
-                // (multi-round-with-tools returns 200 without reasoning_content), and
-                // a "." stub could break non-official deepseek-v4 endpoints
-                // (nvidia/vllm) that don't expect the field — so it is NOT stubbed.
-                // Real reasoning_content the model returns is still round-tripped below.
-                let needs_reasoning_stub =
-                    self.hints.fixed_temperature && self.model.to_lowercase().contains("kimi-k2");
-                let reasoning = match m.reasoning_content.as_deref() {
-                    Some(r) if !r.is_empty() => Some(r),
-                    _ if role == "assistant" && needs_reasoning_stub => Some("."),
-                    _ => None,
+                // We do NOT re-send prior assistant reasoning_content for ordinary
+                // openai-compat models. Reasoning models re-derive their chain of
+                // thought each turn, so round-tripping the full verbose reasoning is
+                // pure context bloat (and grows unboundedly across a tool loop) —
+                // OpenAI's own API and codex both drop it.
+                //
+                // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
+                // returns 400 "reasoning_content is missing in assistant tool call
+                // message" if the field is absent, AND (b) per kimi's docs preserves
+                // historical assistant reasoning for multi-step tool-use continuity
+                // (K3's quickstart likewise mandates "add the complete assistant
+                // message returned by the API to the next request. Do not keep only
+                // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
+                // present, and fall back to a minimal "." stub only to satisfy the
+                // presence check when it's absent.
+                //
+                // kimi-k2/k3 are detected via fixed_temperature + model name
+                // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
+                // verified live to return 200 without the field, and non-official
+                // nvidia/vllm endpoints that don't expect it) get no
+                // reasoning_content at all.
+                let model_lower = self.model.to_lowercase();
+                let needs_reasoning_stub = self.hints.fixed_temperature
+                    && (model_lower.contains("kimi-k2") || model_lower.contains("kimi-k3"));
+                let reasoning = if role == "assistant" && needs_reasoning_stub {
+                    match m.reasoning_content.as_deref() {
+                        Some(r) if !r.is_empty() => Some(r),
+                        _ => Some("."),
+                    }
+                } else {
+                    None
                 };
 
                 OpenAIMessage {
@@ -416,25 +510,48 @@ impl OpenAIProvider {
         // request fields the model's ReasoningStyle expects. Emitted only when
         // an effort is configured AND the model declares a non-None style, so
         // it stays a no-op for models/endpoints that don't accept it.
-        let (reasoning_effort, thinking) =
+        let (reasoning_effort, thinking): (Option<&str>, Option<serde_json::Value>) =
             match (config.reasoning_effort, self.hints.reasoning_style) {
                 (Some(effort), style) if style != ReasoningStyle::None => {
                     use crate::config::ReasoningEffort as RE;
-                    let effort_str = match (effort, style) {
-                        (RE::Low, _) => "low",
-                        (RE::Medium, _) => "medium",
-                        (RE::High, _) => "high",
-                        // DeepSeek V4 accepts "max"; Effort-style providers
-                        // (OpenAI/Grok) have no max tier, so clamp to "high".
-                        (RE::Max, ReasoningStyle::EffortAndThinkingToggle) => "max",
-                        (RE::Max, _) => "high",
-                    };
-                    let thinking = if style == ReasoningStyle::EffortAndThinkingToggle {
-                        Some(serde_json::json!({ "type": "enabled" }))
-                    } else {
-                        None
-                    };
-                    (Some(effort_str), thinking)
+                    let enabled = || serde_json::json!({ "type": "enabled" });
+                    match style {
+                        // GLM-4.5+/5.x: binary thinking toggle, NO reasoning_effort.
+                        ReasoningStyle::ThinkingToggle => (None, Some(enabled())),
+                        // Kimi K3: low|high|max (no medium tier → clamp up to high;
+                        // Max stays "max", NOT clamped to "high"). Thinking always on.
+                        ReasoningStyle::EffortLowHighMax => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium | RE::High => "high",
+                                RE::Max => "max",
+                            };
+                            (Some(e), None)
+                        }
+                        // Legacy manual-override: everything → "max".
+                        ReasoningStyle::EffortMaxOnly => (Some("max"), None),
+                        // DeepSeek V4: reasoning_effort + `thinking` toggle.
+                        ReasoningStyle::EffortAndThinkingToggle => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium => "medium",
+                                RE::High => "high",
+                                RE::Max => "max",
+                            };
+                            (Some(e), Some(enabled()))
+                        }
+                        // OpenAI/Grok: low|medium|high, no max tier → clamp to high.
+                        ReasoningStyle::Effort => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium => "medium",
+                                RE::High => "high",
+                                RE::Max => "high",
+                            };
+                            (Some(e), None)
+                        }
+                        ReasoningStyle::None => (None, None),
+                    }
                 }
                 _ => (None, None),
             };
@@ -480,7 +597,9 @@ impl LlmProvider for OpenAIProvider {
         // `is_image_modality_error` / `ModelHints::detect`.
         if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
             let body = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&body) {
+            if is_image_modality_error(&body)
+                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
@@ -579,10 +698,22 @@ impl LlmProvider for OpenAIProvider {
             reasoning_content,
             tool_calls,
             stop_reason,
-            usage: TokenUsage {
-                input_tokens: api_response.usage.prompt_tokens,
-                output_tokens: api_response.usage.completion_tokens,
-                ..Default::default()
+            usage: {
+                // OpenAI reports cached tokens INSIDE prompt_tokens; the
+                // TokenUsage contract is disjoint (Anthropic-style: total
+                // prompt = input + cache_read), so subtract at the boundary.
+                let cached = api_response
+                    .usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0);
+                TokenUsage {
+                    input_tokens: api_response.usage.prompt_tokens.saturating_sub(cached),
+                    output_tokens: api_response.usage.completion_tokens,
+                    cache_read_tokens: cached,
+                    ..Default::default()
+                }
             },
             provider_index: None,
         })
@@ -601,7 +732,9 @@ impl LlmProvider for OpenAIProvider {
         // text-only if the endpoint rejected the image content parts.
         if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
             let text = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&text) {
+            if is_image_modality_error(&text)
+                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
@@ -930,6 +1063,18 @@ struct FunctionCall {
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Automatic prompt-cache breakdown. `cached_tokens` counts the portion
+    /// of `prompt_tokens` served from OpenAI's cache (INCLUDED in
+    /// `prompt_tokens`, unlike Anthropic's disjoint accounting). Compat
+    /// providers that omit the object parse as `None`.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 // --- Streaming SSE helpers (shared with OpenRouter) ---
@@ -1016,9 +1161,16 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
     }
 
     if let Some(usage) = data.get("usage").filter(|u| !u.is_null()) {
+        // OpenAI reports cached tokens INSIDE prompt_tokens; the TokenUsage
+        // contract is disjoint (total prompt = input + cache_read).
+        let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+        let cached = usage["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0) as u32;
         events.push(StreamEvent::Usage(TokenUsage {
-            input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+            input_tokens: prompt.saturating_sub(cached),
             output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            cache_read_tokens: cached,
             ..Default::default()
         }));
     }
@@ -1032,6 +1184,40 @@ mod tests {
     use crate::config::ChatConfig;
     use crate::provider::LlmProvider;
     use octos_core::{Message, MessageRole};
+
+    #[test]
+    fn tool_call_arguments_wire_passes_objects_through() {
+        let obj = serde_json::json!({"command": "ls -la"});
+        let wire = tool_call_arguments_to_wire(&obj);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            obj
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_coerces_non_object_to_empty_object() {
+        // A bare string is what the old inline fallback produced; serialized
+        // verbatim it caused the provider HTTP 400. It must become `{}`.
+        let bare = serde_json::Value::String("git clone https://x".to_string());
+        assert_eq!(tool_call_arguments_to_wire(&bare), "{}");
+        // Arrays/numbers/null are also not valid arguments objects.
+        assert_eq!(
+            tool_call_arguments_to_wire(&serde_json::json!([1, 2])),
+            "{}"
+        );
+        assert_eq!(tool_call_arguments_to_wire(&serde_json::Value::Null), "{}");
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_recovers_a_stringified_object() {
+        let stringified = serde_json::Value::String(r#"{"command":"ls"}"#.to_string());
+        let wire = tool_call_arguments_to_wire(&stringified);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            serde_json::json!({"command": "ls"})
+        );
+    }
 
     fn msg(content: &str) -> Message {
         Message {
@@ -1247,6 +1433,34 @@ mod tests {
             ModelHints::detect("gpt-5.3-codex").reasoning_style,
             ReasoningStyle::Effort
         );
+        // Kimi K3 (incl. provider-prefixed) -> low|high|max reasoning_effort.
+        assert_eq!(
+            ModelHints::detect("kimi-k3").reasoning_style,
+            ReasoningStyle::EffortLowHighMax
+        );
+        assert_eq!(
+            ModelHints::detect("moonshotai/kimi-k3").reasoning_style,
+            ReasoningStyle::EffortLowHighMax
+        );
+        // GLM-4.5+/5.x (Zhipu / Z.ai) -> binary thinking toggle.
+        assert_eq!(
+            ModelHints::detect("glm-5.2").reasoning_style,
+            ReasoningStyle::ThinkingToggle
+        );
+        assert_eq!(
+            ModelHints::detect("zai-org/glm-4.6").reasoning_style,
+            ReasoningStyle::ThinkingToggle
+        );
+        // Legacy GLM (pre-4.5) REJECTS the `thinking` object — it must NOT get
+        // the toggle style (a bare `contains("glm")` used to misfire here and
+        // send an unsupported field → 400).
+        for legacy in ["glm-4", "glm-4-plus", "zhipu/glm-4-air", "glm-3-turbo"] {
+            assert_eq!(
+                ModelHints::detect(legacy).reasoning_style,
+                ReasoningStyle::None,
+                "{legacy} predates the thinking toggle and must emit no reasoning control"
+            );
+        }
         // Non-thinking / unknown-control models emit nothing. grok-3 is
         // excluded (only grok-4.x is known to accept reasoning_effort).
         for m in [
@@ -1362,8 +1576,7 @@ mod tests {
         // deepseek-v4's official API was verified live NOT to require
         // reasoning_content on assistant tool-call messages (multi-round returns
         // 200 without it), and a "." stub could break non-official endpoints
-        // (nvidia/vllm). So no stub — only kimi-k2 gets one. Real
-        // reasoning_content the model returns is still round-tripped.
+        // (nvidia/vllm). So no stub — only kimi-k2 gets one.
         let p = OpenAIProvider::new("key", "deepseek-v4-pro");
         let mut assistant = msg("the answer");
         assistant.role = MessageRole::Assistant;
@@ -1379,6 +1592,254 @@ mod tests {
         assert!(
             a.get("reasoning_content").is_none(),
             "deepseek-v4 assistant message must not get a reasoning_content stub"
+        );
+    }
+
+    #[test]
+    fn build_request_drops_prior_reasoning_content_for_non_kimi_model() {
+        // (a) A non-kimi reasoning model must NOT have prior verbose
+        // reasoning_content round-tripped back into the request — reasoning
+        // models re-derive their chain of thought each turn, so re-sending it
+        // is pure context bloat. The field must be absent entirely.
+        let p = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let mut assistant = msg("the final answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content =
+            Some("a very long prior chain of thought that should not be re-sent".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert!(
+            a.get("reasoning_content").is_none(),
+            "non-kimi model must drop prior reasoning_content, got: {:?}",
+            a.get("reasoning_content")
+        );
+    }
+
+    #[test]
+    fn build_request_preserves_reasoning_for_kimi_k2() {
+        // kimi-k2 (a) returns 400 "reasoning_content is missing in assistant tool
+        // call message" if the field is absent, AND (b) per kimi's docs preserves
+        // historical reasoning for multi-step tool-use continuity. So kimi keeps the
+        // REAL reasoning when present, and falls back to a "." stub only when absent.
+        let p = OpenAIProvider::new("key", "moonshotai/kimi-k2").with_hints(ModelHints {
+            fixed_temperature: true,
+            ..Default::default()
+        });
+        // (a) real reasoning present -> preserved verbatim (tool-use continuity)
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content =
+            Some("real prior reasoning kept for tool continuity".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("real prior reasoning kept for tool continuity"),
+            "kimi-k2 must preserve real prior reasoning_content for tool-use continuity"
+        );
+        // (b) no reasoning present -> "." stub to satisfy the 400 presence check
+        let mut assistant2 = msg("the answer");
+        assistant2.role = MessageRole::Assistant;
+        assistant2.reasoning_content = None;
+        let msgs2 = [assistant2];
+        let v2 = serde_json::to_value(p.build_request(&msgs2, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a2 = v2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a2.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("."),
+            "kimi-k2 must get the \".\" stub when reasoning_content is absent"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_hints_survive_official_endpoint_and_pin_temperature() {
+        // K3 pins sampling params server-side -> never send temperature.
+        assert!(ModelHints::detect("kimi-k3").fixed_temperature);
+        // Unlike the DeepSeek-specific thinking toggle, K3's max-only
+        // reasoning_effort is a plain top-level field, so with_base_url must
+        // not downgrade it on the official moonshot endpoint.
+        let p = OpenAIProvider::new("k", "kimi-k3")
+            .with_provider_label("moonshot")
+            .with_base_url("https://api.moonshot.ai/v1");
+        assert_eq!(p.hints.reasoning_style, ReasoningStyle::EffortLowHighMax);
+        // Explicit config override still wins (with_hints runs after
+        // with_base_url), e.g. for a proxy that rejects reasoning_effort.
+        let overridden = OpenAIProvider::new("k", "kimi-k3")
+            .with_base_url("https://api.moonshot.ai/v1")
+            .with_hints(ModelHints {
+                reasoning_style: ReasoningStyle::None,
+                fixed_temperature: true,
+                ..Default::default()
+            });
+        assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::None);
+    }
+
+    /// The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
+    /// ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3`. They MUST
+    /// still pin temperature (else the endpoint 400s "only 1 is allowed") and
+    /// get K3's max-only reasoning.
+    #[test]
+    fn coding_plan_k3_ids_pin_temperature_and_max_reasoning() {
+        for id in ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+            let h = ModelHints::detect(id);
+            assert!(
+                h.fixed_temperature,
+                "{id} must pin temperature (K3 rejects any temperature != 1)"
+            );
+            // These ids ARE the K3 model, so they must also get K3's graded
+            // low|high|max reasoning — otherwise `/thinking` is silently a
+            // no-op for the coding-plan aliases even though temperature is pinned.
+            assert_eq!(
+                h.reasoning_style,
+                ReasoningStyle::EffortLowHighMax,
+                "{id} is the K3 model and must get K3's graded low|high|max reasoning"
+            );
+        }
+        // Guard: an unrelated model containing "k3" as a substring is NOT the
+        // coding plan (exact match only), so it is unaffected.
+        assert!(!ModelHints::detect("mock-k3000").fixed_temperature);
+    }
+
+    #[test]
+    fn reasoning_emission_for_k3_is_graded_and_for_glm_is_a_toggle() {
+        use crate::config::ReasoningEffort as RE;
+        let build = |model: &str, effort: Option<RE>| {
+            let p = OpenAIProvider::new("key", model);
+            let cfg = ChatConfig {
+                reasoning_effort: effort,
+                ..ChatConfig::default()
+            };
+            serde_json::to_value(p.build_request(&[msg("hi")], &[], &cfg, false)).unwrap()
+        };
+
+        // Kimi K3: graded low|high|max (no medium tier → clamps up to high; Max
+        // stays "max"). No `thinking` object (K3 rejects it).
+        for (effort, want) in [
+            (RE::Low, "low"),
+            (RE::Medium, "high"),
+            (RE::High, "high"),
+            (RE::Max, "max"),
+        ] {
+            let v = build("k3", Some(effort));
+            assert_eq!(
+                v["reasoning_effort"].as_str(),
+                Some(want),
+                "k3 {effort:?} must map to {want}, not collapse to max"
+            );
+            assert!(
+                v.get("thinking").is_none_or(|t| t.is_null()),
+                "k3 must NOT send a thinking object"
+            );
+        }
+        // No effort configured → nothing emitted (K3 thinks by its server default).
+        let v = build("k3", None);
+        assert!(v.get("reasoning_effort").is_none_or(|r| r.is_null()));
+
+        // GLM-5.2: any effort level ENABLES thinking via the binary toggle; it
+        // must NOT send reasoning_effort (previously it emitted nothing at all).
+        for effort in [RE::Low, RE::Medium, RE::High, RE::Max] {
+            let v = build("glm-5.2", Some(effort));
+            assert_eq!(
+                v["thinking"],
+                serde_json::json!({ "type": "enabled" }),
+                "glm {effort:?} must enable thinking"
+            );
+            assert!(
+                v.get("reasoning_effort").is_none_or(|r| r.is_null()),
+                "glm must NOT send reasoning_effort"
+            );
+        }
+        // No effort → nothing (server default).
+        let v = build("glm-5.2", None);
+        assert!(v.get("thinking").is_none_or(|t| t.is_null()));
+    }
+
+    #[test]
+    fn kimi_k3_pins_temperature_and_never_sends_the_thinking_object() {
+        // K3 always thinks and rejects the K2.x `thinking` object; it also pins
+        // temperature server-side. (Graded low|high|max emission is covered by
+        // `reasoning_emission_for_k3_is_graded_and_for_glm_is_a_toggle`.)
+        let p = OpenAIProvider::new("key", "kimi-k3");
+        let msgs = [msg("hi")];
+        use crate::config::ReasoningEffort as RE;
+        for effort in [RE::Low, RE::Medium, RE::High, RE::Max] {
+            let cfg = ChatConfig {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            };
+            let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+            assert!(
+                v.get("thinking").is_none(),
+                "kimi-k3 must not emit the K2.x thinking object"
+            );
+            assert!(
+                v.get("temperature").is_none(),
+                "kimi-k3 pins temperature server-side"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_preserves_reasoning_for_kimi_k3() {
+        // K3's quickstart mandates the same round-trip contract as kimi-k2:
+        // "add the complete assistant message returned by the API to the next
+        // request. Do not keep only `content`". Auto-detected hints (no
+        // with_hints) must be enough to get it.
+        let p = OpenAIProvider::new("key", "kimi-k3");
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content = Some("prior k3 reasoning".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("prior k3 reasoning"),
+            "kimi-k3 must round-trip prior assistant reasoning_content"
+        );
+        // Absent reasoning -> "." stub (same presence contract as kimi-k2).
+        let mut assistant2 = msg("the answer");
+        assistant2.role = MessageRole::Assistant;
+        assistant2.reasoning_content = None;
+        let msgs2 = [assistant2];
+        let v2 = serde_json::to_value(p.build_request(&msgs2, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a2 = v2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a2.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("."),
+            "kimi-k3 must get the \".\" stub when reasoning_content is absent"
         );
     }
 
@@ -1436,6 +1897,101 @@ mod tests {
         assert_eq!(metadata.model, "kimi-k2.5");
         assert_eq!(metadata.endpoint.as_deref(), Some("autodl.art"));
         assert_eq!(metadata.display_label(), "moonshot/kimi-k2.5 @ autodl.art");
+    }
+
+    // ── FailFast image-modality retry guard ───────────────────────────────────
+
+    /// Build a User message that carries a `.png` image attachment so that
+    /// `request_has_user_images` returns `true` (the path must end in a
+    /// recognised image extension — checked by `vision::is_image`).
+    fn msg_with_user_image() -> Message {
+        Message {
+            role: MessageRole::User,
+            content: "look at this image".to_string(),
+            media: vec!["/tmp/test_image.png".to_string()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// The body string that `is_image_modality_error` recognises as an image-
+    /// modality 400 (matches the `"does not support image"` arm).
+    const IMAGE_MODALITY_400_BODY: &str = r#"{"error":{"message":"This model does not support image input","type":"invalid_request_error"}}"#;
+
+    #[tokio::test]
+    async fn should_not_retry_text_only_when_failfast_on_image_modality_400_stream() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(IMAGE_MODALITY_400_BODY)
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::new("test-key", "gpt-4o").with_base_url(server.uri());
+        let messages = vec![msg_with_user_image()];
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            provider
+                .chat_stream(&messages, &[], &ChatConfig::default())
+                .await
+        })
+        .await;
+
+        assert!(result.is_err(), "expected Err on 400, got Ok");
+        let reqs = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "FailFast must skip text-only retry; got {} request(s)",
+            reqs.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_text_only_when_failfast_on_image_modality_400_chat() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(IMAGE_MODALITY_400_BODY)
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::new("test-key", "gpt-4o").with_base_url(server.uri());
+        let messages = vec![msg_with_user_image()];
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            provider.chat(&messages, &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err(), "expected Err on 400, got Ok");
+        let reqs = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "FailFast must skip text-only retry; got {} request(s)",
+            reqs.len()
+        );
     }
 
     /// Real API test: NVIDIA NIM with Llama 3.3 70B.
@@ -1521,5 +2077,95 @@ mod tests {
         assert!(!full_text.is_empty(), "Stream should produce text");
         assert!(full_text.contains('1'), "Should contain '1': {full_text}");
         assert!(full_text.contains('5'), "Should contain '5': {full_text}");
+    }
+}
+
+#[cfg(test)]
+mod cache_usage_tests {
+    //! OpenAI chat-completions caches long prompts automatically and reports
+    //! the cached portion in `usage.prompt_tokens_details.cached_tokens`.
+    //! Both the non-streaming and SSE paths must surface it as
+    //! `TokenUsage::cache_read_tokens` so cache hits flow into the
+    //! usage/cost pipeline. Compat providers that omit the field parse as 0.
+
+    use super::*;
+    use crate::config::ChatConfig;
+    use octos_core::{Message, MessageRole};
+
+    #[test]
+    fn should_parse_cached_tokens_from_sse_usage() {
+        let event = SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":75}}}"#.into(),
+        };
+        let events = parse_openai_sse_events(&event);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        // Normalized to disjoint accounting: OpenAI's prompt_tokens INCLUDES
+        // cached_tokens, TokenUsage does not — total = input + cache_read.
+        assert_eq!(usage.input_tokens, 25);
+        assert_eq!(usage.cache_read_tokens, 75);
+    }
+
+    #[test]
+    fn should_default_cached_tokens_to_zero_when_details_missing() {
+        let event = SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#.into(),
+        };
+        let events = parse_openai_sse_events(&event);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn should_parse_cached_tokens_from_chat_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":75}}}"#,
+                    )
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::new("test-key", "gpt-4o").with_base_url(server.uri());
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: "hi".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        let response = provider
+            .chat(&messages, &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        // Normalized to disjoint accounting: OpenAI's prompt_tokens INCLUDES
+        // cached_tokens, TokenUsage does not — total = input + cache_read.
+        assert_eq!(response.usage.input_tokens, 25);
+        assert_eq!(response.usage.cache_read_tokens, 75);
     }
 }

@@ -14,12 +14,14 @@ pub(crate) mod agent_orchestrator;
 pub mod auth_handlers;
 mod bilibili;
 pub(crate) mod coding_tool_contract;
+mod cron_panel;
 mod events;
 mod events_harness;
 mod frps_plugin;
 pub(crate) mod goal_loop_runtime;
 mod handlers;
 pub(crate) mod master_continuation_scheduler;
+mod memory_panel;
 pub mod metrics;
 pub(crate) mod ominix_runtime;
 pub mod preview;
@@ -27,6 +29,8 @@ pub mod preview_tokens;
 pub mod purge;
 mod router;
 pub(crate) mod session_ingress;
+mod smart_home_bridge;
+mod smart_home_panel;
 pub(crate) mod solo_auth;
 pub(crate) mod specialist_runner;
 mod static_files;
@@ -34,8 +38,6 @@ pub(crate) mod supervisor_store;
 pub mod swarm;
 pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
-mod ui_protocol_alpha3_bridge;
-mod ui_protocol_alpha4_bridge;
 mod ui_protocol_alpha9_bridge;
 mod ui_protocol_approvals;
 // Relocated to crate::approvals_audit (Phase 4, ROBRIX-PHASE4 ADR) so the
@@ -54,6 +56,7 @@ pub mod usage;
 pub mod user_admin;
 pub(crate) mod voice_turn;
 pub mod voices;
+pub(crate) mod volcano_ws;
 pub mod webhook_proxy;
 pub mod ws_slash;
 
@@ -267,6 +270,33 @@ pub struct AppState {
     /// configs never set) is the primary defence; the handlers additionally
     /// reject any request carrying proxy-forwarding headers.
     pub solo_login_enabled: bool,
+    /// `--danger-full-access`: sessions with NO explicit `/permissions`
+    /// selection default to the dangerous full-access profile (sandbox off,
+    /// network allowed, approvals never) instead of the gated
+    /// workspace-write default — octos' analogue of Claude Code's
+    /// `--dangerously-skip-permissions`. Solo-gated at serve startup (the
+    /// same keystone that gates selecting the profile from the menu); an
+    /// explicit per-session `/permissions` choice always overrides it.
+    pub dangerous_default_permissions: bool,
+    /// `--no-network` opt-OUT of the network-on default. By default a fresh
+    /// solo/Local session with NO explicit `/permissions` selection resolves to
+    /// Workspace-Write **with network ALLOWED** (filesystem still sandboxed) so
+    /// the common dev workflow — `npm install`, git, fetch — works out of the
+    /// box. Setting this (via `--no-network` / `OCTOS_NO_NETWORK=1`) reverts the
+    /// default to Workspace-Write with network DENIED. Cloud/tenant deployments
+    /// are unaffected (they always default to network-denied). An explicit
+    /// per-session `/permissions` choice always overrides either default.
+    pub default_network_denied: bool,
+    /// `--llm-compaction`: AppUI context compaction asks an LLM for a
+    /// higher-quality handoff summary (a real model call — slower, seconds)
+    /// instead of the instant deterministic heuristic. Always falls back to the
+    /// heuristic on any error/timeout/unsupported-runtime, so it can never
+    /// break a turn. Default off.
+    pub llm_compaction: bool,
+    /// Resolved HOST-level memory policy (top-level config). Threaded into
+    /// lazily-bootstrapped profile runtimes so a host opt-out of memory
+    /// refresh (DEFAULT-ON) also binds profiles created after startup.
+    pub host_memory: Option<crate::config::MemoryConfig>,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
@@ -386,6 +416,10 @@ impl AppState {
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
             solo_login_enabled: false,
+            dangerous_default_permissions: false,
+            default_network_denied: false,
+            llm_compaction: false,
+            host_memory: None,
             allow_admin_shell: false,
             content_catalog_mgr: None,
             swarm_state: None,
