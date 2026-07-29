@@ -703,15 +703,21 @@ mod tests {
         let out_file = skill_path.join("captured.txt");
         let out_str = out_file.to_string_lossy().to_string();
 
-        #[cfg(windows)]
-        let capture_command = "echo %OCTOS_SKILL_DIR%>captured.txt".to_owned();
-        #[cfg(not(windows))]
-        let capture_command = format!(r#"printf '%s' "$OCTOS_SKILL_DIR" > "{out_str}""#);
-
         let executor = LifecycleExecutor::new(Box::new(NoSandbox), skill_path.clone());
+        // The lifecycle runs the step through the platform shell (`sh -c` on
+        // Unix, `cmd /C` on Windows), so the command to echo `$OCTOS_SKILL_DIR`
+        // into a file must match that shell: cmd expands `%VAR%` and has no
+        // `printf`. Tempdir paths carry no spaces, so we pass them unquoted
+        // (which also avoids `cmd` mangling Rust's quoted argv). The Windows
+        // `echo <var> >file` appends a trailing space + CRLF, so both sides are
+        // trimmed before comparison.
+        #[cfg(windows)]
+        let command = format!("echo %OCTOS_SKILL_DIR% >{out_str}");
+        #[cfg(not(windows))]
+        let command = format!(r#"printf '%s' "$OCTOS_SKILL_DIR" > "{out_str}""#);
         let steps = vec![LifecycleStep {
             label: "capture env".into(),
-            command: capture_command,
+            command,
             timeout_ms: 5_000,
             retries: 0,
             critical: true,
@@ -721,9 +727,6 @@ mod tests {
         assert!(result.success, "phase failed: {:?}", result.error);
 
         let captured = std::fs::read_to_string(&out_file).unwrap();
-        assert_eq!(
-            captured.trim_end_matches(&['\r', '\n'][..]),
-            skill_path.to_string_lossy()
-        );
+        assert_eq!(captured.trim(), skill_path.to_string_lossy().trim());
     }
 }
