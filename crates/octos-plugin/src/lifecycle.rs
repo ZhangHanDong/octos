@@ -703,10 +703,15 @@ mod tests {
         let out_file = skill_path.join("captured.txt");
         let out_str = out_file.to_string_lossy().to_string();
 
+        #[cfg(windows)]
+        let capture_command = format!(r#"<nul set /p "=%OCTOS_SKILL_DIR%" > "{out_str}""#);
+        #[cfg(not(windows))]
+        let capture_command = format!(r#"printf '%s' "$OCTOS_SKILL_DIR" > "{out_str}""#);
+
         let executor = LifecycleExecutor::new(Box::new(NoSandbox), skill_path.clone());
         let steps = vec![LifecycleStep {
             label: "capture env".into(),
-            command: format!(r#"printf '%s' "$OCTOS_SKILL_DIR" > "{out_str}""#),
+            command: capture_command,
             timeout_ms: 5_000,
             retries: 0,
             critical: true,
