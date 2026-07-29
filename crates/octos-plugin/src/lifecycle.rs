@@ -704,7 +704,7 @@ mod tests {
         let out_str = out_file.to_string_lossy().to_string();
 
         #[cfg(windows)]
-        let capture_command = format!(r#"<nul set /p "=%OCTOS_SKILL_DIR%" > "{out_str}""#);
+        let capture_command = "echo %OCTOS_SKILL_DIR%>captured.txt".to_owned();
         #[cfg(not(windows))]
         let capture_command = format!(r#"printf '%s' "$OCTOS_SKILL_DIR" > "{out_str}""#);
 
@@ -721,6 +721,9 @@ mod tests {
         assert!(result.success, "phase failed: {:?}", result.error);
 
         let captured = std::fs::read_to_string(&out_file).unwrap();
-        assert_eq!(captured, skill_path.to_string_lossy());
+        assert_eq!(
+            captured.trim_end_matches(&['\r', '\n'][..]),
+            skill_path.to_string_lossy()
+        );
     }
 }
