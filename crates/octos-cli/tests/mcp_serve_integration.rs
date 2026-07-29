@@ -166,13 +166,38 @@ impl DispatchHarness {
         workspace: TempDir,
         sandbox: SandboxConfig,
     ) -> Self {
+        Self::build_with_sandbox_and_max_iterations(provider, workspace, sandbox, 4)
+    }
+
+    fn build_with_max_iterations(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        max_iterations: u32,
+    ) -> Self {
+        Self::build_with_sandbox_and_max_iterations(
+            provider,
+            workspace,
+            SandboxConfig {
+                mode: SandboxMode::None,
+                ..SandboxConfig::default()
+            },
+            max_iterations,
+        )
+    }
+
+    fn build_with_sandbox_and_max_iterations(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        sandbox: SandboxConfig,
+        max_iterations: u32,
+    ) -> Self {
         let factory = AgentLlmFactory::scripted(provider);
         let data_dir = workspace.path().join(".octos-data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let config = SessionDispatchConfig {
             cwd: workspace.path().to_path_buf(),
             data_dir,
-            max_iterations: 4,
+            max_iterations,
             sandbox,
             tool_policy: None,
             tool_policy_by_provider: Default::default(),
@@ -334,6 +359,8 @@ async fn arc_agent_task_uses_native_system_prompt_and_structured_task() {
     for expected in [
         "REQ-1:DESIGN:InterfaceDesigner",
         "Design the booking interface.",
+        "requirement_path",
+        "requirements.yaml",
         "inputs",
         "acceptance",
         artifact_rel,
@@ -343,6 +370,60 @@ async fn arc_agent_task_uses_native_system_prompt_and_structured_task() {
             "structured ARC task omitted {expected:?}: {structured_task}"
         );
     }
+}
+
+#[tokio::test]
+async fn arc_agent_task_rejects_stale_artifact_when_agent_reports_failure() {
+    let workspace = TempDir::new().unwrap();
+    let artifact_rel = ".arc/delegated/stale.json";
+    let artifact_path = workspace.path().join(artifact_rel);
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(&artifact_path, r#"{"summary":"from an older attempt"}"#).unwrap();
+
+    // One tool turn consumes the full iteration budget. `Agent::run_task`
+    // therefore returns `Ok(TaskResult { success: false, .. })` while the stale
+    // artifact still exists on disk.
+    let provider = ScriptedLlmProvider::new(vec![tool_use(ToolCall {
+        id: "consume-budget".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": artifact_rel}),
+        metadata: None,
+    })]);
+    let harness = DispatchHarness::build_with_max_iterations(provider, workspace, 1);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                artifact_rel,
+                Some(json!({
+                    "type": "object",
+                    "required": ["summary"],
+                    "properties": {"summary": {"type": "string"}}
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .expect("soft task failure is returned as a typed outcome");
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(outcome.artifact_path.is_none());
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("session_failed:"),
+        "unexpected error: {:?}",
+        outcome.error
+    );
+    assert!(
+        !observer.snapshot().contains(&TaskLifecycleState::Verifying),
+        "an unsuccessful task must not verify a stale artifact"
+    );
 }
 
 #[tokio::test]

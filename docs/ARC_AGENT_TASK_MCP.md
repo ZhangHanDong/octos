@@ -73,6 +73,7 @@ the agent loop:
 | --- | --- |
 | `system_prompt` | Installed through `Agent::with_system_prompt`; it is not copied into user content |
 | `message` | Stored as the structured custom task instruction |
+| `requirement_path` | Preserved in the structured task so the agent can trace the compiled requirement source |
 | `inputs` | Preserved as structured task parameters |
 | `acceptance` | Preserved as mandatory completion criteria |
 | `response_schema` | Sent to the agent and used to validate the final JSON artifact |
@@ -89,10 +90,13 @@ Native ARC execution fails closed when:
 
 - the schema is not exactly `arc.agent-task.v1`;
 - a required field is missing, empty, or has the wrong JSON type;
+- `acceptance.response_schema_required` is true while `response_schema` is null;
 - `workspace_root` does not resolve to the `mcp-serve --cwd` workspace;
 - `expected_artifact` is absolute or contains a parent traversal;
 - the resolved artifact follows a symlink outside the workspace;
 - a declared response schema does not match the JSON artifact.
+- the agent returns an unsuccessful `TaskResult`, even if an artifact from an
+  earlier attempt already exists at `expected_artifact`.
 
 ARC response validation supports the schema constructs emitted by its current
 Pydantic models: `$ref`/`$defs`, `type`, `required`, `properties`, `items`,
