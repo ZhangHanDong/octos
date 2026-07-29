@@ -102,7 +102,8 @@ Scenario: Invalid ARC task fails closed before execution
   Level: unit
   Test Double: temporary workspace
   Targets: ARC task parser and workspace boundary validation
-  Given an ARC task has an unsupported schema, mismatched workspace, or escaping artifact path
+  Given an ARC task has an unsupported schema, mismatched workspace, escaping artifact path,
+  or `acceptance.response_schema_required=true` with a null response schema
   When Octos validates the MCP input
   Then validation returns a typed `arc_task_invalid` error
   And no legacy prompt fallback is selected
@@ -142,6 +143,19 @@ Scenario: Invalid ARC JSON artifact fails schema verification
   When Octos verifies the artifact
   Then the outcome is Failed
   And the error starts with `artifact_schema_invalid:`
+
+Scenario: An unsuccessful agent attempt cannot reuse a stale artifact
+  Test:
+    Package: octos-cli
+    Filter: arc_agent_task_rejects_stale_artifact_when_agent_reports_failure
+  Level: integration
+  Test Double: scripted LLM provider with a one-iteration budget
+  Targets: crates/octos-cli/src/commands/mcp_serve.rs terminal outcome handling
+  Given an artifact from an older attempt already exists
+  And the current Agent run returns `TaskResult { success: false }`
+  When Octos handles the ARC session outcome
+  Then the outcome is Failed without entering Verifying
+  And no stale artifact path or content is returned
 
 ### Rule: backwards-compatibility — Native ARC support does not break prompt callers
 

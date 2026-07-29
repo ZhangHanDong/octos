@@ -673,6 +673,29 @@ impl McpSessionDispatch for RealSessionDispatch {
             }
         };
 
+        // `run_task` reports budget exhaustion and other soft terminal failures
+        // as `Ok(TaskResult { success: false, .. })`. Do not verify a pre-existing
+        // artifact in that case: accepting stale output would turn an
+        // unsuccessful ARC attempt into Ready.
+        if !task_result.success {
+            observer.mark_state(TaskLifecycleState::Failed);
+            let detail = task_result.output.trim();
+            let error = if detail.is_empty() {
+                "session_failed: agent task reported unsuccessful completion without an explanatory message"
+                    .to_string()
+            } else {
+                format!("session_failed: agent task reported unsuccessful completion: {detail}")
+            };
+            return Ok(McpSessionOutcome {
+                final_state: TaskLifecycleState::Failed,
+                artifact_path: None,
+                artifact_content: None,
+                validator_results: Vec::new(),
+                cost: token_usage_to_value(&task_result.token_usage),
+                error: Some(error),
+            });
+        }
+
         observer.mark_state(TaskLifecycleState::Verifying);
 
         // Run completion-phase workspace validators when a policy is

@@ -180,6 +180,7 @@ fn run_octos_session_schema_advertises_arc_agent_task_v1() {
         "node_id",
         "phase",
         "workspace_root",
+        "requirement_path",
         "system_prompt",
         "message",
         "inputs",
@@ -211,6 +212,14 @@ fn arc_agent_task_v1_parses_and_preserves_structured_fields() {
         "object"
     );
     assert_eq!(request.task.skills, vec!["/skills/leaf-full-design/"]);
+    assert_eq!(
+        request.execution_params()["requirement_path"],
+        workspace
+            .path()
+            .join("requirements/requirements.yaml")
+            .display()
+            .to_string()
+    );
     assert_eq!(
         request.expected_artifact,
         std::path::PathBuf::from(".arc/delegated/interface-designer-REQ-1.json")
@@ -255,6 +264,22 @@ fn arc_agent_task_v1_rejects_invalid_schema_and_workspace_escape() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("expected_artifact"));
+
+    let mut missing_required_response_schema = sample_arc_task(workspace.path());
+    missing_required_response_schema["response_schema"] = Value::Null;
+    let error = parse_arc_agent_task_input(
+        &json!({
+            "arc_task": missing_required_response_schema,
+            "expected_artifact": ".arc/delegated/result.json"
+        }),
+        workspace.path(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("acceptance.response_schema_required")
+    );
 }
 
 #[test]

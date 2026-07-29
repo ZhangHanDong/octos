@@ -61,6 +61,7 @@ impl ArcAgentTaskRequest {
             "node_id": self.task.node_id,
             "phase": self.task.phase,
             "app_type": self.task.app_type,
+            "requirement_path": self.task.requirement_path,
             "thread_id": self.task.thread_id,
             "test_type": self.task.test_type,
             "instruction": self.task.message,
@@ -215,6 +216,7 @@ fn validate_task(task: &ArcAgentTaskV1, workspace_root: &Path) -> Result<(), Arc
         ("phase", task.phase.as_str()),
         ("app_type", task.app_type.as_str()),
         ("workspace_root", task.workspace_root.as_str()),
+        ("requirement_path", task.requirement_path.as_str()),
         ("system_prompt", task.system_prompt.as_str()),
         ("message", task.message.as_str()),
     ] {
@@ -231,6 +233,16 @@ fn validate_task(task: &ArcAgentTaskV1, workspace_root: &Path) -> Result<(), Arc
         return Err(ArcTaskError::invalid(
             "arc_task.acceptance must be an object",
         ));
+    }
+    if let Some(response_schema_required) = task.acceptance.get("response_schema_required") {
+        let response_schema_required = response_schema_required.as_bool().ok_or_else(|| {
+            ArcTaskError::invalid("arc_task.acceptance.response_schema_required must be a boolean")
+        })?;
+        if response_schema_required && task.response_schema.is_none() {
+            return Err(ArcTaskError::invalid(
+                "arc_task.response_schema must be an object when acceptance.response_schema_required is true",
+            ));
+        }
     }
     if task
         .response_schema
