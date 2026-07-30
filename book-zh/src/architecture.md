@@ -2,12 +2,12 @@
 
 ## 概述
 
-octos 是一个包含 26 个成员的 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
+octos 是一个包含 27 个成员的 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
 
 **工作区成员**（取自 `Cargo.toml`）：
 - **分层核心**（7 个）：`octos-core`（共享类型）→ `octos-memory` + `octos-llm` → `octos-agent`（agent 循环、工具、沙箱、MCP、压缩）→ `octos-cli`（命令、配置、serve/API），外加 `octos-bus`（14 个渠道、会话、合并、cron）与 `octos-diagnostics`（支撑 `octos doctor`）。
 - **agent 周边**（5 个）：`octos-pipeline`（DOT 图工作流）、`octos-plugin`（插件/技能 SDK）、`octos-swarm`（多 agent 契约创作）、`octos-sandbox`、`octos-dora-mcp`。
-- **内置技能 crate**（14 个）：`crates/app-skills/` 下每个应用技能都是独立 crate——`news`、`deep-search`、`deep-crawl`、`send-email`、`account-manager`、`time`、`weather`、`wechat-bridge`、`skill-evolve`，以及 `harness-starter-{generic,report,audio,coding}` 模板——再加上 `platform-skills/voice`（ASR/TTS）。
+- **内置技能 crate**（15 个）：`crates/app-skills/` 下每个应用技能都是独立 crate——`news`、`deep-search`、`deep-crawl`、`send-email`、`account-manager`、`time`、`weather`、`smart-home`、`wechat-bridge`、`skill-evolve`，以及 `harness-starter-{generic,report,audio,coding}` 模板——再加上 `platform-skills/voice`（ASR/TTS）。
 
 （Web SPA 与终端客户端分别位于独立的 `octos-web` 和 `octos-tui` 仓库，通过 UI Protocol 与 `octos serve` 通信。）
 
@@ -401,7 +401,13 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 ```
 
-**OpenAIEmbedder**：默认模型 `text-embedding-3-small`（1536 维）。`text-embedding-3-large` = 3072 维。
+两种实现：
+
+**OpenAIEmbedder**：远程，OpenAI 兼容（`provider = "openai"`）。默认模型 `text-embedding-3-small`（1536 维），`text-embedding-3-large` 为 3072 维。可选的 `dimensions` 字段用来固定原生维度不同的服务，例如 DashScope `text-embedding-v4` 默认 1024 维。
+
+**LlamaEmbedder**（`octos-embed-llama`）：进程内，通过 llama.cpp 跑任意 GGUF 嵌入模型（`provider = "llamacpp"`，配 `model_path`）。跨平台，默认用 CPU，`metal` / `cuda` feature 可以走 GPU。需要 `--features embed-llama` 才会编译进来。
+
+**索引宽度由 embedder 决定。** `EpisodeStore` 的 HNSW 索引只有一个固定宽度，`HybridIndex::insert` 会丢掉维度不匹配的向量，该 episode 退化成只有 BM25。所以打开 store 用的是 `embedder.dimension()`，不是常量。两个后果：Matryoshka 只能向下截断，768 维的模型填不满 1536 维的索引；换 provider 或换模型会让已有索引失效。不同后端的向量不能混用，上面两者实测余弦一致度是 0.96–0.99，和真正相关的文档之间的差距是同一量级。切换之后已存的 episode 必须重新生成向量。
 
 ### 语音转文字
 
