@@ -175,9 +175,7 @@ impl MicroCompactionPolicy {
             let age = current_turn.saturating_sub(turn_id);
             let content_len = msg.content.len();
             let oversized = size_threshold != usize::MAX && content_len > size_threshold;
-            let stale = matches!(pass, Tier1Pass::Full)
-                && age_threshold > 0
-                && age > age_threshold;
+            let stale = matches!(pass, Tier1Pass::Full) && age_threshold > 0 && age > age_threshold;
 
             let reason: Option<&'static str> = match (stale, oversized) {
                 (true, _) => Some("tier1_stale"),
@@ -835,7 +833,10 @@ mod tests {
 
         let report = policy.prune_with_pass(&mut messages, &[], Tier1Pass::Full);
 
-        assert_eq!(report.results_pruned, 1, "full pass prunes the stale result");
+        assert_eq!(
+            report.results_pruned, 1,
+            "full pass prunes the stale result"
+        );
     }
 
     #[test]

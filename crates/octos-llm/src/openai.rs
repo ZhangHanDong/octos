@@ -1588,7 +1588,12 @@ mod tests {
         // `kimi-for-coding*` — the old gate only matched "kimi-k2"/"kimi-k3"
         // substrings, so the exact ids Kimi Code serves got NO stub and risked
         // 400 "reasoning_content is missing" on multi-round tool calls.
-        for model in ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+        for model in [
+            "k3",
+            "k3-256k",
+            "kimi-for-coding",
+            "kimi-for-coding-highspeed",
+        ] {
             let p = OpenAIProvider::new("key", model);
             let mut assistant = msg("the answer");
             assistant.role = MessageRole::Assistant;

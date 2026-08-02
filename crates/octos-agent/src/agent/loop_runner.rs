@@ -3296,9 +3296,7 @@ fn resolve_shell_command_key(messages: &[Message], tool_msg_index: usize) -> Opt
                         .arguments
                         .get("command")
                         .and_then(|value| value.as_str())
-                        .map(|command| {
-                            command.split_whitespace().collect::<Vec<_>>().join(" ")
-                        })
+                        .map(|command| command.split_whitespace().collect::<Vec<_>>().join(" "))
                         .unwrap_or_else(|| tool_call.arguments.to_string())
                 })
         })

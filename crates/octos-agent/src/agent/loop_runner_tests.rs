@@ -5942,7 +5942,7 @@ fn repeated_identical_failing_command_still_trips_the_retry_limit() {
         ));
     }
 
-    let recovery = recover_shell_retry(&messages, 4)
-        .expect("the same command failing repeatedly is a spiral");
+    let recovery =
+        recover_shell_retry(&messages, 4).expect("the same command failing repeatedly is a spiral");
     assert!(matches!(recovery.kind, ShellRetryRecoveryKind::RetryLimit));
 }
