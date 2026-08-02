@@ -89,6 +89,10 @@ impl ModelHints {
             || m.contains("kimi-k2")
             || m.contains("kimi-k3")
             || m == "k3"
+            // Kimi Code context-window variants (`k3-256k`) share the
+            // temperature restriction; dash-prefix only, so an unrelated
+            // "k30"-style name never matches.
+            || m.starts_with("k3-")
             || m.starts_with("kimi-for-coding")
             || m == "gpt-4.1-nano";
 
@@ -433,7 +437,14 @@ impl OpenAIProvider {
                 // reasoning_content at all.
                 let model_lower = self.model.to_lowercase();
                 let needs_reasoning_stub = self.hints.fixed_temperature
-                    && (model_lower.contains("kimi-k2") || model_lower.contains("kimi-k3"));
+                    && (model_lower.contains("kimi-k2")
+                        || model_lower.contains("kimi-k3")
+                        // Kimi Code API ids: bare `k3`/`k3-256k` and the
+                        // K2.7 Code alias — thinking is always on for them,
+                        // so assistant tool-call messages need the stub too.
+                        || model_lower == "k3"
+                        || model_lower.starts_with("k3-")
+                        || model_lower.starts_with("kimi-for-coding"));
                 let reasoning = if role == "assistant" && needs_reasoning_stub {
                     match m.reasoning_content.as_deref() {
                         Some(r) if !r.is_empty() => Some(r),
@@ -1569,6 +1580,34 @@ mod tests {
         let v2 = serde_json::to_value(p2.build_request(&msgs, &[], &cfg2, false)).unwrap();
         assert!(v2.get("reasoning_effort").is_none());
         assert!(v2.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_request_stubs_reasoning_content_for_bare_k3_ids() {
+        // Kimi Code API model ids are the BARE `k3` / `k3-256k` /
+        // `kimi-for-coding*` — the old gate only matched "kimi-k2"/"kimi-k3"
+        // substrings, so the exact ids Kimi Code serves got NO stub and risked
+        // 400 "reasoning_content is missing" on multi-round tool calls.
+        for model in ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+            let p = OpenAIProvider::new("key", model);
+            let mut assistant = msg("the answer");
+            assistant.role = MessageRole::Assistant;
+            let msgs = [assistant];
+            let v =
+                serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+                    .unwrap();
+            let a = v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "assistant")
+                .expect("assistant message present");
+            assert_eq!(
+                a.get("reasoning_content").and_then(|r| r.as_str()),
+                Some("."),
+                "{model} assistant message must carry the reasoning stub"
+            );
+        }
     }
 
     #[test]
