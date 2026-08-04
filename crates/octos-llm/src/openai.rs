@@ -1739,12 +1739,12 @@ mod tests {
     }
 
     /// The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
-    /// ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3`. They MUST
-    /// still pin temperature (else the endpoint 400s "only 1 is allowed") and
-    /// get K3's max-only reasoning.
+    /// ids `k3` / `k3-256k` / `kimi-for-coding*`, which don't contain `kimi-k3`.
+    /// They MUST still pin temperature (else the endpoint 400s "only 1 is
+    /// allowed") and get K3's max-only reasoning.
     #[test]
     fn coding_plan_k3_ids_pin_temperature_and_max_reasoning() {
-        for id in ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+        for id in ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"] {
             let h = ModelHints::detect(id);
             assert!(
                 h.fixed_temperature,

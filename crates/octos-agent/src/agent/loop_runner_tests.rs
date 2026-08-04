@@ -5902,10 +5902,13 @@ fn distinct_failing_exploration_commands_are_not_a_retry_spiral() {
     // SAME command failing over and over — distinct failures are work,
     // not a loop, and must not trip it.
     let mut messages = vec![Message::user("analyze the makepad repo")];
+    // The grep outputs model the REAL shell tool: a no-match grep prints
+    // nothing, and the tool renders empty output as "(no output)" plus the
+    // exit-code suffix (shell.rs), not as a bare "Exit code: 1".
     messages.extend(spiral_shell_exchange(
         "call_1",
         "grep -rn 'Widget' src/",
-        "Exit code: 1",
+        "(no output)\n\nExit code: 1",
     ));
     messages.extend(spiral_shell_exchange(
         "call_2",
@@ -5915,7 +5918,7 @@ fn distinct_failing_exploration_commands_are_not_a_retry_spiral() {
     messages.extend(spiral_shell_exchange(
         "call_3",
         "grep -rn 'live_design' docs/",
-        "Exit code: 1",
+        "(no output)\n\nExit code: 1",
     ));
     messages.extend(spiral_shell_exchange(
         "call_4",
@@ -5926,6 +5929,38 @@ fn distinct_failing_exploration_commands_are_not_a_retry_spiral() {
     assert!(
         recover_shell_retry(&messages, 4).is_none(),
         "distinct failing commands are exploration, not a retry spiral"
+    );
+}
+
+#[test]
+fn distinct_no_output_failures_are_not_a_retry_spiral() {
+    // The commonest exploration pattern: several DISTINCT grep/rg probes that
+    // all match nothing. The shell tool renders each as literally
+    // "(no output)\n\nExit code: 1", so after the exit-code suffix is stripped
+    // every one of them shares the SAME failure text — the tool's "(no output)"
+    // sentinel. If that sentinel is counted as a failure signature, three
+    // no-match greps "concentrate on one repeated failure text" and the
+    // RetryLimit arm kills a healthy exploration turn — the exact false
+    // positive the signature gate exists to prevent. "(no output)" means the
+    // command produced no error text at all, so it must count as EMPTY.
+    let mut messages = vec![Message::user("where is the onboarding flow?")];
+    for (id, command) in [
+        ("call_1", "grep -rn 'onboarding' src/"),
+        ("call_2", "grep -rn 'Onboarding' crates/"),
+        ("call_3", "rg -l 'welcome_screen'"),
+        ("call_4", "grep -rn 'first_run' app/"),
+    ] {
+        messages.extend(spiral_shell_exchange(
+            id,
+            command,
+            "(no output)\n\nExit code: 1",
+        ));
+    }
+
+    assert!(
+        recover_shell_retry(&messages, 4).is_none(),
+        "distinct no-match probes share the (no output) sentinel, not a failure \
+         text — they must not trip the retry limit"
     );
 }
 
