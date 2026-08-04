@@ -129,14 +129,19 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
-        } else if m.contains("kimi-k3") || m == "k3" || m.starts_with("kimi-for-coding") {
-            // K3, incl. the coding plan's bare `k3` and `kimi-for-coding*` ids
-            // (same K3 model, different ids that don't contain `kimi-k3`): per
-            // its quickstart docs `reasoning_effort` accepts low|high|max
-            // (default max); thinking is always on and the K2.x `thinking`
-            // object is rejected. Graded effort IS honored — do NOT collapse
-            // everything to "max". (These ids already pin temperature above;
-            // they must get the graded style too or `/thinking` is a no-op.)
+        } else if m.contains("kimi-k3")
+            || m == "k3"
+            || m.starts_with("k3-")
+            || m.starts_with("kimi-for-coding")
+        {
+            // K3, incl. the coding plan's bare `k3` / `k3-256k` and
+            // `kimi-for-coding*` ids (same K3 model, different ids that don't
+            // contain `kimi-k3`): per its quickstart docs `reasoning_effort`
+            // accepts low|high|max (default max); thinking is always on and
+            // the K2.x `thinking` object is rejected. Graded effort IS
+            // honored — do NOT collapse everything to "max". (These ids
+            // already pin temperature above; they must get the graded style
+            // too or `/thinking` is a no-op.)
             ReasoningStyle::EffortLowHighMax
         } else if m.contains("glm-4.5")
             || m.contains("glm-4.6")
@@ -1744,7 +1749,12 @@ mod tests {
     /// allowed") and get K3's max-only reasoning.
     #[test]
     fn coding_plan_k3_ids_pin_temperature_and_max_reasoning() {
-        for id in ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+        for id in [
+            "k3",
+            "k3-256k",
+            "kimi-for-coding",
+            "kimi-for-coding-highspeed",
+        ] {
             let h = ModelHints::detect(id);
             assert!(
                 h.fixed_temperature,

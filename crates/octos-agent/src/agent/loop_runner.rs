@@ -3305,14 +3305,23 @@ fn resolve_shell_command_key(messages: &[Message], tool_msg_index: usize) -> Opt
 
 /// Failure text of a shell output: the content with any trailing
 /// `Exit code: N` line removed and whitespace trimmed. Empty for outputs
-/// that carry nothing but the exit code (a no-match grep).
+/// that carry nothing but the exit code — including the shell tool's
+/// "(no output)" sentinel (shell.rs renders empty stdout+stderr as
+/// literally "(no output)\n\nExit code: N"), so several DISTINCT no-match
+/// probes all sharing that sentinel count as no failure text at all and
+/// never concentrate into a spiral signature.
 fn strip_exit_code_suffix(content: &str) -> String {
     let trimmed = content.trim_end();
     let without_exit = match trimmed.rsplit_once("Exit code:") {
         Some((head, tail)) if tail.trim().chars().all(|ch| ch.is_ascii_digit()) => head,
         _ => trimmed,
     };
-    without_exit.trim().to_string()
+    let failure = without_exit.trim();
+    if failure == "(no output)" {
+        String::new()
+    } else {
+        failure.to_string()
+    }
 }
 
 fn recent_tool_results(messages: &[Message], limit: usize) -> Vec<(String, String)> {
