@@ -1,14 +1,16 @@
 //! API router construction.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderValue, StatusCode};
+use axum::extract::{DefaultBodyLimit, MatchedPath};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use url::Url;
 
 use super::AppState;
 use super::admin;
@@ -44,6 +46,35 @@ pub enum AuthIdentity {
 /// base domain via `config.base_domain` or `OCTOS_BASE_DOMAIN`.
 pub const DEFAULT_BASE_DOMAIN: &str = "crew.ominix.io";
 
+/// Return the matched route template for logging, never the raw request path.
+///
+/// Besides query credentials, some public endpoints carry credentials in path
+/// parameters. A route template preserves useful request context while
+/// replacing those values with placeholders. Unmatched paths use a fixed
+/// marker rather than falling back to attacker-controlled input.
+fn request_log_path<B>(request: &axum::http::Request<B>) -> &str {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("<unmatched>")
+}
+
+/// Build the HTTP request span without recording URI query parameters.
+///
+/// Some browser transports authenticate through query parameters (notably
+/// WebSocket `?token=...`). `TraceLayer::new_for_http()` records the complete
+/// URI by default, which would disclose those credentials whenever debug
+/// request tracing is enabled.
+fn make_http_trace_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = %request_log_path(request),
+        version = ?request.version(),
+    )
+}
+
 /// Compose the CORS allowlist for a given base domain.
 ///
 /// The returned list always contains the bare-`ominix.io` entries and
@@ -68,18 +99,155 @@ pub fn cors_allowlist_for_base_domain(base: Option<&str>) -> Vec<String> {
     ]
 }
 
+/// Compose the exact browser-origin allowlist shared by CORS and both
+/// UI Protocol WebSocket upgrade gates.
+///
+/// Legacy OminiX/base-domain and Vite development entries remain first for
+/// backward compatibility. Operator-provided, startup-normalized origins are
+/// appended in declaration order, with the first occurrence winning.
+pub(crate) fn browser_origin_allowlist(
+    base: Option<&str>,
+    appui_allowed_origins: &[String],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    cors_allowlist_for_base_domain(base)
+        .into_iter()
+        .chain(appui_allowed_origins.iter().cloned())
+        .filter(|origin| seen.insert(origin.clone()))
+        .collect()
+}
+
+/// Validate and normalize one exact browser origin.
+///
+/// Paths other than `/`, queries, fragments, credentials, opaque origins,
+/// wildcards, and non-HTTP(S) schemes are deliberately rejected. Returning
+/// `Url::origin()`'s ASCII serialization makes equivalent spellings (scheme
+/// or host case, default ports, IDNs) compare exactly after startup.
+fn normalize_appui_origin(raw: &str) -> eyre::Result<String> {
+    eyre::ensure!(
+        !raw.chars().any(char::is_control),
+        "control characters are not valid in an exact browser origin"
+    );
+    let candidate = raw.trim();
+    eyre::ensure!(!candidate.is_empty(), "origin is empty");
+    eyre::ensure!(
+        !candidate.eq_ignore_ascii_case("null"),
+        "`null` is not a trusted browser origin"
+    );
+    eyre::ensure!(
+        !candidate.contains('*'),
+        "wildcards are not allowed; configure each exact origin"
+    );
+    eyre::ensure!(
+        !candidate.contains('\\'),
+        "backslashes are not valid in an exact browser origin"
+    );
+
+    let parsed =
+        Url::parse(candidate).map_err(|error| eyre::eyre!("invalid origin URL: {error}"))?;
+    eyre::ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "scheme must be http or https"
+    );
+    eyre::ensure!(parsed.host().is_some(), "origin must include a host");
+
+    // `Url::username()` cannot distinguish no userinfo from an explicitly
+    // empty username (`https://@host`), so also inspect the raw authority.
+    let authority_and_suffix = candidate
+        .find("://")
+        .map(|scheme_end| &candidate[scheme_end + 3..])
+        .ok_or_else(|| eyre::eyre!("origin must use `scheme://host` syntax"))?;
+    let authority_end = authority_and_suffix
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_suffix.len());
+    let authority = &authority_and_suffix[..authority_end];
+    let raw_suffix = &authority_and_suffix[authority_end..];
+    eyre::ensure!(
+        !authority.contains('@') && parsed.username().is_empty() && parsed.password().is_none(),
+        "userinfo is not allowed in an origin"
+    );
+    eyre::ensure!(
+        parsed.path() == "/",
+        "origin must not include a non-root path"
+    );
+    eyre::ensure!(parsed.query().is_none(), "origin must not include a query");
+    eyre::ensure!(
+        parsed.fragment().is_none(),
+        "origin must not include a fragment"
+    );
+    eyre::ensure!(
+        raw_suffix.is_empty() || raw_suffix == "/",
+        "origin must contain only scheme, authority, and an optional root slash"
+    );
+
+    Ok(parsed.origin().ascii_serialization())
+}
+
+/// Resolve the effective operator/loopback origin list at serve startup.
+///
+/// A non-empty `OCTOS_APPUI_ALLOWED_ORIGINS` value replaces the config list;
+/// an absent or whitespace-only value leaves config authoritative. The
+/// bound HTTP port's three loopback spellings are appended automatically.
+/// HTTP serve resolves an ephemeral `--port 0` before calling this helper;
+/// a literal `0` is only meaningful to non-HTTP callers and adds no origin.
+pub(crate) fn resolve_appui_allowed_origins(
+    configured: &[String],
+    env_value: Option<&str>,
+    serve_port: u16,
+) -> eyre::Result<Vec<String>> {
+    let env_override = env_value.filter(|value| !value.trim().is_empty());
+    let selected: Vec<&str> = match env_override {
+        Some(value) => value.split(',').collect(),
+        None => configured.iter().map(String::as_str).collect(),
+    };
+
+    let source = if env_override.is_some() {
+        "OCTOS_APPUI_ALLOWED_ORIGINS"
+    } else {
+        "appui.allowed_origins"
+    };
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, raw) in selected.into_iter().enumerate() {
+        let origin = normalize_appui_origin(raw)
+            .map_err(|error| eyre::eyre!("{source}[{index}] is invalid: {error}"))?;
+        if seen.insert(origin.clone()) {
+            normalized.push(origin);
+        }
+    }
+
+    if serve_port != 0 {
+        for raw in [
+            format!("http://127.0.0.1:{serve_port}"),
+            format!("http://localhost:{serve_port}"),
+            format!("http://[::1]:{serve_port}"),
+        ] {
+            let origin = normalize_appui_origin(&raw)
+                .expect("generated loopback origins are valid exact HTTP origins");
+            if seen.insert(origin.clone()) {
+                normalized.push(origin);
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     // Restrict CORS to an explicit allowlist of known origins.
     // Do NOT use suffix matching (e.g. ends_with(".ominix.io")) — a hijacked
     // subdomain would pass the check and enable cross-origin requests.
     //
-    // The allowlist is composed from `state.base_domain` at startup so each
-    // mini accepts its own public subdomain variants (`crew.`, `bot.`,
-    // `octos.`, `ocean.`) without redeploys. `None` preserves the legacy
-    // `crew.ominix.io` triple.
-    let allowed_origins: Arc<Vec<String>> =
-        Arc::new(cors_allowlist_for_base_domain(state.base_domain.as_deref()));
+    // The allowlist combines `state.base_domain` compatibility entries with
+    // the startup-normalized AppUI deployment/loopback origins. The same
+    // composition is used by both WebSocket gates. CORS intentionally does
+    // not call `allow_credentials`: bearer/work-secret auth is an independent
+    // layer and must not become ambient browser authority.
+    let allowed_origins: Arc<Vec<String>> = Arc::new(browser_origin_allowlist(
+        state.base_domain.as_deref(),
+        &state.appui_allowed_origins,
+    ));
     let cors = {
         let allowed = allowed_origins.clone();
         CorsLayer::new()
@@ -90,7 +258,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 },
             ))
             .allow_methods(tower_http::cors::Any)
-            .allow_headers(tower_http::cors::Any)
+            // `Authorization` is a Fetch non-wildcard request header, so
+            // `Access-Control-Allow-Headers: *` does not authorize the bearer
+            // preflight used by AppUI. Mirror the browser's requested header
+            // names after the exact Origin predicate has accepted the request.
+            .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
     };
 
     // Public auth endpoints (no auth required)
@@ -217,6 +389,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // Generic profile-scoped text-to-speech synthesis.
+        .route(
+            "/api/voice/synthesize",
+            post(auth_handlers::synthesize_speech),
+        )
         // Memory + Cron panel REST routes retired in favor of the UI Protocol
         // methods (`memory/overview`, `memory/entity`, `cron/list`,
         // `cron/toggle`, gated by `auxiliary.rest_to_ws.v1`), which wrap the
@@ -768,7 +945,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(protected)
         .fallback(static_files::static_handler)
         .layer(middleware::from_fn(strip_untrusted_profile_id_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(make_http_trace_span))
         .layer(cors)
         .with_state(state)
 }
@@ -932,7 +1109,7 @@ async fn strip_untrusted_profile_id_middleware(
             target: "octos::api::auth",
             remote_addr = ?remote_ip,
             stripped_value = %raw,
-            uri = %req.uri(),
+            path = %request_log_path(&req),
             "X-Profile-Id stripped: request not from a trusted proxy (#995 hardening)"
         );
     }
@@ -1068,6 +1245,28 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
     None
 }
 
+/// Record a user-auth rejection without logging URI query parameters or token
+/// material. Browser WebSocket clients authenticate through `?token=...`, so
+/// logging the complete [`axum::http::Uri`] would disclose the credential.
+fn log_user_auth_rejection(method: &Method, path: &str, token: &str) {
+    tracing::warn!(
+        method = %method,
+        path = %path,
+        token_present = !token.is_empty(),
+        "user auth rejected"
+    );
+}
+
+/// Admin-level counterpart to [`log_user_auth_rejection`].
+fn log_admin_auth_rejection(method: &Method, path: &str, token: &str) {
+    tracing::warn!(
+        method = %method,
+        path = %path,
+        token_present = !token.is_empty(),
+        "admin auth rejected"
+    );
+}
+
 /// Auth middleware for user-level access (user session or admin token).
 ///
 /// Also accepts `X-Profile-Id` header as authentication for the chat API
@@ -1147,13 +1346,7 @@ async fn user_auth_middleware(
         );
     }
 
-    tracing::warn!(
-        method = %method,
-        uri = %uri,
-        token_len = token.len(),
-        token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
-        "user auth rejected"
-    );
+    log_user_auth_rejection(&method, request_log_path(&req), &token);
     Err(StatusCode::UNAUTHORIZED)
 }
 
@@ -1165,7 +1358,6 @@ async fn admin_auth_middleware(
 ) -> Result<axum::response::Response, StatusCode> {
     let token = extract_token(&req);
     let method = req.method().clone();
-    let uri = req.uri().clone();
 
     match resolve_identity(&state, &token).await {
         Some(AuthIdentity::Admin) => {
@@ -1183,13 +1375,7 @@ async fn admin_auth_middleware(
             Ok(next.run(req).await)
         }
         _ => {
-            tracing::warn!(
-                method = %method,
-                uri = %uri,
-                token_len = token.len(),
-                token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
-                "admin auth rejected"
-            );
+            log_admin_auth_rejection(&method, request_log_path(&req), &token);
             Err(StatusCode::UNAUTHORIZED)
         }
     }
@@ -1203,7 +1389,133 @@ mod tests {
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::http::Request;
     use chrono::Utc;
+    use std::io::Write;
     use std::sync::Arc;
+    use tower::ServiceExt;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn as_string(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn rejected_auth_logs_omit_query_and_token_material() {
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let query = "token=synthetic-sensitive-marker%21&feature=chat";
+        let token = "synthetic-sensitive-marker!";
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_user_auth_rejection(&Method::GET, "/api/ui-protocol/ws", token);
+            log_admin_auth_rejection(&Method::GET, "/api/ui-protocol/ws", token);
+        });
+
+        let logs = captured.as_string();
+        assert_eq!(logs.matches("path=/api/ui-protocol/ws").count(), 2);
+        assert_eq!(logs.matches("token_present=true").count(), 2);
+        assert!(!logs.contains(query));
+        assert!(!logs.contains(token));
+        assert!(!logs.contains("synthetic-sensitive-marker"));
+        assert!(!logs.contains("token_prefix"));
+        assert!(!logs.contains("token_len"));
+    }
+
+    #[test]
+    fn http_trace_uses_route_templates_and_omits_credentials() {
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let app = Router::new()
+            .route(
+                "/api/ui-protocol/ws",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/preview-signed/{token}/{*path}",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/register/setup-script/{id}/{auth_token}",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(TraceLayer::new_for_http().make_span_with(make_http_trace_span));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                for uri in [
+                    "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
+                    "/api/preview-signed/synthetic-preview-marker/assets/index.html",
+                    "/api/register/setup-script/test-user/synthetic-setup-marker",
+                ] {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::GET)
+                                .uri(uri)
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                }
+
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri("/synthetic-unmatched-marker")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            });
+        });
+
+        let logs = captured.as_string();
+        assert!(logs.contains("path=/api/ui-protocol/ws"));
+        assert!(logs.contains("/api/preview-signed/{token}/{*path}"));
+        assert!(logs.contains("/api/register/setup-script/{id}/{auth_token}"));
+        assert!(logs.contains("path=<unmatched>"));
+        assert!(!logs.contains("synthetic-query-marker"));
+        assert!(!logs.contains("synthetic-preview-marker"));
+        assert!(!logs.contains("synthetic-setup-marker"));
+        assert!(!logs.contains("synthetic-unmatched-marker"));
+    }
 
     #[test]
     fn test_constant_time_eq_equal() {
@@ -1604,6 +1916,185 @@ mod tests {
         let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
         assert!(!list.iter().any(|s| s.contains("evil.example.com")));
         assert!(!list.iter().any(|s| s.contains("ocean.ominix.io")));
+    }
+
+    #[test]
+    fn appui_origins_are_normalized_deduplicated_and_get_actual_loopbacks() {
+        let configured = vec![
+            " HTTPS://Example.COM:443/ ".to_string(),
+            "https://example.com".to_string(),
+            "http://localhost:50081".to_string(),
+        ];
+        let origins = resolve_appui_allowed_origins(&configured, None, 50081).unwrap();
+
+        assert_eq!(
+            origins,
+            vec![
+                "https://example.com",
+                "http://localhost:50081",
+                "http://127.0.0.1:50081",
+                "http://[::1]:50081",
+            ]
+        );
+        assert!(!origins.contains(&"http://localhost:50080".to_string()));
+    }
+
+    #[test]
+    fn non_empty_appui_origins_env_replaces_config_but_empty_env_does_not() {
+        let configured = vec!["https://from-config.example".to_string()];
+        let overridden = resolve_appui_allowed_origins(
+            &configured,
+            Some(" https://one.example,HTTPS://TWO.EXAMPLE:443/ "),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            overridden,
+            vec!["https://one.example", "https://two.example"]
+        );
+
+        let config_wins = resolve_appui_allowed_origins(&configured, Some("  "), 0).unwrap();
+        assert_eq!(config_wins, vec!["https://from-config.example"]);
+    }
+
+    #[test]
+    fn appui_origin_validation_rejects_non_origins_and_unsafe_schemes() {
+        for invalid in [
+            "",
+            "null",
+            "https://*.example.com",
+            "https://user@example.com",
+            "https://@example.com",
+            "https://example.com/path",
+            "https://example.com/.",
+            "https://example.com/foo/..",
+            "https://example.com\\.",
+            "h\tttps://example.com",
+            "https://exa\nmple.com",
+            "https://exa\rmple.com",
+            "https://example.com/?query=1",
+            "https://example.com/#fragment",
+            "ws://example.com",
+            "wss://example.com",
+            "file:///tmp/index.html",
+        ] {
+            let error =
+                resolve_appui_allowed_origins(&[invalid.to_string()], None, 0).expect_err(invalid);
+            assert!(
+                error.to_string().contains("invalid"),
+                "{invalid:?} returned an unhelpful error: {error}"
+            );
+        }
+
+        let empty_env_item =
+            resolve_appui_allowed_origins(&[], Some("https://ok.example,"), 0).unwrap_err();
+        assert!(empty_env_item.to_string().contains("[1]"));
+    }
+
+    #[test]
+    fn browser_origin_allowlist_preserves_legacy_and_adds_exact_custom_origin() {
+        let custom =
+            resolve_appui_allowed_origins(&["https://public.example".to_string()], None, 50081)
+                .unwrap();
+        let list = browser_origin_allowlist(Some("bot.ominix.io"), &custom);
+
+        assert!(list.contains(&"https://app.ominix.io".to_string()));
+        assert!(list.contains(&"https://app.bot.ominix.io".to_string()));
+        assert!(list.contains(&"http://localhost:5174".to_string()));
+        assert!(list.contains(&"https://public.example".to_string()));
+        assert!(list.contains(&"http://127.0.0.1:50081".to_string()));
+        assert!(!list.contains(&"http://127.0.0.1:50080".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cors_uses_exact_effective_appui_origins_without_credentials() {
+        let state = Arc::new(AppState {
+            appui_allowed_origins: resolve_appui_allowed_origins(&[], None, 50081).unwrap(),
+            ..AppState::empty_for_tests()
+        });
+        let app = build_router(state);
+
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .header(axum::http::header::ORIGIN, "http://localhost:50081")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:50081")
+        );
+        assert!(
+            allowed
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none(),
+            "origin configuration must not opt CORS into ambient credentials"
+        );
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::OPTIONS)
+                    .uri("/api/auth/status")
+                    .header(axum::http::header::ORIGIN, "http://localhost:50081")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:50081")
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .and_then(|value| value.to_str().ok()),
+            Some("authorization"),
+            "authenticated AppUI requests require Authorization to survive preflight"
+        );
+        assert!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+
+        let wrong_port = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .header(axum::http::header::ORIGIN, "http://localhost:50080")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_port
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     // ── #995 — `is_trusted_proxy_addr` + CIDR parser ───────────────────

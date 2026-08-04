@@ -41,10 +41,10 @@ use octos_core::ui_protocol::{
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
     SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
     SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
-    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
-    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
-    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
@@ -100,6 +100,12 @@ use super::master_continuation_scheduler::{
 };
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
+#[cfg(test)]
+use super::skill_action_jobs::SkillActionJobStatus;
+use super::skill_action_jobs::{
+    SkillActionJobRecord, SkillActionProjectionMetadata, load_skill_action_jobs,
+    project_skill_action_job, project_skill_action_jobs, with_skill_action_result,
+};
 use super::specialist_runner::{
     AppUiSupervisorEventSink, SpecialistArtifactSpec, SupervisedCliSpecialist,
     SupervisedMcpSpecialist, SupervisedSpecialistSpec, run_supervised_cli_specialist,
@@ -252,6 +258,10 @@ const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+const APPUI_METHOD_SKILL_ACTION_LIST: &str = "skill/action/list";
+const APPUI_METHOD_SKILL_ACTION_INVOKE: &str = "skill/action/invoke";
+const APPUI_METHOD_SKILL_ACTION_JOB_LIST: &str = "skill/action/job/list";
+const APPUI_METHOD_SKILL_ACTION_JOB_READ: &str = "skill/action/job/read";
 /// #1057: M22 TUI Solo Onboarding backend support contract.
 ///
 /// Backend-owned workspace validation/status for onboarding. Resolves the
@@ -288,6 +298,10 @@ const APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1: &str = "profile.local_creat
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
+const APPUI_FEATURE_SKILL_ACTIONS_V1: &str = "skill.actions.v1";
+const APPUI_FEATURE_SKILL_ACTION_JOBS_V1: &str = "skill.action_jobs.v1";
+const MAX_SKILL_ACTION_BATCH_FILES: usize = 32;
+const MAX_ACTIVE_SKILL_ACTION_BATCHES: usize = 8;
 /// #1057: backend onboarding support contract — TUI Solo Onboarding (M22).
 /// Advertises `onboarding/workspace_probe`, which canonicalizes a workspace
 /// candidate path, reports existence/writability, surfaces
@@ -327,6 +341,10 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+    APPUI_METHOD_SKILL_ACTION_LIST,
+    APPUI_METHOD_SKILL_ACTION_INVOKE,
+    APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+    APPUI_METHOD_SKILL_ACTION_JOB_READ,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
     octos_core::ui_protocol::methods::SESSION_BTW,
     APPUI_METHOD_SESSION_COMPACT,
@@ -352,7 +370,7 @@ type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
 type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>>;
 type DynamicProfileRuntimeMap =
-    tokio::sync::RwLock<HashMap<String, Arc<crate::runtime::ProfileRuntime>>>;
+    std::sync::RwLock<HashMap<String, Arc<crate::runtime::ProfileRuntime>>>;
 
 /// Per-connection registry of live ledger-forwarder tasks keyed by session.
 /// Each entry pumps `LedgeredUiProtocolEvent`s from the ledger broadcast
@@ -490,6 +508,7 @@ pub(crate) struct WsConnection {
     /// [`update_live_features`]). Reads are far more frequent than
     /// writes, so `RwLock` is the right fit.
     live_features: Arc<std::sync::RwLock<ConnectionUiFeatures>>,
+    live_profile_id: Arc<std::sync::RwLock<String>>,
 }
 
 impl WsConnection {
@@ -502,6 +521,7 @@ impl WsConnection {
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
+            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -517,6 +537,7 @@ impl WsConnection {
             live_features: Arc::new(std::sync::RwLock::new(
                 ConnectionUiFeatures::stdio_defaults(),
             )),
+            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -541,6 +562,21 @@ impl WsConnection {
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = features;
+    }
+
+    fn snapshot_live_profile_id(&self) -> String {
+        match self.live_profile_id.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn update_live_profile_id(&self, profile_id: String) {
+        let mut guard = match self.live_profile_id.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = profile_id;
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -866,7 +902,7 @@ impl UiProtocolContractStores {
 
 #[derive(Default)]
 struct SessionWorkspaceStore {
-    entries: std::sync::Mutex<HashMap<SessionKey, SessionWorkspaceBinding>>,
+    entries: std::sync::Mutex<HashMap<(String, SessionKey), SessionWorkspaceBinding>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,38 +919,52 @@ impl SessionWorkspaceStore {
     /// legacy call sites using this method carry an authoritative workspace,
     /// so it is also a runtime cwd hint.
     #[cfg(test)]
-    fn set(&self, session_id: SessionKey, root: PathBuf) {
-        self.set_resolved(session_id, root.clone(), Some(root));
+    fn set(&self, profile_id: &str, session_id: SessionKey, root: PathBuf) {
+        self.set_resolved(profile_id, session_id, root.clone(), Some(root));
     }
 
     /// Publish the resolved tool/UI workspace while retaining whether it came
     /// from an explicit cwd. Keeping the provenance separate prevents a
     /// derived Tier-3 workspace from being fed back into SessionRuntimeCache as
     /// a Tier-1/Tier-2 hint on the next request.
-    fn set_resolved(&self, session_id: SessionKey, root: PathBuf, runtime_hint: Option<PathBuf>) {
+    fn set_resolved(
+        &self,
+        profile_id: &str,
+        session_id: SessionKey,
+        root: PathBuf,
+        runtime_hint: Option<PathBuf>,
+    ) {
         self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(session_id, SessionWorkspaceBinding { root, runtime_hint });
+            .insert(
+                (profile_id.to_owned(), session_id),
+                SessionWorkspaceBinding { root, runtime_hint },
+            );
     }
 
-    fn get(&self, session_id: &SessionKey) -> Option<PathBuf> {
-        self.snapshot(session_id).map(|binding| binding.root)
+    fn get(&self, profile_id: &str, session_id: &SessionKey) -> Option<PathBuf> {
+        self.snapshot(profile_id, session_id)
+            .map(|binding| binding.root)
     }
 
     /// Clone the complete binding under one mutex acquisition. Consumers that
     /// need both root and provenance must use this snapshot so a concurrent
     /// `session/open` cannot pair one binding's root with another's hint.
-    fn snapshot(&self, session_id: &SessionKey) -> Option<SessionWorkspaceBinding> {
+    fn snapshot(
+        &self,
+        profile_id: &str,
+        session_id: &SessionKey,
+    ) -> Option<SessionWorkspaceBinding> {
         self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
+            .get(&(profile_id.to_owned(), session_id.clone()))
             .cloned()
     }
 
-    fn runtime_hint(&self, session_id: &SessionKey) -> Option<PathBuf> {
-        self.snapshot(session_id)
+    fn runtime_hint(&self, profile_id: &str, session_id: &SessionKey) -> Option<PathBuf> {
+        self.snapshot(profile_id, session_id)
             .and_then(|binding| binding.runtime_hint)
     }
 
@@ -928,6 +978,7 @@ impl SessionWorkspaceStore {
     /// collapses that to one atomic step so the seed can only ever fill a gap.
     fn set_if_absent(
         &self,
+        profile_id: &str,
         session_id: SessionKey,
         root: PathBuf,
         runtime_hint: Option<PathBuf>,
@@ -937,7 +988,7 @@ impl SessionWorkspaceStore {
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .entry(session_id)
+            .entry((profile_id.to_owned(), session_id))
         {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
@@ -1003,16 +1054,17 @@ fn reseed_fleet_keeper_candidates(
     seeds: Vec<FleetKeeperSeed>,
 ) {
     for seed in seeds {
+        let profile_id = workspace_profile_scope(None, &seed.wire);
         match seed.scope {
             Some(scope) => {
                 // Seed the pair only into a FRESH wire — never a mixed pair.
-                if workspaces.get(&seed.wire).is_none()
+                if workspaces.get(&profile_id, &seed.wire).is_none()
                     && orchestrator.goal_scope(&seed.wire).is_none()
                 {
                     let root = PathBuf::from(&seed.root);
                     let runtime_hint =
                         (seed.workspace_has_runtime_hint == Some(true)).then(|| root.clone());
-                    workspaces.set_if_absent(seed.wire.clone(), root, runtime_hint);
+                    workspaces.set_if_absent(&profile_id, seed.wire.clone(), root, runtime_hint);
                     orchestrator.set_goal_scope_if_absent(&seed.wire, &scope);
                 }
             }
@@ -1020,7 +1072,7 @@ fn reseed_fleet_keeper_candidates(
                 let root = PathBuf::from(&seed.root);
                 let runtime_hint =
                     (seed.workspace_has_runtime_hint == Some(true)).then(|| root.clone());
-                workspaces.set_if_absent(seed.wire, root, runtime_hint);
+                workspaces.set_if_absent(&profile_id, seed.wire, root, runtime_hint);
             }
         }
     }
@@ -1044,8 +1096,10 @@ mod fleet_keeper_reseed_tests {
         // leaves an established entry untouched (returns false).
         let store = SessionWorkspaceStore::default();
         let key = SessionKey("prof:api:chat#s".to_owned());
+        let profile_id = workspace_profile_scope(None, &key);
         assert!(
             store.set_if_absent(
+                &profile_id,
                 key.clone(),
                 PathBuf::from("/first"),
                 Some(PathBuf::from("/first")),
@@ -1054,6 +1108,7 @@ mod fleet_keeper_reseed_tests {
         );
         assert!(
             !store.set_if_absent(
+                &profile_id,
                 key.clone(),
                 PathBuf::from("/second"),
                 Some(PathBuf::from("/second")),
@@ -1061,12 +1116,12 @@ mod fleet_keeper_reseed_tests {
             "a second insert finds an established entry and returns false"
         );
         assert_eq!(
-            store.get(&key),
+            store.get(&profile_id, &key),
             Some(PathBuf::from("/first")),
             "the established entry is never overwritten"
         );
         assert_eq!(
-            store.runtime_hint(&key),
+            store.runtime_hint(&profile_id, &key),
             Some(PathBuf::from("/first")),
             "a recovered fleet workspace remains an authoritative runtime hint"
         );
@@ -1095,7 +1150,9 @@ mod fleet_keeper_reseed_tests {
         assert_eq!(seeds[0].workspace_has_runtime_hint, Some(false));
         reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
 
-        let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+        let binding = workspaces
+            .snapshot("prof", &wire)
+            .expect("reseeded binding");
         assert_eq!(binding.root, root.path());
         assert_eq!(
             binding.runtime_hint, None,
@@ -1126,7 +1183,9 @@ mod fleet_keeper_reseed_tests {
         assert_eq!(seeds[0].workspace_has_runtime_hint, Some(true));
         reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
 
-        let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+        let binding = workspaces
+            .snapshot("prof", &wire)
+            .expect("reseeded binding");
         assert_eq!(binding.root, root.path());
         assert_eq!(binding.runtime_hint.as_deref(), Some(root.path()));
     }
@@ -1155,7 +1214,7 @@ mod fleet_keeper_reseed_tests {
 
         assert_eq!(
             workspaces
-                .snapshot(&wire)
+                .snapshot("prof", &wire)
                 .expect("reseeded legacy binding")
                 .runtime_hint,
             None,
@@ -1211,8 +1270,10 @@ mod fleet_keeper_reseed_tests {
         // The drain's connection-independent sweep surfaces a pending
         // continuation only when its wire key has a known workspace.
         let is_surfaced = |ws: &SessionWorkspaceStore| -> bool {
-            let runnable =
-                |session: &SessionKey| ws.get(&wire_key_from_goal_key(session)).is_some();
+            let runnable = |session: &SessionKey, profile_id: &str| {
+                ws.get(profile_id, &wire_key_from_goal_key(session))
+                    .is_some()
+            };
             orchestrator
                 .due_loop_targets_with_filter(None, 8, Some(&runnable))
                 .into_iter()
@@ -1236,7 +1297,7 @@ mod fleet_keeper_reseed_tests {
         // The paired pre-pass seeds BOTH maps of the fresh wire from one seed.
         reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
         assert_eq!(
-            workspaces.get(&wire),
+            workspaces.get("prof", &wire),
             Some(root.path().to_path_buf()),
             "Gate A: the wire's workspace is the seed root"
         );
@@ -1284,7 +1345,7 @@ mod fleet_keeper_reseed_tests {
         // The rooted B is admitted: the wire's workspace is B's root (paired) and
         // B is dispatchable.
         assert_eq!(
-            workspaces.get(&SessionKey(wire.to_owned())),
+            workspaces.get("prof", &SessionKey(wire.to_owned())),
             Some(PathBuf::from(&root_b_str)),
             "the wire's workspace is B's root (root and scope paired from one continuation)"
         );
@@ -1315,7 +1376,7 @@ mod fleet_keeper_reseed_tests {
 
         let wire = SessionKey("prof:api:chat#topic".to_owned());
         // Live client: workspace + goal scope already established for this wire.
-        workspaces.set(wire.clone(), live.path().to_path_buf());
+        workspaces.set("prof", wire.clone(), live.path().to_path_buf());
         orchestrator.set_goal_scope(&wire, Some("live-b".to_owned()));
 
         reseed_fleet_keeper_candidates(
@@ -1330,7 +1391,7 @@ mod fleet_keeper_reseed_tests {
         );
 
         assert_eq!(
-            workspaces.get(&wire),
+            workspaces.get("prof", &wire),
             Some(live.path().to_path_buf()),
             "a live workspace is never overwritten by a headless seed"
         );
@@ -1358,7 +1419,7 @@ mod fleet_keeper_reseed_tests {
         let seed_root_str = seed_root.path().to_str().expect("utf8").to_owned();
         let wire = SessionKey("prof:api:chat#topic".to_owned());
         // A live UNscoped session established a workspace but no goal scope.
-        workspaces.set(wire.clone(), live.path().to_path_buf());
+        workspaces.set("prof", wire.clone(), live.path().to_path_buf());
 
         reseed_fleet_keeper_candidates(
             &workspaces,
@@ -1383,7 +1444,7 @@ mod fleet_keeper_reseed_tests {
             "the scoped keeper cannot be admitted to run in the live session's workspace"
         );
         assert_eq!(
-            workspaces.get(&wire),
+            workspaces.get("prof", &wire),
             Some(live.path().to_path_buf()),
             "the live workspace is never overwritten"
         );
@@ -1410,7 +1471,7 @@ mod fleet_keeper_reseed_tests {
         );
 
         assert_eq!(
-            workspaces.get(&wire),
+            workspaces.get("prof", &wire),
             Some(root.path().to_path_buf()),
             "a plain seed fills the workspace gap"
         );
@@ -1422,31 +1483,39 @@ mod fleet_keeper_reseed_tests {
     }
 }
 
+/// Resolve the profile component of an in-memory session-workspace key.
+///
+/// Authenticated SPA sessions deliberately use raw `web-*` ids, so the
+/// `SessionKey` alone is not an isolation boundary. Every workspace lookup
+/// therefore uses the profile already resolved by the protocol entrypoint.
+fn workspace_profile_scope(profile_id: Option<&str>, session_id: &SessionKey) -> String {
+    profile_id
+        .or_else(|| session_id.profile_id())
+        .unwrap_or(MAIN_PROFILE_ID)
+        .to_owned()
+}
+
 #[derive(Default)]
 struct SessionPermissionProfileStore {
     selections: std::sync::Mutex<HashMap<SessionKey, StoredSessionPermissionProfile>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct StoredSessionPermissionProfile {
     selection: octos_core::ui_protocol::PermissionProfileSelection,
     approval_policy: Option<octos_agent::ApprovalPolicy>,
 }
 
-impl Default for StoredSessionPermissionProfile {
-    fn default() -> Self {
-        Self {
-            selection: octos_core::ui_protocol::PermissionProfileSelection::default(),
-            approval_policy: None,
-        }
-    }
-}
-
 impl SessionPermissionProfileStore {
+    // Read-side convenience pair kept for feature combinations that resolve
+    // the stored profile directly; this build only reads via
+    // `get_state_explicit`.
+    #[allow(dead_code)]
     fn get(&self, session_id: &SessionKey) -> octos_core::ui_protocol::PermissionProfileSelection {
         self.get_state(session_id).selection
     }
 
+    #[allow(dead_code)] // see `get` above
     fn get_state(&self, session_id: &SessionKey) -> StoredSessionPermissionProfile {
         self.get_state_explicit(session_id).unwrap_or_default()
     }
@@ -1792,6 +1861,10 @@ struct ConnectionUiFeatures {
     /// the requester is not installed and the tool degrades to its
     /// structured-metadata fallback.
     user_question_v1: bool,
+    /// Generic UI-callable skill action discovery and invocation.
+    skill_actions_v1: bool,
+    /// Persisted background skill action jobs and their update events.
+    skill_action_jobs_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -1875,6 +1948,12 @@ impl ConnectionUiFeatures {
                 UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             ),
             user_question_v1: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+            skill_actions_v1: has_ui_feature(headers, query, APPUI_FEATURE_SKILL_ACTIONS_V1),
+            skill_action_jobs_v1: has_ui_feature(
+                headers,
+                query,
+                APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -1919,6 +1998,8 @@ impl ConnectionUiFeatures {
             review_start_v1: true,
             context_lifecycle_v1: true,
             user_question_v1: true,
+            skill_actions_v1: true,
+            skill_action_jobs_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -1959,6 +2040,8 @@ impl ConnectionUiFeatures {
             review_start_v1: has(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
             context_lifecycle_v1: has(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+            skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
+            skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
             header_present: true,
             stdio_transport,
         }
@@ -2047,6 +2130,12 @@ impl ConnectionUiFeatures {
         if self.user_question_v1 {
             requested.push(UI_PROTOCOL_FEATURE_USER_QUESTION_V1);
         }
+        if self.skill_actions_v1 {
+            requested.push(APPUI_FEATURE_SKILL_ACTIONS_V1);
+        }
+        if self.skill_action_jobs_v1 {
+            requested.push(APPUI_FEATURE_SKILL_ACTION_JOBS_V1);
+        }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
 
@@ -2078,6 +2167,14 @@ impl ConnectionUiFeatures {
         !self.header_present || self.context_lifecycle_v1
     }
 
+    fn skill_actions_available(self) -> bool {
+        !self.header_present || self.skill_actions_v1
+    }
+
+    fn skill_action_jobs_available(self) -> bool {
+        !self.header_present || self.skill_action_jobs_v1
+    }
+
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
         let mut capabilities = self.negotiated_capabilities();
         for method in APPUI_EXTRA_METHODS {
@@ -2095,7 +2192,21 @@ impl ConnectionUiFeatures {
             {
                 continue;
             }
-            if is_profile_skill_appui_method(*method) && state.profile_store.is_none() {
+            if is_profile_skill_appui_method(method) && state.profile_store.is_none() {
+                continue;
+            }
+            if matches!(
+                *method,
+                APPUI_METHOD_SKILL_ACTION_LIST | APPUI_METHOD_SKILL_ACTION_INVOKE
+            ) && !self.skill_actions_available()
+            {
+                continue;
+            }
+            if matches!(
+                *method,
+                APPUI_METHOD_SKILL_ACTION_JOB_LIST | APPUI_METHOD_SKILL_ACTION_JOB_READ
+            ) && !self.skill_action_jobs_available()
+            {
                 continue;
             }
             if !capabilities
@@ -2154,6 +2265,18 @@ impl ConnectionUiFeatures {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_CONTEXT_LIFECYCLE_V1,
+            );
+        }
+        if state.profile_store.is_some() && self.skill_actions_available() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_SKILL_ACTIONS_V1,
+            );
+        }
+        if state.profile_store.is_some() && self.skill_action_jobs_available() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
             );
         }
         // #965 / UPCR-2026-019 — advertise the M13-A canonical capability
@@ -2290,7 +2413,31 @@ fn is_profile_skill_appui_method(method: &str) -> bool {
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
             | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+            | APPUI_METHOD_SKILL_ACTION_LIST
+            | APPUI_METHOD_SKILL_ACTION_INVOKE
+            | APPUI_METHOD_SKILL_ACTION_JOB_LIST
+            | APPUI_METHOD_SKILL_ACTION_JOB_READ
     )
+}
+
+fn skill_action_method_available(method: &str, features: ConnectionUiFeatures) -> Option<bool> {
+    match method {
+        APPUI_METHOD_SKILL_ACTION_LIST | APPUI_METHOD_SKILL_ACTION_INVOKE => {
+            Some(features.skill_actions_available())
+        }
+        APPUI_METHOD_SKILL_ACTION_JOB_LIST | APPUI_METHOD_SKILL_ACTION_JOB_READ => {
+            Some(features.skill_action_jobs_available())
+        }
+        _ => None,
+    }
+}
+
+fn skill_action_execution_available(
+    action: &octos_agent::plugins::SkillActionDef,
+    features: ConnectionUiFeatures,
+) -> bool {
+    action.execution != octos_agent::plugins::SkillActionExecution::Background
+        || features.skill_action_jobs_available()
 }
 
 fn push_capability_feature(features: &mut Vec<String>, feature: &str) {
@@ -4229,7 +4376,7 @@ async fn handle_session_compact(
     // session this is a cache hit that returns the existing runtime.
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = effective_permissions_for_session(state, &session_id)?;
-    let workspace_hint = session_workspaces().runtime_hint(&session_id);
+    let workspace_hint = session_workspaces().runtime_hint(&profile_id, &session_id);
     let session_runtime = state
         .session_cache
         .get_or_init_with_permissions(
@@ -6081,6 +6228,7 @@ enum WsOriginDecision {
 fn decide_ws_origin_gate(
     headers: &HeaderMap,
     base_domain: Option<&str>,
+    appui_allowed_origins: &[String],
     is_authenticated: bool,
 ) -> WsOriginDecision {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
@@ -6089,7 +6237,8 @@ fn decide_ws_origin_gate(
     match origin.to_str() {
         Ok(origin_str) if origin_str.trim().is_empty() => WsOriginDecision::Allow,
         Ok(origin_str) => {
-            let allowed = super::router::cors_allowlist_for_base_domain(base_domain);
+            let allowed =
+                super::router::browser_origin_allowlist(base_domain, appui_allowed_origins);
             if allowed.iter().any(|s| s == origin_str) {
                 return WsOriginDecision::Allow;
             }
@@ -6133,6 +6282,33 @@ fn decide_ws_origin_gate(
     }
 }
 
+fn decide_ui_ws_origin_gate(
+    headers: &HeaderMap,
+    state: &AppState,
+    is_authenticated: bool,
+) -> WsOriginDecision {
+    decide_ws_origin_gate(
+        headers,
+        state.base_domain.as_deref(),
+        &state.appui_allowed_origins,
+        is_authenticated,
+    )
+}
+
+fn decide_session_ingress_ws_origin_gate(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> WsOriginDecision {
+    // The work secret authenticates and scopes the session independently.
+    // It does not replace the browser Origin gate.
+    decide_ws_origin_gate(
+        headers,
+        state.base_domain.as_deref(),
+        &state.appui_allowed_origins,
+        true,
+    )
+}
+
 /// GET /api/ui-protocol/ws — JSON-RPC over WebSocket for UI Protocol v1.
 pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
@@ -6152,7 +6328,7 @@ pub async fn ws_handler(
     // deployments (`has_auth == false` in `router.rs`) `identity` is
     // `None` and the gate falls back to the strict tenant-subdomain rule.
     let is_authenticated = identity.is_some();
-    match decide_ws_origin_gate(&headers, state.base_domain.as_deref(), is_authenticated) {
+    match decide_ui_ws_origin_gate(&headers, &state, is_authenticated) {
         WsOriginDecision::Allow => {}
         WsOriginDecision::RejectDisallowed { origin } => {
             tracing::warn!(
@@ -6244,7 +6420,7 @@ pub(crate) async fn ws_handler_for_session_ingress(
     uri: Uri,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
-    match decide_ws_origin_gate(&headers, state.base_domain.as_deref(), true) {
+    match decide_session_ingress_ws_origin_gate(&headers, &state) {
         WsOriginDecision::Allow => {}
         WsOriginDecision::RejectDisallowed { origin } => {
             tracing::warn!(
@@ -8141,6 +8317,48 @@ struct RawProfileSkillsListParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawSkillActionListParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    surface: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSkillActionInvokeParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    session_id: SessionKey,
+    action_id: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawSkillActionJobListParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    batch_id: Option<String>,
+    #[serde(default)]
+    action_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSkillActionJobReadParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    session_id: SessionKey,
+    job_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawProfileSkillsRegistrySearchParams {
     #[serde(default)]
     profile_id: Option<String>,
@@ -9662,11 +9880,7 @@ fn permission_selection_allowed(
     // as non-solo so the gate tightens. Only `None` (truly absent) and
     // a normalized `solo` keep the relaxed path on a Local server.
     let normalized_override = requested_runtime_mode.map(|raw| raw.trim().to_ascii_lowercase());
-    let request_relaxes_to_solo = match normalized_override.as_deref() {
-        None => true,
-        Some("solo") => true,
-        _ => false,
-    };
+    let request_relaxes_to_solo = matches!(normalized_override.as_deref(), None | Some("solo"));
     // SECURITY KEYSTONE (yolo GAP #1): the relax path requires the explicit
     // `--solo` opt-in, NOT bare Local mode. A Caddy-fronted fleet daemon runs
     // Local mode, so `deployment_mode == Local` alone is not a safe proxy for
@@ -9833,7 +10047,8 @@ async fn tool_status_list_result(
         // preempted caller (codex P1 round 4 on #1639).
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id)?;
-        let workspace_hint = session_workspaces().runtime_hint(session_id);
+        let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+        let workspace_hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
         Some(
             state
                 .session_cache
@@ -9971,7 +10186,7 @@ fn runtime_policy_stamp_for_profile(
             permission_state.approval_policy,
         );
     let workspace_root = session_id
-        .and_then(|session_id| session_workspaces().get(session_id))
+        .and_then(|session_id| session_workspaces().get(profile_id, session_id))
         .map(|path| path.to_string_lossy().to_string());
     let mut stamp = json!({
         "runtime_mode": runtime_mode_for_state(state),
@@ -10371,6 +10586,1333 @@ fn raw_profile_skills_list(
     }))
 }
 
+#[derive(Debug, Clone)]
+struct SkillActionRecord {
+    skill_id: String,
+    action: octos_agent::plugins::SkillActionDef,
+    available: bool,
+    unavailable_reason: Option<String>,
+}
+
+fn action_matches_filters(
+    action: &octos_agent::plugins::SkillActionDef,
+    surface: Option<&str>,
+    required_tags: &[String],
+) -> bool {
+    if let Some(surface) = surface.map(str::trim).filter(|surface| !surface.is_empty()) {
+        if !action.surfaces.is_empty()
+            && !action.surfaces.iter().any(|candidate| candidate == surface)
+        {
+            return false;
+        }
+    }
+    required_tags
+        .iter()
+        .all(|tag| action.tags.iter().any(|candidate| candidate == tag))
+}
+
+fn trusted_skill_action_records(
+    loaded_actions: &[octos_agent::plugins::LoadedSkillAction],
+    registry: &octos_agent::ToolRegistry,
+    surface: Option<&str>,
+    required_tags: &[String],
+) -> Vec<SkillActionRecord> {
+    loaded_actions
+        .iter()
+        .filter(|loaded| action_matches_filters(&loaded.definition, surface, required_tags))
+        .filter(|loaded| loaded.is_bound_to_registry(registry))
+        .map(|loaded| SkillActionRecord {
+            skill_id: loaded.plugin_name.clone(),
+            action: loaded.definition.clone(),
+            available: true,
+            unavailable_reason: None,
+        })
+        .collect()
+}
+
+fn skill_action_record_is_trusted(
+    record: &SkillActionRecord,
+    registry: &octos_agent::ToolRegistry,
+) -> bool {
+    let Some(tool_name) = record.action.binding.tool_name() else {
+        return false;
+    };
+    registry
+        .get(tool_name)
+        .and_then(|tool| {
+            tool.as_any()
+                .downcast_ref::<octos_agent::plugins::PluginTool>()
+        })
+        .is_some_and(|tool| tool.plugin_name() == record.skill_id)
+}
+
+fn resolve_skill_action_record<'a>(
+    records: &'a [SkillActionRecord],
+    requested_id: &str,
+) -> Option<&'a SkillActionRecord> {
+    if requested_id.contains('/') {
+        return records
+            .iter()
+            .find(|record| format!("{}/{}", record.skill_id, record.action.id) == requested_id);
+    }
+
+    let mut matches = records
+        .iter()
+        .filter(|record| record.action.id == requested_id);
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
+
+fn skill_action_record_to_value(record: SkillActionRecord) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("id".into(), Value::String(record.action.id));
+    object.insert("skill_id".into(), Value::String(record.skill_id));
+    object.insert("label".into(), Value::String(record.action.label));
+    if let Some(description) = record.action.description {
+        object.insert("description".into(), Value::String(description));
+    }
+    object.insert("tags".into(), json!(record.action.tags));
+    object.insert("surfaces".into(), json!(record.action.surfaces));
+    object.insert("input_schema".into(), record.action.input_schema);
+    object.insert("execution".into(), json!(record.action.execution));
+    if !record.action.ui_schema.is_null() {
+        object.insert("ui_schema".into(), record.action.ui_schema);
+    }
+    object.insert("available".into(), Value::Bool(record.available));
+    if let Some(reason) = record.unavailable_reason {
+        object.insert("unavailable_reason".into(), Value::String(reason));
+    }
+    Value::Object(object)
+}
+
+fn action_arguments_object(arguments: Value) -> Result<serde_json::Map<String, Value>, RpcError> {
+    match arguments {
+        Value::Null => Ok(serde_json::Map::new()),
+        Value::Object(map) => Ok(map),
+        _ => Err(RpcError::invalid_params(
+            "skill action arguments must be a JSON object",
+        )),
+    }
+}
+
+fn action_schema_error(path: &str, message: impl Into<String>) -> RpcError {
+    RpcError::invalid_params(format!(
+        "skill action arguments do not match input_schema at {path}: {}",
+        message.into()
+    ))
+}
+
+fn action_value_matches_type(value: &Value, expected: &str) -> bool {
+    match expected {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "number" => value.is_number(),
+        "string" => value.is_string(),
+        "integer" => value
+            .as_number()
+            .is_some_and(|number| number.is_i64() || number.is_u64()),
+        _ => false,
+    }
+}
+
+fn validate_action_value(schema: &Value, value: &Value, path: &str) -> Result<(), RpcError> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| action_schema_error(path, "schema must be an object"))?;
+
+    if let Some(expected) = object.get("const") {
+        if value != expected {
+            return Err(action_schema_error(path, "value does not match const"));
+        }
+    }
+    if let Some(allowed) = object.get("enum").and_then(Value::as_array) {
+        if !allowed.iter().any(|candidate| candidate == value) {
+            return Err(action_schema_error(path, "value is not in enum"));
+        }
+    }
+
+    if let Some(types) = object.get("type") {
+        let matches = match types {
+            Value::String(expected) => action_value_matches_type(value, expected),
+            Value::Array(expected) => expected
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|expected| action_value_matches_type(value, expected)),
+            _ => false,
+        };
+        if !matches {
+            return Err(action_schema_error(path, "value has the wrong JSON type"));
+        }
+    }
+
+    if let Some(all_of) = object.get("allOf").and_then(Value::as_array) {
+        for child in all_of {
+            validate_action_value(child, value, path)?;
+        }
+    }
+    if let Some(any_of) = object.get("anyOf").and_then(Value::as_array) {
+        if !any_of
+            .iter()
+            .any(|child| validate_action_value(child, value, path).is_ok())
+        {
+            return Err(action_schema_error(path, "value does not match anyOf"));
+        }
+    }
+    if let Some(one_of) = object.get("oneOf").and_then(Value::as_array) {
+        let matches = one_of
+            .iter()
+            .filter(|child| validate_action_value(child, value, path).is_ok())
+            .count();
+        if matches != 1 {
+            return Err(action_schema_error(
+                path,
+                "value must match exactly one oneOf schema",
+            ));
+        }
+    }
+    if let Some(not) = object.get("not") {
+        if validate_action_value(not, value, path).is_ok() {
+            return Err(action_schema_error(path, "value matches forbidden schema"));
+        }
+    }
+
+    if let Some(map) = value.as_object() {
+        if let Some(min) = object.get("minProperties").and_then(Value::as_u64) {
+            if map.len() < min as usize {
+                return Err(action_schema_error(path, "object has too few properties"));
+            }
+        }
+        if let Some(max) = object.get("maxProperties").and_then(Value::as_u64) {
+            if map.len() > max as usize {
+                return Err(action_schema_error(path, "object has too many properties"));
+            }
+        }
+        if let Some(required) = object.get("required").and_then(Value::as_array) {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !map.contains_key(key) {
+                    return Err(action_schema_error(
+                        path,
+                        format!("required property `{key}` is missing"),
+                    ));
+                }
+            }
+        }
+
+        let properties = object.get("properties").and_then(Value::as_object);
+        if let Some(properties) = properties {
+            for (key, child_value) in map {
+                let child_path = format!("{path}.{key}");
+                if let Some(child_schema) = properties.get(key) {
+                    validate_action_value(child_schema, child_value, &child_path)?;
+                    continue;
+                }
+                match object.get("additionalProperties") {
+                    Some(Value::Bool(true)) => {}
+                    Some(Value::Object(child_schema)) => {
+                        validate_action_value(
+                            &Value::Object(child_schema.clone()),
+                            child_value,
+                            &child_path,
+                        )?;
+                    }
+                    _ => {
+                        return Err(action_schema_error(
+                            path,
+                            format!("property `{key}` is not declared"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        if let Some(min) = object.get("minItems").and_then(Value::as_u64) {
+            if array.len() < min as usize {
+                return Err(action_schema_error(path, "array has too few items"));
+            }
+        }
+        if let Some(max) = object.get("maxItems").and_then(Value::as_u64) {
+            if array.len() > max as usize {
+                return Err(action_schema_error(path, "array has too many items"));
+            }
+        }
+        if object
+            .get("uniqueItems")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            for (index, item) in array.iter().enumerate() {
+                if array[..index].contains(item) {
+                    return Err(action_schema_error(path, "array items must be unique"));
+                }
+            }
+        }
+        if let Some(item_schema) = object.get("items").filter(|items| items.is_object()) {
+            for (index, item) in array.iter().enumerate() {
+                validate_action_value(item_schema, item, &format!("{path}[{index}]"))?;
+            }
+        }
+    }
+
+    if let Some(string) = value.as_str() {
+        let length = string.chars().count();
+        if let Some(min) = object.get("minLength").and_then(Value::as_u64) {
+            if length < min as usize {
+                return Err(action_schema_error(path, "string is too short"));
+            }
+        }
+        if let Some(max) = object.get("maxLength").and_then(Value::as_u64) {
+            if length > max as usize {
+                return Err(action_schema_error(path, "string is too long"));
+            }
+        }
+        if let Some(pattern) = object.get("pattern").and_then(Value::as_str) {
+            let pattern = regex::Regex::new(pattern)
+                .map_err(|_| action_schema_error(path, "schema contains an invalid pattern"))?;
+            if !pattern.is_match(string) {
+                return Err(action_schema_error(path, "string does not match pattern"));
+            }
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = object.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Err(action_schema_error(path, "number is below minimum"));
+            }
+        }
+        if let Some(maximum) = object.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Err(action_schema_error(path, "number is above maximum"));
+            }
+        }
+        if let Some(minimum) = object.get("exclusiveMinimum").and_then(Value::as_f64) {
+            if number <= minimum {
+                return Err(action_schema_error(
+                    path,
+                    "number is below exclusiveMinimum",
+                ));
+            }
+        }
+        if let Some(maximum) = object.get("exclusiveMaximum").and_then(Value::as_f64) {
+            if number >= maximum {
+                return Err(action_schema_error(
+                    path,
+                    "number is above exclusiveMaximum",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_action_arguments(schema: &Value, arguments: &Value) -> Result<(), RpcError> {
+    validate_action_value(schema, arguments, "arguments")
+}
+
+fn string_array_argument(value: Value, field: &str) -> Result<Vec<String>, RpcError> {
+    let array = value.as_array().ok_or_else(|| {
+        RpcError::invalid_params(format!("skill action field `{field}` must be an array"))
+    })?;
+    let mut strings = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(path) = item.as_str().map(str::trim).filter(|path| !path.is_empty()) else {
+            return Err(RpcError::invalid_params(format!(
+                "skill action field `{field}` must contain only non-empty strings"
+            )));
+        };
+        strings.push(path.to_owned());
+    }
+    if strings.is_empty() {
+        return Err(RpcError::invalid_params(format!(
+            "skill action field `{field}` must not be empty"
+        )));
+    }
+    Ok(strings)
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSkillActionCall {
+    input_path: Option<String>,
+    filename: Option<String>,
+    materialized_path: Option<String>,
+    args: Value,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSkillActionInvocation {
+    tool: String,
+    materialized_paths: Vec<String>,
+    calls: Vec<PreparedSkillActionCall>,
+}
+
+struct QueuedSkillActionJob {
+    tool: String,
+    args: Value,
+    workspace_root: PathBuf,
+    execution_context: SkillActionExecutionContext,
+    task_id: String,
+    _terminal_guard: octos_agent::TaskTerminalGuard,
+}
+
+#[derive(Clone)]
+struct SkillActionExecutionContext {
+    tool_context: octos_agent::tools::ToolContext,
+    approval_requester: Option<Arc<dyn octos_agent::ToolApprovalRequester>>,
+}
+
+impl SkillActionExecutionContext {
+    #[cfg(test)]
+    fn zero() -> Self {
+        Self {
+            tool_context: octos_agent::tools::ToolContext::zero(),
+            approval_requester: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SkillActionInvokeUiContext {
+    ws: WsConnection,
+    contracts: Arc<UiProtocolContractStores>,
+    features: ConnectionUiFeatures,
+}
+
+fn filename_from_action_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn materialize_action_file_path(
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    raw_path: &str,
+    materialization: octos_agent::plugins::SkillActionFileMaterialization,
+) -> Result<Vec<String>, RpcError> {
+    match materialization {
+        octos_agent::plugins::SkillActionFileMaterialization::Raw => Ok(vec![raw_path.to_string()]),
+        octos_agent::plugins::SkillActionFileMaterialization::WorkspaceRelative => {
+            use octos_bus::file_handle::ToolPathScope;
+
+            let resolved =
+                octos_bus::file_handle::resolve_tool_path(workspace_root, None, raw_path).map_err(
+                    |error| {
+                        RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` is invalid: {error}"
+                        ))
+                    },
+                )?;
+            match resolved.scope {
+                ToolPathScope::UploadTmpdir => {
+                    let paths = octos_bus::file_handle::materialize_uploads_as_workspace_relative(
+                        workspace_root,
+                        tenant_id,
+                        &[raw_path.to_string()],
+                    );
+                    if paths.len() != 1 || paths[0] == raw_path {
+                        return Err(RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` could not be materialized for this session"
+                        )));
+                    }
+                    Ok(paths)
+                }
+                ToolPathScope::Workspace => {
+                    let canonical_root =
+                        std::fs::canonicalize(workspace_root).map_err(|error| {
+                            RpcError::internal_error(format!(
+                                "failed to resolve action workspace {}: {error}",
+                                workspace_root.display()
+                            ))
+                        })?;
+                    let canonical_path = std::fs::canonicalize(&resolved.absolute).map_err(|_| {
+                        RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` does not identify an existing workspace file"
+                        ))
+                    })?;
+                    let relative = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
+                        RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` escapes the session workspace"
+                        ))
+                    })?;
+                    if !canonical_path.is_file() {
+                        return Err(RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` is not a file"
+                        )));
+                    }
+                    Ok(vec![relative.to_string_lossy().into_owned()])
+                }
+                ToolPathScope::Profile => Err(RpcError::invalid_params(
+                    "profile-scoped files cannot be used as workspace-relative action inputs",
+                )),
+            }
+        }
+        octos_agent::plugins::SkillActionFileMaterialization::TurnMedia => {
+            Ok(octos_bus::file_handle::materialize_turn_uploads(
+                workspace_root,
+                tenant_id,
+                &[raw_path.to_string()],
+            ))
+        }
+    }
+}
+
+fn prepare_skill_action_tool_invocation(
+    action: &octos_agent::plugins::SkillActionDef,
+    registry: &octos_agent::ToolRegistry,
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    arguments: Value,
+) -> Result<PreparedSkillActionInvocation, RpcError> {
+    let (tool, input_mode, file_argument, file_materialization) = match &action.binding {
+        octos_agent::plugins::SkillActionBinding::Tool {
+            tool,
+            input_mode,
+            file_argument,
+            file_materialization,
+        } => (
+            tool.as_str(),
+            *input_mode,
+            file_argument.as_deref(),
+            *file_materialization,
+        ),
+    };
+    if registry.get(tool).is_none() {
+        return Err(RpcError::invalid_params(format!(
+            "skill action '{}' is bound to unavailable tool '{}'",
+            action.id, tool
+        )));
+    }
+
+    std::fs::create_dir_all(workspace_root).map_err(|error| {
+        RpcError::internal_error(format!(
+            "failed to create action workspace {}: {error}",
+            workspace_root.display()
+        ))
+    })?;
+
+    let mut args = action_arguments_object(arguments)?;
+    validate_action_arguments(&action.input_schema, &Value::Object(args.clone()))?;
+    match input_mode {
+        octos_agent::plugins::SkillActionInputMode::Single => Ok(PreparedSkillActionInvocation {
+            tool: tool.to_string(),
+            materialized_paths: Vec::new(),
+            calls: vec![PreparedSkillActionCall {
+                input_path: None,
+                filename: None,
+                materialized_path: None,
+                args: Value::Object(args),
+            }],
+        }),
+        octos_agent::plugins::SkillActionInputMode::FileEach => {
+            let paths = args.remove("paths").ok_or_else(|| {
+                RpcError::invalid_params("file_each skill action requires arguments.paths")
+            })?;
+            let raw_paths = string_array_argument(paths, "paths")?;
+            if raw_paths.len() > MAX_SKILL_ACTION_BATCH_FILES {
+                return Err(RpcError::invalid_params(format!(
+                    "file_each skill action accepts at most {MAX_SKILL_ACTION_BATCH_FILES} files per batch"
+                )));
+            }
+            let file_argument = file_argument.unwrap_or("path");
+            if args.contains_key(file_argument) {
+                return Err(RpcError::invalid_params(format!(
+                    "skill action field `{file_argument}` is host-owned and cannot be supplied by the caller"
+                )));
+            }
+            let mut materialized_paths = Vec::new();
+            let mut calls = Vec::new();
+            for raw_path in raw_paths {
+                let prepared_paths = materialize_action_file_path(
+                    workspace_root,
+                    tenant_id,
+                    &raw_path,
+                    file_materialization,
+                )?;
+                for materialized_path in prepared_paths {
+                    let mut call_args = args.clone();
+                    call_args.insert(
+                        file_argument.to_string(),
+                        Value::String(materialized_path.clone()),
+                    );
+                    let filename = filename_from_action_path(&materialized_path)
+                        .or_else(|| filename_from_action_path(&raw_path));
+                    materialized_paths.push(materialized_path.clone());
+                    calls.push(PreparedSkillActionCall {
+                        input_path: Some(raw_path.clone()),
+                        filename,
+                        materialized_path: Some(materialized_path),
+                        args: Value::Object(call_args),
+                    });
+                }
+            }
+            if calls.is_empty() {
+                return Err(RpcError::invalid_params(
+                    "no action input files could be materialized for this session",
+                ));
+            }
+            Ok(PreparedSkillActionInvocation {
+                tool: tool.to_string(),
+                materialized_paths,
+                calls,
+            })
+        }
+    }
+}
+
+fn artifact_media_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("md" | "markdown") => "text/markdown",
+        Some("txt") => "text/plain",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("m4a") => "audio/mp4",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+}
+
+fn action_artifact_value(workspace_root: &Path, path: &Path) -> Option<Value> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
+    let canonical_path = std::fs::canonicalize(candidate).ok()?;
+    if !canonical_path.is_file() || !canonical_path.starts_with(&canonical_root) {
+        return None;
+    }
+    let handle =
+        octos_bus::file_handle::encode_workspace_file_handle(&canonical_root, &canonical_path)?;
+    let display_name = canonical_path.file_name()?.to_str()?;
+    let size = std::fs::metadata(&canonical_path).ok()?.len();
+    Some(json!({
+        "handle": handle,
+        "display_name": display_name,
+        "media_type": artifact_media_type(&canonical_path),
+        "size": size,
+    }))
+}
+
+fn tool_result_to_action_value(result: octos_agent::ToolResult, workspace_root: &Path) -> Value {
+    let file_modified = result
+        .file_modified
+        .as_deref()
+        .and_then(|path| action_artifact_value(workspace_root, path))
+        .and_then(|artifact| artifact.get("handle").cloned());
+    let mut seen = HashSet::new();
+    let artifacts = result
+        .files_to_send
+        .iter()
+        .filter_map(|path| action_artifact_value(workspace_root, path))
+        .filter(|artifact| {
+            artifact
+                .get("handle")
+                .and_then(Value::as_str)
+                .is_some_and(|handle| seen.insert(handle.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "success": result.success,
+        "output": result.output,
+        "file_modified": file_modified,
+        "artifacts": artifacts,
+        "structured_metadata": result.structured_metadata,
+    })
+}
+
+async fn execute_skill_action_tool_call(
+    action_id: &str,
+    tool: &str,
+    registry: &octos_agent::ToolRegistry,
+    args: &Value,
+    execution_context: &SkillActionExecutionContext,
+) -> Result<octos_agent::ToolResult, RpcError> {
+    let tool_context = execution_context.tool_context.clone();
+    let execute = octos_agent::tools::TOOL_CTX.scope(tool_context.clone(), async {
+        registry
+            .execute_with_context(&tool_context, tool, args)
+            .await
+    });
+    let result = match &execution_context.approval_requester {
+        Some(requester) => {
+            octos_agent::tools::TOOL_APPROVAL_CTX
+                .scope(requester.clone(), execute)
+                .await
+        }
+        None => execute.await,
+    };
+    result.map_err(|error| {
+        RpcError::internal_error(format!(
+            "skill action '{action_id}' failed to invoke tool '{tool}': {error}"
+        ))
+    })
+}
+
+async fn invoke_skill_action_tool_binding(
+    action: &octos_agent::plugins::SkillActionDef,
+    registry: &octos_agent::ToolRegistry,
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    arguments: Value,
+    execution_context: &SkillActionExecutionContext,
+) -> Result<Value, RpcError> {
+    let prepared = prepare_skill_action_tool_invocation(
+        action,
+        registry,
+        workspace_root,
+        tenant_id,
+        arguments,
+    )?;
+    let mut ok = true;
+    let mut results = Vec::with_capacity(prepared.calls.len());
+    for call in &prepared.calls {
+        let result = execute_skill_action_tool_call(
+            &action.id,
+            &prepared.tool,
+            registry,
+            &call.args,
+            execution_context,
+        )
+        .await?;
+        ok &= result.success;
+        results.push(tool_result_to_action_value(result, workspace_root));
+        if !ok {
+            break;
+        }
+    }
+    let mut response = serde_json::Map::new();
+    response.insert("action_id".into(), Value::String(action.id.clone()));
+    response.insert("ok".into(), Value::Bool(ok));
+    if !prepared.materialized_paths.is_empty() {
+        response.insert(
+            "materialized_paths".into(),
+            json!(prepared.materialized_paths),
+        );
+    }
+    response.insert("results".into(), Value::Array(results));
+    Ok(Value::Object(response))
+}
+
+fn install_skill_action_job_projection_listener(
+    supervisor: &octos_agent::TaskSupervisor,
+    profile_id: &str,
+    session_id: &SessionKey,
+    ledger: &Arc<UiProtocolLedger>,
+) {
+    let listener_key = format!("skill-action-job:{profile_id}:{session_id}");
+    let ledger = Arc::clone(ledger);
+    let expected_profile = profile_id.to_owned();
+    let expected_session = session_id.clone();
+    supervisor.set_on_change_listener(listener_key, move |task| {
+        let Some(job) = project_skill_action_job(task) else {
+            return;
+        };
+        if job.profile_id != expected_profile || job.session_id != expected_session {
+            return;
+        }
+        let Ok(job_value) = serde_json::to_value(&job) else {
+            return;
+        };
+        let _ = ledger.append_notification(UiNotification::SkillActionJobUpdated(
+            SkillActionJobUpdatedEvent {
+                profile_id: job.profile_id,
+                session_id: job.session_id,
+                job: job_value,
+            },
+        ));
+    });
+}
+
+// This adapter boundary keeps every trust and lifecycle scope explicit: the
+// manifest action, resolved tool registry, workspace/tenant scope, profile and
+// session identity, caller arguments, and execution context must not be
+// inferred from ambient state.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_background_skill_action_jobs(
+    action: &octos_agent::plugins::SkillActionDef,
+    skill_id: &str,
+    registry: &octos_agent::ToolRegistry,
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    profile_id: &str,
+    session_id: &SessionKey,
+    arguments: Value,
+    execution_context: &SkillActionExecutionContext,
+) -> Result<(Value, Vec<QueuedSkillActionJob>), RpcError> {
+    let prepared = prepare_skill_action_tool_invocation(
+        action,
+        registry,
+        workspace_root,
+        tenant_id,
+        arguments,
+    )?;
+    let batch_id = format!("skillbatch_{}", uuid::Uuid::now_v7().simple());
+    let mut queued_jobs: Vec<QueuedSkillActionJob> = Vec::with_capacity(prepared.calls.len());
+    let mut job_values = Vec::with_capacity(prepared.calls.len());
+    for call in prepared.calls {
+        let supervisor = registry.supervisor();
+        let tool_call_id = format!("skill-action:{batch_id}:{}", queued_jobs.len());
+        let task_id = match supervisor.try_register_with_input(
+            &prepared.tool,
+            &tool_call_id,
+            Some(&session_id.0),
+            Some(call.args.clone()),
+        ) {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                for queued in &queued_jobs {
+                    supervisor.mark_failed(
+                        &queued.task_id,
+                        format!("skill action batch enqueue aborted: {error}"),
+                    );
+                }
+                return Err(RpcError::internal_error(format!(
+                    "failed to register skill action task: {error}"
+                )));
+            }
+        };
+        supervisor.set_projection_metadata(
+            &task_id,
+            SkillActionProjectionMetadata::new(
+                batch_id.clone(),
+                profile_id.to_owned(),
+                session_id.clone(),
+                action.id.clone(),
+                skill_id.to_owned(),
+                call.input_path,
+                call.filename,
+                call.materialized_path,
+            )
+            .into_value(),
+        );
+        let task = supervisor
+            .get_task(&task_id)
+            .expect("registered skill action task remains tracked");
+        let job = project_skill_action_job(&task)
+            .expect("registered skill action task has projection metadata");
+        job_values.push(skill_action_job_record_to_value(job)?);
+        let terminal_guard =
+            octos_agent::TaskTerminalGuard::new(Arc::clone(&supervisor), task_id.clone());
+        queued_jobs.push(QueuedSkillActionJob {
+            tool: prepared.tool.clone(),
+            args: call.args,
+            workspace_root: workspace_root.to_path_buf(),
+            execution_context: execution_context.clone(),
+            task_id,
+            _terminal_guard: terminal_guard,
+        });
+    }
+
+    Ok((
+        json!({
+            "action_id": action.id.clone(),
+            "ok": true,
+            "execution": "background",
+            "batch_id": batch_id,
+            "queued": queued_jobs.len(),
+            "materialized_paths": prepared.materialized_paths,
+            "jobs": job_values,
+        }),
+        queued_jobs,
+    ))
+}
+
+async fn run_background_skill_action_job(
+    registry: Arc<octos_agent::ToolRegistry>,
+    queued: QueuedSkillActionJob,
+) {
+    let supervisor = registry.supervisor();
+    let task = match supervisor.get_task(&queued.task_id) {
+        Some(task) => task,
+        None => return,
+    };
+    let Some(metadata) = SkillActionProjectionMetadata::from_task(&task) else {
+        supervisor.mark_failed(
+            &queued.task_id,
+            "skill action task is missing projection metadata".to_owned(),
+        );
+        return;
+    };
+    let cancel_token = supervisor.cancel_token(&queued.task_id);
+    if cancel_token.is_cancelled() {
+        return;
+    }
+    supervisor.mark_running(&queued.task_id);
+    let execute = execute_skill_action_tool_call(
+        &metadata.action_id,
+        &queued.tool,
+        &registry,
+        &queued.args,
+        &queued.execution_context,
+    );
+    let result = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => None,
+        result = execute => Some(result),
+    };
+    let Some(result) = result else {
+        // `TaskSupervisor::cancel` owns and has already persisted the distinct
+        // cancelled terminal state. The worker must not rewrite it as failed.
+        return;
+    };
+    match result {
+        Ok(tool_result) => {
+            let success = tool_result.success;
+            let output = tool_result.output.clone();
+            let output_files = tool_result
+                .files_to_send
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let result_value = tool_result_to_action_value(tool_result, &queued.workspace_root);
+            if let Some(task) = supervisor.get_task(&queued.task_id)
+                && let Some(metadata) = with_skill_action_result(&task, result_value)
+            {
+                supervisor.set_projection_metadata(&queued.task_id, metadata);
+            }
+            if !output.is_empty() {
+                supervisor.record_final_output(&queued.task_id, &output);
+            }
+            if success {
+                supervisor.mark_completed(&queued.task_id, output_files);
+            } else {
+                supervisor.mark_failed(
+                    &queued.task_id,
+                    if output.is_empty() {
+                        "skill action tool returned unsuccessful result".to_string()
+                    } else {
+                        output
+                    },
+                );
+            }
+        }
+        Err(error) => {
+            supervisor.mark_failed(&queued.task_id, error.message);
+        }
+    }
+}
+
+fn skill_action_batch_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    Arc::clone(
+        SEMAPHORE
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_SKILL_ACTION_BATCHES))),
+    )
+}
+
+fn exclusive_skill_action_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    Arc::clone(SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))))
+}
+
+fn reserve_skill_action_batch() -> Result<tokio::sync::OwnedSemaphorePermit, RpcError> {
+    skill_action_batch_semaphore()
+        .try_acquire_owned()
+        .map_err(|_| {
+            RpcError::invalid_request(
+                "skill action executor is busy; retry after an active batch completes",
+            )
+        })
+}
+
+async fn run_background_skill_action_batch(
+    registry: Arc<octos_agent::ToolRegistry>,
+    queued_jobs: Vec<QueuedSkillActionJob>,
+    concurrency_class: octos_agent::ConcurrencyClass,
+    _batch_permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _exclusive_permit = if concurrency_class == octos_agent::ConcurrencyClass::Exclusive {
+        Some(
+            exclusive_skill_action_semaphore()
+                .acquire_owned()
+                .await
+                .expect("skill action exclusive semaphore is never closed"),
+        )
+    } else {
+        None
+    };
+
+    for queued_job in queued_jobs {
+        run_background_skill_action_job(Arc::clone(&registry), queued_job).await;
+    }
+}
+
+async fn skill_action_session_runtime(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<Arc<crate::runtime::SessionRuntime>, RpcError> {
+    let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
+    let Some(profile_runtime) = profile_runtime else {
+        return Err(runtime_unavailable_error(
+            "profile runtime is required for skill actions",
+        ));
+    };
+    let permissions_epoch = state.session_cache.session_generation(session_id);
+    let permissions = effective_permissions_for_session(state, session_id)?;
+    let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+    let workspace_hint = session_workspaces().get(&workspace_profile_id, session_id);
+    state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            workspace_hint,
+            permissions,
+            permissions_epoch,
+        )
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!(
+                "failed to bootstrap session runtime for skill action: {error}"
+            ))
+        })
+}
+
+async fn raw_skill_action_list(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionListParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let active_profile_id = validate_session_scope(
+        &session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let session_runtime =
+        skill_action_session_runtime(state, &session_id, active_profile_id.as_deref()).await?;
+    let records = trusted_skill_action_records(
+        &session_runtime.profile.skill_actions,
+        &session_runtime.tools,
+        params.surface.as_deref(),
+        &params.tags,
+    );
+    let actions = records
+        .into_iter()
+        .filter(|record| skill_action_execution_available(&record.action, features))
+        .map(skill_action_record_to_value)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "profile_id": active_profile_id.unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+        "session_id": session_id,
+        "count": actions.len(),
+        "actions": actions,
+    }))
+}
+
+async fn raw_skill_action_invoke(
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+    ui_context: Option<SkillActionInvokeUiContext>,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionInvokeParams = parse_raw_params(request)?;
+    let active_profile_id = validate_session_scope(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let session_runtime =
+        skill_action_session_runtime(state, &params.session_id, active_profile_id.as_deref())
+            .await?;
+    let records = trusted_skill_action_records(
+        &session_runtime.profile.skill_actions,
+        &session_runtime.tools,
+        None,
+        &[],
+    );
+    let record = resolve_skill_action_record(&records, &params.action_id).ok_or_else(|| {
+        RpcError::invalid_params(format!(
+            "skill action '{}' is not available in this session",
+            params.action_id
+        ))
+    })?;
+    if !skill_action_record_is_trusted(record, &session_runtime.tools) {
+        return Err(RpcError::invalid_params(format!(
+            "skill action '{}' is no longer bound to its declaring plugin tool",
+            params.action_id
+        )));
+    }
+    let features = ui_context
+        .as_ref()
+        .map(|context| context.features)
+        .unwrap_or_default();
+    if !skill_action_execution_available(&record.action, features) {
+        return Err(RpcError::method_not_supported(
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+        ));
+    }
+    let session_scope = session_runtime
+        .agent
+        .session_scope()
+        .filter(|scope| scope.workspace() == session_runtime.workspace_root.as_path())
+        .cloned();
+    if session_runtime.agent.session_scope().is_some() && session_scope.is_none() {
+        warn!(
+            session = %params.session_id,
+            workspace = %session_runtime.workspace_root.display(),
+            "skill action skipped a mismatched SessionScope"
+        );
+    }
+    let approval_requester = ui_context.map(|ui_context| {
+        Arc::new(UiProtocolApprovalRequester {
+            ws: ui_context.ws,
+            ledger: Arc::clone(ledger),
+            contracts: ui_context.contracts,
+            state: Arc::clone(state),
+            session_id: params.session_id.clone(),
+            turn_id: TurnId::new(),
+            features: ui_context.features,
+        }) as Arc<dyn octos_agent::ToolApprovalRequester>
+    });
+    let execution_context = SkillActionExecutionContext {
+        tool_context: octos_agent::tools::ToolContext {
+            tool_id: record.action.id.clone(),
+            session_scope,
+            ..octos_agent::tools::ToolContext::zero()
+        },
+        approval_requester,
+    };
+    match record.action.execution {
+        octos_agent::plugins::SkillActionExecution::Sync => {
+            invoke_skill_action_tool_binding(
+                &record.action,
+                &session_runtime.tools,
+                &session_runtime.workspace_root,
+                Some(session_runtime.profile.profile_id.as_str()),
+                params.arguments,
+                &execution_context,
+            )
+            .await
+        }
+        octos_agent::plugins::SkillActionExecution::Background => {
+            let batch_permit = reserve_skill_action_batch()?;
+            let profile_id = session_runtime.profile.profile_id.clone();
+            let supervisor = session_runtime.tools.supervisor();
+            install_skill_action_job_projection_listener(
+                &supervisor,
+                &profile_id,
+                &params.session_id,
+                ledger,
+            );
+            supervisor
+                .enable_persistence(ui_protocol_task_output::task_state_path(
+                    &session_runtime.sessions_root,
+                    &params.session_id,
+                ))
+                .map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "failed to enable skill action task persistence: {error}"
+                    ))
+                })?;
+            if let Some(store) = state.task_query_store.as_ref() {
+                store.register(
+                    &params.session_id,
+                    &supervisor,
+                    &session_runtime.sessions_root,
+                );
+            }
+            let (response, queued_jobs) = enqueue_background_skill_action_jobs(
+                &record.action,
+                &record.skill_id,
+                &session_runtime.tools,
+                &session_runtime.workspace_root,
+                Some(profile_id.as_str()),
+                &profile_id,
+                &params.session_id,
+                params.arguments,
+                &execution_context,
+            )?;
+            let registry = session_runtime.tools.clone();
+            let concurrency_class = queued_jobs
+                .first()
+                .map(|queued| registry.concurrency_class(&queued.tool))
+                .unwrap_or_default();
+            tokio::spawn(run_background_skill_action_batch(
+                registry,
+                queued_jobs,
+                concurrency_class,
+                batch_permit,
+            ));
+            Ok(response)
+        }
+    }
+}
+
+fn skill_action_job_record_to_value(job: SkillActionJobRecord) -> Result<Value, RpcError> {
+    serde_json::to_value(job).map_err(|error| {
+        RpcError::internal_error(format!("failed to serialize skill action job: {error}"))
+    })
+}
+
+fn skill_action_profile_data_dir(
+    state: &AppState,
+    active_profile_id: Option<&str>,
+) -> Result<(String, PathBuf), RpcError> {
+    let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
+    if let Some(runtime) = state.profiles.get(&profile_id) {
+        return Ok((profile_id, runtime.data_dir.clone()));
+    }
+    let store = profile_store(state)?;
+    let profile = store
+        .get(&profile_id)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read profile: {error}")))?
+        .ok_or_else(|| profile_unresolved_error(&profile_id))?;
+    Ok((profile_id, store.resolve_data_dir(&profile)))
+}
+
+async fn load_skill_action_job_view(
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<(String, Vec<SkillActionJobRecord>), RpcError> {
+    match skill_action_session_runtime(state, session_id, active_profile_id).await {
+        Ok(runtime) => {
+            let profile_id = runtime.profile.profile_id.clone();
+            let supervisor = runtime.tools.supervisor();
+            install_skill_action_job_projection_listener(
+                &supervisor,
+                &profile_id,
+                session_id,
+                ledger,
+            );
+            supervisor
+                .enable_persistence(ui_protocol_task_output::task_state_path(
+                    &runtime.sessions_root,
+                    session_id,
+                ))
+                .map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "failed to restore skill action tasks: {error}"
+                    ))
+                })?;
+            Ok((
+                profile_id,
+                project_skill_action_jobs(supervisor.get_tasks_for_session(&session_id.0)),
+            ))
+        }
+        Err(_) => {
+            let (profile_id, store_root) = skill_action_profile_data_dir(state, active_profile_id)?;
+            let jobs = load_skill_action_jobs(&store_root, session_id).map_err(|error| {
+                RpcError::internal_error(format!("failed to restore skill action tasks: {error}"))
+            })?;
+            Ok((profile_id, jobs))
+        }
+    }
+}
+
+async fn raw_skill_action_job_list(
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionJobListParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let active_profile_id = validate_session_scope(
+        &session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let (profile_id, mut jobs) =
+        load_skill_action_job_view(state, ledger, &session_id, active_profile_id.as_deref())
+            .await?;
+    if let Some(batch_id) = params
+        .batch_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        jobs.retain(|job| job.batch_id == batch_id);
+    }
+    if let Some(action_id) = params
+        .action_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        jobs.retain(|job| job.action_id == action_id);
+    }
+    let jobs = jobs
+        .into_iter()
+        .map(skill_action_job_record_to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "profile_id": profile_id,
+        "session_id": session_id,
+        "count": jobs.len(),
+        "jobs": jobs,
+    }))
+}
+
+async fn raw_skill_action_job_read(
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSkillActionJobReadParams = parse_raw_params(request)?;
+    let active_profile_id = validate_session_scope(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let (_profile_id, jobs) = load_skill_action_job_view(
+        state,
+        ledger,
+        &params.session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
+    let Some(job) = jobs.into_iter().find(|job| job.job_id == params.job_id) else {
+        return Err(RpcError::invalid_params(format!(
+            "skill action job '{}' was not found",
+            params.job_id
+        ))
+        .with_data(json!({
+            "kind": "skill_action_job_not_found",
+            "job_id": params.job_id,
+        })));
+    };
+    Ok(json!({
+        "job": skill_action_job_record_to_value(job)?,
+    }))
+}
+
 async fn raw_profile_skills_registry_search(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
@@ -10429,6 +11971,9 @@ async fn raw_profile_skills_install(
 ) -> Result<Value, RpcError> {
     let params: RawProfileSkillsInstallParams = parse_raw_params(request)?;
     let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    // Keep disk mutation, plugin rebuild/publication, and session eviction in
+    // one per-profile critical section so an older rebuild cannot publish last.
+    let _mutation_guard = state.profile_skill_mutation_locks.lock(&profile_id).await;
     let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
     let repo =
         nonempty(Some(params.repo)).ok_or_else(|| RpcError::invalid_params("repo is required"))?;
@@ -10440,6 +11985,9 @@ async fn raw_profile_skills_install(
     .await
     .map_err(|err| RpcError::internal_error(format!("skill install join error: {err}")))?
     .map_err(|err| RpcError::invalid_params(format!("failed to install skill: {err}")))?;
+    if !result.installed.is_empty() {
+        rebuild_profile_runtime_after_skill_mutation(state, &profile_id).await?;
+    }
     Ok(json!({
         "profile_id": profile_id,
         "ok": true,
@@ -10456,6 +12004,8 @@ async fn raw_profile_skills_remove(
 ) -> Result<Value, RpcError> {
     let params: RawProfileSkillsRemoveParams = parse_raw_params(request)?;
     let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    // See install: the guard spans the full mutation-to-publication sequence.
+    let _mutation_guard = state.profile_skill_mutation_locks.lock(&profile_id).await;
     let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
     let name =
         nonempty(Some(params.name)).ok_or_else(|| RpcError::invalid_params("name is required"))?;
@@ -10464,6 +12014,7 @@ async fn raw_profile_skills_remove(
         .await
         .map_err(|err| RpcError::internal_error(format!("skill remove join error: {err}")))?
         .map_err(|err| RpcError::invalid_params(format!("failed to remove skill: {err}")))?;
+    rebuild_profile_runtime_after_skill_mutation(state, &profile_id).await?;
     Ok(json!({
         "profile_id": profile_id,
         "ok": true,
@@ -10616,7 +12167,14 @@ async fn raw_profile_llm_select(
         // ProfileRuntime caches forever, so evict both and re-bootstrap.
         state.session_cache.invalidate_profile(&profile_id).await;
         if let Some(key) = dynamic_profile_runtime_key(state, &profile_id) {
-            dynamic_profile_runtimes().write().await.remove(&key);
+            dynamic_profile_runtimes()
+                .write()
+                .map_err(|err| {
+                    RpcError::internal_error(format!(
+                        "dynamic profile runtime cache lock poisoned: {err}"
+                    ))
+                })?
+                .remove(&key);
         }
         if state.profiles.contains_key(&profile_id) {
             // Startup-config profiles live in an immutable map — the saved
@@ -10638,12 +12196,7 @@ async fn raw_profile_llm_select(
     let session_id = params
         .session_id
         .unwrap_or_else(|| SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"));
-    let refreshed = store
-        .get(&profile_id)
-        .ok()
-        .flatten()
-        .or(Some(profile))
-        .unwrap();
+    let refreshed = store.get(&profile_id).ok().flatten().unwrap_or(profile);
     let models = model_list_result(state, session_id.clone(), &profile_id, Some(&refreshed));
     let selected = models
         .get("models")
@@ -10843,7 +12396,7 @@ fn raw_profile_llm_delete(
         ));
     };
 
-    let mut applied = false;
+    let applied: bool;
     if llm
         .primary
         .as_ref()
@@ -11893,32 +13446,82 @@ fn stage_peer(
                 "peer '{slug}' staging directory is no longer a real directory"
             )));
         }
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workspace_root)
-            .arg("worktree")
-            .arg("add")
-            .arg("-b")
-            .arg(&branch)
-            .arg(&worktree_path)
-            .output();
-        let output = match output {
-            Ok(output) => output,
-            Err(err) => {
-                cleanup_staged_peer(workspace_root, &slug, &peer_dir);
-                return Err(RpcError::invalid_params(format!(
-                    "failed to run git: {err}"
-                )));
+        // A CLONE, not `git worktree add`. A worktree's `.git` is a FILE
+        // pointing at `<repo>/.git/worktrees/<name>`, which lives OUTSIDE the
+        // peer's sandboxed workspace — so every git command inside a worktree
+        // peer failed with `fatal: not a git repository ... exit 128`, and the
+        // model "recovered" by running `git init`, destroying the fence. The
+        // branch then stayed at the seed commit and no deliverable ever landed.
+        // A clone puts the whole `.git` INSIDE `peers/<slug>/wt`, so git works
+        // with no sandbox widening, and one peer cannot reach another's refs.
+        //
+        // `--no-hardlinks` because isolation is the entire point here: the
+        // default local-clone optimisation shares object-file inodes with the
+        // parent, so a peer writing into its own `.git` could corrupt the
+        // source repo's objects. Costs a real object copy per peer; revisit
+        // with evidence if staging latency becomes the problem.
+        let run_git = |args: &[&std::ffi::OsStr]| -> Result<(), String> {
+            match std::process::Command::new("git").args(args).output() {
+                Err(err) => Err(format!("failed to run git: {err}")),
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
             }
         };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let as_os = |s: &str| std::ffi::OsString::from(s);
+        let clone_args: Vec<std::ffi::OsString> = vec![
+            as_os("clone"),
+            as_os("--quiet"),
+            as_os("--no-hardlinks"),
+            workspace_root.as_os_str().to_os_string(),
+            worktree_path.as_os_str().to_os_string(),
+        ];
+        let clone_ref: Vec<&std::ffi::OsStr> = clone_args.iter().map(AsRef::as_ref).collect();
+        if let Err(detail) = run_git(&clone_ref) {
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::invalid_params(format!(
-                "git worktree add failed (is {} a git repo?): {}",
+                "git clone failed (is {} a git repo?): {}",
                 workspace_root.display(),
-                stderr
+                detail
             )));
+        }
+        // The fence branch now lives in the peer's OWN clone.
+        let branch_args: Vec<std::ffi::OsString> = vec![
+            as_os("-C"),
+            worktree_path.as_os_str().to_os_string(),
+            as_os("checkout"),
+            as_os("-q"),
+            as_os("-b"),
+            as_os(&branch),
+        ];
+        let branch_ref: Vec<&std::ffi::OsStr> = branch_args.iter().map(AsRef::as_ref).collect();
+        if let Err(detail) = run_git(&branch_ref) {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::invalid_params(format!(
+                "git checkout -b {branch} failed in the peer clone: {detail}"
+            )));
+        }
+        // A clone does NOT inherit the source's LOCAL config, so a peer would
+        // have no commit identity and every `git commit` would fail. Carry the
+        // parent's over when it has one; otherwise git falls back to global.
+        for key in ["user.name", "user.email"] {
+            let read = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace_root)
+                .args(["config", "--get", key])
+                .output();
+            let Ok(out) = read else { continue };
+            if !out.status.success() {
+                continue;
+            }
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if value.is_empty() {
+                continue;
+            }
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree_path)
+                .args(["config", key, &value])
+                .output();
         }
         worktree_path
     } else {
@@ -12044,6 +13647,63 @@ fn remove_peer_worktree(workspace_root: &Path, dir: &Path) {
         if mine {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// Fetch a peer's fence branch out of its own clone and into the workspace repo.
+///
+/// Peers are staged as CLONES (see `stage_peer`), so `peer/<slug>` exists only
+/// inside `peers/<slug>/wt`. Without this the work is invisible from the
+/// workspace — `git branch` would not list it and the deliverable would look
+/// like it never happened. Run on close, once the peer is done writing.
+///
+/// Best-effort by design: a peer that never committed, was staged without a
+/// worktree, or whose clone is gone simply has nothing to collect, and none of
+/// those should fail the close.
+fn collect_peer_branch(peer_dir: &Path, slug: &str) {
+    let clone = peer_dir.join("wt");
+    if !clone.join(".git").exists() {
+        return;
+    }
+    // The clone's `origin` IS the workspace repo it was cloned from, so the
+    // destination is self-describing — no need to thread a workspace root
+    // through the close callback, and it stays correct even if the session's
+    // workspace moved after staging.
+    let origin = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        _ => return,
+    };
+    if origin.is_empty() {
+        return;
+    }
+    let workspace_root = PathBuf::from(origin);
+    let branch = format!("peer/{slug}");
+    // `+` forces the update: a re-opened peer that committed again must not be
+    // refused for a non-fast-forward.
+    let refspec = format!("+{branch}:{branch}");
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace_root)
+        .args(["fetch", "--no-tags", "--quiet"])
+        .arg(&clone)
+        .arg(&refspec)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!(slug, branch = %branch, "collected peer branch from its clone");
+        }
+        Ok(out) => tracing::warn!(
+            slug,
+            branch = %branch,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "could not collect the peer branch (it may have committed nothing)"
+        ),
+        Err(error) => tracing::warn!(slug, %error, "failed to run git to collect the peer branch"),
     }
 }
 
@@ -13174,6 +14834,21 @@ fn write_peer_result_if_peer_session(
     if let Err(err) = peer_io::append_peer_line(&peer_dir, "turns.txt", &index_line) {
         tracing::warn!(?err, slug, turn_count, "failed to append to turns.txt");
     }
+
+    // Publish this turn's commits to the workspace repo NOW, not only on close.
+    //
+    // A peer's fence branch lives in its own clone, so until it is fetched back
+    // the work is invisible from the workspace — `git branch` does not list it
+    // and it reads as though the peer produced nothing. Collecting only on close
+    // meant a peer that was never closed (the common case: peers usually just
+    // finish) kept its deliverable stranded in the clone. Live soak showed
+    // exactly that: the closed peer's branch landed, the un-closed peer's did
+    // not, despite both having committed.
+    //
+    // Here is the right moment — the peer has just finished a turn, so whatever
+    // it committed exists. Best-effort and idempotent: the fetch is a forced
+    // refspec, so re-running it per turn simply fast-forwards.
+    collect_peer_branch(&peer_dir, slug);
 }
 
 /// Count how many `result-<n>.md` version files exist in the peer directory,
@@ -13758,6 +15433,12 @@ fn build_peer_close_callback(
                 "failed to write close marker for peer '{slug}': {err}"
             ));
         }
+        // The fence branch lives in the peer's own clone, so pull it into the
+        // workspace repo now that the peer is done — otherwise its work is
+        // invisible from the workspace and looks like it never happened.
+        // AFTER the marker: collection is best-effort and must never leave a
+        // peer un-closed.
+        collect_peer_branch(&peer_dir, &slug);
         // #436 leak fix — the marker now refuses NEW sends; actively CANCEL +
         // tombstone any injection queued for this peer BEFORE the close so
         // nothing stays stranded in the durable queue (the drain gates skip a
@@ -14747,6 +16428,10 @@ fn raw_autonomy_rpc_with_orchestrator(
     }
 }
 
+// Raw-dispatch entry point: it threads the full per-request dispatch context
+// (connection, stores, negotiated features, profile scope, rpc id) through to
+// every raw method arm, so the wide flat parameter list is intentional.
+#[allow(clippy::too_many_arguments)]
 async fn handle_raw_appui_rpc(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -14766,6 +16451,14 @@ async fn handle_raw_appui_rpc(
     // drift from what this handler actually serves.
     if !raw_method_is_dispatched(request.method.as_str(), features.stdio_transport) {
         return false;
+    }
+    if skill_action_method_available(request.method.as_str(), features) == Some(false) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::method_not_supported(request.method.as_str()),
+        );
+        return true;
     }
 
     if request.method == APPUI_METHOD_REVIEW_START {
@@ -14878,6 +16571,29 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_PEER_GATHER => raw_peer_gather(state, request, connection_profile_id),
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
+        }
+        APPUI_METHOD_SKILL_ACTION_LIST => {
+            raw_skill_action_list(state, request, connection_profile_id, features).await
+        }
+        APPUI_METHOD_SKILL_ACTION_INVOKE => {
+            raw_skill_action_invoke(
+                state,
+                ledger,
+                request,
+                connection_profile_id,
+                Some(SkillActionInvokeUiContext {
+                    ws: ws.clone(),
+                    contracts: Arc::clone(contracts),
+                    features,
+                }),
+            )
+            .await
+        }
+        APPUI_METHOD_SKILL_ACTION_JOB_LIST => {
+            raw_skill_action_job_list(state, ledger, request, connection_profile_id).await
+        }
+        APPUI_METHOD_SKILL_ACTION_JOB_READ => {
+            raw_skill_action_job_read(state, ledger, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
             raw_profile_skills_registry_search(state, request, connection_profile_id).await
@@ -15263,6 +16979,10 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
             | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+            | APPUI_METHOD_SKILL_ACTION_LIST
+            | APPUI_METHOD_SKILL_ACTION_INVOKE
+            | APPUI_METHOD_SKILL_ACTION_JOB_LIST
+            | APPUI_METHOD_SKILL_ACTION_JOB_READ
             | APPUI_METHOD_AUTH_STATUS
             | APPUI_METHOD_AUTH_ME
             | APPUI_METHOD_AUTH_SEND_CODE
@@ -15545,6 +17265,10 @@ fn is_auth_scope_violation(error: &RpcError) -> bool {
         .unwrap_or(false)
 }
 
+// The session/open pipeline needs the approval and question stores, live
+// forwarders, negotiated features, and the caller's profile scope as separate
+// pieces — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_open(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -15595,6 +17319,7 @@ async fn handle_session_open(
             return false;
         }
     };
+    ws.update_live_profile_id(outcome.profile_id.clone());
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -15636,6 +17361,9 @@ async fn handle_session_open(
     //
     // Reusing the helper keeps replay and live capability behavior in lockstep.
     for event in outcome.replay {
+        if !ledger_event_matches_profile_scope(&event.event, &outcome.profile_id) {
+            continue;
+        }
         let projected = features
             .projection_envelope_v2
             .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
@@ -15781,6 +17509,15 @@ fn ledger_event_matches_topic_scope(
     }
 }
 
+fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id: &str) -> bool {
+    match event {
+        UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(update)) => {
+            update.profile_id == profile_id
+        }
+        _ => true,
+    }
+}
+
 fn stdio_session_open_candidate_profile(
     params: &SessionOpenParams,
     current_profile_id: Option<&str>,
@@ -15798,6 +17535,10 @@ fn stdio_session_open_candidate_profile(
 /// gating as the live-emit path. The task ends when the WS write channel
 /// closes (peer gone), the broadcast sender is dropped (rare), or the
 /// connection cleanup aborts the handle.
+// Each parameter is an independent piece of the forwarder's runtime state
+// (connection, ledger, replay baseline, negotiated features, broadcast
+// receiver); grouping them would only obscure the per-connection wiring.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_live_forwarder(
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
@@ -15843,6 +17584,12 @@ async fn spawn_live_forwarder(
                         continue;
                     }
                     if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
+                        continue;
+                    }
+                    if !ledger_event_matches_profile_scope(
+                        &event.event,
+                        &ws.snapshot_live_profile_id(),
+                    ) {
                         continue;
                     }
                     // Stage 1 v2 is a wire projection of this existing
@@ -16177,20 +17924,20 @@ fn live_event_passes_capability_filter(
     // Keep this branch before the historical capability gates below so a
     // replayed source event cannot leak beside its v2 projection.
     if features.projection_envelope_v2 {
-        if let UiProtocolLedgerEvent::Notification(notification) = event {
-            match notification {
-                UiNotification::Envelope(_)
-                | UiNotification::MessageDelta(_)
-                | UiNotification::ReasoningDelta(_)
-                | UiNotification::ToolStarted(_)
-                | UiNotification::ToolProgress(_)
-                | UiNotification::ToolCompleted(_)
-                | UiNotification::FileAttached(_)
-                | UiNotification::TurnCompleted(_)
-                | UiNotification::TurnError(_)
-                | UiNotification::TurnSpawnComplete(_) => return false,
-                _ => {}
-            }
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::Envelope(_)
+            | UiNotification::MessageDelta(_)
+            | UiNotification::ReasoningDelta(_)
+            | UiNotification::ToolStarted(_)
+            | UiNotification::ToolProgress(_)
+            | UiNotification::ToolCompleted(_)
+            | UiNotification::FileAttached(_)
+            | UiNotification::TurnCompleted(_)
+            | UiNotification::TurnError(_)
+            | UiNotification::TurnSpawnComplete(_),
+        ) = event
+        {
+            return false;
         }
     }
     if !features.context_lifecycle_available() {
@@ -16245,6 +17992,12 @@ fn live_event_passes_capability_filter(
     // that can act on it.
     if !features.user_question_v1 {
         if let UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(_)) = event
+        {
+            return false;
+        }
+    }
+    if !features.skill_action_jobs_available() {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(_)) = event
         {
             return false;
         }
@@ -16306,6 +18059,7 @@ struct SessionOpenOutcome {
     /// where an event landing between replay and the session/open append
     /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
     replay_baseline_seq: u64,
+    profile_id: String,
 }
 
 // Threading both the approval store and the (UPCR-2026-023) question store
@@ -16329,6 +18083,9 @@ async fn open_session_result(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
+    let ledger_profile_id = active_profile_id
+        .clone()
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
@@ -16476,6 +18233,7 @@ async fn open_session_result(
     }
     if let Some(root) = effective_workspace_root.as_ref() {
         session_workspaces().set_resolved(
+            &ledger_profile_id,
             params.session_id.clone(),
             root.clone(),
             effective_runtime_hint,
@@ -16488,7 +18246,10 @@ async fn open_session_result(
     register_peer_wire_session(state, &params.session_id);
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
-    replay.retain(|event| ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()));
+    replay.retain(|event| {
+        ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
+            && ledger_event_matches_profile_scope(&event.event, &ledger_profile_id)
+    });
     let replayed_approval_ids = replay
         .iter()
         .filter_map(|event| match &event.event {
@@ -16566,8 +18327,9 @@ async fn open_session_result(
     // The cached SessionRuntime's `workspace_root` is the source of truth
     // for the wire response when present. Fall back to the legacy lookup
     // when no SessionRuntime was materialized (no profile registered).
-    let workspace_root = effective_workspace_root
-        .or_else(|| session_workspace_root_for_state(state, &params.session_id));
+    let workspace_root = effective_workspace_root.or_else(|| {
+        session_workspace_root_for_profile(active_profile_id.as_deref(), &params.session_id)
+    });
     let panes = features
         .pane_snapshots
         .then(|| build_pane_snapshot(&data_dir, &params.session_id, workspace_root.as_deref()));
@@ -16614,6 +18376,7 @@ async fn open_session_result(
         pending_questions,
         opened_event,
         replay_baseline_seq,
+        profile_id: ledger_profile_id,
     })
 }
 
@@ -16935,9 +18698,7 @@ fn validate_session_workspace_path_safety(workspace_root: &Path) -> Result<(), R
 fn workspace_root_escape_under_system_path(path: &Path) -> Option<&'static str> {
     let mut components = path.components();
     let _root = components.next();
-    let Some(first) = components.next() else {
-        return None;
-    };
+    let first = components.next()?;
     let first = first.as_os_str();
     const BANNED: &[&str] = &[
         "etc", "sbin", "bin", "boot", "dev", "proc", "sys", "usr", "var", "root",
@@ -17137,18 +18898,19 @@ pub(crate) fn resolve_session_profile_runtime(
     active_profile_id: Option<&str>,
 ) -> Option<Arc<crate::runtime::ProfileRuntime>> {
     let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    state.profiles.get(candidate).cloned().or_else(|| {
-        let key = dynamic_profile_runtime_key(state, candidate)?;
+    let dynamic = dynamic_profile_runtime_key(state, candidate).and_then(|key| {
         dynamic_profile_runtimes()
-            .try_read()
-            .ok()
-            .and_then(|runtimes| runtimes.get(&key).cloned())
-    })
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+    });
+    dynamic.or_else(|| state.profiles.get(candidate).cloned())
 }
 
 fn dynamic_profile_runtimes() -> &'static DynamicProfileRuntimeMap {
     static RUNTIMES: OnceLock<DynamicProfileRuntimeMap> = OnceLock::new();
-    RUNTIMES.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+    RUNTIMES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<String> {
@@ -17164,18 +18926,23 @@ async fn ensure_session_profile_runtime(
     active_profile_id: Option<&str>,
 ) -> Result<Option<Arc<crate::runtime::ProfileRuntime>>, RpcError> {
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    if let Some(runtime) = state.profiles.get(profile_id) {
-        return Ok(Some(runtime.clone()));
-    }
     let Some(store) = state.profile_store.as_ref() else {
-        return Ok(None);
+        return Ok(state.profiles.get(profile_id).cloned());
     };
     let Some(key) = dynamic_profile_runtime_key(state, profile_id) else {
         return Ok(None);
     };
 
-    if let Some(runtime) = dynamic_profile_runtimes().read().await.get(&key).cloned() {
+    if let Some(runtime) = dynamic_profile_runtimes()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+    {
         return Ok(Some(runtime));
+    }
+    if let Some(runtime) = state.profiles.get(profile_id) {
+        return Ok(Some(runtime.clone()));
     }
 
     let profile = store
@@ -17184,11 +18951,16 @@ async fn ensure_session_profile_runtime(
     let Some(profile) = profile else {
         return Ok(None);
     };
+    let profile_data_dir = store.resolve_data_dir(&profile);
+    // Restart recovery belongs exclusively to `octos serve` startup, which
+    // scans every persisted profile before runtimes are bootstrapped. This
+    // helper also runs for live cache replacement (for example
+    // `profile/llm/select`), where marking active jobs abandoned would lie
+    // about work still executing in this process.
     if !profile.enabled || profile.parent_id.is_some() || !profile.config.has_llm_selection() {
         return Ok(None);
     }
 
-    let profile_data_dir = store.resolve_data_dir(&profile);
     // Lazily-created profiles must honour host-level policy too — without
     // host_memory, a host opt-out of (default-on) memory refresh would not
     // bind profiles created after startup.
@@ -17207,13 +18979,37 @@ async fn ensure_session_profile_runtime(
             "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error}"
         ))
     })?;
-
-    let mut runtimes = dynamic_profile_runtimes().write().await;
+    let mut runtimes = dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let runtime = runtimes
         .entry(key)
         .or_insert_with(|| runtime.clone())
         .clone();
     Ok(Some(runtime))
+}
+
+async fn rebuild_profile_runtime_after_skill_mutation(
+    state: &Arc<AppState>,
+    profile_id: &str,
+) -> Result<(), RpcError> {
+    let Some(current) = ensure_session_profile_runtime(state, Some(profile_id)).await? else {
+        return Ok(());
+    };
+    let replacement = current.rebuild_plugin_layer().await.map_err(|error| {
+        runtime_unavailable_error(format!(
+            "failed to rebuild profile runtime after skill mutation: {error}"
+        ))
+    })?;
+    let key = dynamic_profile_runtime_key(state, profile_id).ok_or_else(|| {
+        runtime_unavailable_error("profile runtime catalog is unavailable for skill mutation")
+    })?;
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, replacement);
+    state.session_cache.invalidate_profile(profile_id).await;
+    Ok(())
 }
 
 /// Explain why `ensure_session_profile_runtime`/`resolve_session_profile_runtime`
@@ -17283,7 +19079,8 @@ pub(crate) async fn resolve_sessions_for_lookup(
         .or(connection_profile_id)
         .or(routed_profile_id);
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
-        let hint = session_workspaces().runtime_hint(session_id);
+        let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+        let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
@@ -17303,23 +19100,24 @@ pub(crate) async fn resolve_sessions_for_lookup(
     state.sessions.clone()
 }
 
+pub(crate) fn session_workspace_root_for_profile(
+    profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> Option<PathBuf> {
+    // The cached SessionRuntime is authoritative after bootstrap. This map is
+    // only the synchronous read-through view used before an async cache lookup
+    // can complete, so its key must include the resolved profile as well as the
+    // raw session id.
+    let workspace_profile_id = workspace_profile_scope(profile_id, session_id);
+    session_workspaces().get(&workspace_profile_id, session_id)
+}
+
 pub(crate) fn session_workspace_root_for_state(
     state: &AppState,
     session_id: &SessionKey,
 ) -> Option<PathBuf> {
-    // M11-F: read-through view on `session_workspaces()` only. The
-    // legacy `state.agent.tool_registry().workspace_root()` fallback
-    // was deleted alongside `state.agent`; the cached
-    // `SessionRuntime.workspace_root` is the canonical source on a
-    // successful open, and the in-memory `session_workspaces()` map is
-    // the synchronous read-through view `session/open`'s pane snapshot
-    // path uses (computed BEFORE the async cache load completes).
-    // Tier-2 (`appui.default_session_cwd`) is consulted at
-    // `open_session_result` time as a fallback hint, so the map
-    // already reflects the operator default when no client cwd was
-    // supplied.
-    let _ = state; // unused after the agent-fallback deletion
-    session_workspaces().get(session_id)
+    let _ = state;
+    session_workspace_root_for_profile(None, session_id)
 }
 
 /// Append the per-session workspace-root hint to the system prompt.
@@ -17557,7 +19355,7 @@ fn build_git_pane_snapshot(workspace_dirs: &[PathBuf]) -> UiGitPaneSnapshot {
     let Some(repo_root) = workspace_dirs
         .iter()
         .filter(|path| path.exists())
-        .find_map(git_repo_root)
+        .find_map(|path| git_repo_root(path))
     else {
         return UiGitPaneSnapshot {
             repo_root: None,
@@ -17602,7 +19400,7 @@ fn build_git_pane_snapshot(workspace_dirs: &[PathBuf]) -> UiGitPaneSnapshot {
     }
 }
 
-fn git_repo_root(path: &PathBuf) -> Option<PathBuf> {
+fn git_repo_root(path: &Path) -> Option<PathBuf> {
     git_output(path, ["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
@@ -17787,7 +19585,7 @@ async fn handle_review_start(
     let accepted_agent_count =
         expected_review_agent_count_for_profile(state, Some(review_profile_runtime.as_ref()));
 
-    let turn_id = params.turn_id.clone().unwrap_or_else(TurnId::new);
+    let turn_id = params.turn_id.clone().unwrap_or_default();
     let session_id = params.session_id.clone();
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -17891,6 +19689,11 @@ async fn handle_review_start(
     let _ = start_tx.send(());
 }
 
+// Turn-start threads the full dispatch context (connection, stores, turn
+// registries, caller and routed profile scope, negotiated features) straight
+// through to `handle_turn_start_with_accept`; the wide signature is the
+// adapter boundary, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_turn_start(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -18349,6 +20152,7 @@ async fn handle_turn_steer(
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                tool_context: None,
                 live_video: false,
             };
             handle_turn_start_with_accept(
@@ -18513,6 +20317,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
@@ -18744,6 +20549,10 @@ fn continuation_may_complete(is_peer_injection: bool, agent_dispatched: bool) ->
     !is_peer_injection || agent_dispatched
 }
 
+// The drain needs the dispatch stores, turn registries, this connection's
+// open-session set, and negotiated features as separate inputs — a flat
+// per-request dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn drain_appui_due_master_continuations(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -19051,9 +20860,9 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // #1666 residue — a goal target is cwd-scoped (`<wire>\u{0}~cwd-…`)
             // while `session_workspaces()` is keyed by the plain wire id, so
             // the workspace-known gate must strip the scope before probing.
-            let runnable = |session: &SessionKey| {
+            let runnable = |session: &SessionKey, profile_id: &str| {
                 session_workspaces()
-                    .get(&wire_key_from_goal_key(session))
+                    .get(profile_id, &wire_key_from_goal_key(session))
                     .is_some()
             };
             let orchestrator = default_agent_orchestrator();
@@ -20077,6 +21886,10 @@ async fn handle_task_restart_from_node(
 /// land an event with cursor ≤ result.cursor that the client did not also
 /// observe — so a follow-up `session/hydrate { after: result.cursor }`
 /// returns only events strictly after the snapshot, with no gap.
+// The handler threads the ledger, approval/question stores, turn registry,
+// and the caller's profile scope plus negotiated features as one flat
+// per-request dependency list.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_hydrate(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -20761,6 +22574,9 @@ async fn handle_session_fork(
 }
 
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
+// Connection state, ledger, turn registry, and the caller's profile scope
+// arrive as separate per-request pieces — a flat dependency list.
+#[allow(clippy::too_many_arguments)]
 async fn handle_thread_graph_get(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -20850,6 +22666,10 @@ async fn handle_thread_graph_get(
 /// review asked for the durable backing so a turn the registry has already
 /// evicted (e.g. daemon restart, idle eviction) can still surface a
 /// non-`unknown` state.
+// The handler consults the ledger AND the active-turn registry under the
+// caller's profile scope and negotiated features — a flat per-request
+// dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_turn_state_get(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -21224,6 +23044,9 @@ fn btw_activity_line(notification: &UiNotification) -> Option<String> {
 /// soon as the aside is validated and snapshotted, so the connection's read
 /// loop keeps serving interrupts/approvals — and the busy gate actually
 /// gates — while the answer (up to 30s) is produced.
+// Connection, ledger, turn registry, and the caller's profile scope arrive
+// as separate per-request pieces — a flat dependency list.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_btw(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -21719,11 +23542,10 @@ fn project_turn_from_ledger(
                 });
             }
             UiNotification::EnvelopeV2(envelope)
-                if envelope.envelope.turn_id == target.0.to_string() =>
+                if envelope.envelope.turn_id == target.0.to_string()
+                    && projection.thread_id.is_none() =>
             {
-                if projection.thread_id.is_none() {
-                    projection.thread_id = Some(envelope.envelope.thread_id.clone());
-                }
+                projection.thread_id = Some(envelope.envelope.thread_id.clone());
             }
             _ => {}
         }
@@ -22000,6 +23822,11 @@ fn axum_path(value: String) -> axum::extract::Path<String> {
     axum::extract::Path(value)
 }
 
+// This WS-to-REST adapter forwards the request headers and auth identity
+// alongside the connection state and negotiated features, pushing the
+// handler past clippy's 7-arg lint; the parameters are a flat dependency
+// list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_list(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -22268,6 +24095,10 @@ fn resolve_launch_result(
     })
 }
 
+// This WS-to-REST adapter forwards the request headers and auth identity
+// alongside the connection state, routed profile scope, and negotiated
+// features — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_status_get(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -24262,9 +26093,13 @@ async fn m9_fixture_delay_or_interrupt(
 }
 
 fn m9_fixture_has_pending_interrupt(interrupt_rx: &mut mpsc::Receiver<()>) -> bool {
-    matches!(interrupt_rx.try_recv(), Ok(_))
+    interrupt_rx.try_recv().is_ok()
 }
 
+// The M9 fixture drives a full turn end-to-end, so it takes the connection,
+// stores, fixture definition, shared turn state, and interrupt channel as
+// separate pieces — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn run_m9_fixture_turn(
     ws: WsConnection,
     state: Arc<AppState>,
@@ -24875,8 +26710,9 @@ async fn run_m14_codex_p0_tool_parity_fixture_turn(
     interrupt_rx: &mut mpsc::Receiver<()>,
 ) -> M9FixtureOutcome {
     append_appui_server_log("#969 Codex P0 tool parity soak started");
+    let workspace_profile_id = workspace_profile_scope(None, session_id);
     let workspace = session_workspaces()
-        .get(session_id)
+        .get(&workspace_profile_id, session_id)
         .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if let Err(error) = std::fs::create_dir_all(&workspace) {
@@ -25499,7 +27335,8 @@ async fn run_native_code_review_turn(
                 return;
             }
         };
-    let hint = session_workspaces().runtime_hint(&session_id);
+    let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
+    let hint = session_workspaces().runtime_hint(&workspace_profile_id, &session_id);
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
@@ -25959,6 +27796,10 @@ fn native_review_task(objective: &str, target: &str, spec: &NativeCodeReviewSpec
     )
 }
 
+// The specialist spawn needs the join set, connection/ledger handles, the
+// review's session/profile/workspace scope, and the dispatch policy as
+// separate pieces — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 fn maybe_spawn_cli_review_specialist(
     joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
     ws: &WsConnection,
@@ -26862,7 +28703,7 @@ async fn seed_m9_task_output_fixture(
 
 /// #1133 — context required to fold a finished AppUI goal turn back
 /// into the goal runtime. Carries the profile id so `record_goal_turn`
-/// + `maybe_complete_goal_from_model` can be invoked once the agent
+/// and `maybe_complete_goal_from_model` can be invoked once the agent
 /// task returns AND the assistant reply has been persisted into the
 /// per-session `SessionRuntime.sessions` manager.
 ///
@@ -26974,6 +28815,7 @@ fn reasoning_effort_from_wire(
 ///   forwarded), never via raw foreground tokens, so dropping these loses
 ///   nothing user-facing. Pairs with the octos-tui client guard that ignores
 ///   deltas for already-terminal turns (belt + suspenders).
+///
 /// Chars of a background REPORT result inlined into the parent conversation.
 /// At or below this, the full text is inlined; above it, a preview of this
 /// size is inlined plus a recovery pointer. The old behaviour (300-char
@@ -27015,6 +28857,19 @@ fn drain_should_skip_event(event_type: Option<&str>) -> bool {
         event_type,
         Some("done") | Some("error") | Some("token") | Some("reasoning_chunk")
     )
+}
+
+fn normalize_tool_context(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// Child-stream coalescing window (#1799 follow-up). A fast child can fire
@@ -27259,11 +29114,12 @@ async fn run_standalone_turn(
         return;
     };
 
+    let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
     // Keep two meanings separate: every opened session has an effective
     // workspace root for tools/goals/UI, but only a Tier-1 client cwd or Tier-2
     // operator default is a runtime hint that may relocate transcript storage.
     // A derived Tier-3 workspace therefore yields `hint == None`.
-    let workspace_binding = session_workspaces().snapshot(&session_id);
+    let workspace_binding = session_workspaces().snapshot(&workspace_profile_id, &session_id);
     let hint = workspace_binding
         .as_ref()
         .and_then(|binding| binding.runtime_hint.clone());
@@ -27448,6 +29304,7 @@ async fn run_standalone_turn(
         .iter()
         .any(|file_ref| octos_bus::media::is_audio(&file_ref.path));
     let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
+    tool_registry.set_active_context(normalize_tool_context(params.tool_context.as_deref()));
     // Stamp the per-turn snapshot with this session's key so
     // `spawn::register_with_lineage` writes `session_key:
     // Some(<session_id.0>)` onto every `BackgroundTask` it tracks
@@ -31445,6 +33302,9 @@ struct TurnCompletionDetails {
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
     session_result: Option<TurnSessionResult>,
+    // Populated on the standalone-turn `done` path; read only by feature
+    // combinations that project the terminal outcome into the lifecycle emit.
+    #[allow(dead_code)]
     outcome: Option<TurnTerminalOutcome>,
 }
 
@@ -33522,12 +35382,7 @@ fn merge_artifact_index(dir: &Path, agent_id: &Value, artifacts: &[Value]) {
     let mut merged: Vec<Value> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| {
-            value
-                .get("artifacts")
-                .and_then(Value::as_array)
-                .map(Clone::clone)
-        })
+        .and_then(|value| value.get("artifacts").and_then(Value::as_array).cloned())
         .unwrap_or_default();
     for artifact in new_artifacts {
         let already_present = merged.iter().any(|existing| {
@@ -34362,6 +36217,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_)
             | UiNotification::VoiceExit(_)
+            | UiNotification::SkillActionJobUpdated(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
             | UiNotification::ToolCompleted(_)

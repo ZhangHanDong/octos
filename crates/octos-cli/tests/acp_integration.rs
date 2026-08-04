@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionNotification,
-    SessionUpdate, StopReason, TextContent,
+    ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    SessionNotification, SessionUpdate, StopReason, TextContent,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 
@@ -114,6 +114,17 @@ impl octos_llm::LlmProvider for RecordingLlm {
 fn agent_message_text(update: &SessionUpdate) -> Option<String> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Pull the text out of a user-message `session/update`, if that's what it is.
+fn user_message_text(update: &SessionUpdate) -> Option<String> {
+    match update {
+        SessionUpdate::UserMessageChunk(chunk) => match &chunk.content {
             ContentBlock::Text(t) => Some(t.text.clone()),
             _ => None,
         },
@@ -445,4 +456,464 @@ fn should_emit_only_valid_json_on_stdout_when_running_acp() {
             panic!("non-JSON line on the ACP stdout stream (would -32700 in Zed): {line:?} ({e})")
         });
     }
+}
+
+/// A conversation must survive the process that created it.
+///
+/// ACP sessions were memory-only: `AcpSession.history` was a `Mutex<Vec<Message>>`
+/// and nothing wrote it anywhere. A kill -9 or a supervisor restart left the agent
+/// with no idea what it had been doing, while the fleet reported it healthy —
+/// silent amnesia mid-task, which is worse than staying down.
+///
+/// This drives two independent transports over one store: the first holds a
+/// conversation, the second loads that session id and must see the earlier turns.
+#[tokio::test]
+async fn should_restore_a_conversation_through_session_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    // ---- first process: one turn, then drop the transport entirely ----
+    let seen_one: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm_one: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
+        seen: seen_one.clone(),
+        replies: vec!["REMEMBER_THIS".to_string()],
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let factory_one = TestAgentFactory::new(llm_one, memory_dir.clone(), cwd.clone())
+        .with_session_store(&sessions_dir);
+
+    let cwd_one = cwd.clone();
+    let session_id = Client
+        .builder()
+        .name("octos-acp-persist-1")
+        .on_receive_notification(
+            async move |_n: SessionNotification,
+                        _cx: ConnectionTo<agent_client_protocol::Agent>| Ok(()),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory_one),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(cwd_one.clone()))
+                    .block_task()
+                    .await?;
+                let id = new_session.session_id.clone();
+                connection
+                    .send_request(PromptRequest::new(
+                        id.clone(),
+                        vec![ContentBlock::from("FIRST_QUESTION")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(id)
+            },
+        )
+        .await
+        .expect("first session");
+
+    // ---- second process: same store, same id, fresh everything else ----
+    let seen_two: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm_two: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
+        seen: seen_two.clone(),
+        replies: vec!["SECOND_REPLY".to_string()],
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let factory_two =
+        TestAgentFactory::new(llm_two, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
+
+    let cwd_two = cwd.clone();
+    let id_two = session_id.clone();
+    Client
+        .builder()
+        .name("octos-acp-persist-2")
+        .on_receive_notification(
+            async move |_n: SessionNotification,
+                        _cx: ConnectionTo<agent_client_protocol::Agent>| Ok(()),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory_two),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(LoadSessionRequest::new(id_two.clone(), cwd_two.clone()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        id_two.clone(),
+                        vec![ContentBlock::from("SECOND_QUESTION")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(())
+            },
+        )
+        .await
+        .expect("second session");
+
+    // The second process's LLM must have been handed the first turn as context.
+    let calls = seen_two.lock().await;
+    let last = calls.last().expect("the reloaded session ran a turn");
+    let joined = last.join("\n");
+    assert!(
+        joined.contains("FIRST_QUESTION"),
+        "session/load did not restore the earlier user turn; saw: {joined}"
+    );
+    assert!(
+        joined.contains("REMEMBER_THIS"),
+        "session/load did not restore the earlier assistant turn; saw: {joined}"
+    );
+}
+
+/// #1909: `session/load` must REPLAY the restored transcript as `session/update`
+/// notifications — the response carries no history, so without a replay a
+/// reconnecting client renders an empty conversation even though the agent
+/// restored it (the client then prompts from zero context and the agent
+/// answers as if it forgot everything).
+///
+/// Same two-transport shape as `should_restore_a_conversation_through_session_load`,
+/// but the second client RECORDS the updates and asserts the earlier turns were
+/// replayed by the time `session/load` responded.
+#[tokio::test]
+async fn should_replay_stored_history_as_session_updates_on_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    // ---- first process: one persisted turn ----
+    let llm_one: Arc<dyn octos_llm::LlmProvider> = Arc::new(MockLlm {
+        reply: "REMEMBER_THIS".to_string(),
+    });
+    let factory_one = TestAgentFactory::new(llm_one, memory_dir.clone(), cwd.clone())
+        .with_session_store(&sessions_dir);
+
+    let cwd_one = cwd.clone();
+    let session_id = Client
+        .builder()
+        .name("octos-acp-replay-1")
+        .on_receive_notification(
+            async move |_n: SessionNotification,
+                        _cx: ConnectionTo<agent_client_protocol::Agent>| Ok(()),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory_one),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(cwd_one.clone()))
+                    .block_task()
+                    .await?;
+                let id = new_session.session_id.clone();
+                connection
+                    .send_request(PromptRequest::new(
+                        id.clone(),
+                        vec![ContentBlock::from("FIRST_QUESTION")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(id)
+            },
+        )
+        .await
+        .expect("first session");
+
+    // ---- second process: same store, load, recording every session/update ----
+    let llm_two: Arc<dyn octos_llm::LlmProvider> = Arc::new(MockLlm {
+        reply: "SECOND_REPLY".to_string(),
+    });
+    let factory_two =
+        TestAgentFactory::new(llm_two, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
+
+    let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let updates_for_handler = updates.clone();
+    let id_two = session_id.clone();
+    let cwd_two = cwd.clone();
+    Client
+        .builder()
+        .name("octos-acp-replay-2")
+        .on_receive_notification(
+            async move |n: SessionNotification, _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                updates_for_handler.lock().await.push(n.update);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory_two),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                // By the time session/load RESPONDS, the replay must have
+                // landed — the frames precede the response on the connection.
+                connection
+                    .send_request(LoadSessionRequest::new(id_two.clone(), cwd_two.clone()))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(())
+            },
+        )
+        .await
+        .expect("second session");
+
+    let recorded = updates.lock().await;
+    let user_texts: Vec<String> = recorded.iter().filter_map(user_message_text).collect();
+    let agent_texts: Vec<String> = recorded.iter().filter_map(agent_message_text).collect();
+    assert!(
+        user_texts.iter().any(|t| t.contains("FIRST_QUESTION")),
+        "session/load must replay the user turn as a UserMessageChunk; recorded: {recorded:?}"
+    );
+    assert!(
+        agent_texts.iter().any(|t| t.contains("REMEMBER_THIS")),
+        "session/load must replay the assistant turn as an AgentMessageChunk; recorded: {recorded:?}"
+    );
+}
+
+/// `session/load` must not evict a session that is already live.
+///
+/// A bare insert dropped the existing entry and with it the `shutdown` flag an
+/// in-flight turn watches, so a `session/cancel` for that turn flipped a flag
+/// nobody read and cancellation silently stopped working. Loading an id the agent
+/// already holds is a no-op.
+#[tokio::test]
+async fn should_not_evict_a_live_session_on_reload() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
+        seen: seen.clone(),
+        replies: vec!["FIRST".to_string(), "SECOND".to_string()],
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let factory =
+        TestAgentFactory::new(llm, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
+
+    let prompt_cwd = cwd.clone();
+    Client
+        .builder()
+        .name("octos-acp-reload-client")
+        .on_receive_notification(
+            async move |_n: SessionNotification,
+                        _cx: ConnectionTo<agent_client_protocol::Agent>| { Ok(()) },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                    .block_task()
+                    .await?;
+                let id = new_session.session_id;
+
+                connection
+                    .send_request(PromptRequest::new(
+                        id.clone(),
+                        vec![ContentBlock::from("TURN_ONE")],
+                    ))
+                    .block_task()
+                    .await?;
+
+                // Reload the id the agent is already holding.
+                connection
+                    .send_request(LoadSessionRequest::new(id.clone(), prompt_cwd.clone()))
+                    .block_task()
+                    .await?;
+
+                // The session must still work, and still carry its earlier turn.
+                connection
+                    .send_request(PromptRequest::new(
+                        id.clone(),
+                        vec![ContentBlock::from("TURN_TWO")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(())
+            },
+        )
+        .await
+        .expect("reload should not break the session");
+
+    let calls = seen.lock().await;
+    let last = calls.last().expect("second turn ran");
+    let joined = last.join("\n");
+    assert!(
+        joined.contains("TURN_ONE"),
+        "reloading a live session lost its history; saw: {joined}"
+    );
+}
+
+/// #1909: a stored transcript must be SANITIZED on load, before it touches the
+/// LLM or the client. The store is append-only JSONL, so a crash can leave an
+/// assistant tool_call whose result never landed — feeding that back to the
+/// provider is a 400 ("tool_use without tool_result"), and replaying it renders
+/// a tool card that never completes in the client. Every other resume path runs
+/// `ResumePolicy`; ACP's `session/load` must too.
+#[tokio::test]
+async fn should_sanitize_stored_history_when_loading_a_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    let session_id = agent_client_protocol::schema::v1::SessionId::new("octos-seeded");
+    let key = octos_core::SessionKey::with_profile(
+        octos_core::MAIN_PROFILE_ID,
+        "acp",
+        session_id.0.as_ref(),
+    );
+
+    // Seed the store directly: one healthy user + assistant pair, one assistant
+    // tool_call with NO matching result (crash residue), one whitespace-only
+    // assistant row. All thread-stamped so the fail-closed write path accepts
+    // them.
+    {
+        let mut mgr = octos_bus::session::SessionManager::open(&sessions_dir).expect("open store");
+        let msg = |role: octos_core::MessageRole, content: &str| octos_core::Message {
+            role,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some("t-seed".into()),
+            timestamp: chrono::Utc::now(),
+        };
+        mgr.add_message(&key, msg(octos_core::MessageRole::User, "SEED_USER"))
+            .await
+            .expect("user row");
+        let mut ghost = msg(octos_core::MessageRole::Assistant, "");
+        ghost.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "ghost-call".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }]);
+        mgr.add_message(&key, ghost)
+            .await
+            .expect("ghost tool-call row");
+        mgr.add_message(&key, msg(octos_core::MessageRole::Assistant, "   "))
+            .await
+            .expect("whitespace row");
+        mgr.add_message(
+            &key,
+            msg(octos_core::MessageRole::Assistant, "SEED_ASSISTANT"),
+        )
+        .await
+        .expect("assistant row");
+    }
+
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
+        seen: seen.clone(),
+        replies: vec!["AFTER_LOAD".to_string()],
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let factory =
+        TestAgentFactory::new(llm, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
+
+    let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let updates_for_handler = updates.clone();
+    let id_for_client = session_id.clone();
+    let cwd_for_client = cwd.clone();
+    Client
+        .builder()
+        .name("octos-acp-sanitize-client")
+        .on_receive_notification(
+            async move |n: SessionNotification, _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                updates_for_handler.lock().await.push(n.update);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(LoadSessionRequest::new(
+                        id_for_client.clone(),
+                        cwd_for_client.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        id_for_client.clone(),
+                        vec![ContentBlock::from("NEXT_QUESTION")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(())
+            },
+        )
+        .await
+        .expect("load + prompt");
+
+    // The replay must not contain a ToolCall frame for the unresolved call —
+    // the client would render a tool card that never completes.
+    let recorded = updates.lock().await;
+    assert!(
+        !recorded
+            .iter()
+            .any(|u| matches!(u, SessionUpdate::ToolCall(_))),
+        "the unresolved tool call must be sanitized away before replay; recorded: {recorded:?}"
+    );
+    let user_texts: Vec<String> = recorded.iter().filter_map(user_message_text).collect();
+    let agent_texts: Vec<String> = recorded.iter().filter_map(agent_message_text).collect();
+    assert!(
+        user_texts.iter().any(|t| t.contains("SEED_USER")),
+        "healthy rows still replay; recorded: {recorded:?}"
+    );
+    assert!(
+        agent_texts.iter().any(|t| t.contains("SEED_ASSISTANT")),
+        "healthy rows still replay; recorded: {recorded:?}"
+    );
+
+    // And the LLM must never see the orphan rows on the next prompt: no
+    // empty/whitespace-only payloads in the handed-over transcript.
+    let calls = seen.lock().await;
+    let last = calls.last().expect("a turn ran after load");
+    assert!(
+        last.iter().any(|c| c.contains("SEED_USER"))
+            && last.iter().any(|c| c.contains("SEED_ASSISTANT")),
+        "healthy rows reach the LLM: {last:?}"
+    );
+    let blanks = last.iter().filter(|c| c.trim().is_empty()).count();
+    assert_eq!(
+        blanks, 0,
+        "sanitized history must not hand the LLM payload-free rows: {last:?}"
+    );
 }
