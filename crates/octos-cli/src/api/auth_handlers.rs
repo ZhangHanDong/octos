@@ -1,13 +1,14 @@
 //! Authentication and user self-service API handlers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -409,6 +410,12 @@ pub struct AuthStatusResponse {
     /// The flag does NOT mean auth is bypassed — the endpoints still
     /// enforce a loopback peer at request time.
     pub local_solo_enabled: bool,
+    /// When solo is advertised: whether a solo owner already exists. The
+    /// SPA uses this to pick the first-run (create form) vs returning
+    /// (one-click continue) experience WITHOUT a doomed solo-login round
+    /// trip. Absent when solo is not advertised at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solo_profile_exists: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoped_profile: Option<ScopedAuthTarget>,
 }
@@ -621,6 +628,12 @@ pub async fn auth_status(
         // sets it), so the SPA never offers the no-password path there. See
         // `supports_local_solo_profile_create` / `crate::api::solo_auth`.
         local_solo_enabled: crate::api::ui_protocol::supports_local_solo_profile_create(&state),
+        solo_profile_exists: if crate::api::ui_protocol::supports_local_solo_profile_create(&state)
+        {
+            Some(crate::api::solo_auth::resolve_solo_user(&state).is_some())
+        } else {
+            None
+        },
         scoped_profile,
     }))
 }
@@ -1512,6 +1525,240 @@ pub struct VoiceReadiness {
     pub asr: VoiceLeg,
     pub llm: VoiceLeg,
     pub tts: VoiceTtsLeg,
+}
+
+const MAX_SPEECH_SYNTHESIS_CHARS: usize = 4_000;
+const MAX_CONCURRENT_SPEECH_SYNTHESIS_PER_PROFILE: usize = 1;
+const MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW: u32 = 20;
+const MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW: usize = 20_000;
+const SPEECH_SYNTHESIS_QUOTA_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+static SPEECH_SYNTHESIS_LIMITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SPEECH_SYNTHESIS_QUOTAS: LazyLock<Mutex<HashMap<String, SpeechSynthesisQuota>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug)]
+pub(crate) struct SpeechSynthesisError {
+    status: StatusCode,
+    message: String,
+    retry_after_seconds: Option<u64>,
+}
+
+impl SpeechSynthesisError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn rate_limited(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            retry_after_seconds: Some(retry_after_seconds.max(1)),
+        }
+    }
+}
+
+impl IntoResponse for SpeechSynthesisError {
+    fn into_response(self) -> Response {
+        let mut response = (self.status, self.message).into_response();
+        if let Some(seconds) = self.retry_after_seconds
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
+    }
+}
+
+#[derive(Debug)]
+struct SpeechSynthesisQuota {
+    started_at: std::time::Instant,
+    requests: u32,
+    characters: usize,
+}
+
+impl SpeechSynthesisQuota {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            requests: 0,
+            characters: 0,
+        }
+    }
+
+    fn consume(
+        &mut self,
+        characters: usize,
+        now: std::time::Instant,
+    ) -> Result<(), SpeechSynthesisError> {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if elapsed >= SPEECH_SYNTHESIS_QUOTA_WINDOW {
+            *self = Self::new(now);
+        }
+        if self.requests >= MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW
+            || self.characters.saturating_add(characters) > MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW
+        {
+            let remaining = SPEECH_SYNTHESIS_QUOTA_WINDOW
+                .saturating_sub(now.saturating_duration_since(self.started_at));
+            let retry_after_seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            return Err(SpeechSynthesisError::rate_limited(
+                format!(
+                    "speech synthesis quota exceeded; limit is {MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW} requests or {MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW} characters per minute"
+                ),
+                retry_after_seconds,
+            ));
+        }
+        self.requests += 1;
+        self.characters += characters;
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SpeechSynthesisRequest {
+    pub text: String,
+}
+
+fn validate_synthesis_text(text: &str) -> Result<&str, SpeechSynthesisError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(SpeechSynthesisError::new(
+            StatusCode::BAD_REQUEST,
+            "text must not be empty",
+        ));
+    }
+    if text.chars().count() > MAX_SPEECH_SYNTHESIS_CHARS {
+        return Err(SpeechSynthesisError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("text exceeds {MAX_SPEECH_SYNTHESIS_CHARS} characters"),
+        ));
+    }
+    Ok(text)
+}
+
+fn acquire_speech_synthesis_permit(
+    profile_id: &str,
+) -> Result<tokio::sync::OwnedSemaphorePermit, SpeechSynthesisError> {
+    let semaphore = {
+        let mut limits = SPEECH_SYNTHESIS_LIMITS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        limits.retain(|_, limit| limit.strong_count() > 0);
+        if let Some(limit) = limits.get(profile_id).and_then(Weak::upgrade) {
+            limit
+        } else {
+            let limit = Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_SPEECH_SYNTHESIS_PER_PROFILE,
+            ));
+            limits.insert(profile_id.to_owned(), Arc::downgrade(&limit));
+            limit
+        }
+    };
+
+    semaphore.try_acquire_owned().map_err(|_| {
+        SpeechSynthesisError::rate_limited(
+            "speech synthesis already in progress for this profile",
+            1,
+        )
+    })
+}
+
+fn consume_speech_synthesis_quota(
+    profile_id: &str,
+    characters: usize,
+) -> Result<(), SpeechSynthesisError> {
+    let now = std::time::Instant::now();
+    let mut quotas = SPEECH_SYNTHESIS_QUOTAS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    quotas.retain(|_, quota| {
+        now.saturating_duration_since(quota.started_at) < SPEECH_SYNTHESIS_QUOTA_WINDOW
+    });
+    quotas
+        .entry(profile_id.to_owned())
+        .or_insert_with(|| SpeechSynthesisQuota::new(now))
+        .consume(characters, now)
+}
+
+fn speech_audio_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") | Some("opus") => "audio/ogg",
+        Some("pcm") => "audio/pcm",
+        _ => "audio/wav",
+    }
+}
+
+/// POST /api/voice/synthesize — synthesize text with the caller's voice profile.
+///
+/// The caller's effective profile runtime supplies the provider, credentials,
+/// and selected voice. The endpoint is intentionally independent of any
+/// product-specific playback or content model.
+pub(crate) async fn synthesize_speech(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(request): Json<SpeechSynthesisRequest>,
+) -> Result<Response, SpeechSynthesisError> {
+    let text = validate_synthesis_text(&request.text)?;
+    let profile_store = state.profile_store.as_ref().ok_or_else(|| {
+        SpeechSynthesisError::new(StatusCode::SERVICE_UNAVAILABLE, "profile store unavailable")
+    })?;
+    let profile_id = resolve_my_profile_id(&identity, profile_store, &state, &headers)
+        .map_err(|status| SpeechSynthesisError::new(status, "profile unavailable"))?;
+    let _synthesis_permit = acquire_speech_synthesis_permit(&profile_id)?;
+    consume_speech_synthesis_quota(&profile_id, text.chars().count())?;
+    let runtime =
+        crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id))
+            .ok_or_else(|| {
+                SpeechSynthesisError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "profile runtime unavailable",
+                )
+            })?;
+    let voice = crate::api::voices::resolve_reply_voice(&profile_id, &runtime.voice.default_voice);
+    let output_dir = tempfile::tempdir().map_err(|error| {
+        tracing::error!(%error, "failed to create speech synthesis temp directory");
+        SpeechSynthesisError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to prepare speech synthesis",
+        )
+    })?;
+    let audio_path = crate::api::voice_turn::synthesize_reply(
+        text,
+        &voice,
+        &runtime.voice.tts_provider,
+        runtime.voice.cloud.as_ref(),
+        output_dir.path(),
+    )
+    .await
+    .ok_or_else(|| {
+        SpeechSynthesisError::new(
+            StatusCode::BAD_GATEWAY,
+            "configured TTS provider failed to synthesize speech",
+        )
+    })?;
+    let content_type = speech_audio_content_type(&audio_path);
+    let audio = tokio::fs::read(&audio_path).await.map_err(|error| {
+        tracing::error!(%error, path = %audio_path.display(), "failed to read synthesized speech");
+        SpeechSynthesisError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read synthesized speech",
+        )
+    })?;
+    let mut response = Response::new(Body::from(audio));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
@@ -3818,9 +4065,266 @@ fn build_portal_state(
     }
 }
 
+// ---------------------------------------------------------------------------
+// WeChat QR Login (user-scoped)
+// ---------------------------------------------------------------------------
+
+/// GET /api/my/profile/wechat/qr-start
+pub async fn my_wechat_qr_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Check if ProcessManager has a bridge with QR info
+    if let Some(pm) = state.process_manager.as_ref() {
+        let ps = state
+            .profile_store
+            .as_ref()
+            .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
+        let profile_id =
+            super::auth_handlers::resolve_my_profile_id(&identity, ps, &state, &headers)
+                .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
+        let key = format!("{}-wechat", profile_id);
+        if let Some(info) = pm.bridge_qr(&key).await {
+            if let Some(ref qr_url) = info.qr {
+                return Ok(Json(serde_json::json!({
+                    "qrcode_url": qr_url,
+                    "session_key": "",
+                    "bridge_managed": true
+                })));
+            }
+        }
+    }
+
+    // Fallback: direct QR fetch
+    let client = reqwest::Client::new();
+    let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed to fetch QR: {e}")))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("invalid QR response: {e}")))?;
+    let qrcode = body["qrcode"]
+        .as_str()
+        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode".into()))?;
+    let qrcode_url = body["qrcode_img_content"]
+        .as_str()
+        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode_img_content".into()))?;
+
+    Ok(Json(serde_json::json!({
+        "qrcode_url": qrcode_url,
+        "session_key": qrcode
+    })))
+}
+
+/// POST /api/my/profile/wechat/qr-poll
+pub async fn my_wechat_qr_poll(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
+    let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps, &state, &headers)
+        .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
+
+    let session_key = req["session_key"].as_str().unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(40))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let encoded: String = session_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect();
+
+    let url = format!(
+        "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode={}",
+        encoded
+    );
+    let resp = client
+        .get(&url)
+        .header("iLink-App-ClientVersion", "1")
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                return (StatusCode::OK, "timeout".into());
+            }
+            (StatusCode::BAD_GATEWAY, format!("poll failed: {e}"))
+        })?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("parse error: {e}")))?;
+
+    let status = body["status"].as_str().unwrap_or("wait");
+
+    if status == "confirmed" {
+        let bot_token = body["bot_token"].as_str().unwrap_or_default().to_string();
+        let bot_id = body["ilink_bot_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        if !bot_token.is_empty() {
+            if let Ok(Some(mut profile)) = ps.get(&profile_id) {
+                let has_wechat = profile
+                    .config
+                    .channels
+                    .iter()
+                    .any(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }));
+                if !has_wechat {
+                    profile
+                        .config
+                        .channels
+                        .push(crate::profiles::ChannelCredentials::WeChat {
+                            token_env: "WECHAT_BOT_TOKEN".into(),
+                            base_url: "https://ilinkai.weixin.qq.com".into(),
+                        });
+                }
+                profile
+                    .config
+                    .env_vars
+                    .insert("WECHAT_BOT_TOKEN".into(), bot_token.clone());
+                let _ = ps.save(&profile);
+                // Set env var so the running wechat channel picks it up on next reconnect
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open("/tmp/octos-wechat-token")
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
+                }
+            }
+        }
+
+        // Don't expose bot_token to client — already saved server-side
+        return Ok(Json(serde_json::json!({
+            "status": status,
+            "bot_id": bot_id
+        })));
+    }
+
+    Ok(Json(serde_json::json!({ "status": status })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_synthesis_rejects_blank_and_oversized_text() {
+        assert_eq!(
+            validate_synthesis_text("  ").unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        let oversized = "旁".repeat(MAX_SPEECH_SYNTHESIS_CHARS + 1);
+        assert_eq!(
+            validate_synthesis_text(&oversized).unwrap_err().status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn speech_synthesis_trims_valid_text_and_maps_audio_mime() {
+        assert_eq!(
+            validate_synthesis_text("  先看这个圆。 \n").unwrap(),
+            "先看这个圆。"
+        );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.mp3")),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.wav")),
+            "audio/wav"
+        );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.pcm")),
+            "audio/pcm"
+        );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.ogg")),
+            "audio/ogg"
+        );
+    }
+
+    #[tokio::test]
+    async fn speech_synthesis_limits_concurrency_per_profile() {
+        let profile = format!("speech-limit-{}", uuid::Uuid::now_v7());
+        let other_profile = format!("speech-limit-{}", uuid::Uuid::now_v7());
+
+        let first = acquire_speech_synthesis_permit(&profile).expect("first call is admitted");
+        assert_eq!(
+            acquire_speech_synthesis_permit(&profile)
+                .unwrap_err()
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let other = acquire_speech_synthesis_permit(&other_profile).expect("profiles are isolated");
+
+        drop(first);
+        let resumed =
+            acquire_speech_synthesis_permit(&profile).expect("permit is reusable after completion");
+        drop(resumed);
+        drop(other);
+    }
+
+    #[test]
+    fn speech_synthesis_quota_bounds_requests_and_characters_per_window() {
+        let started_at = std::time::Instant::now();
+        let mut request_quota = SpeechSynthesisQuota::new(started_at);
+        for _ in 0..MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW {
+            request_quota.consume(1, started_at).unwrap();
+        }
+        let request_error = request_quota.consume(1, started_at).unwrap_err();
+        assert_eq!(request_error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(request_error.retry_after_seconds, Some(60));
+
+        let mut character_quota = SpeechSynthesisQuota::new(started_at);
+        character_quota
+            .consume(MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW, started_at)
+            .unwrap();
+        assert_eq!(
+            character_quota.consume(1, started_at).unwrap_err().status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        request_quota
+            .consume(1, started_at + SPEECH_SYNTHESIS_QUOTA_WINDOW)
+            .expect("a new window restores the profile budget");
+    }
+
+    #[test]
+    fn speech_synthesis_rate_limit_response_sets_retry_after() {
+        let response = SpeechSynthesisError::rate_limited("speech synthesis quota exceeded", 17)
+            .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "17");
+    }
     use crate::login_allowlist::{AllowedLogin, LoginAllowlistStore};
     use crate::otp::AuthManager;
     use crate::profiles::ProfileStore;
@@ -4251,6 +4755,55 @@ mod tests {
             .await
             .unwrap();
         assert!(!status.local_solo_enabled);
+    }
+
+    #[tokio::test]
+    async fn auth_status_reports_solo_profile_exists_lifecycle() {
+        // The SPA's first-run flow keys off this flag: `Some(false)` means
+        // "solo is available but nobody has onboarded yet — show the create
+        // form directly instead of a doomed solo-login round trip".
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let state = Arc::new(state);
+
+        let Json(status) = auth_status(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(status.local_solo_enabled);
+        assert_eq!(status.solo_profile_exists, Some(false));
+
+        let _ = crate::api::solo_auth::solo_create(
+            State(state.clone()),
+            axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40000))),
+            HeaderMap::new(),
+            Json(octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: None,
+                name: "Ada".into(),
+                username: "ada".into(),
+                email: "ada@example.com".into(),
+                make_default: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(status) = auth_status(State(state), HeaderMap::new()).await.unwrap();
+        assert_eq!(status.solo_profile_exists, Some(true));
+    }
+
+    #[tokio::test]
+    async fn auth_status_omits_solo_profile_exists_when_solo_not_advertised() {
+        // Tenant hosts never advertise solo, so the flag must be absent
+        // (the SPA treats "not offered" and "offered but empty" differently).
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let state = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            ..state
+        };
+        let Json(status) = auth_status(State(Arc::new(state)), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(!status.local_solo_enabled);
+        assert_eq!(status.solo_profile_exists, None);
     }
 
     fn scoped_host_headers(host: &str) -> HeaderMap {
@@ -5031,7 +5584,7 @@ mod tests {
 
         // A smaller map: KEEP updated, DROP omitted → removed. (Assert on the
         // persisted profile: the API response masks secret values.)
-        update_my_profile(
+        let _ = update_my_profile(
             State(state.clone()),
             HeaderMap::new(),
             axum::Extension(AuthIdentity::User {
@@ -5053,7 +5606,7 @@ mod tests {
         );
 
         // An explicit empty map clears everything.
-        update_my_profile(
+        let _ = update_my_profile(
             State(state),
             HeaderMap::new(),
             axum::Extension(AuthIdentity::User {
@@ -5185,7 +5738,7 @@ mod tests {
         };
         profile_store.save(&profile).unwrap();
 
-        update_my_profile(
+        let _ = update_my_profile(
             State(Arc::new(state)),
             HeaderMap::new(),
             axum::Extension(AuthIdentity::User {
@@ -5855,170 +6408,4 @@ mod tests {
             .unwrap();
         assert_eq!(extract_bearer_token(&req), Some(String::new()));
     }
-}
-
-// ---------------------------------------------------------------------------
-// WeChat QR Login (user-scoped)
-// ---------------------------------------------------------------------------
-
-/// GET /api/my/profile/wechat/qr-start
-pub async fn my_wechat_qr_start(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Check if ProcessManager has a bridge with QR info
-    if let Some(pm) = state.process_manager.as_ref() {
-        let ps = state
-            .profile_store
-            .as_ref()
-            .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
-        let profile_id =
-            super::auth_handlers::resolve_my_profile_id(&identity, ps, &state, &headers)
-                .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
-        let key = format!("{}-wechat", profile_id);
-        if let Some(info) = pm.bridge_qr(&key).await {
-            if let Some(ref qr_url) = info.qr {
-                return Ok(Json(serde_json::json!({
-                    "qrcode_url": qr_url,
-                    "session_key": "",
-                    "bridge_managed": true
-                })));
-            }
-        }
-    }
-
-    // Fallback: direct QR fetch
-    let client = reqwest::Client::new();
-    let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed to fetch QR: {e}")))?;
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("invalid QR response: {e}")))?;
-    let qrcode = body["qrcode"]
-        .as_str()
-        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode".into()))?;
-    let qrcode_url = body["qrcode_img_content"]
-        .as_str()
-        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode_img_content".into()))?;
-
-    Ok(Json(serde_json::json!({
-        "qrcode_url": qrcode_url,
-        "session_key": qrcode
-    })))
-}
-
-/// POST /api/my/profile/wechat/qr-poll
-pub async fn my_wechat_qr_poll(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-    Json(req): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
-    let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps, &state, &headers)
-        .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
-
-    let session_key = req["session_key"].as_str().unwrap_or_default();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(40))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let encoded: String = session_key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect();
-
-    let url = format!(
-        "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode={}",
-        encoded
-    );
-    let resp = client
-        .get(&url)
-        .header("iLink-App-ClientVersion", "1")
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                return (StatusCode::OK, "timeout".into());
-            }
-            (StatusCode::BAD_GATEWAY, format!("poll failed: {e}"))
-        })?;
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("parse error: {e}")))?;
-
-    let status = body["status"].as_str().unwrap_or("wait");
-
-    if status == "confirmed" {
-        let bot_token = body["bot_token"].as_str().unwrap_or_default().to_string();
-        let bot_id = body["ilink_bot_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-
-        if !bot_token.is_empty() {
-            if let Ok(Some(mut profile)) = ps.get(&profile_id) {
-                let has_wechat = profile
-                    .config
-                    .channels
-                    .iter()
-                    .any(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }));
-                if !has_wechat {
-                    profile
-                        .config
-                        .channels
-                        .push(crate::profiles::ChannelCredentials::WeChat {
-                            token_env: "WECHAT_BOT_TOKEN".into(),
-                            base_url: "https://ilinkai.weixin.qq.com".into(),
-                        });
-                }
-                profile
-                    .config
-                    .env_vars
-                    .insert("WECHAT_BOT_TOKEN".into(), bot_token.clone());
-                let _ = ps.save(&profile);
-                // Set env var so the running wechat channel picks it up on next reconnect
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let _ = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open("/tmp/octos-wechat-token")
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
-                }
-            }
-        }
-
-        // Don't expose bot_token to client — already saved server-side
-        return Ok(Json(serde_json::json!({
-            "status": status,
-            "bot_id": bot_id
-        })));
-    }
-
-    Ok(Json(serde_json::json!({ "status": status })))
 }

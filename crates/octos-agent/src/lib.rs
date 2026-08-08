@@ -56,7 +56,7 @@ pub mod steering;
 pub mod subagent_output;
 pub mod subagent_summary;
 mod subprocess_env;
-pub use subprocess_env::register_secret_env_names;
+pub use subprocess_env::{register_secret_env_names, sanitize_default_subprocess_env};
 pub mod summarizer;
 pub mod swarm;
 pub mod task_supervisor;
@@ -143,7 +143,9 @@ pub use memory_segment::{
     MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
 };
 pub use permissions::{InvalidSafetyTier, SafetyTier};
-pub use plugins::{PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig};
+pub use plugins::{
+    PluginLoadError, PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig,
+};
 pub use policy::{
     ApprovalPolicy, EffectivePermissions, FileAccessMode, FilesystemScope, NetworkPolicy,
     PermissionProfile, PermissionProfileError, RuntimeMode,
@@ -187,7 +189,7 @@ pub use swarm::{
 pub use task_supervisor::{
     BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
     TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,
-    TaskSupervisor, TerminalEvent, TerminalOutcome, parse_alternatives,
+    TaskSupervisor, TaskTerminalGuard, TerminalEvent, TerminalOutcome, parse_alternatives,
 };
 pub use tools::{
     AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
@@ -216,7 +218,7 @@ pub use tools::{
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{
     VALIDATOR_RESULT_SCHEMA_VERSION, ValidatorInvocation, ValidatorLedger, ValidatorOutcome,
-    ValidatorPhase, ValidatorRunner, ValidatorStatus, run_workspace_validators,
+    ValidatorPhase, ValidatorRunner, ValidatorStatus, kill_child_process, run_workspace_validators,
 };
 pub use workspace_git::{
     WorkspaceArtifactStatus, WorkspaceCheckStatus, WorkspaceContractStatus, WorkspaceProjectKind,

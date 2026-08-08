@@ -30,7 +30,10 @@ use crate::graph::{
     PipelineGraph, PipelineNode,
 };
 use crate::guard::{GuardContext, GuardDecision, PipelineGuard};
-use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler};
+use crate::handler::{
+    CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler, NotifyHandler,
+    ShellCheckHandler, WaitHandler,
+};
 use crate::parser::parse_dot;
 use crate::validate;
 
@@ -251,6 +254,9 @@ fn handler_kind_label(kind: &HandlerKind) -> &'static str {
         HandlerKind::Noop => "noop",
         HandlerKind::Parallel => "parallel",
         HandlerKind::DynamicParallel => "dynamic_parallel",
+        HandlerKind::ShellCheck => "shell_check",
+        HandlerKind::Notify => "notify",
+        HandlerKind::Wait => "wait",
     }
 }
 
@@ -1117,7 +1123,26 @@ fn resolve_provider(
     model_key: Option<&str>,
 ) -> Result<Arc<dyn LlmProvider>> {
     match (model_key, router) {
-        (Some(key), Some(r)) => r.resolve(key),
+        // A missing/unknown model key must degrade to the default provider,
+        // matching CodergenHandler::resolve_provider (handler.rs) — the
+        // model-assignment pass may rewrite lane keys (e.g. `strong`) to
+        // catalog models this profile's router never registered, and that
+        // must not fail the whole pipeline.
+        (Some(key), Some(r)) => match r.resolve(key) {
+            Ok(provider) => Ok(provider),
+            // Keep the router's error: it names the keys that ARE registered
+            // (`available: [..]`), which is the one thing an operator needs to
+            // fix the gap. Dropping it leaves a warning that says what failed
+            // but not what would have worked.
+            Err(err) => {
+                warn!(
+                    model = key,
+                    %err,
+                    "pipeline model not in provider router; using default provider"
+                );
+                Ok(default.clone())
+            }
+        },
         (Some(key), None) => {
             warn!(
                 model = key,
@@ -2399,6 +2424,14 @@ impl PipelineExecutor {
         registry.register(HandlerKind::Noop, Arc::new(NoopHandler));
         // DynamicParallel is handled directly in execute_graph, but needs a registry entry
         registry.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
+        // IR palette handlers — registered so the palette kinds dispatch to
+        // real implementations instead of falling through to Noop/Codergen.
+        registry.register(HandlerKind::ShellCheck, Arc::new(ShellCheckHandler));
+        registry.register(
+            HandlerKind::Notify,
+            Arc::new(NotifyHandler::new().with_host_context(self.config.host_context.clone())),
+        );
+        registry.register(HandlerKind::Wait, Arc::new(WaitHandler));
 
         registry
     }

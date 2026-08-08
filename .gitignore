@@ -20,6 +20,7 @@ Thumbs.db
 # git checkouts). They must never be tracked — committed as gitlinks they
 # break every git consumer of this repo (e.g. cargo git dependencies).
 .claude/worktrees/
+.worktrees/
 
 # Octos runtime state (keep config, ignore runtime data)
 .octos/*
@@ -72,6 +73,8 @@ test_a2.md
 !CHANGELOG.md
 !.octos/AGENTS.md
 !specs/task-approval-post-tool-continuation.spec.md
+!specs/kv-cache-friendly-compaction.spec.md
+!specs/task-compaction-instruction-priority.spec.md
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md

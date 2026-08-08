@@ -222,7 +222,7 @@ pub struct Config {
     #[serde(default)]
     pub content_routing: Option<octos_llm::RoutingConfig>,
 
-    /// AppUi (octos-app, octos-tui, etc.) session defaults applied by
+    /// AppUi (octos-app, octoscode, etc.) session defaults applied by
     /// `octos serve`. Operators can anchor every AppUi session that
     /// does not advertise the `session.workspace_cwd.v1` capability to
     /// a chosen folder via `appui.default_session_cwd` — the Tier-2
@@ -293,7 +293,8 @@ pub struct PluginsConfig {
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
 ///
-/// Both fields are optional. `default_session_cwd` defaults to `None` (no
+/// All fields have backward-compatible defaults. `allowed_origins` defaults
+/// to empty, `default_session_cwd` defaults to `None` (no
 /// server-side default cwd; sessions fall through Tier-3 of the
 /// `session_tool_registry` chain unchanged), but `sessions_in_cwd` defaults
 /// to `true` — see its field doc for the coexistence trade-off — so an
@@ -302,6 +303,16 @@ pub struct PluginsConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppUiConfig {
+    /// Additional browser origins allowed to call the REST API and open
+    /// either UI Protocol WebSocket endpoint.
+    ///
+    /// Every entry must be an exact `http://` or `https://` origin (scheme,
+    /// host, and optional port only). `octos serve` validates and normalizes
+    /// the list at startup. `OCTOS_APPUI_ALLOWED_ORIGINS`, when non-empty,
+    /// replaces this list with a comma-separated deployment override.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
     /// Optional default workspace cwd for AppUi sessions. When set, every
     /// `session/open` call against this server falls back to this cwd
     /// (Tier-2 of `session_tool_registry`'s fallback chain) when the
@@ -354,6 +365,7 @@ fn default_sessions_in_cwd() -> bool {
 impl Default for AppUiConfig {
     fn default() -> Self {
         Self {
+            allowed_origins: Vec::new(),
             default_session_cwd: None,
             sessions_in_cwd: default_sessions_in_cwd(),
         }
@@ -1450,7 +1462,14 @@ pub enum QueueMode {
     #[default]
     Collect,
     /// Keep only the latest message, discard older queued messages.
-    Steer,
+    ///
+    /// Renamed from `steer`: that word means mid-turn INJECTION everywhere
+    /// else in this codebase (`turn/steer`, the agent's `SteerBuffer`),
+    /// where nothing is dropped — the opposite of this variant. The serde
+    /// alias keeps existing configs parsing; the `/queue` chat command
+    /// accepts both spellings.
+    #[serde(alias = "steer")]
+    Latest,
     /// Cancel the current run and process the new message immediately.
     Interrupt,
     /// If the current LLM call exceeds the patience threshold and a new message
@@ -1474,7 +1493,9 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub system_prompt: Option<String>,
 
-    /// Message queue mode: "followup" (default) or "collect".
+    /// Message queue mode for messages arriving while a run is active:
+    /// "followup" | "collect" (default) | "latest" | "interrupt" |
+    /// "speculative". See [`QueueMode`].
     #[serde(default)]
     pub queue_mode: QueueMode,
 
@@ -2141,6 +2162,24 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// `QueueMode::Latest` was renamed from `steer` (the word collides with
+    /// `turn/steer`, which injects rather than discards). Existing configs
+    /// and `/queue steer` must keep working; new ones use `latest`.
+    #[test]
+    fn queue_mode_latest_parses_both_spellings_and_defaults_to_collect() {
+        use super::QueueMode;
+        let latest: QueueMode = serde_json::from_str("\"latest\"").expect("canonical name");
+        assert_eq!(latest, QueueMode::Latest);
+        let steer: QueueMode = serde_json::from_str("\"steer\"").expect("legacy alias");
+        assert_eq!(steer, QueueMode::Latest);
+        // Round-trip now WRITES the canonical spelling.
+        assert_eq!(
+            serde_json::to_string(&QueueMode::Latest).expect("serialize"),
+            "\"latest\""
+        );
+        assert_eq!(QueueMode::default(), QueueMode::Collect);
+    }
+
     use super::*;
 
     /// Crate-wide lock for EVERY test that pivots the global `HOME` /
@@ -2309,6 +2348,7 @@ mod tests {
             absent.appui.sessions_in_cwd,
             "an absent [appui] section must default sessions_in_cwd on",
         );
+        assert!(absent.appui.allowed_origins.is_empty());
 
         // Present `[appui]` missing the key → the field-level
         // `#[serde(default = \"default_sessions_in_cwd\")]` path → ON.
@@ -2331,6 +2371,26 @@ mod tests {
 
         // The programmatic Default agrees with both serde paths.
         assert!(AppUiConfig::default().sessions_in_cwd);
+        assert!(AppUiConfig::default().allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn appui_allowed_origins_deserialize_without_prevalidating_deployment_values() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "appui": {
+                    "allowed_origins": [
+                        "https://octos.example",
+                        "http://localhost:50081"
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.appui.allowed_origins,
+            vec!["https://octos.example", "http://localhost:50081"]
+        );
     }
 
     #[test]

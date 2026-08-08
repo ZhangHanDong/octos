@@ -10,7 +10,9 @@ use eyre::{Result, WrapErr};
 use octos_bus::SessionManager;
 
 use super::Executable;
-use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
+use crate::api::{
+    AppState, EventBroadcaster, build_router, init_metrics, resolve_appui_allowed_origins,
+};
 use crate::config::Config;
 
 // #1857 PR 5a — fleet worker pool defaults (serve boot). Conservative single-
@@ -49,6 +51,22 @@ const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
 /// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     !octos_agent::sandbox::create_sandbox(sandbox_cfg).is_noop()
+}
+
+/// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
+/// daemon-user FS write together with the reads git needs — the third gate
+/// condition for the fleet WORKTREE flow (§5). Computed at serve boot (mirrors
+/// [`fleet_sandbox_is_isolating`]) from the base sandbox's
+/// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
+/// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
+/// sandbox. When `false`, the pool falls back to a scratch workspace for every
+/// task (a worktree worker whose `git commit` can't reach `<repo>/.git` would
+/// lose its deliverable when the checkout is removed). Threaded into
+/// `PoolConfig.repo_git_write_supported`.
+fn fleet_sandbox_supports_repo_git_write(
+    sandbox_cfg: &octos_agent::sandbox::SandboxConfig,
+) -> bool {
+    octos_agent::sandbox::create_sandbox(sandbox_cfg).supports_repo_git_write()
 }
 
 /// #1857 PR 5a fix (HIGH 2) — reconcile the fleet store at boot with a bounded
@@ -430,13 +448,38 @@ fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTa
     stdio.then(crate::session_actor::SessionTaskQueryStore::default)
 }
 
+/// Bind the HTTP listener before constructing `AppState`.
+///
+/// Port `0` asks the OS for an ephemeral port. Resolving it here ensures every
+/// downstream consumer (gateway launch configuration, browser-Origin policy,
+/// and user-facing URLs) sees the real port instead of the sentinel `0`.
+/// Stdio mode does not bind HTTP and preserves the configured value.
+async fn bind_http_listener(
+    stdio: bool,
+    host: &str,
+    requested_port: u16,
+) -> Result<(Option<tokio::net::TcpListener>, u16)> {
+    if stdio {
+        return Ok((None, requested_port));
+    }
+
+    let listener = tokio::net::TcpListener::bind((host, requested_port))
+        .await
+        .wrap_err_with(|| format!("failed to bind octos API server to {host}:{requested_port}"))?;
+    let actual_port = listener
+        .local_addr()
+        .wrap_err("failed to inspect bound octos API listener")?
+        .port();
+    Ok((Some(listener), actual_port))
+}
+
 /// Stable, machine-greppable marker embedded in the "data directory is already
-/// owned by another serve" error. octos-tui (a separate repo) spawns
+/// owned by another serve" error. octoscode (a separate repo) spawns
 /// `octos serve --stdio` as a child and greps its stderr for this exact token
 /// on child-exit to recognize the single-writer conflict and STOP relaunching —
 /// instead of the silent ~5s crash-loop it used to hit when the second serve
 /// died mid-startup opening `admin_audit.redb`. MUST stay byte-stable: the
-/// client matches it verbatim (octos-tui `transport.rs` DATA_DIR_LOCKED_MARKER).
+/// client matches it verbatim (octoscode `transport.rs` DATA_DIR_LOCKED_MARKER).
 pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
 
 /// Held for the serve process's whole lifetime: an exclusive OS advisory lock
@@ -473,7 +516,7 @@ fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDi
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Err(eyre::eyre!(
                 "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for this data \
-                 directory ({}). Close the other octos-tui (or `octos serve`), or start this one \
+                 directory ({}). Close the other octoscode (or `octos serve`), or start this one \
                  against a different --data-dir.",
                 data_dir.display()
             ))
@@ -558,7 +601,7 @@ impl ServeCommand {
             Ok(guard) => guard,
             Err(error) => {
                 if error.to_string().contains(DATA_DIR_LOCKED_MARKER) {
-                    // A guaranteed clean, un-colored stderr line the octos-tui
+                    // A guaranteed clean, un-colored stderr line the octoscode
                     // client greps on child-exit (color-eyre's rendering of the
                     // returned error may interleave ANSI, so don't rely on it).
                     eprintln!(
@@ -877,20 +920,24 @@ impl ServeCommand {
                 });
             match keeper {
                 Some(rt) => {
-                    // PR-3 requires a network-isolated sandbox: the closed worker
-                    // tool set is a denylist, not a boundary, so the shell's
-                    // reach is bounded only by the sandbox. Force
-                    // `allow_network = false` regardless of the profile default.
+                    // PR-3 requires a network-isolated sandbox: the worker tool
+                    // set is a denylist, not a boundary, so the shell's reach is
+                    // bounded only by the sandbox. Base the sandbox on the profile
+                    // default with network OFF; PR A re-enables raw egress
+                    // PER-ATTEMPT only for a `Full` network grant (see the factory
+                    // closure below). `None`/`Hosts` keep it off (`Hosts` is
+                    // enforced by the granted web tools, not raw egress).
                     let mut sandbox_cfg = rt.default_sandbox.clone();
                     sandbox_cfg.allow_network = false;
                     // #1857 PR 5a fix (HIGH 1) — FAIL CLOSED: install the pool
-                    // ONLY when the forced-no-network sandbox is a REAL isolating
-                    // backend. A disabled sandbox (or `Auto` with no backend on
-                    // this host) yields `NoSandbox` = unbounded shell reach
-                    // (curl / git push / host access), breaking PR-3's
-                    // replay-safe boundary. Leave the pool unset so goal_dispatch
-                    // cleanly reports "unavailable" instead of running a fleet
-                    // worker unsandboxed with network.
+                    // ONLY when the sandbox is a REAL isolating backend. A
+                    // disabled sandbox (or `Auto` with no backend on this host)
+                    // yields `NoSandbox` = unbounded shell reach (curl / git push
+                    // / host access), breaking PR-3's replay-safe boundary. The
+                    // isolation of the BACKEND is independent of the network flag,
+                    // so probing with network off is sufficient. Leave the pool
+                    // unset so goal_dispatch cleanly reports "unavailable" instead
+                    // of running a fleet worker unsandboxed.
                     if !fleet_sandbox_is_isolating(&sandbox_cfg) {
                         tracing::error!(
                             keeper_profile = %rt.profile_id,
@@ -900,12 +947,31 @@ impl ServeCommand {
                              will report the pool unavailable."
                         );
                     } else {
-                        let sandbox_factory: octos_fleet_worker::SandboxFactory =
-                            Arc::new(move |_cwd: &std::path::Path| {
+                        // §5 gate condition 3: compute the repo-`.git`-write
+                        // capability BEFORE the factory closure moves `sandbox_cfg`
+                        // in (the closure needs the whole config; the pool only
+                        // needs the bool).
+                        let repo_git_write_supported =
+                            fleet_sandbox_supports_repo_git_write(&sandbox_cfg);
+                        // The SandboxFactory folds the per-attempt SandboxGrant
+                        // (derived from the task's WorkerGrant) onto the base
+                        // network-isolated sandbox: `allow_network` from the
+                        // network lane (`Full` → true, `None`/`Hosts` → false) and
+                        // `repo_git_write` from the FS lane (`FsGrant::Host` worktree
+                        // worker → `Some(<repo>/.git)`, a TARGETED rw-bind so its
+                        // `git commit` can reach `<repo>/.git` outside its cwd
+                        // WITHOUT exposing host sockets via `--bind / /`).
+                        let sandbox_factory: octos_fleet_worker::SandboxFactory = Arc::new(
+                            move |_cwd: &std::path::Path,
+                                  grant: octos_fleet_worker::SandboxGrant| {
+                                let mut cfg = sandbox_cfg.clone();
+                                cfg.allow_network = grant.allow_network;
+                                cfg.repo_git_write = grant.repo_git_dir;
                                 Arc::<dyn octos_agent::sandbox::Sandbox>::from(
-                                    octos_agent::sandbox::create_sandbox(&sandbox_cfg),
+                                    octos_agent::sandbox::create_sandbox(&cfg),
                                 )
-                            });
+                            },
+                        );
                         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
                             rt.llm.clone(),
                             rt.memory.clone(),
@@ -925,6 +991,12 @@ impl ServeCommand {
                             // Fix (HIGH 4): the pool's bound keeper profile — the
                             // keeper fences a cross-profile goal against it.
                             keeper_profile_id: rt.profile_id.clone(),
+                            // §5 gate condition 3: only take the worktree flow when
+                            // the resolved backend supports full-FS write (bwrap /
+                            // full-read macOS). Otherwise every task falls back to a
+                            // scratch workspace so a non-supporting backend never
+                            // loses a deliverable.
+                            repo_git_write_supported,
                         };
                         let pool = octos_fleet_worker::FleetWorkerPool::new(
                             Arc::new(fleet_store),
@@ -947,6 +1019,43 @@ impl ServeCommand {
             }
         }
 
+        // Boot-resume — "a fleet survives an octos restart". The boot reconcile
+        // above flipped any restart-interrupted fleet's in-flight children back
+        // to `Ready`, but emitted NO outbox event — so the outbox consumer never
+        // wakes the keeper and an in-progress fleet would STALL forever after a
+        // restart (nothing re-dispatches its ready tasks). Now that the worker
+        // pool is installed, enqueue a keeper wake for every live fleet with a
+        // launchable child; the global master-continuation drain (started below,
+        // ~5s poll) picks them up on its next tick → PR-4b reseed pre-pass →
+        // `run_standalone_turn` → the keeper's `goal_dispatch` re-launches the
+        // ready set. Gated on a reconciled store AND an installed pool (no pool ⇒
+        // nothing to dispatch onto). Re-fetch the store here: the local binding
+        // was moved into the outbox consumer / worker pool above.
+        let boot_resume_orchestrator = crate::api::agent_orchestrator::default_agent_orchestrator();
+        let boot_resume_store =
+            if fleet_reconciled && boot_resume_orchestrator.fleet_pool().is_some() {
+                boot_resume_orchestrator.fleet_store()
+            } else {
+                None
+            };
+        if let Some(store) = boot_resume_store {
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            match crate::api::fleet_wake::enqueue_fleet_boot_resume_wakes(
+                &store,
+                boot_resume_orchestrator,
+                now_ms,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => tracing::info!(
+                    fleets = n,
+                    "fleet boot-resume: re-woke keepers for restart-stranded fleets"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "fleet boot-resume wake pass failed"),
+            }
+        }
+
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
                 // Per-project session storage (opt-in, default off). When set,
@@ -955,11 +1064,14 @@ impl ServeCommand {
                 .with_sessions_in_cwd(config.appui.sessions_in_cwd),
         );
 
+        let (http_listener, effective_serve_port) =
+            bind_http_listener(self.stdio, &self.host, self.port).await?;
+
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(self.port, auth_token.clone())
+                .with_serve_config(effective_serve_port, auth_token.clone())
                 // Section B (codex review round-5 P1.2): every spawned
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
@@ -970,7 +1082,13 @@ impl ServeCommand {
                 )
                 .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
                     config.memory.as_ref(),
-                )),
+                ))
+                .with_host_asr_language(
+                    config
+                        .voice
+                        .as_ref()
+                        .and_then(|voice| voice.asr_language.clone()),
+                ),
         );
         process_manager.set_self_ref();
 
@@ -1153,9 +1271,28 @@ impl ServeCommand {
                 config.mode
             );
         }
+        // Resolve browser origins once, before any HTTP route is exposed.
+        // A malformed explicit origin aborts startup instead of silently
+        // weakening CORS/WS behavior. Empty env means "use config"; a
+        // non-empty env value replaces the config list for deployments.
+        let appui_allowed_origins_env = match std::env::var("OCTOS_APPUI_ALLOWED_ORIGINS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eyre::bail!("OCTOS_APPUI_ALLOWED_ORIGINS must be valid Unicode")
+            }
+        };
+        let appui_allowed_origins = resolve_appui_allowed_origins(
+            &config.appui.allowed_origins,
+            appui_allowed_origins_env.as_deref(),
+            effective_serve_port,
+        )
+        .wrap_err("invalid AppUI browser-origin configuration")?;
+
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
+            profile_skill_mutation_locks: Arc::new(crate::api::ProfileSkillMutationLocks::new()),
             sessions,
             broadcaster,
             started_at: chrono::Utc::now(),
@@ -1195,6 +1332,7 @@ impl ServeCommand {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| config.base_domain.clone().filter(|s| !s.trim().is_empty())),
+            appui_allowed_origins,
             frps_server: config
                 .frps_server
                 .clone()
@@ -1503,7 +1641,12 @@ impl ServeCommand {
         crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
 
         let app = build_router(state);
-        let addr = format!("{}:{}", self.host, self.port);
+        let listener =
+            http_listener.expect("non-stdio serve must bind its HTTP listener before AppState");
+        let addr = listener
+            .local_addr()
+            .wrap_err("failed to inspect bound octos API listener")?
+            .to_string();
 
         tracing::info!(address = %addr, "octos API server starting");
         tracing::info!(dashboard = %format!("http://{}/admin/", addr), "dashboard available");
@@ -1523,7 +1666,6 @@ impl ServeCommand {
         }
         println!();
 
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1577,6 +1719,9 @@ impl ServeCommand {
     /// [`octos_swarm::DispatchPolicy::from_agent_gates`] rustdoc for
     /// the boundary. Closes audit issue #713 (M7 req 7 production
     /// wiring).
+    // Each argument is a distinct `--swarm-*` CLI flag or shared handle;
+    // grouping them would just rename the same parameter list.
+    #[allow(clippy::too_many_arguments)]
     async fn build_swarm_state_from_flags(
         swarm_backend: Option<&str>,
         swarm_backend_cmd: Option<&str>,
@@ -1703,7 +1848,7 @@ mod tests {
         // `--stdio` runs session actors in-process with no gateway to
         // proxy `task/cancel` to, so the store must be present for the
         // per-turn supervisor to self-register into — otherwise AppUI
-        // task commands fail `runtime_unavailable` and octos-tui Esc/`x`
+        // task commands fail `runtime_unavailable` and octoscode Esc/`x`
         // cannot cancel a spawned background task (the reported bug).
         assert!(
             stdio_task_query_store(true).is_some(),
@@ -1719,6 +1864,25 @@ mod tests {
             stdio_task_query_store(false).is_none(),
             "gateway/http serve must leave task_query_store None"
         );
+    }
+
+    #[tokio::test]
+    async fn port_zero_resolves_before_origin_configuration() {
+        let (listener, effective_port) = bind_http_listener(false, "127.0.0.1", 0)
+            .await
+            .expect("bind an ephemeral loopback listener");
+        let listener = listener.expect("HTTP serve returns a bound listener");
+
+        assert_ne!(effective_port, 0, "the OS-selected port must be concrete");
+        assert_eq!(
+            listener.local_addr().unwrap().port(),
+            effective_port,
+            "all downstream configuration must use the bound listener's port"
+        );
+        let origins = resolve_appui_allowed_origins(&[], None, effective_port).unwrap();
+        assert!(origins.contains(&format!("http://127.0.0.1:{effective_port}")));
+        assert!(origins.contains(&format!("http://localhost:{effective_port}")));
+        assert!(origins.contains(&format!("http://[::1]:{effective_port}")));
     }
 
     /// #1857 PR 5a fix (HIGH 1) — the fleet worker pool installs ONLY behind a
@@ -1786,6 +1950,7 @@ mod tests {
                 detail: "d".to_owned(),
                 deps: Vec::new(),
                 acceptance: Vec::new(),
+                grant: octos_fleet::WorkerGrant::minimal(),
             }],
             1,
         )

@@ -550,8 +550,8 @@ class StdioClient extends AppUiClient {
       env: {
         ...process.env,
         OCTOS_M9_PROTOCOL_FIXTURES: '1',
-        OCTOS_TUI_M15_UX_OUTPUT_DIR: runRoot,
-        OCTOS_TUI_M15_UX_WORKDIR: workspace,
+        OCTOSCODE_M15_UX_OUTPUT_DIR: runRoot,
+        OCTOSCODE_M15_UX_WORKDIR: workspace,
         RUST_BACKTRACE: process.env.RUST_BACKTRACE || '1',
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -665,8 +665,8 @@ async function startWsServer(port) {
     env: {
       ...process.env,
       OCTOS_M9_PROTOCOL_FIXTURES: '1',
-      OCTOS_TUI_M15_UX_OUTPUT_DIR: runRoot,
-      OCTOS_TUI_M15_UX_WORKDIR: workspace,
+      OCTOSCODE_M15_UX_OUTPUT_DIR: runRoot,
+      OCTOSCODE_M15_UX_WORKDIR: workspace,
       RUST_BACKTRACE: process.env.RUST_BACKTRACE || '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1059,6 +1059,14 @@ function routeProbeParams(method) {
       return { profile_id: profileId, name: 'm18-missing-skill' };
     case 'profile/skills/remove':
       return { profile_id: profileId, name: 'm18-missing-skill' };
+    case 'skill/action/list':
+      return { session_id: sessionId, profile_id: profileId };
+    case 'skill/action/invoke':
+      return { session_id: sessionId, profile_id: profileId, action_id: 'm18-missing-action' };
+    case 'skill/action/job/list':
+      return { session_id: sessionId, profile_id: profileId };
+    case 'skill/action/job/read':
+      return { session_id: sessionId, profile_id: profileId, job_id: 'm18-missing-job' };
     case 'onboarding/workspace_probe':
       return { path: workspace };
     default:

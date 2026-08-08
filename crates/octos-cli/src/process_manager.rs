@@ -19,7 +19,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
-use crate::profiles::{ChannelCredentials, ProfileStore, UserProfile};
+use crate::profiles::{ChannelCredentials, HOST_ASR_LANGUAGE_ENV, ProfileStore, UserProfile};
 
 /// Base port for managed WhatsApp bridge WebSocket servers.
 /// HTTP media port = WS port + 1.
@@ -62,6 +62,9 @@ pub struct ProcessManager {
     /// Host-level `memory.refresh.enabled` forwarded via
     /// `OCTOS_MEMORY_REFRESH_ENABLED` under the same field-level rule.
     host_memory_refresh_enabled: bool,
+    /// Host-level `voice.asr_language` forwarded to spawned profile gateways.
+    /// `None` preserves automatic language detection.
+    host_asr_language: Option<String>,
 }
 
 struct GatewayProcess {
@@ -255,6 +258,7 @@ impl ProcessManager {
             // Matches the product default (memory refresh DEFAULT-ON);
             // serve overwrites from the resolved host config.
             host_memory_refresh_enabled: true,
+            host_asr_language: None,
         }
     }
 
@@ -279,6 +283,14 @@ impl ProcessManager {
     /// `OCTOS_MEMORY_REFRESH_ENABLED` (field-level: profile value wins).
     pub fn with_host_memory_refresh_enabled(mut self, enabled: bool) -> Self {
         self.host_memory_refresh_enabled = enabled;
+        self
+    }
+
+    /// Mirror the serve-level ASR language default to spawned profile
+    /// gateways. The profile's structured override is still resolved from its
+    /// JSON on every voice message and takes precedence over this value.
+    pub fn with_host_asr_language(mut self, language: Option<String>) -> Self {
+        self.host_asr_language = language;
         self
     }
 
@@ -438,42 +450,42 @@ impl ProcessManager {
                     crate::auth::keychain::resolve_env_vars(&parent.config.env_vars);
                 for (key, value) in &resolved_parent {
                     // Sub-account's own env_vars take priority
-                    if !profile.config.env_vars.contains_key(key) {
-                        if !BLOCKED_ENV_VARS
+                    if !profile.config.env_vars.contains_key(key)
+                        && !BLOCKED_ENV_VARS
                             .iter()
                             .any(|blocked| key.eq_ignore_ascii_case(blocked))
-                        {
-                            // Section B (codex review round-7 P3): the
-                            // host's strict-signing env var is reserved
-                            // for the parent serve. Refuse a parent
-                            // profile env_vars entry that would override
-                            // it (sub-account inheritance otherwise lets
-                            // a parent silently flip strict signing on).
-                            if key.eq_ignore_ascii_case("OCTOS_PLUGINS_REQUIRE_SIGNED") {
-                                tracing::warn!(
-                                    profile = %profile.id,
-                                    parent = %parent_id,
-                                    var = %key,
-                                    "skipping parent env var that would override host plugin policy"
-                                );
-                                continue;
-                            }
-                            // The host memory envs are equally
-                            // host-reserved: a parent profile must not
-                            // impersonate them toward sub-accounts.
-                            if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS")
-                                || key.eq_ignore_ascii_case("OCTOS_MEMORY_REFRESH_ENABLED")
-                            {
-                                tracing::warn!(
-                                    profile = %profile.id,
-                                    parent = %parent_id,
-                                    var = %key,
-                                    "skipping parent env var that would override host memory settings"
-                                );
-                                continue;
-                            }
-                            cmd.env(key, value);
+                    {
+                        // Section B (codex review round-7 P3): the
+                        // host's strict-signing env var is reserved
+                        // for the parent serve. Refuse a parent
+                        // profile env_vars entry that would override
+                        // it (sub-account inheritance otherwise lets
+                        // a parent silently flip strict signing on).
+                        if key.eq_ignore_ascii_case("OCTOS_PLUGINS_REQUIRE_SIGNED") {
+                            tracing::warn!(
+                                profile = %profile.id,
+                                parent = %parent_id,
+                                var = %key,
+                                "skipping parent env var that would override host plugin policy"
+                            );
+                            continue;
                         }
+                        // The host memory envs are equally
+                        // host-reserved: a parent profile must not
+                        // impersonate them toward sub-accounts.
+                        if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS")
+                            || key.eq_ignore_ascii_case("OCTOS_MEMORY_REFRESH_ENABLED")
+                            || key.eq_ignore_ascii_case(HOST_ASR_LANGUAGE_ENV)
+                        {
+                            tracing::warn!(
+                                profile = %profile.id,
+                                parent = %parent_id,
+                                var = %key,
+                                "skipping parent env var that would override host memory settings"
+                            );
+                            continue;
+                        }
+                        cmd.env(key, value);
                     }
                 }
             }
@@ -554,6 +566,7 @@ impl ProcessManager {
             // spoofing the host-controlled env vars.
             if key.eq_ignore_ascii_case("OCTOS_MEMORY_MAX_INJECT_TOKENS")
                 || key.eq_ignore_ascii_case("OCTOS_MEMORY_REFRESH_ENABLED")
+                || key.eq_ignore_ascii_case(HOST_ASR_LANGUAGE_ENV)
             {
                 tracing::warn!(
                     profile = %profile.id,
@@ -593,6 +606,14 @@ impl ProcessManager {
             // disabled host must mirror an explicit OFF — env_remove would
             // let the child fall back to on.
             cmd.env("OCTOS_MEMORY_REFRESH_ENABLED", "0");
+        }
+        match self.host_asr_language.as_deref() {
+            Some(language) => {
+                cmd.env(HOST_ASR_LANGUAGE_ENV, language);
+            }
+            None => {
+                cmd.env_remove(HOST_ASR_LANGUAGE_ENV);
+            }
         }
 
         tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");
@@ -1400,7 +1421,6 @@ impl ProcessManager {
 
     /// Allocate the next available port pair for a bridge.
     /// Checks both the in-memory bridge map and actual port availability.
-
     fn allocate_wechat_port(&self, bridges: &HashMap<String, BridgeProcess>) -> u16 {
         let used: std::collections::HashSet<u16> = bridges.values().map(|b| b.ws_port).collect();
         let mut port = 3201u16;
@@ -1490,6 +1510,13 @@ mod tests {
     fn make_pm() -> (tempfile::TempDir, ProcessManager) {
         let (dir, store) = temp_profile_store();
         (dir, ProcessManager::new(store))
+    }
+
+    #[test]
+    fn should_store_host_asr_language_for_spawned_gateways() {
+        let (_dir, pm) = make_pm();
+        let pm = pm.with_host_asr_language(Some("English".to_string()));
+        assert_eq!(pm.host_asr_language.as_deref(), Some("English"));
     }
 
     // ── port_available ────────────────────────────────────────────────
@@ -1982,6 +2009,9 @@ mod tests {
     // ── No port collision across allocation types ─────────────────────
 
     #[test]
+    // Deliberately asserts the ordering of compile-time port constants —
+    // the values being constant is the point of the test.
+    #[allow(clippy::assertions_on_constants)]
     fn should_have_distinct_base_ports() {
         // Verify that the base port constants are all different.
         let ports = [BRIDGE_BASE_WS_PORT, WEBHOOK_BASE_PORT, API_BASE_PORT];

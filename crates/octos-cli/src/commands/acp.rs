@@ -80,6 +80,9 @@ use octos_llm::{EmbeddingProvider, LlmProvider};
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::Mutex;
 
+use octos_bus::session::SessionManager;
+use octos_core::SessionKey;
+
 use super::Executable;
 use crate::config::Config;
 
@@ -143,6 +146,15 @@ impl Executable for AcpCommand {
 /// Everything a spawned prompt turn needs, shared behind the session map.
 struct AcpSession {
     agent: Arc<Agent>,
+    /// Where this conversation is persisted. ACP sessions were memory-only, so a
+    /// crash or supervisor restart lost the whole conversation — the agent came
+    /// back mid-task with no idea what it had been doing while the fleet reported
+    /// it healthy. SessionManager already backs the REST and WebSocket paths;
+    /// `SessionKey` is a newtype over "channel:chat_id", so "acp" is simply
+    /// another channel alongside the existing ones.
+    session_key: SessionKey,
+    /// Held on the session rather than threaded through run_prompt_turn's callers.
+    session_store: Option<Arc<Mutex<SessionManager>>>,
     /// Conversation history accumulated across prompt turns in this session.
     history: Mutex<Vec<octos_core::Message>>,
     /// Flipped to `true` by a `session/cancel` notification; the agent's
@@ -163,6 +175,19 @@ trait SessionAgentFactory: Send + Sync {
     /// Build a runnable agent rooted at `cwd`, returning it plus the shared
     /// shutdown flag wired into it (flipped on `session/cancel`).
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)>;
+
+    /// Where ACP conversations are persisted, if anywhere. `None` means sessions
+    /// will not survive a restart — the test factory, or a store that failed to open.
+    fn session_store(&self) -> Option<Arc<Mutex<SessionManager>>> {
+        None
+    }
+
+    /// Profile dimension for this factory's session keys. Sessions elsewhere are
+    /// profile-scoped; an unscoped ACP key would collide across profiles running
+    /// the same session id and would not isolate them.
+    fn session_profile_id(&self) -> String {
+        octos_core::MAIN_PROFILE_ID.to_string()
+    }
 }
 
 /// Build the tool registry shared by every ACP session: built-ins rooted at
@@ -252,6 +277,8 @@ struct AcpSharedStores {
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     agent_config: AgentConfig,
     memory_refresh_enabled: bool,
+    /// Opened once per process; shared by every session.
+    sessions_store: Option<Arc<Mutex<SessionManager>>>,
     max_inject_tokens: usize,
     data_dir: PathBuf,
     config: Config,
@@ -283,6 +310,40 @@ struct AcpBootstrap {
     )>,
     /// Canonicalized skill dirs → `SessionScope` skill-read zones (fail-closed).
     skill_read_zones: Vec<PathBuf>,
+}
+
+/// Open the ACP session store, degrading to `None` with a loud log rather than
+/// failing the agent: an unpersisted session is worse than a persisted one and
+/// far better than none. Silent non-persistence is the bug this exists to fix,
+/// so it must not be reintroduced here.
+///
+/// Rooted at `data_dir` itself — the SAME root gateway/serve/api_channel hand
+/// [`SessionManager::open`], because it appends its own `sessions/` segment.
+/// Pre-joining `sessions/` here nested ACP transcripts at
+/// `sessions/sessions/`, where no other surface (and no fixed build) would
+/// ever look (#1909).
+fn open_acp_session_store(data_dir: &std::path::Path) -> Option<Arc<Mutex<SessionManager>>> {
+    // Heads-up for transcripts written by the nested-path bug: they stay put —
+    // moving them across the store's flat/users layouts is riskier than
+    // leaving them for manual cleanup.
+    let legacy = data_dir.join("sessions").join("sessions");
+    if legacy.is_dir() {
+        tracing::warn!(
+            path = %legacy.display(),
+            "found ACP transcripts written under the pre-#1909 nested \
+             sessions/sessions path; they are NOT loaded — move or delete them manually"
+        );
+    }
+    match SessionManager::open(data_dir) {
+        Ok(store) => Some(Arc::new(Mutex::new(store))),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "session store unavailable; ACP conversations will NOT survive a restart"
+            );
+            None
+        }
+    }
 }
 
 impl AcpSharedStores {
@@ -346,6 +407,7 @@ impl AcpSharedStores {
             embedder,
             agent_config,
             memory_refresh_enabled,
+            sessions_store: open_acp_session_store(&data_dir),
             max_inject_tokens,
             data_dir,
             config,
@@ -620,6 +682,18 @@ impl SessionAgentFactory for ConfigAgentFactory {
         &self.default_cwd
     }
 
+    fn session_store(&self) -> Option<Arc<Mutex<SessionManager>>> {
+        // Only present once the shared stores exist, which happens on the first
+        // session/new. Before that there is nothing to persist anyway.
+        self.shared.get().and_then(|s| s.sessions_store.clone())
+    }
+
+    fn session_profile_id(&self) -> String {
+        self.profile
+            .clone()
+            .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_string())
+    }
+
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
         // Normalize the client-supplied cwd (resolve `..` + symlinks) up front so
         // the per-cwd cache key is stable and the session scope's `..`-rejecting
@@ -792,6 +866,8 @@ async fn spawn_acp_agent(
 ) -> std::result::Result<(), AcpError> {
     let factory_for_new = factory.clone();
     let sessions_for_new = sessions.clone();
+    let factory_for_load = factory.clone();
+    let sessions_for_load = sessions.clone();
     let sessions_for_prompt = sessions.clone();
     let sessions_for_cancel = sessions;
 
@@ -820,6 +896,19 @@ async fn spawn_acp_agent(
         .on_receive_request(
             async move |req: NewSessionRequest, responder, _cx: ConnectionTo<Client>| {
                 match handle_new_session(factory_for_new.as_ref(), &sessions_for_new, req).await {
+                    Ok(resp) => responder.respond(resp),
+                    Err(err) => responder.respond_with_error(err),
+                }
+            },
+            on_receive_request!(),
+        )
+        // session/load: rebuild a session and replay its stored history, so a
+        // conversation survives a crash or a supervisor restart.
+        .on_receive_request(
+            async move |req: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
+                match handle_load_session(factory_for_load.as_ref(), &sessions_for_load, req, &cx)
+                    .await
+                {
                     Ok(resp) => responder.respond(resp),
                     Err(err) => responder.respond_with_error(err),
                 }
@@ -861,6 +950,9 @@ pub struct TestAgentFactory {
     llm: Arc<dyn LlmProvider>,
     memory_dir: PathBuf,
     default_cwd: PathBuf,
+    /// Absent by default, so existing tests keep their in-memory behaviour. Set
+    /// via `with_session_store` to exercise persistence and session/load.
+    session_store: Option<Arc<Mutex<SessionManager>>>,
 }
 
 #[doc(hidden)]
@@ -872,12 +964,26 @@ impl TestAgentFactory {
             llm,
             memory_dir,
             default_cwd,
+            session_store: None,
         }
+    }
+
+    /// Persist this factory's sessions under `dir`, so a test can prove a
+    /// conversation survives being reloaded into a fresh transport.
+    pub fn with_session_store(mut self, dir: &std::path::Path) -> Self {
+        self.session_store = SessionManager::open(dir)
+            .ok()
+            .map(|store| Arc::new(Mutex::new(store)));
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl SessionAgentFactory for TestAgentFactory {
+    fn session_store(&self) -> Option<Arc<Mutex<SessionManager>>> {
+        self.session_store.clone()
+    }
+
     fn default_cwd(&self) -> &std::path::Path {
         &self.default_cwd
     }
@@ -1005,8 +1111,13 @@ fn build_initialize_response(req: &InitializeRequest) -> InitializeResponse {
     // Image/audio/embedded-context are left false (v1 extracts text only).
     let prompt = PromptCapabilities::new();
     let caps = AgentCapabilities::new()
-        // We accept `session/load` no better than `session/new` today, so do
-        // NOT advertise loadSession (leave it false / default).
+        // Advertised because session/load now genuinely restores: it reads the
+        // conversation back from SessionManager, which session/prompt writes each
+        // turn through to. It stayed false while load was a stub, and must go back
+        // to false if that store is ever removed — a client that sees the
+        // capability will call it, and a load that silently returns nothing is
+        // worse than a method_not_found.
+        .load_session(true)
         .prompt_capabilities(prompt);
 
     let negotiated = if req.protocol_version == ProtocolVersion::V1 {
@@ -1043,8 +1154,17 @@ async fn handle_new_session(
         .map_err(|e| agent_client_protocol::util::internal_error(format!("build agent: {e}")))?;
 
     let session_id = new_session_id();
+    // A fresh session/new starts empty. session/load is what restores a prior
+    // conversation; hydrating here too would silently resurrect history for a
+    // client that explicitly asked for a new session.
     let session = Arc::new(AcpSession {
         agent,
+        session_key: SessionKey::with_profile(
+            &factory.session_profile_id(),
+            "acp",
+            session_id.0.as_ref(),
+        ),
+        session_store: factory.session_store(),
         history: Mutex::new(Vec::new()),
         shutdown,
     });
@@ -1067,7 +1187,9 @@ fn handle_prompt(
     responder: agent_client_protocol::Responder<PromptResponse>,
 ) -> std::result::Result<(), AcpError> {
     // Look up the session synchronously (try_lock avoids awaiting in the
-    // dispatch loop; the map is only briefly held by session/new + cancel).
+    // dispatch loop; session/new + cancel hold the map only briefly, while
+    // session/load holds it across its build — contended prompts take the
+    // deferred path below and resolve inside the spawned turn task).
     let session = {
         let map = match sessions.try_lock() {
             Ok(map) => map,
@@ -1173,8 +1295,16 @@ async fn run_prompt_turn(
             // still holds the earlier turns (we only cloned it above, never
             // cleared it), so APPEND — replacing would drop every earlier turn
             // and the agent would forget context after the second prompt.
+            // Captured under the same guard that appends, not re-read afterwards.
+            //
+            // Taking the index here and re-locking later to slice from it let two
+            // turns interleaving on one session compute overlapping ranges and
+            // write the same messages twice. Holding one guard across append and
+            // capture means each turn takes exactly the rows it appended.
+            let fresh: Vec<octos_core::Message>;
             {
                 let mut h = session.history.lock().await;
+                let persisted_upto = h.len();
                 let assistant_reply = resp.content.clone();
                 h.extend(resp.messages);
                 // For a plain-text turn, `resp.messages` carries the user row but
@@ -1191,6 +1321,7 @@ async fn run_prompt_turn(
                     h.last(),
                     Some(last) if last.role == octos_core::MessageRole::Assistant && last.content == assistant_reply
                 );
+                #[allow(clippy::needless_late_init)]
                 if !cancelled && !assistant_reply.is_empty() && !already_persisted {
                     h.push(octos_core::Message {
                         role: octos_core::MessageRole::Assistant,
@@ -1203,6 +1334,73 @@ async fn run_prompt_turn(
                         thread_id: None,
                         timestamp: chrono::Utc::now(),
                     });
+                }
+                fresh = h
+                    .get(persisted_upto..)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default();
+            }
+
+            // Write this turn through to the store so it outlives the process.
+            //
+            // Everything above only mutated an in-memory Vec, which is why a kill -9 left
+            // the agent with no idea what it had been doing while the fleet reported it
+            // healthy. Only what this turn added is written: the store appends, so
+            // re-sending earlier turns would duplicate them.
+            //
+            // A store failure is logged, never fatal — losing persistence must not also
+            // lose the turn the agent just completed.
+            if let Some(store) = session.session_store.as_ref() {
+                if !fresh.is_empty() {
+                    // Every message this turn produced shares one thread id.
+                    //
+                    // The store is fail-closed for Assistant and Tool rows:
+                    // derive_thread_id_for_new_write rejects them outright unless the
+                    // caller has stamped the originating turn's thread_id, because a
+                    // derived one picked the wrong sibling user under rapid-fire
+                    // turns. Unstamped, the user row persisted and the assistant row
+                    // was rejected — a stored conversation with the answers missing,
+                    // which is worse than none.
+                    let turn_thread = fresh
+                        .iter()
+                        .find(|m| matches!(m.role, octos_core::MessageRole::User))
+                        .and_then(|m| m.thread_id.clone().or_else(|| m.client_message_id.clone()))
+                        .unwrap_or_else(|| {
+                            // No user row to inherit from, so there is nothing to
+                            // stamp these rows onto. Minting an id keeps the write
+                            // fail-OPEN rather than dropping the turn, but it
+                            // creates exactly the orphan the store's fail-closed
+                            // check exists to prevent: assistant/tool rows in a
+                            // thread containing no user message. Expected to be
+                            // unreachable — say so out loud rather than silently
+                            // converting "we do not know the thread" into
+                            // "invent one", which is what made the original
+                            // thread-id bug so expensive to find.
+                            let minted = uuid::Uuid::now_v7().to_string();
+                            tracing::warn!(
+                                thread_id = %minted,
+                                rows = fresh.len(),
+                                "ACP turn produced no user row; persisting its \
+                                 messages under a MINTED thread id — they will \
+                                 load as a thread with no user message"
+                            );
+                            minted
+                        });
+
+                    let mut guard = store.lock().await;
+                    for mut message in fresh {
+                        if message.thread_id.is_none() {
+                            message.thread_id = Some(turn_thread.clone());
+                        }
+                        // Carry on rather than break: the rows are independent, and
+                        // dropping the rest because one failed loses more than it saves.
+                        if let Err(e) = guard.add_message(&session.session_key, message).await {
+                            tracing::warn!(
+                                error = %e, session = %session.session_key.0,
+                                "failed to persist an ACP message; it will not survive a restart"
+                            );
+                        }
+                    }
                 }
             }
             // Distinguish a client-driven cancel from a natural end-of-turn.
@@ -1247,15 +1445,157 @@ async fn handle_cancel(sessions: &SessionMap, notif: CancelNotification) {
     }
 }
 
-/// Handle `session/load` — NOT supported in v1: octos does not persist ACP
-/// sessions across process restarts. Kept as a documented stub so the intent is
-/// explicit; not wired into the builder (an unregistered method returns
-/// `method_not_found` automatically).
-#[allow(dead_code)]
-fn handle_load_session_unsupported(
-    _req: LoadSessionRequest,
+/// Handle `session/load`: rebuild a session and replay its stored history.
+///
+/// ACP sessions were memory-only, so a crash or supervisor restart lost the whole
+/// conversation. `session/prompt` now writes each turn through to `SessionManager`;
+/// this is the read side that makes that worth doing.
+async fn handle_load_session(
+    factory: &dyn SessionAgentFactory,
+    sessions: &SessionMap,
+    req: LoadSessionRequest,
+    cx: &ConnectionTo<Client>,
 ) -> std::result::Result<LoadSessionResponse, AcpError> {
-    Err(AcpError::method_not_found())
+    let history = load_session_locked(factory, sessions, &req).await?;
+    // The response carries no history — ACP expects the transcript replayed as
+    // `session/update` notifications BEFORE the load resolves, or a
+    // reconnecting client renders an empty conversation (#1909).
+    replay_history(cx, &req.session_id, &history);
+    Ok(LoadSessionResponse::default())
+}
+
+/// The restore half of `session/load`: resolve (or rebuild) the session and
+/// return the transcript the caller must replay to the client.
+async fn load_session_locked(
+    factory: &dyn SessionAgentFactory,
+    sessions: &SessionMap,
+    req: &LoadSessionRequest,
+) -> std::result::Result<Vec<octos_core::Message>, AcpError> {
+    // ONE map lock across check → build → restore → insert (#1909). The old
+    // contains_key → build().await → insert sequence dropped the guard
+    // between check and insert, so a concurrent load of the same id slipped
+    // past the emptiness check while the first was still building and then
+    // OVERWROTE its session — evicting the `shutdown` flag an in-flight turn
+    // could be watching, the exact harm the already-live branch exists to
+    // prevent. Holding the lock makes a racing load observe the live session
+    // instead of replacing it (and keeps it from double-building an agent,
+    // whose second redb open would fail outright).
+    //
+    // Contention is safe by construction: `factory.build` and the store read
+    // never re-acquire THIS map, prompt lookup uses try_lock with a deferred
+    // fallback, and cancel/new only wait for the lock. Lock ordering here is
+    // map → history → store; no path takes those in reverse.
+    let mut map = sessions.lock().await;
+
+    // Never replace a session that is already live, and do not build an agent we
+    // would then discard.
+    //
+    // A bare insert dropped the existing entry and with it the `shutdown` flag an
+    // in-flight turn is watching, so a `session/cancel` for that turn flipped a flag
+    // nobody read and cancellation silently stopped working. Loading an id the agent
+    // already holds is a no-op: it is by definition already loaded, and a
+    // reconnecting client should not lose its running turn.
+    //
+    // The check comes first because factory.build() opens the episode store, and a
+    // second open on a live session fails on the redb lock.
+    //
+    // The live session's OWN history is what gets replayed — a client that
+    // re-loads an active id still expects the transcript back.
+    if let Some(live) = map.get(&req.session_id) {
+        tracing::info!(
+            session = %req.session_id.0,
+            "session/load for an already-active session; keeping the live one"
+        );
+        return Ok(live.history.lock().await.clone());
+    }
+
+    let cwd = if req.cwd.as_os_str().is_empty() {
+        factory.default_cwd().to_path_buf()
+    } else {
+        req.cwd.clone()
+    };
+
+    let (agent, shutdown) = factory
+        .build(cwd)
+        .await
+        .map_err(|e| agent_client_protocol::util::internal_error(format!("build agent: {e}")))?;
+
+    let session_key = SessionKey::with_profile(
+        &factory.session_profile_id(),
+        "acp",
+        req.session_id.0.as_ref(),
+    );
+    let session_store = factory.session_store();
+
+    // An id the store has never seen loads as an empty session rather than an
+    // error. The likeliest cause is that the store was unavailable when the
+    // session was written, and refusing would strand an agent that can still work
+    // — just without its past. The warning is what makes that visible.
+    let history = match session_store.as_ref() {
+        Some(store) => {
+            let guard = store.lock().await;
+            match guard.load(&session_key).await {
+                Some(stored) => {
+                    // Sanitize BEFORE the transcript touches an LLM or a client
+                    // (#1909). The store is append-only JSONL, so a crash can
+                    // leave residue the provider rejects (an assistant tool_call
+                    // whose result never landed → 400 on the next turn) or that
+                    // replays as UI debris (orphaned thinking-only rows,
+                    // whitespace-only rows, a tool card that never completes).
+                    // Every other resume path runs this same ResumePolicy.
+                    //
+                    // workspace_root is None deliberately: ResumePolicy's
+                    // worktree check writes an mtime marker into the root —
+                    // right for agent-managed worktrees, wrong for the user's
+                    // own project dir an ACP client points at (it would dirty
+                    // git status on every load).
+                    match octos_bus::ResumePolicy::sanitize(stored.messages, None, None) {
+                        Ok(outcome) => {
+                            tracing::info!(
+                                session = %session_key.0,
+                                report = %outcome.report,
+                                "restored an ACP session from the store"
+                            );
+                            outcome.messages
+                        }
+                        Err(error) => {
+                            // Only WorktreeMissing can fail, and only when a
+                            // workspace_root is provided — unreachable with None
+                            // above. If a future variant appears, refuse the
+                            // load loudly rather than resume a transcript the
+                            // policy judged unsafe.
+                            return Err(agent_client_protocol::util::internal_error(format!(
+                                "transcript sanitize refused resume: {error}"
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        session = %session_key.0,
+                        "session/load found no stored conversation; starting empty"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        None => {
+            tracing::warn!("session/load with no session store; starting empty");
+            Vec::new()
+        }
+    };
+
+    let session = Arc::new(AcpSession {
+        agent,
+        session_key,
+        session_store,
+        history: Mutex::new(history.clone()),
+        shutdown,
+    });
+
+    map.insert(req.session_id.clone(), session);
+
+    Ok(history)
 }
 
 /// Generate a fresh, unique ACP session id.
@@ -1434,9 +1774,270 @@ pub(crate) fn project_progress_event_deduped(
     progress_event_to_acp(event)
 }
 
+/// Project one stored transcript row into the `session/update` sequence that
+/// rebuilds it client-side on `session/load`. Pure counterpart of
+/// [`progress_event_to_acp`] for the replay path.
+///
+/// Mapping:
+/// - User text             -> `UserMessageChunk`
+/// - Assistant reasoning   -> `AgentThoughtChunk` (before the text chunk)
+/// - Assistant text        -> `AgentMessageChunk`
+/// - Assistant tool_calls  -> `ToolCall` (InProgress), one per call
+/// - Tool result           -> `ToolCallUpdate` (Completed + output)
+/// - System / empty rows   -> nothing (system prompts are agent-side context,
+///   not user-visible transcript; empty chunks render as blank bubbles)
+fn message_to_replay_updates(message: &octos_core::Message) -> Vec<SessionUpdate> {
+    let chunk = |text: &str| ContentChunk::new(ContentBlock::from(text.to_string()));
+    match message.role {
+        octos_core::MessageRole::User => {
+            if message.content.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![SessionUpdate::UserMessageChunk(chunk(&message.content))]
+            }
+        }
+        octos_core::MessageRole::Assistant => {
+            let mut updates = Vec::new();
+            if let Some(reasoning) = message.reasoning_content.as_deref() {
+                if !reasoning.trim().is_empty() {
+                    updates.push(SessionUpdate::AgentThoughtChunk(chunk(reasoning)));
+                }
+            }
+            if !message.content.trim().is_empty() {
+                updates.push(SessionUpdate::AgentMessageChunk(chunk(&message.content)));
+            }
+            if let Some(calls) = message.tool_calls.as_ref() {
+                for call in calls {
+                    updates.push(SessionUpdate::ToolCall(
+                        ToolCall::new(call.id.clone(), call.name.clone())
+                            .kind(tool_kind_for(&call.name))
+                            .status(ToolCallStatus::InProgress),
+                    ));
+                }
+            }
+            updates
+        }
+        octos_core::MessageRole::Tool => {
+            let Some(tool_call_id) = message.tool_call_id.clone() else {
+                return Vec::new();
+            };
+            let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+            if !message.content.is_empty() {
+                fields = fields.content(vec![ToolCallContent::from(ContentBlock::from(
+                    message.content.clone(),
+                ))]);
+            }
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id,
+                fields,
+            ))]
+        }
+        // System rows (base prompt, compaction summaries) and anything else.
+        _ => Vec::new(),
+    }
+}
+
+/// Replay a loaded transcript to the client as `session/update` notifications.
+///
+/// ACP REQUIRES this on `session/load`: the response carries no history, so
+/// without the replay a reconnecting client renders an empty conversation even
+/// though the agent restored it (#1909). Best-effort per frame — a send
+/// failure is logged, never fatal to the load.
+fn replay_history(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    history: &[octos_core::Message],
+) {
+    let mut sent = 0usize;
+    for message in history {
+        for update in message_to_replay_updates(message) {
+            let notif = SessionNotification::new(session_id.clone(), update);
+            if let Err(err) = cx.send_notification(notif) {
+                tracing::warn!(error = %err, "failed to send ACP session/update during load replay");
+            } else {
+                sent += 1;
+            }
+        }
+    }
+    if sent > 0 {
+        tracing::info!(
+            session = %session_id.0,
+            frames = sent,
+            "replayed an ACP transcript on session/load"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored user message, thread-stamped the way `run_prompt_turn` stamps
+    /// every row of a turn (the store is fail-closed for unstamped rows).
+    fn stored_user(content: &str, thread: &str) -> octos_core::Message {
+        octos_core::Message {
+            role: octos_core::MessageRole::User,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some(thread.into()),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// #1909: the ACP store must be rooted at the SAME dir gateway / serve /
+    /// api_channel hand `SessionManager::open` (which appends its own
+    /// `sessions/` segment). ACP pre-joined `sessions/`, nesting transcripts
+    /// at `sessions/sessions/` where no other surface — and no fixed build —
+    /// would ever look.
+    #[tokio::test]
+    async fn should_share_session_store_layout_with_other_surfaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "acp", "layout-check");
+
+        let store = open_acp_session_store(dir.path()).expect("ACP store opens");
+        {
+            let mut guard = store.lock().await;
+            guard
+                .add_message(&key, stored_user("hello", "t-layout"))
+                .await
+                .expect("message persists");
+        }
+
+        // The gateway/serve way of opening the SAME store must see the row.
+        let other = SessionManager::open(dir.path()).expect("gateway-style open");
+        let saw = other
+            .load(&key)
+            .await
+            .map(|s| s.messages.iter().any(|m| m.content == "hello"))
+            .unwrap_or(false);
+        assert!(
+            saw,
+            "a store opened the gateway/serve way must see ACP transcripts \
+             (sessions/sessions nesting, #1909)"
+        );
+    }
+
+    /// A stored assistant message, thread-stamped like [`stored_user`].
+    fn stored_assistant(content: &str, thread: &str) -> octos_core::Message {
+        octos_core::Message {
+            role: octos_core::MessageRole::Assistant,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some(thread.into()),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn replay_text(update: &SessionUpdate) -> Option<&str> {
+        match update {
+            SessionUpdate::UserMessageChunk(c)
+            | SessionUpdate::AgentMessageChunk(c)
+            | SessionUpdate::AgentThoughtChunk(c) => match &c.content {
+                ContentBlock::Text(t) => Some(&t.text),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn should_map_user_message_to_user_message_chunk_when_replaying_history() {
+        let updates = message_to_replay_updates(&stored_user("USER_TEXT", "t"));
+        assert_eq!(updates.len(), 1);
+        assert!(
+            matches!(updates[0], SessionUpdate::UserMessageChunk(_)),
+            "user rows replay as UserMessageChunk, got {:?}",
+            updates[0]
+        );
+        assert_eq!(replay_text(&updates[0]), Some("USER_TEXT"));
+    }
+
+    #[test]
+    fn should_map_assistant_reasoning_then_text_when_replaying_history() {
+        let mut msg = stored_assistant("ASSISTANT_TEXT", "t");
+        msg.reasoning_content = Some("THOUGHT".into());
+        let updates = message_to_replay_updates(&msg);
+        assert_eq!(updates.len(), 2);
+        assert!(
+            matches!(updates[0], SessionUpdate::AgentThoughtChunk(_)),
+            "reasoning replays first, as a thought chunk: {:?}",
+            updates[0]
+        );
+        assert!(
+            matches!(updates[1], SessionUpdate::AgentMessageChunk(_)),
+            "the visible reply replays as a message chunk: {:?}",
+            updates[1]
+        );
+        assert_eq!(replay_text(&updates[0]), Some("THOUGHT"));
+        assert_eq!(replay_text(&updates[1]), Some("ASSISTANT_TEXT"));
+    }
+
+    #[test]
+    fn should_map_tool_call_and_result_to_call_then_completed_update_when_replaying() {
+        let mut call_msg = stored_assistant("", "t");
+        call_msg.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }]);
+        let updates = message_to_replay_updates(&call_msg);
+        assert_eq!(updates.len(), 1, "one ToolCall frame per call");
+        match &updates[0] {
+            SessionUpdate::ToolCall(call) => {
+                assert_eq!(call.tool_call_id.0.as_ref(), "call-1");
+                assert_eq!(call.title, "shell");
+                assert!(matches!(call.status, ToolCallStatus::InProgress));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+
+        let mut result_msg = stored_assistant("OUTPUT", "t");
+        result_msg.role = octos_core::MessageRole::Tool;
+        result_msg.tool_call_id = Some("call-1".into());
+        let updates = message_to_replay_updates(&result_msg);
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            SessionUpdate::ToolCallUpdate(u) => {
+                assert_eq!(u.tool_call_id.0.as_ref(), "call-1");
+                assert!(matches!(u.fields.status, Some(ToolCallStatus::Completed)));
+                let content = u.fields.content.as_ref().expect("output content present");
+                assert_eq!(content.len(), 1);
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_skip_system_and_empty_messages_when_replaying_history() {
+        let mut system = stored_user("BASE PROMPT", "t");
+        system.role = octos_core::MessageRole::System;
+        system.thread_id = None;
+        assert!(
+            message_to_replay_updates(&system).is_empty(),
+            "system rows are agent-side context, not replayed transcript"
+        );
+        assert!(
+            message_to_replay_updates(&stored_user("   ", "t")).is_empty(),
+            "whitespace-only user rows render as blank bubbles — skip"
+        );
+        assert!(
+            message_to_replay_updates(&stored_assistant("", "t")).is_empty(),
+            "payload-free assistant rows produce no frames"
+        );
+        // A tool-result row with no tool_call_id is malformed — skip, don't panic.
+        let mut orphan = stored_assistant("OUTPUT", "t");
+        orphan.role = octos_core::MessageRole::Tool;
+        assert!(message_to_replay_updates(&orphan).is_empty());
+    }
 
     /// The ACP assembler wires the long-term memory bank (chat parity), so the
     /// agent is no longer a bare-builtins skeleton. Exercises the real
@@ -1813,8 +2414,12 @@ mod tests {
         // Text-only prompt capabilities: image/audio/embedded_context all false.
         assert!(!resp.agent_capabilities.prompt_capabilities.image);
         assert!(!resp.agent_capabilities.prompt_capabilities.audio);
-        // We do not advertise loadSession in v1.
-        assert!(!resp.agent_capabilities.load_session);
+        // loadSession is advertised now that session/load genuinely restores a
+        // conversation from SessionManager. Advertising it while load was a stub
+        // would have been worse than not advertising: a client that sees the
+        // capability calls it, and a load that silently returns nothing looks like
+        // an agent that has forgotten everything.
+        assert!(resp.agent_capabilities.load_session);
     }
 
     #[test]
@@ -2202,6 +2807,131 @@ mod tests {
             !fresh.iter().any(|c| c.contains("done")),
             "the cancelled turn's aborted assistant reply must NOT persist into the \
              fresh prompt's history; fresh-turn messages: {fresh:?}"
+        );
+    }
+
+    /// Factory whose FIRST `build()` blocks until the test releases it
+    /// (announcing entry first), so two concurrent `session/load`s interleave
+    /// deterministically: load #1 provably inside `build()` while load #2
+    /// arrives. `builds` counts invocations — the race is observable as
+    /// `builds > 1`, no sleep-based guessing on the outcome side.
+    struct GatedBuildFactory {
+        llm: Arc<dyn octos_llm::LlmProvider>,
+        memory_dir: PathBuf,
+        default_cwd: PathBuf,
+        builds: Arc<std::sync::atomic::AtomicUsize>,
+        first_build_entered: Arc<tokio::sync::Notify>,
+        release_first_build: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionAgentFactory for GatedBuildFactory {
+        fn default_cwd(&self) -> &std::path::Path {
+            &self.default_cwd
+        }
+        async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
+            if self.builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_build_entered.notify_one();
+                self.release_first_build.notified().await;
+            }
+            let memory = Arc::new(EpisodeStore::open(&self.memory_dir).await?);
+            let tools = ToolRegistry::with_builtins_and_sandbox(
+                &cwd,
+                create_sandbox(&octos_agent::SandboxConfig::default()),
+            );
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let agent = Agent::new(
+                AgentId::new("acp-race-test"),
+                self.llm.clone(),
+                tools,
+                memory,
+            )
+            .with_shutdown(shutdown.clone());
+            Ok((Arc::new(agent), shutdown))
+        }
+    }
+
+    /// #1909: two concurrent `session/load`s for the same id must not both
+    /// build. The old contains_key → build().await → insert sequence dropped
+    /// the map guard between check and insert, so load #2 slipped past the
+    /// emptiness check while load #1 was still building and then OVERWROTE
+    /// #1's session — evicting the `shutdown` flag an in-flight turn could be
+    /// watching, the exact harm the already-live branch exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_not_build_twice_when_concurrent_loads_race() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(BarrierLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            // Never exercised: no prompt turn runs in this test, so chat()
+            // is never called and the barrier branch never triggers.
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let factory = Arc::new(GatedBuildFactory {
+            llm,
+            memory_dir,
+            default_cwd: cwd.clone(),
+            builds: builds.clone(),
+            first_build_entered: entered.clone(),
+            release_first_build: release.clone(),
+        });
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let sid = SessionId::new("race-me");
+        let req = LoadSessionRequest::new(sid.clone(), cwd.clone());
+
+        // Load #1: runs until its build is gated.
+        let load_one = {
+            let factory = factory.clone();
+            let sessions = sessions.clone();
+            let req = req.clone();
+            tokio::spawn(
+                async move { load_session_locked(factory.as_ref(), &sessions, &req).await },
+            )
+        };
+        // Wait until #1 is provably INSIDE build(), then fire load #2.
+        entered.notified().await;
+        let load_two = {
+            let factory = factory.clone();
+            let sessions = sessions.clone();
+            let req = req.clone();
+            tokio::spawn(
+                async move { load_session_locked(factory.as_ref(), &sessions, &req).await },
+            )
+        };
+
+        // Give #2 every chance to sneak past the check: it must not start a
+        // second build while #1 is in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "load #2 started a second agent build while load #1 was still building"
+        );
+
+        release.notify_one();
+        let r1 = load_one.await.expect("load #1 task joins");
+        let r2 = load_two.await.expect("load #2 task joins");
+        assert!(r1.is_ok(), "load #1 succeeds: {r1:?}");
+        assert!(
+            r2.is_ok(),
+            "load #2 must also succeed (as a no-op over the live session): {r2:?}"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "exactly one agent built across the racing loads"
+        );
+        assert!(
+            sessions.lock().await.contains_key(&sid),
+            "the winning load's session is the one that stays live"
         );
     }
 }
