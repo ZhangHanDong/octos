@@ -140,8 +140,9 @@ mod gate_tests {
     /// `event.turn_steer_dropped.v1` order promise breaks silently.
     #[test]
     fn every_terminal_outlet_goes_through_the_settling_gate() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/ui_protocol.rs");
-        let text = std::fs::read_to_string(&path).expect("read ui_protocol.rs");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/api/ui_protocol_transport.rs");
+        let text = std::fs::read_to_string(&path).expect("read ui_protocol_transport.rs");
         let mut current_fn = String::new();
         let mut offenders = Vec::new();
         for (i, line) in text.lines().enumerate() {

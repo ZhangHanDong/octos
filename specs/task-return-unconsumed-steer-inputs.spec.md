@@ -68,7 +68,7 @@ ledger（可 replay），使客户端能确定性地重新入队，而不是靠"
 - crates/octos-core/src/ui_protocol_tests.rs
 - crates/octos-cli/src/lib.rs
 - crates/octos-cli/src/steer_return.rs
-- crates/octos-cli/src/api/ui_protocol.rs
+- crates/octos-cli/src/api/ui_protocol_transport.rs
 - crates/octos-cli/src/api/ui_protocol_ledger.rs
 - crates/octos-cli/src/api/ui_protocol_tests.rs
 - specs/task-return-unconsumed-steer-inputs.spec.md
@@ -128,7 +128,7 @@ Scenario: 所有终态出口都经过结算闸门（结构检查）
   Test:
     Package: octos-cli
     Filter: every_terminal_outlet_goes_through_the_settling_gate
-  When 扫描 `crates/octos-cli/src/api/ui_protocol.rs`
+  When 扫描 `crates/octos-cli/src/api/ui_protocol_transport.rs`
   Then `transition_to_terminal(` 只在 `transition_to_terminal_settling_steers` 内被调用
 
 Scenario: 状态 Terminal 后不再受理 steer（需 --features api）
