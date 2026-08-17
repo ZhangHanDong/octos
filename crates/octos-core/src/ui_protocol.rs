@@ -1101,12 +1101,14 @@ pub mod methods {
     pub const TURN_STARTED: &str = "turn/started";
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_ERROR: &str = "turn/error";
-    /// task-return-unconsumed-steer-inputs: emitted AFTER a turn's terminal
-    /// when `turn/steer` inputs the server had accepted (`steered:true`) were
-    /// still sitting in the pending-input buffer at turn end — i.e. never
-    /// drained into the conversation. Carries the texts back, in order, so the
-    /// client can re-queue them deterministically instead of inferring the
-    /// loss from a missing echo.
+    /// task-return-unconsumed-steer-inputs: emitted at turn end — after the
+    /// turn can no longer accept steers and BEFORE its terminal frame
+    /// (`event.turn_steer_dropped.v1`) — when `turn/steer` inputs the server
+    /// had accepted (`steered:true`) were still sitting in the pending-input
+    /// buffer, i.e. never drained into the conversation. Carries the texts
+    /// back, in order, so the client can re-queue them deterministically; a
+    /// terminal without a preceding `turn/steer_dropped` naming a steer means
+    /// the server consumed it.
     pub const TURN_STEER_DROPPED: &str = "turn/steer_dropped";
     pub const MESSAGE_DELTA: &str = "message/delta";
     pub const MESSAGE_REASONING_DELTA: &str = "message/reasoning_delta";
@@ -6333,7 +6335,8 @@ pub struct TurnErrorEvent {
 /// task-return-unconsumed-steer-inputs: `turn/steer_dropped` payload. See
 /// [`methods::TURN_STEER_DROPPED`]. `inputs` preserves the buffer order;
 /// `reason` is `"interrupted"` when the turn was interrupted by the client and
-/// `"turn_ended"` otherwise. Sent after the turn's terminal event.
+/// `"turn_ended"` otherwise. Sent BEFORE the turn's terminal event on the same
+/// stream (`event.turn_steer_dropped.v1`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnSteerDroppedEvent {
     pub session_id: SessionKey,

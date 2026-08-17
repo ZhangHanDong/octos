@@ -33448,7 +33448,16 @@ fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
     buffer.push("first steer".into());
     buffer.push("second steer".into());
 
-    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, true);
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
 
     assert_eq!(returned, 2);
     assert!(buffer.is_empty(), "the buffer is drained");
@@ -33483,7 +33492,16 @@ fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
     let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
     buffer.push("late steer".into());
 
-    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, false);
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        false,
+    );
 
     assert_eq!(returned, 1);
     let frame = steer_dropped_frame(&writer_rx);
@@ -33500,7 +33518,16 @@ fn no_leftover_steers_emits_nothing() {
     let turn_id = TurnId::new();
     let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
 
-    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, true);
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
 
     assert_eq!(returned, 0);
     assert!(
@@ -33541,7 +33568,16 @@ fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
     let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
     buffer.push("orphaned steer".into());
 
-    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, true);
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
 
     assert_eq!(returned, 1);
     let ledgered = ledgered_steer_dropped(&ledger, &session_id);
@@ -33677,4 +33713,74 @@ fn turn_steer_dropped_feature_is_advertised_when_requested_and_by_stdio_default(
             .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
         "not advertised unless requested"
     );
+}
+
+/// task-return-unconsumed-steer-inputs (review round 3, P0): the connection-
+/// close abort path is a terminal outlet too. It must go through the same
+/// gate, so the ledger a reconnecting client replays reads
+/// `turn/steer_dropped` strictly BEFORE `turn/error(connection_closed)`.
+#[tokio::test]
+async fn connection_close_settles_steers_before_connection_closed_terminal() {
+    let session_id = SessionKey("api:profile/local:closing".into());
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("typed just before the socket died".into());
+    let mut entry = test_active_turn(turn_id.clone(), handle.abort_handle());
+    entry.steer = Some(buffer.clone());
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    connection_turns
+        .lock()
+        .await
+        .insert(session_id.clone(), turn_id.clone());
+
+    let scopes = ScopePolicy::default();
+    let ledger = UiProtocolLedger::new(16);
+    let approvals = PendingApprovalStore::default();
+    let user_questions = PendingQuestionStore::default();
+    abort_connection_turns(
+        &active_turns,
+        &connection_turns,
+        &scopes,
+        &ledger,
+        &approvals,
+        &user_questions,
+    )
+    .await;
+
+    let baseline = UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    };
+    let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+    let kinds: Vec<String> = replay
+        .iter()
+        .filter_map(|e| match &e.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSteerDropped(d)) => {
+                assert_eq!(d.inputs, vec!["typed just before the socket died"]);
+                assert_eq!(d.reason, "interrupted");
+                Some("turn/steer_dropped".to_string())
+            }
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnError(err)) => {
+                Some(format!("turn/error:{}", err.code))
+            }
+            _ => None,
+        })
+        .collect();
+    let dropped_at = kinds.iter().position(|k| k == "turn/steer_dropped");
+    let terminal_at = kinds
+        .iter()
+        .position(|k| k == "turn/error:connection_closed");
+    assert!(dropped_at.is_some() && terminal_at.is_some(), "{kinds:?}");
+    assert!(
+        dropped_at < terminal_at,
+        "replay order must be steer_dropped → terminal: {kinds:?}"
+    );
+    assert!(
+        buffer.is_empty(),
+        "the aborted turn's later safety-net drain finds nothing"
+    );
+    handle.abort();
 }

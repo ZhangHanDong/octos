@@ -2,7 +2,9 @@
 //! notification that hands accepted-but-undrained `turn/steer` inputs back to
 //! the client at turn end. Kept outside the `api` feature so its shape is
 //! verifiable with a plain `cargo test -p octos-cli`; the `api` side
-//! (`settle_leftover_steers`) drains the buffer, calls this and sends durably.
+//! (`settle_leftover_steers`, invoked from the single terminal gate
+//! `transition_to_terminal_settling_steers`) drains the buffer, calls this
+//! and sends it — always BEFORE the terminal frame (`event.turn_steer_dropped.v1`).
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{TurnId, TurnSteerDroppedEvent, UiNotification};
@@ -126,5 +128,45 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(completed_keys, vec!["session_id", "turn_id"]);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    /// Structural guard, feature-independent: `transition_to_terminal(` is
+    /// invoked ONLY inside `transition_to_terminal_settling_steers` — every
+    /// terminal outlet (live emit, connection-close abort, early bail-outs,
+    /// fixtures) must go through the settling gate, or the
+    /// `event.turn_steer_dropped.v1` order promise breaks silently.
+    #[test]
+    fn every_terminal_outlet_goes_through_the_settling_gate() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/ui_protocol.rs");
+        let text = std::fs::read_to_string(&path).expect("read ui_protocol.rs");
+        let mut current_fn = String::new();
+        let mut offenders = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("async fn ")
+                || t.starts_with("fn ")
+                || t.starts_with("pub(crate) async fn ")
+                || t.starts_with("pub(crate) fn ")
+            {
+                current_fn = t.to_string();
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            if t.contains("transition_to_terminal(")
+                && !t.contains("fn transition_to_terminal(")
+                && !current_fn.contains("fn transition_to_terminal_settling_steers(")
+            {
+                offenders.push(format!("{}: {}", i + 1, t));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "call transition_to_terminal_settling_steers instead:\n{}",
+            offenders.join("\n")
+        );
     }
 }

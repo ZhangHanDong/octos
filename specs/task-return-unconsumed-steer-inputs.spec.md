@@ -37,17 +37,23 @@ ledger（可 replay），使客户端能确定性地重新入队，而不是靠"
   下的测试验证并以 `Review: human` 场景登记。
 - 发送方式：`send_notification_durable`（等待容量、写 ledger），因为载荷是用户
   文本，不允许因背压丢帧。
-- 时序（v2，审查 P0）：`try_emit_terminal` 在 `transition_to_terminal` 把状态置为
-  Terminal 之后、终态帧之前调用 `settle_leftover_steers`，因此同一连接上
-  `turn/steer_dropped` **严格先于** `turn/error`/`turn/completed`；`handle_turn_steer`
-  在持有 turn 状态锁期间完成 check-and-push，状态转 Terminal 后不再受理，故结算看到
-  的是完整的残留集合。`agent_task.await` 之后的旧 drain 仅作安全网保留。
+- 时序（v2，审查 P0）：唯一的终态闸门 `transition_to_terminal_settling_steers`
+  = `transition_to_terminal`（状态置 Terminal）→ `settle_leftover_steers`（发/写
+  `turn/steer_dropped`）→ 调用方发终态帧。**所有**终态出口——live 的
+  `try_emit_terminal`、连接关闭的 `abort_connection_turns`（v3：连接已断，只写 ledger，
+  `SteerReturnSink::LedgerOnly`）、`turn/started` 发送失败的早退、测试夹具——都经此闸门；
+  `transition_to_terminal` 不得在闸门之外调用（结构测试守卫）。因此同一连接/ledger 流上
+  `turn/steer_dropped` **严格先于** `turn/error`/`turn/completed`（含 `connection_closed`）；
+  `handle_turn_steer` 在持有 turn 状态锁期间完成 check-and-push，状态转 Terminal 后不再受理，
+  故结算看到的是完整的残留集合。`agent_task.await` 之后的旧 drain 仅作安全网（找到残留即
+  WARN 违反不变量）。
 - capability：新增 `UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1 = "event.turn_steer_dropped.v1"`
   加入 `UI_PROTOCOL_KNOWN_FEATURES`，`ConnectionUiFeatures` 增加 `turn_steer_dropped_v1`
   （stdio 默认开、ws 按请求）。客户端见到该 feature 即可把"终态前没有 dropped 点名
   我的 steer"解释为"服务端已消费"，不再做终态兜底重排。
 - 恢复边界（审查 P1）：本任务的 durable/ledger 只支持**同一客户端进程内的断线重连
-  replay**（客户端凭内存中的 retained 记录匹配）；客户端进程重启后 `/resume` 无法
+  replay**（客户端凭内存中的 retained 记录匹配；连接关闭路径的返还也在 ledger 中先于
+  `connection_closed` 终态，重连 replay 时顺序成立）；客户端进程重启后 `/resume` 无法
   恢复未消费 steer——那需要稳定的 steer 回执 id 与持久化的提交/消费状态，列为后续
   工作，不在本任务范围内声称。
 - 服务端在 `Interrupting` 状态下继续受理 steer 的行为不变——被受理的输入现在保证
@@ -106,6 +112,24 @@ Scenario: steer_dropped 严格先于终态帧且状态已 Terminal（critical；
   Then 连接上 `turn/steer_dropped` 帧的位置在 `turn/error` 之前
   And 状态为 `Terminal(Interrupted)`、buffer 为空
   And 第二次调用不再产生任何帧
+
+Scenario: 连接关闭路径同样先返还再终态（critical；需 --features api）
+  Tags: critical
+  Review: human
+  Test:
+    Package: octos-cli
+    Filter: connection_close_settles_steers_before_connection_closed_terminal
+  Given 注册表中一个 Active turn 的 `SteerBuffer` 有一条残留，连接随后关闭
+  When `abort_connection_turns` 处理该连接
+  Then ledger replay 中 `turn/steer_dropped` 严格早于 `turn/error(connection_closed)`
+  And buffer 为空
+
+Scenario: 所有终态出口都经过结算闸门（结构检查）
+  Test:
+    Package: octos-cli
+    Filter: every_terminal_outlet_goes_through_the_settling_gate
+  When 扫描 `crates/octos-cli/src/api/ui_protocol.rs`
+  Then `transition_to_terminal(` 只在 `transition_to_terminal_settling_steers` 内被调用
 
 Scenario: 状态 Terminal 后不再受理 steer（需 --features api）
   Review: human
