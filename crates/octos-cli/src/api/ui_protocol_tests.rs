@@ -20168,12 +20168,10 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     assert_eq!(
@@ -20242,7 +20240,6 @@ async fn unified_terminal_sink_failure_without_ack_suppresses_recovery() {
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     assert_eq!(
@@ -20284,12 +20281,10 @@ async fn unified_terminal_sink_success_queues_child_completed_under_profile() {
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
