@@ -1113,6 +1113,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "event.voice_audio.v1",
                 "plan.todos.v1",
                 "event.background_activity.v1",
+                "event.turn_steer_dropped.v1",
                 "smart_home.v1"
             ]
         })
