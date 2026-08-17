@@ -33393,3 +33393,149 @@ async fn interactive_sentinel_skips_verifier_without_completion_claim() {
         .expect("goal exists");
     assert_eq!(tokens_used, 0, "nothing charged without a claim");
 }
+
+// ---- task-return-unconsumed-steer-inputs: accepted-but-undrained steers are
+// returned to the client as `turn/steer_dropped` at turn end ----
+
+fn steer_dropped_frame(writer_rx: &std::sync::mpsc::Receiver<WsMessage>) -> Value {
+    let message = writer_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("a frame reaches the stdio writer");
+    let WsMessage::Text(text) = message else {
+        panic!("expected a text frame");
+    };
+    serde_json::from_str::<Value>(text.as_ref()).expect("valid JSON frame")
+}
+
+fn ledgered_steer_dropped(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+) -> Vec<octos_core::ui_protocol::TurnSteerDroppedEvent> {
+    let baseline = UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    };
+    ledger
+        .replay_after(session_id, Some(&baseline))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| match &e.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSteerDropped(event)) => {
+                Some(event.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dropped".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("first steer".into());
+    buffer.push("second steer".into());
+
+    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, true);
+
+    assert_eq!(returned, 2);
+    assert!(buffer.is_empty(), "the buffer is drained");
+    let frame = steer_dropped_frame(&writer_rx);
+    assert_eq!(frame["method"], json!("turn/steer_dropped"));
+    assert_eq!(frame["params"]["session_id"], json!("local:steer-dropped"));
+    assert_eq!(frame["params"]["turn_id"], json!(turn_id));
+    assert_eq!(
+        frame["params"]["inputs"],
+        json!(["first steer", "second steer"]),
+        "buffer order is preserved"
+    );
+    assert_eq!(frame["params"]["reason"], json!("interrupted"));
+
+    let ledgered = ledgered_steer_dropped(&ledger, &session_id);
+    assert_eq!(
+        ledgered.len(),
+        1,
+        "the return is durable for reconnect replay"
+    );
+    assert_eq!(ledgered[0].inputs, vec!["first steer", "second steer"]);
+    assert_eq!(ledgered[0].reason, "interrupted");
+}
+
+#[test]
+fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dropped-ended".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("late steer".into());
+
+    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, false);
+
+    assert_eq!(returned, 1);
+    let frame = steer_dropped_frame(&writer_rx);
+    assert_eq!(frame["params"]["reason"], json!("turn_ended"));
+    assert_eq!(frame["params"]["inputs"], json!(["late steer"]));
+}
+
+#[test]
+fn no_leftover_steers_emits_nothing() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-none".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+
+    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, true);
+
+    assert_eq!(returned, 0);
+    assert!(
+        writer_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "an empty buffer must not produce an empty return frame"
+    );
+    assert!(ledgered_steer_dropped(&ledger, &session_id).is_empty());
+    // Terminal payload shapes are untouched by this task: the legacy
+    // `turn/error` frame still carries exactly its four fields.
+    let error = UiNotification::TurnError(TurnErrorEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_id.clone(),
+        code: "interrupted".into(),
+        message: "turn interrupted by client".into(),
+    })
+    .into_rpc_notification()
+    .expect("serialize turn/error");
+    let keys: Vec<&str> = error
+        .params
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["session_id", "turn_id", "code", "message"]);
+}
+
+#[test]
+fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    let ws = WsConnection::new_stdio(writer_tx);
+    // Simulate a dead stdio peer: the receiver is gone, so every send fails.
+    drop(writer_rx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dead-peer".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("orphaned steer".into());
+
+    let returned = settle_leftover_steers(&buffer, &ws, &ledger, &session_id, &turn_id, true);
+
+    assert_eq!(returned, 1);
+    let ledgered = ledgered_steer_dropped(&ledger, &session_id);
+    assert_eq!(ledgered.len(), 1, "text survives in the ledger for replay");
+    assert_eq!(ledgered[0].inputs, vec!["orphaned steer"]);
+}

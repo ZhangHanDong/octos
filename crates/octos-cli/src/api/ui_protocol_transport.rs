@@ -32663,23 +32663,24 @@ async fn run_standalone_turn(
 
     let _ = agent_task.await;
 
-    // `turn/steer` turn-end race residual (codex §5 parity): the loop keeps
-    // the turn alive for steers that land BEFORE its final EndTurn check,
-    // but a steer accepted in the narrow window between that check and this
-    // point never drains. Make the drop observable rather than silent — the
+    // `turn/steer` turn-end residual: the loop keeps the turn alive for
+    // steers that land BEFORE its final EndTurn check, but a steer accepted
+    // after that check — or, far more commonly, one accepted while a tool
+    // was running when the client then INTERRUPTED the turn (incident
+    // 2026-08-17: 32 s between accept and abort) — never drains. The
     // registry entry is still keyed to this turn, so no later turn can
-    // consume the leftovers.
+    // consume the leftovers. task-return-unconsumed-steer-inputs: hand them
+    // back to the client as `turn/steer_dropped` (durable + ledgered) so it
+    // can re-queue them deterministically instead of inferring the loss.
     if let Some(buffer) = steer_buffer.as_ref() {
-        let leftovers = buffer.drain();
-        if !leftovers.is_empty() {
-            warn!(
-                session = %session_id.0,
-                turn = %turn_id.0,
-                dropped = leftovers.len(),
-                "turn/steer input(s) arrived as the turn ended and were dropped; \
-                 the client should re-send (a fresh call now falls back to a new turn)"
-            );
-        }
+        settle_leftover_steers(
+            buffer,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            interrupt_observed,
+        );
     }
 
     // NEW-16 codex round-3 P1+P2: GC moved from here to the
@@ -35913,6 +35914,44 @@ fn send_raw_notification_ephemeral(
     ws.send_ephemeral(frame, method)
 }
 
+/// task-return-unconsumed-steer-inputs: drain whatever `turn/steer` inputs the
+/// server accepted (`steered:true`) but never fed to the loop, and return
+/// them to the client as ONE `turn/steer_dropped` notification (buffer
+/// order preserved). Sent durable — the payload is user text, so it must not
+/// be lost to backpressure — and appended to the ledger so a reconnecting
+/// client replays it. Emits nothing for an empty buffer. Returns the number
+/// of inputs returned. Called after the turn's terminal event; the client
+/// treats it as "re-queue these as new input".
+pub(crate) fn settle_leftover_steers(
+    buffer: &octos_agent::SharedSteerBuffer,
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    interrupt_observed: bool,
+) -> usize {
+    let leftovers = buffer.drain();
+    let count = leftovers.len();
+    let Some(notification) = crate::steer_return::leftover_steer_notification(
+        session_id,
+        turn_id,
+        leftovers,
+        interrupt_observed,
+    ) else {
+        return 0;
+    };
+    warn!(
+        session = %session_id.0,
+        turn = %turn_id.0,
+        dropped = count,
+        interrupted = interrupt_observed,
+        "turn/steer input(s) were still pending when the turn ended; returning them \
+         to the client as turn/steer_dropped"
+    );
+    let _ = send_notification_durable(ws, ledger, notification);
+    count
+}
+
 fn send_turn_error(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -36630,6 +36669,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::ProgressUpdated(_)
             | UiNotification::Warning(_)
             | UiNotification::TurnError(_)
+            | UiNotification::TurnSteerDropped(_)
             // ReplayLossy references a `last_durable_cursor` belonging to
             // the events it summarises, not its own — surfacing it here
             // would re-loop the replay flag onto itself.
