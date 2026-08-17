@@ -15,6 +15,7 @@ ledger（可 replay），使客户端能确定性地重新入队，而不是靠"
 
 ## Decisions
 
+<!-- lint-ack: decision-coverage — "恢复边界"是范围声明（same-process reconnect only），无对应可执行场景；跨进程恢复列入 Out of Scope -->
 <!-- lint-ack: verification-metadata-suggestion — 两个错误路径场景使用进程内 stdio WsConnection + 内存 ledger fixture，无真实外部 I/O -->
 
 - 新增 `octos-core` 通知 `UiNotification::TurnSteerDropped(TurnSteerDroppedEvent)`，
@@ -35,10 +36,22 @@ ledger（可 replay），使客户端能确定性地重新入队，而不是靠"
   顺序/reason/空残留由纯函数测试机械验证，发送与 ledger 行为由 `--features api`
   下的测试验证并以 `Review: human` 场景登记。
 - 发送方式：`send_notification_durable`（等待容量、写 ledger），因为载荷是用户
-  文本，不允许因背压丢帧；该通知在 turn 终态事件之后发出，客户端应把它当作
-  "终态后需重新入队的输入"处理。
+  文本，不允许因背压丢帧。
+- 时序（v2，审查 P0）：`try_emit_terminal` 在 `transition_to_terminal` 把状态置为
+  Terminal 之后、终态帧之前调用 `settle_leftover_steers`，因此同一连接上
+  `turn/steer_dropped` **严格先于** `turn/error`/`turn/completed`；`handle_turn_steer`
+  在持有 turn 状态锁期间完成 check-and-push，状态转 Terminal 后不再受理，故结算看到
+  的是完整的残留集合。`agent_task.await` 之后的旧 drain 仅作安全网保留。
+- capability：新增 `UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1 = "event.turn_steer_dropped.v1"`
+  加入 `UI_PROTOCOL_KNOWN_FEATURES`，`ConnectionUiFeatures` 增加 `turn_steer_dropped_v1`
+  （stdio 默认开、ws 按请求）。客户端见到该 feature 即可把"终态前没有 dropped 点名
+  我的 steer"解释为"服务端已消费"，不再做终态兜底重排。
+- 恢复边界（审查 P1）：本任务的 durable/ledger 只支持**同一客户端进程内的断线重连
+  replay**（客户端凭内存中的 retained 记录匹配）；客户端进程重启后 `/resume` 无法
+  恢复未消费 steer——那需要稳定的 steer 回执 id 与持久化的提交/消费状态，列为后续
+  工作，不在本任务范围内声称。
 - 服务端在 `Interrupting` 状态下继续受理 steer 的行为不变——被受理的输入现在保证
-  要么被 drain 进对话，要么通过 `turn/steer_dropped` 返还。
+  要么被 drain 进对话，要么在终态帧之前通过 `turn/steer_dropped` 返还。
 - 不修改 `TurnErrorEvent`/`TurnCompletedEvent` 的字段，保持既有客户端兼容（由
   "没有残留时不发任何帧"场景与既有终态测试共同约束：终态帧形状不变）。
 
@@ -81,6 +94,34 @@ Scenario: 正常结束时的残留标为 turn_ended
   Given 一条残留输入
   When `leftover_steer_notification` 以 `interrupt_observed = false` 被调用
   Then 事件的 `reason` 为 `"turn_ended"`
+
+Scenario: steer_dropped 严格先于终态帧且状态已 Terminal（critical；需 --features api）
+  Tags: critical
+  Review: human
+  Test:
+    Package: octos-cli
+    Filter: steer_dropped_is_emitted_before_the_terminal_frame
+  Given 一个 Active 的 turn 状态与含一条残留的 `SteerBuffer`
+  When `try_emit_terminal(Interrupted, …, Some(buffer))` 被调用
+  Then 连接上 `turn/steer_dropped` 帧的位置在 `turn/error` 之前
+  And 状态为 `Terminal(Interrupted)`、buffer 为空
+  And 第二次调用不再产生任何帧
+
+Scenario: 状态 Terminal 后不再受理 steer（需 --features api）
+  Review: human
+  Test:
+    Package: octos-cli
+    Filter: steer_is_not_accepted_after_terminal_transition
+  When `transition_to_terminal` 成功
+  Then steer 受理检查读到 `Terminal` 并走 `NoActiveTurn`
+
+Scenario: capability 广告（需 --features api）
+  Review: human
+  Test:
+    Package: octos-cli
+    Filter: turn_steer_dropped_feature_is_advertised_when_requested_and_by_stdio_default
+  When stdio 默认能力或 ws 请求含 `UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1`（`event.turn_steer_dropped.v1`）
+  Then `supported_features` 含该 feature；未请求则不含
 
 Scenario: 没有残留时不生成事件（错误路径：不能产生空返还）
   Test:
@@ -131,6 +172,7 @@ Scenario: 事件的 topic 路由与其他 turn 事件一致
 
 ## Out of Scope
 
-- 客户端（octoscode）消费 `turn/steer_dropped` 并重新入队（需先把 octos-core 重新 pin 到本改动之后的 rev）。
+- 客户端（octoscode）消费 `turn/steer_dropped`（task-consume-turn-steer-dropped）。
+- 跨客户端进程重启的 durable 恢复（需要 steer 回执 id 与持久化状态；本任务明确为 same-process reconnect only）。
 - interrupt/steer 的 INFO 级关联日志（F7）、`octos serve` fd 累积（F8）。
 - 把残留输入合并进 `turn/error`/`turn/completed` 载荷。

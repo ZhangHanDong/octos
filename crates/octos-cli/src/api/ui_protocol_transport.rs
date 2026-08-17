@@ -61,15 +61,15 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
-    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -1896,6 +1896,9 @@ struct ConnectionUiFeatures {
     skill_actions_v1: bool,
     /// Persisted background skill action jobs and their update events.
     skill_action_jobs_v1: bool,
+    /// task-return-unconsumed-steer-inputs: client asked for the
+    /// dropped-before-terminal steer settlement guarantee.
+    turn_steer_dropped_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -1995,6 +1998,11 @@ impl ConnectionUiFeatures {
                 query,
                 APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
             ),
+            turn_steer_dropped_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2043,6 +2051,7 @@ impl ConnectionUiFeatures {
             user_question_v1: true,
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
+            turn_steer_dropped_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -2087,6 +2096,7 @@ impl ConnectionUiFeatures {
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
+            turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
             header_present: true,
             stdio_transport,
         }
@@ -2186,6 +2196,9 @@ impl ConnectionUiFeatures {
         }
         if self.skill_action_jobs_v1 {
             requested.push(APPUI_FEATURE_SKILL_ACTION_JOBS_V1);
+        }
+        if self.turn_steer_dropped_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -19632,7 +19645,15 @@ async fn handle_turn_steer(
                 // counts as live: the client asked to stop, and a raced
                 // steer behaves like the codex loop-exit race (buffered,
                 // possibly dropped at turn end — logged, never mis-routed).
-                let terminal = matches!(*existing.state.lock().await, TurnState::Terminal(_));
+                // task-return-unconsumed-steer-inputs: hold the turn-state
+                // guard across check AND push. `try_emit_terminal` settles
+                // the steer buffer right after it flips the state to
+                // `Terminal` (under this same lock) and BEFORE the terminal
+                // frame — so any input accepted here is either drained by
+                // the loop, or returned by that settlement; nothing can slip
+                // in between the settlement and the terminal frame.
+                let state = existing.state.lock().await;
+                let terminal = matches!(*state, TurnState::Terminal(_));
                 if terminal {
                     TurnSteerDecision::NoActiveTurn
                 } else if params
@@ -26206,6 +26227,7 @@ async fn run_m9_fixture_turn(
                     None,
                     // M9 fixtures replay canned events; no live LLM token data.
                     None,
+                    None,
                 )
                 .await;
             }
@@ -26219,6 +26241,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 Some((code, message.as_str())),
+                None,
                 None,
             )
             .await;
@@ -26251,6 +26274,7 @@ async fn run_m9_fixture_turn(
                     "interrupted",
                     captured_interrupt_origin(&turn_state).await.message(),
                 )),
+                None,
                 None,
             )
             .await;
@@ -27054,6 +27078,7 @@ async fn run_native_code_review_turn(
                     &turn_id,
                     Some(("runtime_unavailable", message.as_str())),
                     None,
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -27069,6 +27094,7 @@ async fn run_native_code_review_turn(
                     &session_id,
                     &turn_id,
                     Some(("runtime_unavailable", message.as_str())),
+                    None,
                     None,
                 )
                 .await;
@@ -27091,6 +27117,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
+                None,
                 None,
             )
             .await;
@@ -27119,6 +27146,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
+                None,
                 None,
             )
             .await;
@@ -27352,6 +27380,7 @@ async fn run_native_code_review_turn(
                     &turn_id,
                     Some(("interrupted", "review/start interrupted by client")),
                     None,
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -27474,6 +27503,7 @@ async fn run_native_code_review_turn(
         // review/start scatter-join does not run a single LLM turn end
         // to end; the summary message is emitted ad-hoc. No aggregated
         // token data is in scope here.
+        None,
         None,
     )
     .await;
@@ -28971,6 +29001,7 @@ async fn run_standalone_turn(
             &turn_id,
             Some(("runtime_unavailable", error.as_str())),
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29020,6 +29051,7 @@ async fn run_standalone_turn(
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
                 None,
+                steer_buffer.as_ref(),
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29048,6 +29080,7 @@ async fn run_standalone_turn(
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
                 None,
+                steer_buffer.as_ref(),
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29337,7 +29370,7 @@ async fn run_standalone_turn(
     // forward `FailoverEvent`s as `router/failover` notifications for
     // the duration of this turn. The abort handle ends the forwarder
     // when the turn ends — see the `.abort()` call near
-    // `try_emit_terminal()` below.
+    // `try_emit_terminal(, steer_buffer.as_ref())` below.
     let failover_forwarder = spawn_router_failover_forwarder(
         ws.clone(),
         ledger.clone(),
@@ -29386,6 +29419,7 @@ async fn run_standalone_turn(
             // Slash-command shortcut bypasses the LLM entirely; the
             // reply is canned and no token meter ran.
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -30986,6 +31020,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     Some(("profile_config_unavailable", &error.to_string())),
                     None,
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -31040,6 +31075,7 @@ async fn run_standalone_turn(
             &turn_id,
             None,
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -32179,6 +32215,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     None,
                     Some(details),
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 break;
@@ -32279,6 +32316,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     Some((code, wire_msg.as_str())),
                     None,
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 break;
@@ -32645,6 +32683,7 @@ async fn run_standalone_turn(
                 captured_interrupt_origin(&turn_state).await.message(),
             )),
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         // codex #2 residual — a client-interrupted peer takes THIS branch, not
@@ -33601,12 +33640,33 @@ async fn try_emit_terminal(
     turn_id: &TurnId,
     error_payload: Option<(&str, &str)>,
     completion_details: Option<TurnCompletionDetails>,
+    // task-return-unconsumed-steer-inputs: the turn's `turn/steer` buffer, if
+    // it has one. Settled (returned as `turn/steer_dropped`) after the state
+    // flips to Terminal and BEFORE the terminal frame below — see
+    // `settle_leftover_steers`.
+    steer_buffer: Option<&octos_agent::SharedSteerBuffer>,
 ) {
     let Some(TerminalTransition { reason, ack }) =
         transition_to_terminal(turn_state, expected_reason).await
     else {
         return;
     };
+    // The state is Terminal now: `handle_turn_steer` (which holds the same
+    // state lock across check-and-push) can no longer accept input for this
+    // turn, so whatever is in the buffer is the complete set of accepted-but-
+    // undrained steers. Return them FIRST, so a client that sees the
+    // terminal without a preceding `turn/steer_dropped` naming its steer may
+    // conclude the steer was consumed (`event.turn_steer_dropped.v1`).
+    if let Some(buffer) = steer_buffer {
+        settle_leftover_steers(
+            buffer,
+            ws,
+            ledger,
+            session_id,
+            turn_id,
+            matches!(reason, TerminalReason::Interrupted),
+        );
+    }
 
     // Terminal events are lifecycle: failure to deliver does not change the
     // state-machine outcome (the entry stays terminal for replay/idempotency)

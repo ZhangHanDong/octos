@@ -267,6 +267,16 @@ pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 /// as before, and this stream is NEVER fed back into model context.
 pub const UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1: &str = "event.background_activity.v1";
 
+/// task-return-unconsumed-steer-inputs: the server settles `turn/steer` input
+/// at turn end — after the turn can no longer accept steers and BEFORE the
+/// terminal frame it emits one `turn/steer_dropped` carrying every accepted
+/// input that was never drained into the conversation. A client that sees
+/// this feature may treat "terminal without a preceding `turn/steer_dropped`
+/// naming my steer" as "the server consumed it" (no client-side re-stage
+/// needed); without it, the client must fall back to its own terminal
+/// re-stage heuristics.
+pub const UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1: &str = "event.turn_steer_dropped.v1";
+
 /// Feature flag for the model-authored plan/todo checklist. When negotiated,
 /// the server pushes `plan/updated` notifications carrying the agent's current
 /// ordered checklist (the `update_plan` tool's live state), and replays the
@@ -315,6 +325,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
 ];
 

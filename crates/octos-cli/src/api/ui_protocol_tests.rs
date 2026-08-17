@@ -8639,6 +8639,7 @@ async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() 
         &turn_id,
         None,
         Some(details.clone()),
+        None,
     )
     .await;
 
@@ -8699,6 +8700,7 @@ async fn try_emit_terminal_with_no_details_omits_token_fields() {
         &ledger,
         &session_id,
         &turn_id,
+        None,
         None,
         None,
     )
@@ -11014,6 +11016,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11083,6 +11086,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11197,6 +11201,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11266,6 +11271,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11328,6 +11334,7 @@ fn shell_approval_still_emits_risk_field() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11433,6 +11440,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14084,6 +14092,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -33538,4 +33547,134 @@ fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
     let ledgered = ledgered_steer_dropped(&ledger, &session_id);
     assert_eq!(ledgered.len(), 1, "text survives in the ledger for replay");
     assert_eq!(ledgered[0].inputs, vec!["orphaned steer"]);
+}
+
+/// task-return-unconsumed-steer-inputs (v2 ordering): once the turn flips to
+/// Terminal, its accepted-but-undrained steers are returned as ONE
+/// `turn/steer_dropped` BEFORE the terminal frame, on the same connection —
+/// so a client may treat "terminal without a preceding steer_dropped naming
+/// my steer" as "consumed". Drives `try_emit_terminal` directly (the wire-side
+/// closure), like the #1332 test above.
+#[tokio::test]
+async fn steer_dropped_is_emitted_before_the_terminal_frame() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+    let ws = WsConnection::new(tx);
+    let ledger = UiProtocolLedger::new(32);
+    let session_id = SessionKey("local:steer-order".into());
+    let turn_id = TurnId::new();
+    let turn_state = TokioMutex::new(TurnState::Active);
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("accepted but never drained".into());
+
+    try_emit_terminal(
+        &turn_state,
+        TerminalReason::Interrupted,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        Some(("interrupted", "turn interrupted by client")),
+        None,
+        Some(&buffer),
+    )
+    .await;
+
+    let mut methods = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let axum::extract::ws::Message::Text(text) = msg {
+            let frame: Value = serde_json::from_str(text.as_ref()).expect("json frame");
+            if let Some(method) = frame.get("method").and_then(Value::as_str) {
+                methods.push(method.to_string());
+                if method == "turn/steer_dropped" {
+                    assert_eq!(
+                        frame["params"]["inputs"],
+                        json!(["accepted but never drained"])
+                    );
+                    assert_eq!(frame["params"]["reason"], json!("interrupted"));
+                }
+            }
+        }
+    }
+    let dropped_at = methods.iter().position(|m| m == "turn/steer_dropped");
+    let terminal_at = methods.iter().position(|m| m == "turn/error");
+    assert!(dropped_at.is_some(), "steer_dropped emitted: {methods:?}");
+    assert!(terminal_at.is_some(), "terminal emitted: {methods:?}");
+    assert!(
+        dropped_at < terminal_at,
+        "steer_dropped must precede the terminal: {methods:?}"
+    );
+    assert!(buffer.is_empty());
+    assert!(matches!(
+        *turn_state.lock().await,
+        TurnState::Terminal(TerminalReason::Interrupted)
+    ));
+
+    // A second terminal attempt is a no-op (idempotent) and returns nothing more.
+    try_emit_terminal(
+        &turn_state,
+        TerminalReason::Interrupted,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        Some(("interrupted", "turn interrupted by client")),
+        None,
+        Some(&buffer),
+    )
+    .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "no duplicate frames after the terminal"
+    );
+}
+
+/// Once the state is Terminal, `turn/steer` can no longer be accepted for the
+/// turn — the settlement above therefore saw the complete set of inputs.
+#[tokio::test]
+async fn steer_is_not_accepted_after_terminal_transition() {
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let transition = transition_to_terminal(&turn_state, TerminalReason::Completed).await;
+    assert!(transition.is_some());
+    // The steer admission check reads the same state: Terminal → NoActiveTurn.
+    let terminal = matches!(*turn_state.lock().await, TurnState::Terminal(_));
+    assert!(terminal, "post-terminal steers fall back to a fresh turn");
+}
+
+/// The dropped-before-terminal guarantee is advertised as
+/// `event.turn_steer_dropped.v1` — on by default for stdio, and honoured when
+/// a ws client requests it — so a client can decide whether "terminal without
+/// steer_dropped" means "consumed" (new server) or "unknown" (old server).
+#[test]
+fn turn_steer_dropped_feature_is_advertised_when_requested_and_by_stdio_default() {
+    let stdio = ConnectionUiFeatures::stdio_defaults().negotiated_capabilities();
+    assert!(
+        stdio
+            .supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+        "{:?}",
+        stdio.supported_features
+    );
+    let ws = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1],
+        false,
+    )
+    .negotiated_capabilities();
+    assert!(
+        ws.supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1)
+    );
+    let legacy = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1],
+        false,
+    )
+    .negotiated_capabilities();
+    assert!(
+        !legacy
+            .supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+        "not advertised unless requested"
+    );
 }
