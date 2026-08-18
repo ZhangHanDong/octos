@@ -29,6 +29,9 @@ pub(crate) mod autonomy;
 /// `turn/steer_dropped` return (the `api` module does the sending).
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod steer_return;
+/// task-sysinfo-proc-stat-fd-budget: the one place the metrics `sysinfo::System`
+/// is constructed (handle cache off, no startup process snapshot).
+pub(crate) mod sysinfo_budget;
 pub use octos_services::cli_agent_adapter;
 pub mod commands;
 pub use octos_services::compaction;
