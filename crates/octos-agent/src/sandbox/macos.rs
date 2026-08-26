@@ -164,6 +164,12 @@ pub struct MacosSandbox {
     /// create-vs-overwrite, so `create_only`'s no-overwrite half remains
     /// tool-layer enforced (documented on `SandboxConfig::write_allow_globs`).
     pub(crate) write_allow_globs: Option<Vec<String>>,
+    /// Precise toolchain write set (rustup settings/scratch, cargo caches —
+    /// see `toolchain_write_grants` in `mod.rs` for what is and is NOT in
+    /// it). Emitted ONLY alongside a full workspace write grant: a read-only
+    /// workspace or a #1976 fence suppresses it (deny-wins — a profile that
+    /// confines writes must not quietly regain toolchain caches).
+    pub(crate) toolchain_write_grants: super::ToolchainWriteGrants,
 }
 
 impl Sandbox for MacosSandbox {
@@ -284,6 +290,36 @@ impl Sandbox for MacosSandbox {
         //   denies the write. `/dev/null` stays writable regardless so shell
         //   redirections and git internals still function.
         let cwd_write_rule = format!("(allow file-write* (subpath \"{cwd}\"))\n", cwd = real_cwd);
+        // Toolchain write rules (rustup settings/scratch, cargo caches).
+        // Built here, appended ONLY in the full-workspace-write arms below:
+        // under a #1976 fence or a read-only workspace the profile said
+        // "confine writes", and deny-wins means these grants vanish with it.
+        // Each path is validated for SBPL metacharacters like every other
+        // injected path; an unsafe entry is skipped (that path simply stays
+        // unwritable — fail closed), never emitted.
+        let toolchain_write_rules = {
+            let mut rules = String::new();
+            let unsafe_path = |p: &String| {
+                p.bytes().any(|b| {
+                    b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"'
+                })
+            };
+            for path in &self.toolchain_write_grants.literals {
+                if unsafe_path(path) {
+                    tracing::error!(path = %path, "toolchain grant contains SBPL metacharacters, skipping");
+                    continue;
+                }
+                rules.push_str(&format!("(allow file-write* (literal \"{path}\"))\n"));
+            }
+            for path in &self.toolchain_write_grants.subpaths {
+                if unsafe_path(path) {
+                    tracing::error!(path = %path, "toolchain grant contains SBPL metacharacters, skipping");
+                    continue;
+                }
+                rules.push_str(&format!("(allow file-write* (subpath \"{path}\"))\n"));
+            }
+            rules
+        };
         let workspace_write_rule = if let Some(globs) = &self.write_allow_globs {
             let mut rules = String::new();
             for glob in globs {
@@ -320,12 +356,14 @@ impl Sandbox for MacosSandbox {
                 tracing::error!(
                     "repo_git_write path contains SBPL metacharacters, granting cwd-only write"
                 );
-                cwd_write_rule
+                format!("{cwd_write_rule}{toolchain_write_rules}")
             } else {
-                format!("{cwd_write_rule}(allow file-write* (subpath \"{real_git}\"))\n")
+                format!(
+                    "{cwd_write_rule}(allow file-write* (subpath \"{real_git}\"))\n{toolchain_write_rules}"
+                )
             }
         } else if self.workspace_write {
-            cwd_write_rule
+            format!("{cwd_write_rule}{toolchain_write_rules}")
         } else {
             String::new()
         };
@@ -445,6 +483,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_command() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: true,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -490,6 +529,7 @@ mod tests {
         // above its grant). Only reached under unrestricted reads, which
         // `supports_repo_git_write` gates.
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -532,6 +572,7 @@ mod tests {
 
         // Default (no repo_git_write): only the cwd subpath is writable, no global.
         let plain = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -560,6 +601,7 @@ mod tests {
         // `.git` READ `git commit` needs, so it must NOT be reported as
         // supporting the worktree flow (the pool gate falls back to scratch).
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/opt/custom".to_string()],
             workspace_write: true,
@@ -576,6 +618,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_rejects_control_chars() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -599,6 +642,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_rejects_sbpl_metacharacters() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -630,6 +674,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_denies_network() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -652,6 +697,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_accepts_valid_path() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -667,6 +713,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_rejects_del_character() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -684,6 +731,7 @@ mod tests {
     #[test]
     fn should_use_global_file_read_when_no_read_paths() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -714,6 +762,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/custom/path".to_string()],
             workspace_write: true,
@@ -760,6 +809,7 @@ mod tests {
     #[test]
     fn should_reject_read_allow_paths_with_sbpl_metacharacters() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![
                 "/safe/path".to_string(),
@@ -802,6 +852,7 @@ mod tests {
     #[test]
     fn should_reject_read_allow_paths_with_parens() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/path/with(parens)".to_string()],
             workspace_write: true,
@@ -828,6 +879,7 @@ mod tests {
     #[test]
     fn should_reject_read_allow_paths_with_control_chars() {
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![
                 "/path/with\x01control".to_string(),
@@ -871,6 +923,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: true,
@@ -898,6 +951,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: true,
@@ -932,6 +986,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
@@ -970,6 +1025,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -1003,6 +1059,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
@@ -1048,6 +1105,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
@@ -1223,6 +1281,7 @@ mod tests {
         let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
@@ -1270,6 +1329,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: false,
@@ -1296,6 +1356,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: false,
@@ -1325,6 +1386,7 @@ mod tests {
         std::fs::write(&secret_file, "top-secret-data").expect("write secret");
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/nonexistent/path".to_string()],
             workspace_write: true,
@@ -1384,6 +1446,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -1456,6 +1519,7 @@ mod tests {
         // path is simply not writable — and no injected rule appears.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -1500,6 +1564,7 @@ mod tests {
         std::fs::create_dir(cwd.join("cards")).expect("pre-create cards/");
 
         let sb = MacosSandbox {
+            toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
@@ -1555,5 +1620,93 @@ mod tests {
             "shell append to a granted path is OS-allowed (documented) — create_only \
              overwrite protection lives at the file-tool layer"
         );
+    }
+
+    /// The precise toolchain set rides along with a FULL workspace write
+    /// grant: rustup's settings lock as a literal, cargo's registry as a
+    /// subpath — and never `<cargo>/bin` or `<rustup>/toolchains` (those
+    /// are persistence vectors; `toolchain_write_grants` excludes them at
+    /// detection, this test pins the emission side).
+    #[test]
+    fn toolchain_grants_emitted_with_workspace_write() {
+        let sb = MacosSandbox {
+            toolchain_write_grants: super::super::ToolchainWriteGrants {
+                literals: vec!["/Users/t/.rustup/settings.toml".into()],
+                subpaths: vec!["/Users/t/.cargo/registry".into()],
+            },
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+            write_allow_globs: None,
+        };
+        let cmd = sb.wrap_command("cargo build", Path::new("/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            profile.contains("(allow file-write* (literal \"/Users/t/.rustup/settings.toml\"))"),
+            "rustup settings lock must be writable: {profile}"
+        );
+        assert!(
+            profile.contains("(allow file-write* (subpath \"/Users/t/.cargo/registry\"))"),
+            "cargo registry must be writable: {profile}"
+        );
+    }
+
+    /// Deny-wins: a profile that CONFINES writes (read-only workspace, or a
+    /// #1976 per-path fence) must not quietly regain toolchain caches — the
+    /// grants vanish with the workspace write grant.
+    #[test]
+    fn toolchain_grants_suppressed_when_writes_confined() {
+        let grants = super::super::ToolchainWriteGrants {
+            literals: vec!["/Users/t/.rustup/settings.toml".into()],
+            subpaths: vec!["/Users/t/.cargo/registry".into()],
+        };
+        for (label, sb) in [
+            (
+                "read-only workspace",
+                MacosSandbox {
+                    toolchain_write_grants: grants.clone(),
+                    allow_network: false,
+                    read_allow_paths: Vec::new(),
+                    workspace_write: false,
+                    repo_git_write: None,
+                    write_allow_globs: None,
+                },
+            ),
+            (
+                "write fence",
+                MacosSandbox {
+                    toolchain_write_grants: grants.clone(),
+                    allow_network: false,
+                    read_allow_paths: Vec::new(),
+                    workspace_write: true,
+                    repo_git_write: None,
+                    write_allow_globs: Some(vec!["out.txt".into()]),
+                },
+            ),
+        ] {
+            let cmd = sb.wrap_command("cargo build", Path::new("/tmp/ws"));
+            let args: Vec<_> = cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let profile = args
+                .iter()
+                .find(|a| a.contains("deny default"))
+                .expect("should have SBPL profile");
+            assert!(
+                !profile.contains(".rustup") && !profile.contains(".cargo"),
+                "{label}: toolchain grants must be suppressed, got: {profile}"
+            );
+        }
     }
 }

@@ -113,6 +113,26 @@ pub struct SandboxConfig {
     /// Profile name for sandbox isolation (used as AppContainer profile ID on Windows).
     #[serde(default)]
     pub profile_name: Option<String>,
+
+    /// Grant the shell WRITE to the handful of paths a language toolchain
+    /// must touch to function at all (default: `true`).
+    ///
+    /// The motivating failure: with writes confined to the cwd, `cargo build`
+    /// dies before compiling anything — rustup's cargo shim takes a write
+    /// lock on `~/.rustup/settings.toml` ("could not read settings file:
+    /// Operation not permitted"), and cargo itself must populate
+    /// `~/.cargo/registry`. A coding agent that cannot compile writes broken
+    /// code with no feedback loop, so the pragmatic default is on.
+    ///
+    /// The grant is PRECISE, not a blanket toolchain-home write:
+    /// `~/.cargo/bin` (on PATH — a writable shim there is persistence) and
+    /// `~/.rustup/toolchains` (writable compiler binaries) are deliberately
+    /// NOT granted. Deny-wins: a read-only workspace
+    /// (`workspace_write: false`) or a #1976 write fence suppresses these
+    /// grants entirely — a profile that says "this shell writes nothing /
+    /// only these globs" must not quietly regain toolchain caches.
+    #[serde(default = "default_enabled")]
+    pub allow_toolchains: bool,
 }
 
 /// Default system paths that must be readable for shell commands to work.
@@ -144,6 +164,76 @@ pub(crate) const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/dev/random",
 ];
 
+/// The write grants a detected toolchain needs — split by SBPL rule kind:
+/// `literals` are single files, `subpaths` are directory trees.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ToolchainWriteGrants {
+    pub(crate) literals: Vec<String>,
+    pub(crate) subpaths: Vec<String>,
+}
+
+/// Detect installed toolchains and return the PRECISE write set each needs.
+///
+/// Rust (rustup + cargo), detected via `$RUSTUP_HOME`/`$CARGO_HOME` or their
+/// conventional `~/.rustup`/`~/.cargo` homes:
+/// - `<rustup>/settings.toml` — the shim write-locks it on EVERY cargo/rustc
+///   invocation; this single literal is what turns "could not read settings
+///   file: Operation not permitted" into a working build.
+/// - `<rustup>/tmp`, `<rustup>/downloads` — rustup's own scratch.
+/// - `<cargo>/registry`, `<cargo>/git` — the crate cache `cargo build` must
+///   populate.
+/// - `<cargo>/.package-cache`, `<cargo>/.rustc_info.json`,
+///   `<cargo>/.global-cache` — cargo's lock and metadata files.
+///
+/// Deliberately NOT granted: `<cargo>/bin` (on PATH — a writable shim there
+/// is persistence beyond the sandbox) and `<rustup>/toolchains` (writable
+/// compiler binaries outlive the session). Only paths whose toolchain home
+/// actually exists are returned, so a machine without rustup grants nothing.
+pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
+    let mut grants = ToolchainWriteGrants::default();
+    let home = std::env::var("HOME").ok();
+    let resolve = |env_name: &str, conventional: &str| -> Option<PathBuf> {
+        let path = std::env::var(env_name)
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| Path::new(h).join(conventional)))?;
+        path.is_dir().then_some(path)
+    };
+    if let Some(rustup) = resolve("RUSTUP_HOME", ".rustup") {
+        grants
+            .literals
+            .push(rustup.join("settings.toml").to_string_lossy().into_owned());
+        for dir in ["tmp", "downloads"] {
+            grants
+                .subpaths
+                .push(rustup.join(dir).to_string_lossy().into_owned());
+        }
+    }
+    if let Some(cargo) = resolve("CARGO_HOME", ".cargo") {
+        for dir in ["registry", "git"] {
+            grants
+                .subpaths
+                .push(cargo.join(dir).to_string_lossy().into_owned());
+        }
+        for file in [".package-cache", ".rustc_info.json", ".global-cache"] {
+            grants
+                .literals
+                .push(cargo.join(file).to_string_lossy().into_owned());
+        }
+    }
+    grants
+}
+
+/// The grants a config asks for: the detected set when `allow_toolchains`
+/// is on, nothing otherwise.
+fn configured_toolchain_grants(config: &SandboxConfig) -> ToolchainWriteGrants {
+    if config.allow_toolchains {
+        toolchain_write_grants()
+    } else {
+        ToolchainWriteGrants::default()
+    }
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
@@ -156,6 +246,7 @@ impl Default for SandboxConfig {
             read_allow_paths: Vec::new(),
             write_allow_globs: None,
             profile_name: None,
+            allow_toolchains: true,
         }
     }
 }
@@ -403,6 +494,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             repo_git_write: config.repo_git_write.clone(),
             // #1976: macOS EXPRESSES the fence (per-glob SBPL regex rules).
             write_allow_globs: config.write_allow_globs.clone(),
+            toolchain_write_grants: configured_toolchain_grants(config),
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
             config: fence_degraded_docker(config),
@@ -479,6 +571,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 repo_git_write: config.repo_git_write.clone(),
                 // #1976: macOS EXPRESSES the fence (per-glob regex rules).
                 write_allow_globs: config.write_allow_globs.clone(),
+                toolchain_write_grants: configured_toolchain_grants(config),
             });
         }
     }
@@ -639,6 +732,7 @@ mod tests {
     #[test]
     fn test_create_sandbox_disabled() {
         let config = SandboxConfig {
+            allow_toolchains: true,
             enabled: false,
             ..SandboxConfig::default()
         };
@@ -784,6 +878,7 @@ mod tests {
     #[test]
     fn test_create_sandbox_mode_none() {
         let config = SandboxConfig {
+            allow_toolchains: true,
             enabled: true,
             mode: SandboxMode::None,
             allow_network: false,
@@ -825,6 +920,7 @@ mod tests {
         // so a fenced workspace is bound READ-ONLY for the shell (fail
         // closed; granted paths stay writable via the fenced file tools).
         let config = SandboxConfig {
+            allow_toolchains: true,
             mode: SandboxMode::Bwrap,
             workspace_write: true,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
@@ -861,6 +957,7 @@ mod tests {
         // #1976 honest degradation: Docker mounts are concrete too — a
         // fenced workspace mounts `:ro` (fail closed for the shell).
         let config = SandboxConfig {
+            allow_toolchains: true,
             mode: SandboxMode::Docker,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
             ..SandboxConfig::default()
@@ -888,6 +985,7 @@ mod tests {
         // macOS is the one backend that EXPRESSES the fence (SBPL regex);
         // create_sandbox must thread the globs through, not degrade them.
         let config = SandboxConfig {
+            allow_toolchains: true,
             mode: SandboxMode::Macos,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
             ..SandboxConfig::default()
@@ -931,10 +1029,12 @@ mod tests {
         // (refuse). This is host-independent.
         for config in [
             SandboxConfig {
+                allow_toolchains: true,
                 enabled: false,
                 ..SandboxConfig::default()
             },
             SandboxConfig {
+                allow_toolchains: true,
                 enabled: true,
                 mode: SandboxMode::None,
                 ..SandboxConfig::default()
@@ -945,5 +1045,33 @@ mod tests {
                 "config {config:?} must produce a no-op sandbox"
             );
         }
+    }
+
+    /// The detected toolchain write set must NEVER include the persistence
+    /// vectors: `<cargo>/bin` is on PATH (a writable shim there outlives the
+    /// sandbox) and `<rustup>/toolchains` holds the compiler binaries. And
+    /// `allow_toolchains: false` must yield nothing at all.
+    #[test]
+    fn toolchain_grants_exclude_persistence_vectors_and_honor_config() {
+        let grants = toolchain_write_grants();
+        for path in grants.literals.iter().chain(grants.subpaths.iter()) {
+            assert!(
+                !path.contains("/.cargo/bin") && !path.contains("/.rustup/toolchains"),
+                "persistence vector granted: {path}"
+            );
+        }
+        let off = configured_toolchain_grants(&SandboxConfig {
+            allow_toolchains: false,
+            ..SandboxConfig::default()
+        });
+        assert_eq!(off, ToolchainWriteGrants::default());
+    }
+
+    /// An old config JSON that predates `allow_toolchains` must deserialize
+    /// with the pragmatic default (true) — serde default, not Rust default.
+    #[test]
+    fn allow_toolchains_defaults_true_for_old_configs() {
+        let config: SandboxConfig = serde_json::from_str("{}").expect("empty config");
+        assert!(config.allow_toolchains);
     }
 }

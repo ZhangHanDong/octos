@@ -66,6 +66,30 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
     output
 }
 
+/// Explain a sandbox denial the kernel reports as a bare EPERM.
+///
+/// Inside the sandbox, a denied write surfaces as the failing program's own
+/// confused error ("could not read settings file: Operation not permitted"),
+/// which reads as a bug in the command — the one party that knows the
+/// sandbox denied it is the harness, so the harness must say so. Observed
+/// cost of not saying so: a coding session whose every `cargo` invocation
+/// died on the rustup settings lock, with the model (and user) left
+/// debugging cargo instead of the sandbox. Appended only when the command
+/// FAILED under a real sandbox and the text carries the kernel's phrase;
+/// a successful command that logged the phrase is not a denial.
+fn append_sandbox_denial_hint(text: &mut String, sandboxed: bool, success: bool) {
+    if success || !sandboxed || !text.contains("Operation not permitted") {
+        return;
+    }
+    text.push_str(
+        "\n[sandbox] 'Operation not permitted' here usually means the OS sandbox denied a \
+         file access outside the workspace — not a bug in the command. Toolchain caches \
+         (~/.rustup settings, ~/.cargo registry) are writable when `sandbox.allow_toolchains` \
+         is enabled (the default); other paths need an explicit allowance in the sandbox \
+         config.",
+    );
+}
+
 fn resolve_optional_workdir(
     base_dir: &Path,
     workdir: Option<&str>,
@@ -397,6 +421,11 @@ impl ExecCommandTool {
                     "\n\nExit code: {}",
                     output.status.code().unwrap_or(-1)
                 ));
+                append_sandbox_denial_hint(
+                    &mut text,
+                    !self.sandbox.is_noop(),
+                    output.status.success(),
+                );
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
                 Ok(ToolResult {
                     output: truncate_output(text, max),
@@ -1833,6 +1862,11 @@ impl Tool for BashTool {
                 }
                 let exit_code = output.status.code().unwrap_or(-1);
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
+                append_sandbox_denial_hint(
+                    &mut text,
+                    !self.sandbox.is_noop(),
+                    output.status.success(),
+                );
                 Ok(ToolResult {
                     output: truncate_output(text, MAX_CAPTURE_BYTES),
                     success: output.status.success(),

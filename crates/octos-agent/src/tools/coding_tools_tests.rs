@@ -2641,3 +2641,36 @@ fn should_declare_element_schema_when_spawn_agent_items_is_array() {
     assert!(items["items"]["properties"]["type"].is_object());
     assert!(items["items"]["properties"]["text"].is_object());
 }
+
+/// The sandbox-denial hint fires only on the exact combination that needs
+/// explaining: a FAILED command, under a REAL sandbox, whose output carries
+/// the kernel's bare EPERM phrase. Every other combination stays untouched
+/// (a passing command that merely logs the phrase is not a denial).
+#[test]
+fn sandbox_denial_hint_fires_only_on_sandboxed_failures() {
+    let denial = "error: could not read settings file: Operation not permitted";
+
+    let mut text = denial.to_string();
+    super::append_sandbox_denial_hint(&mut text, true, false);
+    assert!(
+        text.contains("[sandbox]"),
+        "sandboxed failure must be explained"
+    );
+    assert!(
+        text.contains("allow_toolchains"),
+        "hint must name the config lever"
+    );
+
+    for (sandboxed, success, body) in [
+        (false, false, denial),                         // no sandbox: EPERM is real
+        (true, true, denial),                           // command succeeded
+        (true, false, "error: normal compile failure"), // failed, but no EPERM
+    ] {
+        let mut text = body.to_string();
+        super::append_sandbox_denial_hint(&mut text, sandboxed, success);
+        assert!(
+            !text.contains("[sandbox]"),
+            "no hint for ({sandboxed}, {success}, {body})"
+        );
+    }
+}
