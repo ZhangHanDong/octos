@@ -2644,32 +2644,45 @@ fn should_declare_element_schema_when_spawn_agent_items_is_array() {
 
 /// The sandbox-denial hint fires only on the exact combination that needs
 /// explaining: a FAILED command, under a REAL sandbox, whose output carries
-/// the kernel's bare EPERM phrase. Every other combination stays untouched
-/// (a passing command that merely logs the phrase is not a denial).
+/// one of the kernel's denial phrases — EPERM (macOS seatbelt), EACCES
+/// (Landlock), or EROFS (bwrap/Docker read-only). Every other combination
+/// stays untouched (a passing command that merely logs a phrase is not a
+/// denial).
 #[test]
 fn sandbox_denial_hint_fires_only_on_sandboxed_failures() {
-    let denial = "error: could not read settings file: Operation not permitted";
+    use crate::sandbox::sandbox_denial_hint;
 
-    let mut text = denial.to_string();
-    super::append_sandbox_denial_hint(&mut text, true, false);
-    assert!(
-        text.contains("[sandbox]"),
-        "sandboxed failure must be explained"
-    );
-    assert!(
-        text.contains("allow_toolchains"),
-        "hint must name the config lever"
-    );
+    for denial in [
+        "error: could not read settings file: Operation not permitted",
+        "mkdir: cannot create directory: Permission denied",
+        "touch: cannot touch '/etc/x': Read-only file system",
+    ] {
+        let hint = sandbox_denial_hint(true, false, denial);
+        let hint = hint.expect("sandboxed failure must be explained");
+        assert!(hint.contains("[sandbox]"), "hint must be tagged: {hint}");
+    }
+
+    // The toolchain-cache lever is only advertised where it is implemented.
+    let hint = sandbox_denial_hint(true, false, "Operation not permitted").unwrap();
+    if cfg!(target_os = "macos") {
+        assert!(
+            hint.contains("allow_toolchains"),
+            "macOS hint names the lever"
+        );
+    } else {
+        assert!(
+            !hint.contains("allow_toolchains"),
+            "non-macOS backends do not implement the grants; the hint must not advertise them"
+        );
+    }
 
     for (sandboxed, success, body) in [
-        (false, false, denial),                         // no sandbox: EPERM is real
-        (true, true, denial),                           // command succeeded
-        (true, false, "error: normal compile failure"), // failed, but no EPERM
+        (false, false, "Operation not permitted"), // no sandbox: errno is real
+        (true, true, "Operation not permitted"),   // command succeeded
+        (true, false, "error: normal compile failure"), // failed, but no denial phrase
     ] {
-        let mut text = body.to_string();
-        super::append_sandbox_denial_hint(&mut text, sandboxed, success);
         assert!(
-            !text.contains("[sandbox]"),
+            sandbox_denial_hint(sandboxed, success, body).is_none(),
             "no hint for ({sandboxed}, {success}, {body})"
         );
     }

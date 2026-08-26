@@ -234,6 +234,66 @@ fn configured_toolchain_grants(config: &SandboxConfig) -> ToolchainWriteGrants {
     }
 }
 
+/// The kernel phrasings a sandbox denial surfaces as, per backend: macOS
+/// seatbelt returns EPERM ("Operation not permitted"), Landlock returns
+/// EACCES ("Permission denied"), bwrap ro-binds and Docker `:ro` mounts
+/// return EROFS ("Read-only file system").
+const DENIAL_PHRASES: &[&str] = &[
+    "Operation not permitted",
+    "Permission denied",
+    "Read-only file system",
+];
+
+/// Explain a sandbox denial the kernel reports as a bare errno string.
+///
+/// Inside the sandbox, a denied access surfaces as the failing program's
+/// own confused error ("could not read settings file: Operation not
+/// permitted"), which reads as a bug in the command — the one party that
+/// knows the sandbox denied it is the harness, so the harness must say so.
+/// Observed cost of not saying so: a coding session whose every `cargo`
+/// invocation died on the rustup settings lock, with the model (and user)
+/// left debugging cargo instead of the sandbox.
+///
+/// Returns a hint ONLY when the command FAILED under a real sandbox and
+/// `scan_text` carries one of the kernel's denial phrases — a successful
+/// command that merely logged the phrase is not a denial. Callers scan the
+/// PRE-truncation text (the denial line may be exactly what truncation
+/// cuts) and append the hint AFTER truncating, so the hint itself survives.
+///
+/// The toolchain-cache pointer is macOS-only on purpose: `allow_toolchains`
+/// grants are implemented in the seatbelt backend today, and advertising
+/// the lever on a backend that ignores it would misstate what is writable.
+pub(crate) fn sandbox_denial_hint(
+    sandboxed: bool,
+    success: bool,
+    scan_text: &str,
+) -> Option<&'static str> {
+    if success || !sandboxed {
+        return None;
+    }
+    if !DENIAL_PHRASES
+        .iter()
+        .any(|phrase| scan_text.contains(phrase))
+    {
+        return None;
+    }
+    if cfg!(target_os = "macos") {
+        Some(
+            "\n[sandbox] This denial usually means the OS sandbox blocked a file access \
+             outside the workspace — not a bug in the command. Toolchain caches \
+             (~/.rustup settings, ~/.cargo registry) are writable when \
+             `sandbox.allow_toolchains` is enabled (the default); other paths need an \
+             explicit allowance in the sandbox config.",
+        )
+    } else {
+        Some(
+            "\n[sandbox] This denial usually means the OS sandbox blocked a file access \
+             outside the workspace — not a bug in the command. Grant the path in the \
+             sandbox config, or run under a less restrictive sandbox mode.",
+        )
+    }
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {

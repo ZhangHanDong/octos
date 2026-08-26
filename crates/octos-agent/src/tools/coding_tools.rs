@@ -66,29 +66,7 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
     output
 }
 
-/// Explain a sandbox denial the kernel reports as a bare EPERM.
-///
-/// Inside the sandbox, a denied write surfaces as the failing program's own
-/// confused error ("could not read settings file: Operation not permitted"),
-/// which reads as a bug in the command — the one party that knows the
-/// sandbox denied it is the harness, so the harness must say so. Observed
-/// cost of not saying so: a coding session whose every `cargo` invocation
-/// died on the rustup settings lock, with the model (and user) left
-/// debugging cargo instead of the sandbox. Appended only when the command
-/// FAILED under a real sandbox and the text carries the kernel's phrase;
-/// a successful command that logged the phrase is not a denial.
-fn append_sandbox_denial_hint(text: &mut String, sandboxed: bool, success: bool) {
-    if success || !sandboxed || !text.contains("Operation not permitted") {
-        return;
-    }
-    text.push_str(
-        "\n[sandbox] 'Operation not permitted' here usually means the OS sandbox denied a \
-         file access outside the workspace — not a bug in the command. Toolchain caches \
-         (~/.rustup settings, ~/.cargo registry) are writable when `sandbox.allow_toolchains` \
-         is enabled (the default); other paths need an explicit allowance in the sandbox \
-         config.",
-    );
-}
+use crate::sandbox::sandbox_denial_hint;
 
 fn resolve_optional_workdir(
     base_dir: &Path,
@@ -421,14 +399,17 @@ impl ExecCommandTool {
                     "\n\nExit code: {}",
                     output.status.code().unwrap_or(-1)
                 ));
-                append_sandbox_denial_hint(
-                    &mut text,
-                    !self.sandbox.is_noop(),
-                    output.status.success(),
-                );
+                // Scan BEFORE truncation (the denial line may be what gets
+                // cut), append AFTER (so the hint itself survives the cut).
+                let hint =
+                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
+                let mut out = truncate_output(text, max);
+                if let Some(hint) = hint {
+                    out.push_str(hint);
+                }
                 Ok(ToolResult {
-                    output: truncate_output(text, max),
+                    output: out,
                     success: output.status.success(),
                     ..Default::default()
                 })
@@ -1862,13 +1843,15 @@ impl Tool for BashTool {
                 }
                 let exit_code = output.status.code().unwrap_or(-1);
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
-                append_sandbox_denial_hint(
-                    &mut text,
-                    !self.sandbox.is_noop(),
-                    output.status.success(),
-                );
+                // Scan BEFORE truncation, append AFTER — see run_to_completion.
+                let hint =
+                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let mut out = truncate_output(text, MAX_CAPTURE_BYTES);
+                if let Some(hint) = hint {
+                    out.push_str(hint);
+                }
                 Ok(ToolResult {
-                    output: truncate_output(text, MAX_CAPTURE_BYTES),
+                    output: out,
                     success: output.status.success(),
                     structured_metadata: Some(json!({
                         "codex_tool": "bash",
