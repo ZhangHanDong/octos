@@ -280,25 +280,33 @@ fn is_write_tool(name: &str) -> bool {
     )
 }
 
-/// The file path a read/write tool call targets, from its arguments (both the
-/// `path` and `file_path` conventions).
+/// The file path a read/write tool call targets, from its arguments. Covers
+/// the `path`, `file_path`, and `filePath` conventions — `read_file` accepts
+/// the camelCase `filePath` alias (#1767), so missing it would silently leave
+/// alias-style reads unpinned/undeduped.
 fn tool_target_path(args: &serde_json::Value) -> Option<String> {
     args.get("path")
         .or_else(|| args.get("file_path"))
+        .or_else(|| args.get("filePath"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
 }
 
-/// A read's (path, offset, limit) identity for dedup — the same window of the
-/// same file is the same read. `None` when the call has no path.
+/// A read's (path, start, end, limit) identity for dedup — the same window of
+/// the same file is the same read. `read_file`'s range is `start_line`/`offset`
+/// plus EITHER `end_line` OR `limit`, so ALL of them belong in the key: two
+/// reads of `x` at start 1 with `end_line: 50` vs `end_line: 10` are different
+/// windows and must NOT dedup to each other (that would silently drop lines
+/// 11-50 and force a re-read — the very thrash this feature prevents).
 fn read_range_key(args: &serde_json::Value) -> Option<String> {
     let path = tool_target_path(args)?;
-    let offset = args
+    let start = args
         .get("offset")
         .or_else(|| args.get("start_line"))
         .and_then(serde_json::Value::as_i64);
+    let end = args.get("end_line").and_then(serde_json::Value::as_i64);
     let limit = args.get("limit").and_then(serde_json::Value::as_i64);
-    Some(format!("{path}\u{1f}{offset:?}\u{1f}{limit:?}"))
+    Some(format!("{path}\u{1f}{start:?}\u{1f}{end:?}\u{1f}{limit:?}"))
 }
 
 /// Working-set analysis of the conversation for one tier-1 pass (#2131):
@@ -945,6 +953,43 @@ mod tests {
         assert_eq!(parsed.reason, "tier1_superseded");
         // r2 (newest) survives untouched.
         assert!(!is_placeholder(&messages[4].content));
+    }
+
+    #[test]
+    fn reads_differing_only_by_end_line_are_not_deduped() {
+        // #2131 review: end_line is part of a read's window identity. Two reads
+        // of the same file+start but different end_line are DIFFERENT windows
+        // and must both survive — deduping them would silently drop content.
+        let mut messages = vec![
+            user_msg("go"),
+            assistant_call_args(
+                "read_file",
+                "r_wide",
+                serde_json::json!({"path": "a.txt", "start_line": 1, "end_line": 50}),
+            ),
+            tool_result("r_wide", "lines 1-50"),
+            assistant_call_args(
+                "read_file",
+                "r_narrow",
+                serde_json::json!({"path": "a.txt", "start_line": 1, "end_line": 10}),
+            ),
+            tool_result("r_narrow", "lines 1-10"),
+        ];
+        let policy = MicroCompactionPolicy {
+            max_age_turns: 0,
+            max_size_bytes_per_result: u32::MAX,
+            pin_recent_files: 0, // isolate dedup
+            dedup_duplicate_reads: true,
+        };
+        policy.prune(&mut messages, &[]);
+        assert!(
+            !is_placeholder(&messages[2].content),
+            "the wider read (lines 1-50) must NOT be deduped away by a narrower one"
+        );
+        assert!(
+            !is_placeholder(&messages[4].content),
+            "the narrower read survives too"
+        );
     }
 
     #[test]
