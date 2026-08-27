@@ -264,7 +264,23 @@ fn sanitize_payload(
 
     let sanitized_args = arguments.map(|args| {
         if is_sensitive {
-            serde_json::json!({"redacted": true, "reason": "sensitive tool"})
+            // #2129 review round 2, finding 2: a file PATH is not a secret
+            // (the file CONTENT is), and the path_filter matcher reads
+            // `arguments.path` to decide whether a checker fires. Redacting
+            // the whole object silently disabled every path-filtered hook
+            // on write_file (the new-file case). Preserve the path-
+            // identifying keys; redact everything else.
+            let mut kept = serde_json::Map::new();
+            if let Some(obj) = args.as_object() {
+                for key in ["path", "file_path", "filename", "file"] {
+                    if let Some(v @ serde_json::Value::String(_)) = obj.get(key) {
+                        kept.insert(key.to_string(), v.clone());
+                    }
+                }
+            }
+            kept.insert("redacted".into(), serde_json::Value::Bool(true));
+            kept.insert("reason".into(), serde_json::json!("sensitive tool"));
+            serde_json::Value::Object(kept)
         } else {
             truncate_json_value(&args, MAX_PAYLOAD_FIELD_BYTES)
         }
@@ -850,6 +866,14 @@ impl HookExecutor {
             }
 
             let hook_cwd = payload_ref.cwd.as_deref().map(std::path::Path::new);
+            // #2129 review round 2, finding 5: a project-scoped checker
+            // (declares `requires_bin`: cargo/eslint/ruff) is meaningless
+            // without a known workspace root — running it in the daemon's
+            // start directory checks an unrelated project (or exits 101 and
+            // trips the breaker). Skip rather than run in the wrong place.
+            if hook_cwd.is_none() && hook.requires_bin.is_some() {
+                continue;
+            }
             match self.execute_hook(hook, &payload_json, hook_cwd).await {
                 Ok((0, stdout, _stderr)) => {
                     self.failures[i].store(0, Ordering::Relaxed);
@@ -860,92 +884,89 @@ impl HookExecutor {
                         injected_contexts.push(stdout);
                     }
                 }
-                Ok((1, stdout, stderr)) => {
+                // Exit 2 on a before-modify event = replacement payload.
+                Ok((2, stdout, _stderr))
                     if matches!(
+                        event,
+                        HookEvent::BeforeToolCall | HookEvent::BeforeSpawnVerify
+                    ) =>
+                {
+                    self.failures[i].store(0, Ordering::Relaxed);
+                    match serde_json::from_str::<serde_json::Value>(&stdout) {
+                        Ok(modified_args) => {
+                            tracing::info!(
+                                hook_command = ?hook.command,
+                                ?event,
+                                "hook modified event payload"
+                            );
+                            return HookResult::Modified(modified_args);
+                        }
+                        Err(e) => {
+                            warn!(
+                                hook_command = ?hook.command,
+                                error = %e,
+                                "hook exit 2 but stdout is not valid JSON, treating as error"
+                            );
+                            last_error = Some(format!("hook modified output not valid JSON: {e}"));
+                        }
+                    }
+                }
+                // Any OTHER nonzero exit.
+                Ok((code, stdout, stderr)) => {
+                    let is_before = matches!(
                         event,
                         HookEvent::UserPromptSubmit
                             | HookEvent::BeforeToolCall
                             | HookEvent::BeforeLlmCall
                             | HookEvent::BeforeSpawnVerify
-                    ) {
-                        self.failures[i].store(0, Ordering::Relaxed);
-                        return HookResult::Deny(stdout);
-                    }
-                    // Exit 1 WITH output on an after-hook is the feedback
-                    // channel WORKING — a checker reporting diagnostics.
-                    // It does NOT count toward the circuit breaker: a model
-                    // iterating on compile errors legitimately fails the
-                    // check many times in a row, and disabling the hook at
-                    // the third failure would kill the feedback loop exactly
-                    // when it is most needed (#2129 review, finding 2).
-                    let mut output = if stderr.is_empty() {
-                        stdout
-                    } else if stdout.is_empty() {
-                        stderr
-                    } else {
-                        format!("{stdout}\n{stderr}")
-                    };
-                    octos_core::truncate_utf8(&mut output, 2000, "\n... (hook output truncated)");
-                    if output.trim().is_empty() {
-                        // Exit 1 with NOTHING to say is indistinguishable
-                        // from a broken hook: infrastructure error, counted.
-                        let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
-                        let msg = format!(
-                            "hook {:?} exited with code 1 on after-event ({}/{})",
-                            hook.command, new_count, self.failure_threshold
-                        );
-                        warn!("{}", msg);
-                        last_error = Some(msg);
-                    } else {
-                        self.failures[i].store(0, Ordering::Relaxed);
-                        feedback.push(format!("{:?}:\n{}", hook.command, output));
-                    }
-                }
-                Ok((2, stdout, _stderr)) => {
-                    // Exit 2 = modified input (before-hooks only).
-                    // Stdout contains the replacement JSON payload.
-                    if matches!(
-                        event,
-                        HookEvent::BeforeToolCall | HookEvent::BeforeSpawnVerify
-                    ) {
-                        self.failures[i].store(0, Ordering::Relaxed);
-                        match serde_json::from_str::<serde_json::Value>(&stdout) {
-                            Ok(modified_args) => {
-                                tracing::info!(
-                                    hook_command = ?hook.command,
-                                    ?event,
-                                    "hook modified event payload"
-                                );
-                                return HookResult::Modified(modified_args);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    hook_command = ?hook.command,
-                                    error = %e,
-                                    "hook exit 2 but stdout is not valid JSON, treating as error"
-                                );
-                                last_error =
-                                    Some(format!("hook modified output not valid JSON: {e}"));
-                            }
-                        }
-                    } else {
-                        let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
-                        let msg = format!(
-                            "hook {:?} exited with code 2 on non-before-tool event ({}/{})",
-                            hook.command, new_count, self.failure_threshold
-                        );
-                        warn!("{}", msg);
-                        last_error = Some(msg);
-                    }
-                }
-                Ok((code, _stdout, _stderr)) => {
-                    let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
-                    let msg = format!(
-                        "hook {:?} exited with code {} ({}/{})",
-                        hook.command, code, new_count, self.failure_threshold
                     );
-                    warn!("{}", msg);
-                    last_error = Some(msg);
+                    if is_before {
+                        // Before-events: exit 1 DENIES; anything else is infra.
+                        if code == 1 {
+                            self.failures[i].store(0, Ordering::Relaxed);
+                            return HookResult::Deny(stdout);
+                        }
+                        let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                        let msg = format!(
+                            "hook {:?} exited with code {} on before-event ({}/{})",
+                            hook.command, code, new_count, self.failure_threshold
+                        );
+                        warn!("{}", msg);
+                        last_error = Some(msg);
+                    } else {
+                        // AFTER-events: a checker reporting problems. ANY
+                        // nonzero exit WITH output is FEEDBACK and does NOT
+                        // count toward the breaker — cargo check exits 101
+                        // on compile errors (#2129 review round 2, finding
+                        // 1), eslint/ruff exit 1, tsc 1/2; a model iterating
+                        // on errors legitimately fails many times in a row.
+                        // Empty output on a nonzero exit is indistinguishable
+                        // from a broken hook: infra error, counted.
+                        let mut output = if stderr.is_empty() {
+                            stdout
+                        } else if stdout.is_empty() {
+                            stderr
+                        } else {
+                            format!("{stdout}\n{stderr}")
+                        };
+                        octos_core::truncate_utf8(
+                            &mut output,
+                            2000,
+                            "\n... (hook output truncated)",
+                        );
+                        if output.trim().is_empty() {
+                            let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                            let msg = format!(
+                                "hook {:?} exited with code {} and no output ({}/{})",
+                                hook.command, code, new_count, self.failure_threshold
+                            );
+                            warn!("{}", msg);
+                            last_error = Some(msg);
+                        } else {
+                            self.failures[i].store(0, Ordering::Relaxed);
+                            feedback.push(format!("{:?}:\n{}", hook.command, output));
+                        }
+                    }
                 }
                 Err(e) => {
                     let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
@@ -2337,6 +2358,116 @@ mod tests {
 
     /// #2129 review finding 2: repeated exit-1-with-output must NOT trip
     /// the circuit breaker — a model iterating on compile errors fails the
+    /// #2129 review round 2, finding 1: cargo check exits 101 on compile
+    /// errors — its diagnostics must reach the model as Feedback (not the
+    /// discarded infra arm) and must NOT count toward the breaker.
+    #[tokio::test]
+    async fn cargo_style_101_exit_reaches_the_model_as_feedback() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo 'error[E0308]: mismatched types' >&2; exit 101".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        for _ in 0..10 {
+            let payload =
+                HookPayload::after_tool("edit_file", "id", "ok".into(), true, 5, None, None, None);
+            match executor.run(HookEvent::AfterToolCall, &payload).await {
+                HookResult::Feedback(entries) => {
+                    assert!(
+                        entries.join("\n").contains("E0308"),
+                        "diagnostics must surface"
+                    );
+                }
+                other => panic!("cargo 101 must be Feedback, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2129 review round 2, finding 2: write_file is a SENSITIVE_TOOL, but
+    /// its PATH is not a secret — the path must survive redaction so a
+    /// path-filtered checker still fires on new-file creation.
+    #[tokio::test]
+    async fn write_file_path_survives_redaction_so_checkers_fire() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo diag; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec!["write_file".to_string()],
+            path_filter: vec!["**/*.rs".to_string()],
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        // write_file args carry both a path AND file content (a secret-
+        // bearing field). The path must be preserved; the content redacted.
+        let args = serde_json::json!({
+            "path": "src/lib.rs",
+            "content": "const API_KEY: &str = \"sk-secret\";"
+        });
+        let payload = HookPayload::after_tool(
+            "write_file",
+            "id",
+            "ok".into(),
+            true,
+            5,
+            Some(&args),
+            None,
+            None,
+        );
+        // The sanitized payload keeps the path, drops the content.
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("src/lib.rs"), "path must survive: {json}");
+        assert!(
+            !json.contains("sk-secret"),
+            "content must be redacted: {json}"
+        );
+        // And the path-filtered checker fires (matches src/lib.rs).
+        assert!(matches!(
+            executor.run(HookEvent::AfterToolCall, &payload).await,
+            HookResult::Feedback(_)
+        ));
+    }
+
+    /// #2129 review round 2, finding 5: a project-scoped checker
+    /// (requires_bin) must be SKIPPED when the workspace root is unknown
+    /// (cwd None) rather than run in the daemon's directory.
+    #[tokio::test]
+    async fn project_hook_skipped_when_workspace_root_unknown() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo should-not-run; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: Some("sh".to_string()), // present, but cwd is None
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        let payload =
+            HookPayload::after_tool("edit_file", "id", "ok".into(), true, 5, None, None, None);
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload).await,
+                HookResult::Allow
+            ),
+            "project hook must be skipped without a workspace root"
+        );
+    }
+
     /// check many times in a row, and that is the channel working.
     #[tokio::test]
     async fn repeated_check_failures_do_not_trip_the_breaker() {
