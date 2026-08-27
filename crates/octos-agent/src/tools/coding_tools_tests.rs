@@ -2687,3 +2687,21 @@ fn sandbox_denial_hint_fires_only_on_sandboxed_failures() {
         );
     }
 }
+
+/// #2136 review P1: the session paths (exec_command yielded, write_stdin)
+/// carry the [sandbox] denial hint too — scan the FULL capture, truncate,
+/// then append so the hint survives the cap.
+#[test]
+fn session_payload_carries_denial_hint_on_sandboxed_failures() {
+    let denial = "error: could not read settings file: Operation not permitted".to_string();
+    let payload = super::session_output_payload(denial.clone(), Some(1), true, 4096);
+    if cfg!(target_os = "macos") {
+        assert!(payload.contains("[sandbox]"), "{payload}");
+    }
+    // Still running (no exit code): not a failure, no hint.
+    let payload = super::session_output_payload(denial.clone(), None, true, 4096);
+    assert!(!payload.contains("[sandbox]"), "{payload}");
+    // Unsandboxed: EPERM is real, no hint.
+    let payload = super::session_output_payload(denial, Some(1), false, 4096);
+    assert!(!payload.contains("[sandbox]"), "{payload}");
+}

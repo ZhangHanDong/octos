@@ -174,21 +174,21 @@ pub(crate) struct ToolchainWriteGrants {
 
 /// Detect installed toolchains and return the PRECISE write set each needs.
 ///
-/// Rust (rustup + cargo), detected via `$RUSTUP_HOME`/`$CARGO_HOME` or their
-/// conventional `~/.rustup`/`~/.cargo` homes:
-/// - `<rustup>/settings.toml` — the shim write-locks it on EVERY cargo/rustc
-///   invocation; this single literal is what turns "could not read settings
-///   file: Operation not permitted" into a working build.
-/// - `<rustup>/tmp`, `<rustup>/downloads` — rustup's own scratch.
-/// - `<cargo>/registry`, `<cargo>/git` — the crate cache `cargo build` must
-///   populate.
-/// - `<cargo>/.package-cache`, `<cargo>/.rustc_info.json`,
-///   `<cargo>/.global-cache` — cargo's lock and metadata files.
+/// Rust (rustup), detected via `$RUSTUP_HOME` or the conventional
+/// `~/.rustup` home:
+/// - `<rustup>/settings.toml` — the shim write-locks it on EVERY
+///   cargo/rustc invocation; this single literal is what turns "could not
+///   read settings file: Operation not permitted" into a working build.
+/// - `<rustup>/tmp`, `<rustup>/downloads` — rustup's own scratch; staged
+///   toolchain archives are hash-verified by rustup on install, so a
+///   poisoned staging file fails verification rather than executing.
 ///
-/// Deliberately NOT granted: `<cargo>/bin` (on PATH — a writable shim there
-/// is persistence beyond the sandbox) and `<rustup>/toolchains` (writable
-/// compiler binaries outlive the session). Only paths whose toolchain home
-/// actually exists are returned, so a machine without rustup grants nothing.
+/// Deliberately NOT granted: anything under `~/.cargo` (#2136 review, P1 —
+/// the shared registry/git caches hold code cargo later executes OUTSIDE
+/// the sandbox; sandboxed commands get a per-workspace CARGO_HOME overlay
+/// instead), `<cargo>/bin` (on PATH — a writable shim is persistence), and
+/// `<rustup>/toolchains` (writable compiler binaries outlive the session).
+/// Only paths whose toolchain home actually exists are returned.
 pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
     let mut grants = ToolchainWriteGrants::default();
     let home = std::env::var("HOME").ok();
@@ -209,18 +209,14 @@ pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
                 .push(rustup.join(dir).to_string_lossy().into_owned());
         }
     }
-    if let Some(cargo) = resolve("CARGO_HOME", ".cargo") {
-        for dir in ["registry", "git"] {
-            grants
-                .subpaths
-                .push(cargo.join(dir).to_string_lossy().into_owned());
-        }
-        for file in [".package-cache", ".rustc_info.json", ".global-cache"] {
-            grants
-                .literals
-                .push(cargo.join(file).to_string_lossy().into_owned());
-        }
-    }
+    // NO shared-cargo grants (#2136 review, P1): ~/.cargo/registry and
+    // ~/.cargo/git hold dependency sources, build scripts, and proc
+    // macros that cargo later EXECUTES in other workspaces and outside
+    // the sandbox — a writable shared cache is a persistent poisoning
+    // vector. Sandboxed commands instead get a per-workspace CARGO_HOME
+    // overlay under the scratch dir (see the macOS backend), which is
+    // already writable and already ignored by workspace tracking. The
+    // cost is a per-workspace dependency cache; safety over reuse.
     grants
 }
 
@@ -1115,8 +1111,11 @@ mod tests {
     fn toolchain_grants_exclude_persistence_vectors_and_honor_config() {
         let grants = toolchain_write_grants();
         for path in grants.literals.iter().chain(grants.subpaths.iter()) {
+            // #2136 review P1: NOTHING under ~/.cargo is ever granted —
+            // the shared caches hold code cargo executes outside the
+            // sandbox; sandboxed builds use a per-workspace CARGO_HOME.
             assert!(
-                !path.contains("/.cargo/bin") && !path.contains("/.rustup/toolchains"),
+                !path.contains("/.cargo") && !path.contains("/.rustup/toolchains"),
                 "persistence vector granted: {path}"
             );
         }

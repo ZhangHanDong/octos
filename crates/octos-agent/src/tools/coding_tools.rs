@@ -51,6 +51,7 @@ struct ExecSession {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     output: Arc<Mutex<String>>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    sandboxed: bool,
 }
 
 fn next_exec_session_id() -> String {
@@ -67,6 +68,27 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
 }
 
 use crate::sandbox::sandbox_denial_hint;
+
+/// Session-output payload shared by `exec_command`'s yielded path and
+/// `write_stdin` (#2136 review, P1: the principal ASYNC execution path
+/// returned permission failures without the [sandbox] explanation the
+/// synchronous paths carry). Scans the FULL captured text, truncates,
+/// then appends the hint so it survives the cap — same ordering contract
+/// as the synchronous assemblers.
+fn session_output_payload(
+    captured: String,
+    exit_code: Option<i32>,
+    sandboxed: bool,
+    cap: usize,
+) -> String {
+    let failed = matches!(exit_code, Some(code) if code != 0);
+    let hint = sandbox_denial_hint(sandboxed, !failed, &captured);
+    let mut output = truncate_output(captured, cap);
+    if let Some(hint) = hint {
+        output.push_str(hint);
+    }
+    output
+}
 
 fn resolve_optional_workdir(
     base_dir: &Path,
@@ -479,6 +501,7 @@ impl ExecCommandTool {
                 stdin: Arc::new(Mutex::new(stdin)),
                 output: output.clone(),
                 exit_code: exit_code.clone(),
+                sandboxed: !self.sandbox.is_noop(),
             },
         );
         tokio::time::sleep(Duration::from_millis(
@@ -492,7 +515,12 @@ impl ExecCommandTool {
                 "session_id": session_id,
                 "running": code.is_none(),
                 "exit_code": code,
-                "output": truncate_output(captured, input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES)),
+                "output": session_output_payload(
+                    captured,
+                    code,
+                    !self.sandbox.is_noop(),
+                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
+                ),
             })
             .to_string(),
             success: true,
@@ -572,7 +600,12 @@ impl Tool for WriteStdinTool {
                 "session_id": input.session_id,
                 "running": code.is_none(),
                 "exit_code": code,
-                "output": truncate_output(output, input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES)),
+                "output": session_output_payload(
+                    output,
+                    code,
+                    session.sandboxed,
+                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
+                ),
             })
             .to_string(),
             success: true,

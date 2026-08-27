@@ -201,8 +201,18 @@ impl Sandbox for MacosSandbox {
         // Path is validated above -- no escaping needed since \ and " are rejected.
         let cwd_escaped = &cwd_str;
 
+        let toolchains_active = !self.toolchain_write_grants.literals.is_empty()
+            || !self.toolchain_write_grants.subpaths.is_empty();
         let network_rule = if self.allow_network {
             "(allow network*)"
+        } else if toolchains_active {
+            // #2136 review, P1: a default build must be able to DOWNLOAD
+            // dependencies — with full network deny, cargo only works when
+            // every crate is already cached. Scoped egress: outbound HTTPS
+            // and HTTP (registry + git transports) plus DNS, nothing
+            // inbound, no other ports. Operators who need the full deny
+            // back set `sandbox.allow_toolchains = false`.
+            "(deny network*)\n(allow network-outbound (remote tcp \"*:443\"))\n(allow network-outbound (remote tcp \"*:80\"))\n(allow network-outbound (remote udp \"*:53\"))\n(allow system-socket)"
         } else {
             "(deny network*)"
         };
@@ -461,6 +471,17 @@ impl Sandbox for MacosSandbox {
         cmd.env("TMPDIR", &user_tmp);
         cmd.env("TEMP", &user_tmp);
         cmd.env("TMP", &user_tmp);
+        // #2136 review, P1: per-workspace Cargo overlay. The shared
+        // ~/.cargo caches hold sources/build scripts/proc macros that
+        // cargo EXECUTES in other workspaces and outside the sandbox, so
+        // they must never be sandbox-writable; redirecting CARGO_HOME into
+        // the (writable, tracking-ignored) scratch dir gives builds a
+        // working cache with workspace-local blast radius. Reads of the
+        // host cache are irrelevant once CARGO_HOME moves — cargo uses one
+        // home for both — so the price is a per-workspace re-download.
+        if toolchains_active {
+            cmd.env("CARGO_HOME", user_tmp.join("cargo-home"));
+        }
         // Clear dangerous environment variables (sandbox-exec inherits parent env)
         for var in BLOCKED_ENV_VARS {
             cmd.env_remove(var);
@@ -1632,7 +1653,7 @@ mod tests {
         let sb = MacosSandbox {
             toolchain_write_grants: super::super::ToolchainWriteGrants {
                 literals: vec!["/Users/t/.rustup/settings.toml".into()],
-                subpaths: vec!["/Users/t/.cargo/registry".into()],
+                subpaths: vec!["/Users/t/.rustup/tmp".into()],
             },
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1655,8 +1676,8 @@ mod tests {
             "rustup settings lock must be writable: {profile}"
         );
         assert!(
-            profile.contains("(allow file-write* (subpath \"/Users/t/.cargo/registry\"))"),
-            "cargo registry must be writable: {profile}"
+            profile.contains("(allow file-write* (subpath \"/Users/t/.rustup/tmp\"))"),
+            "rustup scratch must be writable: {profile}"
         );
     }
 
@@ -1667,7 +1688,7 @@ mod tests {
     fn toolchain_grants_suppressed_when_writes_confined() {
         let grants = super::super::ToolchainWriteGrants {
             literals: vec!["/Users/t/.rustup/settings.toml".into()],
-            subpaths: vec!["/Users/t/.cargo/registry".into()],
+            subpaths: vec!["/Users/t/.rustup/tmp".into()],
         };
         for (label, sb) in [
             (
@@ -1708,5 +1729,85 @@ mod tests {
                 "{label}: toolchain grants must be suppressed, got: {profile}"
             );
         }
+    }
+
+    /// #2136 review P1: with toolchains active and general network OFF,
+    /// the profile allows SCOPED egress only (443/80 + DNS) so a default
+    /// build can download dependencies; toolchains off keeps the full
+    /// deny; allow_network keeps the full allow. And sandboxed commands
+    /// get a per-workspace CARGO_HOME under the scratch dir — never the
+    /// shared host cache.
+    #[test]
+    fn toolchains_enable_scoped_egress_and_cargo_overlay() {
+        let sb = MacosSandbox {
+            toolchain_write_grants: super::super::ToolchainWriteGrants {
+                literals: vec!["/Users/t/.rustup/settings.toml".into()],
+                subpaths: vec![],
+            },
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+            write_allow_globs: None,
+        };
+        let cmd = sb.wrap_command("cargo build", Path::new("/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("profile");
+        assert!(profile.contains("(deny network*)"), "{profile}");
+        assert!(
+            profile.contains("(allow network-outbound (remote tcp \"*:443\"))"),
+            "registry egress must be allowed: {profile}"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (remote udp \"*:53\"))"),
+            "DNS must be allowed: {profile}"
+        );
+        let cargo_home = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("CARGO_HOME"))
+            .and_then(|(_, v)| v)
+            .expect("CARGO_HOME must be redirected")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            cargo_home.starts_with("/tmp/ws"),
+            "CARGO_HOME must live in the workspace scratch, got {cargo_home}"
+        );
+
+        // Toolchains OFF: full deny, no overlay.
+        let plain = MacosSandbox {
+            toolchain_write_grants: Default::default(),
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+            write_allow_globs: None,
+        };
+        let cmd = plain.wrap_command("echo hi", Path::new("/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("profile");
+        assert!(profile.contains("(deny network*)"), "{profile}");
+        assert!(!profile.contains("network-outbound"), "{profile}");
+        assert!(
+            !cmd.as_std()
+                .get_envs()
+                .any(|(k, _)| k == std::ffi::OsStr::new("CARGO_HOME")),
+            "no overlay without toolchains"
+        );
     }
 }
