@@ -2186,13 +2186,24 @@ mod tests {
             "gpt-test",
             &profile,
         );
-        for resurrected in ["workspace_diff", "view_image", "tool_search", "web_search"] {
+        for resurrected in ["workspace_diff", "view_image", "web_search"] {
             assert!(
                 !session.is_tool_visible(resurrected),
                 "{resurrected} must stay excluded in the rebound session registry"
             );
         }
-        for kept in ["read_file", "shell", "grep", "edit_file"] {
+        // #2133: `tool_search` is now in the lean allow list (the escape
+        // hatch) and `bash` is the single retained shell; both must survive
+        // the rebind re-narrowing. `check`/`update_plan` too.
+        for kept in [
+            "read_file",
+            "bash",
+            "grep",
+            "edit_file",
+            "tool_search",
+            "check",
+            "update_plan",
+        ] {
             assert!(
                 session.is_tool_visible(kept),
                 "{kept} must survive the rebound session registry"

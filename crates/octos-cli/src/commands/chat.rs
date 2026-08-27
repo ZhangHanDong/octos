@@ -104,9 +104,11 @@ pub struct ChatCommand {
     /// so you don't re-enter a model or key that a profile already holds.
     /// `--config`, `--provider`, and `--model` still override.
     ///
-    /// Defaults to `coding`, the lean core-coding tool surface (files,
-    /// shell, search, memory, spawn, user questions). Use `coding-full`
-    /// for the unfiltered pre-lean tool set (web, research, pipelines,
+    /// Defaults to `coding`, the tight core-coding tool surface (files,
+    /// one shell, search, check, plan tracking, user questions, and
+    /// `tool_search` as the escape hatch to everything else). Use
+    /// `coding-full` for the unfiltered pre-lean tool set (web, research,
+    /// pipelines,
     /// bundled skills).
     #[arg(long)]
     pub profile: Option<String>,

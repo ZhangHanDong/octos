@@ -681,22 +681,48 @@ mod tests {
         // per-round tool-schema overhead.
         match &coding.tools {
             ProfileTools::AllowList { tools } => {
+                // #2133: the allow list names the core loop EXPLICITLY (not
+                // via groups) so it lands exactly the intended surface —
+                // `group:fs` drags in `apply_patch`, `group:runtime` drags in
+                // three redundant shell entry points, and neither `check`,
+                // `update_plan`, nor `tool_search` belongs to any group.
                 for required in [
-                    "group:fs",
-                    "group:runtime",
-                    "group:search",
-                    "group:memory",
-                    "spawn",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "diff_edit",
+                    "bash",
+                    "grep",
+                    "glob",
+                    "list_dir",
+                    "check",
+                    "update_plan",
                     "ask_user_question",
+                    // The escape hatch: without it the lean surface is a
+                    // dead end — the model can neither use nor recover the
+                    // tools the allow list drops.
+                    "tool_search",
                 ] {
                     assert!(
                         tools.contains(&required.to_string()),
                         "coding allow list must keep {required}, got {tools:?}",
                     );
                 }
-                // The heavy non-core surfaces must stay out of the lean
-                // default (available via `coding-full` or a custom profile).
+                // Dropped from the default surface (still reachable via
+                // `tool_search` or `coding-full`): memory, sub-agent spawn,
+                // redundant shell aliases / patch, and the heavy web /
+                // research / media / pipeline surfaces.
                 for excluded in [
+                    "group:fs",
+                    "group:runtime",
+                    "group:memory",
+                    "spawn",
+                    "apply_patch",
+                    "shell",
+                    "exec_command",
+                    "write_stdin",
+                    "recall_memory",
+                    "save_memory",
                     "group:web",
                     "group:research",
                     "group:media",
@@ -782,8 +808,9 @@ mod tests {
             name: "get_weather",
         });
         // `spawn` is registered by the chat/acp bootstrap (SpawnTool),
-        // not by `with_builtins`; a stub stands in for the inclusion
-        // assertion.
+        // not by `with_builtins`; a stub stands in so the exclusion
+        // assertion proves the lean profile filters it out (#2133 drops it
+        // from the default surface — it is reached via `tool_search`).
         tools.register(StubTool { name: "spawn" });
 
         let coding = ProfileDefinition::builtin("coding").expect("coding");
@@ -796,11 +823,14 @@ mod tests {
             "read_file",
             "write_file",
             "edit_file",
-            "shell",
+            "diff_edit",
+            "bash",
             "glob",
             "grep",
             "list_dir",
-            "spawn",
+            "check",
+            "update_plan",
+            "tool_search",
             "ask_user_question",
         ] {
             assert!(
@@ -809,6 +839,13 @@ mod tests {
             );
         }
         for excluded in [
+            // #2133: spawn + memory + redundant shell/patch aliases are no
+            // longer front-loaded — the model reaches them via `tool_search`.
+            "spawn",
+            "apply_patch",
+            "shell",
+            "exec_command",
+            "write_stdin",
             "web_search",
             "web_fetch",
             "browser",
@@ -818,7 +855,6 @@ mod tests {
             "workspace_diff",
             "spawn_agent",
             "delegate",
-            "update_plan",
         ] {
             assert!(
                 !names.contains(excluded),
