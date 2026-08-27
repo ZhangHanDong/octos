@@ -183,12 +183,28 @@ pub(crate) struct ToolchainWriteGrants {
 ///   toolchain archives are hash-verified by rustup on install, so a
 ///   poisoned staging file fails verification rather than executing.
 ///
-/// Deliberately NOT granted: anything under `~/.cargo` (#2136 review, P1 —
-/// the shared registry/git caches hold code cargo later executes OUTSIDE
-/// the sandbox; sandboxed commands get a per-workspace CARGO_HOME overlay
-/// instead), `<cargo>/bin` (on PATH — a writable shim is persistence), and
-/// `<rustup>/toolchains` (writable compiler binaries outlive the session).
-/// Only paths whose toolchain home actually exists are returned.
+/// Cargo, detected via `$CARGO_HOME` or `~/.cargo`, is granted ONLY its
+/// non-executable coordination files so an OFFLINE build against an
+/// already-populated host cache works without opening a poisoning vector:
+/// - `<cargo>/.package-cache` — the advisory build lock cargo opens
+///   write-intent on every invocation (an EPERM here fails the build
+///   before it starts).
+/// - `<cargo>/registry/index` — the registry INDEX cache (JSON/bincode
+///   metadata cargo writes during dependency resolution). Not executable
+///   code; a tampered checksum here is caught against the read-only crate
+///   cache rather than substituting a crate.
+///
+/// Deliberately NOT granted (read-only — reads are globally allowed, so
+/// cached deps remain usable): `<cargo>/registry/cache` and
+/// `<cargo>/registry/src` (the .crate archives and extracted sources cargo
+/// EXECUTES — the review's poisoning vector), `<cargo>/git` (source
+/// checkouts, likewise), `<cargo>/bin` (on PATH — a writable shim is
+/// persistence), `<rustup>/toolchains` (compiler binaries outlive the
+/// session). Fresh DOWNLOADS need writes to registry/cache+src and so
+/// need `allow_network` plus, ultimately, proxy-isolated fetch (tracked
+/// separately) — the sandbox supports BUILDING with cached dependencies,
+/// not populating the cache. Only paths whose home actually exists are
+/// returned.
 pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
     let mut grants = ToolchainWriteGrants::default();
     let home = std::env::var("HOME").ok();
@@ -209,14 +225,22 @@ pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
                 .push(rustup.join(dir).to_string_lossy().into_owned());
         }
     }
-    // NO shared-cargo grants (#2136 review, P1): ~/.cargo/registry and
-    // ~/.cargo/git hold dependency sources, build scripts, and proc
-    // macros that cargo later EXECUTES in other workspaces and outside
-    // the sandbox — a writable shared cache is a persistent poisoning
-    // vector. Sandboxed commands instead get a per-workspace CARGO_HOME
-    // overlay under the scratch dir (see the macOS backend), which is
-    // already writable and already ignored by workspace tracking. The
-    // cost is a per-workspace dependency cache; safety over reuse.
+    if let Some(cargo) = resolve("CARGO_HOME", ".cargo") {
+        // Lock file (literal): opened write-intent on every cargo run.
+        grants
+            .literals
+            .push(cargo.join(".package-cache").to_string_lossy().into_owned());
+        // Registry INDEX only (metadata, non-executable). NOT registry/cache
+        // or registry/src (executable payloads — read-only, so a cached
+        // build reads them but nothing can overwrite a crate), and NOT git.
+        grants.subpaths.push(
+            cargo
+                .join("registry")
+                .join("index")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
     grants
 }
 
@@ -1111,12 +1135,17 @@ mod tests {
     fn toolchain_grants_exclude_persistence_vectors_and_honor_config() {
         let grants = toolchain_write_grants();
         for path in grants.literals.iter().chain(grants.subpaths.iter()) {
-            // #2136 review P1: NOTHING under ~/.cargo is ever granted —
-            // the shared caches hold code cargo executes outside the
-            // sandbox; sandboxed builds use a per-workspace CARGO_HOME.
+            // #2136 review: the EXECUTABLE cargo payloads stay read-only —
+            // registry/cache (.crate archives), registry/src (extracted
+            // sources), git (checkouts) — plus the persistence vectors.
+            // Only the non-executable lock + index are writable.
             assert!(
-                !path.contains("/.cargo") && !path.contains("/.rustup/toolchains"),
-                "persistence vector granted: {path}"
+                !path.contains("/registry/cache")
+                    && !path.contains("/registry/src")
+                    && !path.contains("/.cargo/git")
+                    && !path.contains("/.cargo/bin")
+                    && !path.contains("/.rustup/toolchains"),
+                "executable/persistence path granted writable: {path}"
             );
         }
         let off = configured_toolchain_grants(&SandboxConfig {

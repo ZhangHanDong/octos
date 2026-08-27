@@ -1403,6 +1403,41 @@ async fn exec_command_runs_to_completion() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn exec_session_captures_all_output_when_process_exits_at_deadline() {
+    // #2136 review round 2, P2: a process that prints then exits right at
+    // the yield deadline must still have its FULL output captured before
+    // `running` flips to false — the exit-code task joins the pipe readers
+    // first. Runs many trials because the race is timing-sensitive.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let registry = ToolRegistry::with_builtins(temp.path());
+    for _ in 0..15 {
+        let result = registry
+            .execute(
+                "exec_command",
+                &json!({
+                    // Emit a distinctive tail, then exit immediately; the
+                    // 5ms yield races the ~instant exit.
+                    "cmd": "printf 'HEAD MIDDLE TAIL_MARKER'; exit 0",
+                    "yield_time_ms": 5
+                }),
+            )
+            .await
+            .expect("exec command");
+        let payload: Value = serde_json::from_str(&result.output).expect("session payload");
+        // If it reports finished, the full output MUST be present (no
+        // truncated-by-race capture).
+        if payload["running"] == Value::Bool(false) {
+            let out = payload["output"].as_str().unwrap_or("");
+            assert!(
+                out.contains("TAIL_MARKER"),
+                "completed session dropped output to a race: {out:?}"
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn write_stdin_talks_to_exec_session() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());

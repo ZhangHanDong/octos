@@ -484,15 +484,27 @@ impl ExecCommandTool {
         let session_id = next_exec_session_id();
         let output = Arc::new(Mutex::new(String::new()));
         let exit_code = Arc::new(Mutex::new(None));
-        if let Some(stdout) = stdout {
-            tokio::spawn(append_reader_output(stdout, output.clone(), "stdout"));
-        }
-        if let Some(stderr) = stderr {
-            tokio::spawn(append_reader_output(stderr, output.clone(), "stderr"));
-        }
+        // #2136 review round 2, P2: the exit-code task must JOIN the pipe
+        // readers before publishing completion. Otherwise a process that
+        // exits right at the yield deadline can flip `running` to false
+        // before its final stdout/stderr (including a denial line) is
+        // captured — the payload then omits the [sandbox] hint and the
+        // caller may not poll again. Draining the pipes to EOF (which
+        // happens when the child's fds close, i.e. at/after exit) before
+        // recording the code makes "not running" imply "output complete".
+        let stdout_reader = stdout
+            .map(|stdout| tokio::spawn(append_reader_output(stdout, output.clone(), "stdout")));
+        let stderr_reader = stderr
+            .map(|stderr| tokio::spawn(append_reader_output(stderr, output.clone(), "stderr")));
         let exit_code_for_wait = exit_code.clone();
         tokio::spawn(async move {
             let code = child.wait().await.ok().and_then(|status| status.code());
+            if let Some(handle) = stdout_reader {
+                let _ = handle.await;
+            }
+            if let Some(handle) = stderr_reader {
+                let _ = handle.await;
+            }
             *exit_code_for_wait.lock().await = Some(code.unwrap_or(-1));
         });
         exec_sessions().lock().await.insert(
