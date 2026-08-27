@@ -10,11 +10,13 @@
 //! across a dozen startup sites; afterwards, a single profile declaration
 //! consolidates the envelope.
 //!
-//! The built-in `coding` profile is the no-flag default and carries a lean
-//! core-coding allow list (files, shell, search, memory, spawn, user
-//! questions) so `octos chat` does not ship every tool schema to the LLM on
-//! every round. The `coding-full` built-in preserves the pre-lean
-//! unfiltered surface byte-for-byte for sessions that want everything.
+//! The built-in `coding` profile is the no-flag default and carries a tight
+//! core-coding allow list (files, one shell, search, the workspace check
+//! tool, plan tracking, user questions, and `tool_search` as the on-demand
+//! escape hatch to every other builtin) so `octos chat` does not ship every
+//! tool schema to the LLM on every round. The `coding-full` built-in
+//! preserves the pre-lean unfiltered surface byte-for-byte for sessions that
+//! want everything.
 //! Alternate profiles (e.g. `swarm`) declare their own allow lists and
 //! expanded agent sets.
 //!
