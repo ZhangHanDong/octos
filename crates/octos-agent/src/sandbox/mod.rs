@@ -200,7 +200,16 @@ pub(crate) fn toolchain_write_grants(allow_network: bool) -> ToolchainWriteGrant
             .ok()
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| Path::new(h).join(conventional)))?;
-        path.is_dir().then_some(path)
+        if !path.is_dir() {
+            return None;
+        }
+        // #2136 review: seatbelt matches the SYMLINK-RESOLVED path (macos.rs
+        // canonicalizes cwd/git for the same reason). A symlinked HOME or
+        // CARGO_HOME (e.g. /tmp -> /private/tmp) would otherwise emit a rule
+        // that never matches and the write stays denied — fail-closed and
+        // silent. Canonicalize the (existing) home dir; leaf names append
+        // cleanly onto the resolved path.
+        Some(std::fs::canonicalize(&path).unwrap_or(path))
     };
     // Cargo, default (network OFF): ONLY the advisory build lock. Reads of
     // the whole cargo home are globally allowed, so a cached/offline build
@@ -233,7 +242,6 @@ pub(crate) fn toolchain_write_grants(allow_network: bool) -> ToolchainWriteGrant
     // persistently change the user's default toolchain/overrides — removed.
     // (rustup's original "could not READ settings" symptom was an
     // octoscode read-restriction, not an octos one.)
-    let _ = resolve; // retained for the cargo branch above
     grants
 }
 

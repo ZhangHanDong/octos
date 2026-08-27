@@ -484,14 +484,18 @@ impl ExecCommandTool {
         let session_id = next_exec_session_id();
         let output = Arc::new(Mutex::new(String::new()));
         let exit_code = Arc::new(Mutex::new(None));
-        // #2136 review round 2, P2: the exit-code task must JOIN the pipe
-        // readers before publishing completion. Otherwise a process that
-        // exits right at the yield deadline can flip `running` to false
-        // before its final stdout/stderr (including a denial line) is
-        // captured — the payload then omits the [sandbox] hint and the
-        // caller may not poll again. Draining the pipes to EOF (which
-        // happens when the child's fds close, i.e. at/after exit) before
-        // recording the code makes "not running" imply "output complete".
+        // #2136 review: after the child exits, give the pipe readers a
+        // BOUNDED grace to drain before publishing the exit code, then
+        // publish regardless. A plain reader-join deadlocked when a
+        // descendant (a backgrounded `server &`, a daemon that inherits
+        // stdout) keeps a pipe write-end open — EOF never arrives and the
+        // session reported `running` forever. The grace closes the
+        // round-2 race (a fast-exiting command's final output — e.g. a
+        // denial line — is captured within the window, since its fds close
+        // at exit) without hanging on a surviving descendant; combined
+        // with sampling the exit code BEFORE the output, "not running"
+        // implies "output drained" in the common case.
+        const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
         let stdout_reader = stdout
             .map(|stdout| tokio::spawn(append_reader_output(stdout, output.clone(), "stdout")));
         let stderr_reader = stderr
@@ -499,12 +503,15 @@ impl ExecCommandTool {
         let exit_code_for_wait = exit_code.clone();
         tokio::spawn(async move {
             let code = child.wait().await.ok().and_then(|status| status.code());
-            if let Some(handle) = stdout_reader {
-                let _ = handle.await;
-            }
-            if let Some(handle) = stderr_reader {
-                let _ = handle.await;
-            }
+            let _ = tokio::time::timeout(READER_DRAIN_GRACE, async {
+                if let Some(handle) = stdout_reader {
+                    let _ = handle.await;
+                }
+                if let Some(handle) = stderr_reader {
+                    let _ = handle.await;
+                }
+            })
+            .await;
             *exit_code_for_wait.lock().await = Some(code.unwrap_or(-1));
         });
         exec_sessions().lock().await.insert(

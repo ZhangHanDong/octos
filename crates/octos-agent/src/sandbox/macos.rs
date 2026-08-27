@@ -99,6 +99,16 @@ fn canonicalize_lexical(path: &Path) -> std::path::PathBuf {
 /// `[^/]*`, `?` → `[^/]`, everything else a regex-escaped literal. v1 grant
 /// validation already rejected `**`/classes/alternations, so the two layers
 /// provably grant the same path set.
+/// SBPL-injection guard: true when `path` holds a byte that could break out
+/// of a `(literal "…")` / `(subpath "…")` string or inject a rule. One
+/// definition for every host-derived path interpolated into an SBPL
+/// profile — a future tightening (e.g. rejecting more bytes) lands in one
+/// place instead of the several ad-hoc copies scattered through this file.
+pub(crate) fn path_has_sbpl_metachars(path: &str) -> bool {
+    path.bytes()
+        .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+}
+
 pub(crate) fn glob_to_sbpl_regex(real_cwd: &str, glob: &str) -> String {
     let mut pattern = String::with_capacity(real_cwd.len() + glob.len() + 8);
     pattern.push('^');
@@ -307,20 +317,15 @@ impl Sandbox for MacosSandbox {
         // unwritable — fail closed), never emitted.
         let toolchain_write_rules = {
             let mut rules = String::new();
-            let unsafe_path = |p: &String| {
-                p.bytes().any(|b| {
-                    b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"'
-                })
-            };
             for path in &self.toolchain_write_grants.literals {
-                if unsafe_path(path) {
+                if path_has_sbpl_metachars(path) {
                     tracing::error!(path = %path, "toolchain grant contains SBPL metacharacters, skipping");
                     continue;
                 }
                 rules.push_str(&format!("(allow file-write* (literal \"{path}\"))\n"));
             }
             for path in &self.toolchain_write_grants.subpaths {
-                if unsafe_path(path) {
+                if path_has_sbpl_metachars(path) {
                     tracing::error!(path = %path, "toolchain grant contains SBPL metacharacters, skipping");
                     continue;
                 }

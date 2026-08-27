@@ -1403,6 +1403,51 @@ async fn exec_command_runs_to_completion() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn exec_session_completes_even_when_a_descendant_keeps_stdout_open() {
+    // #2136 review: joining pipe readers before publishing the exit code
+    // hung forever when a backgrounded descendant held a pipe write-end
+    // open (EOF never arrives). The bounded drain grace must let the
+    // foreground command report completion regardless. `sleep 30 &` keeps
+    // a child alive with stdout inherited; the foreground shell exits
+    // immediately, and the session must report running:false well within
+    // the sleep.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let registry = ToolRegistry::with_builtins(temp.path());
+    let start = std::time::Instant::now();
+    let result = registry
+        .execute(
+            "exec_command",
+            &json!({
+                // Yield past the reader-drain grace so the completed exit
+                // code has published; the background `sleep 30` is still
+                // alive, which is exactly the descendant-holds-stdout case.
+                "cmd": "sleep 30 & echo foreground-done",
+                "yield_time_ms": 600
+            }),
+        )
+        .await
+        .expect("exec command");
+    let payload: Value = serde_json::from_str(&result.output).expect("session payload");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "must not block on a surviving descendant; took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        payload["running"],
+        Value::Bool(false),
+        "foreground command must report completion despite the background child: {}",
+        result.output
+    );
+    assert!(
+        payload["output"].as_str().unwrap_or("").contains("foreground-done"),
+        "foreground output must be captured: {}",
+        result.output
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn exec_session_captures_all_output_when_process_exits_at_deadline() {
     // #2136 review round 2, P2: a process that prints then exits right at
     // the yield deadline must still have its FULL output captured before
