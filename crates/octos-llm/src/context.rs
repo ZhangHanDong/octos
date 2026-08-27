@@ -246,6 +246,137 @@ pub fn estimate_request_tokens_base(
         .sum()
 }
 
+/// #2143 part 2: turn-scoped cooperation so the router can RE-COMPACT a
+/// conversation for a specific route instead of SKIPPING it.
+///
+/// A router wrapper cannot re-compact on its own — it has no
+/// tool-result-placeholder / summary logic — so the prompt-construction layer
+/// can inject a richer resizer for the turn via [`with_route_resizer`]. When
+/// none is injected the router falls back to [`mechanical_route_refit`], a
+/// safe best-effort trim. An implementation MUST return a message set that
+/// preserves the provider-required tool_call/tool_result pairing, or `None` to
+/// leave the route skipped (the pre-#2143 behavior).
+#[async_trait::async_trait]
+pub trait RouteResizer: Send + Sync {
+    /// Re-fit `messages` to `window` tokens for one route, or `None` if it
+    /// cannot.
+    async fn refit(
+        &self,
+        messages: &[octos_core::Message],
+        window: u32,
+    ) -> Option<Vec<octos_core::Message>>;
+}
+
+tokio::task_local! {
+    /// #2143 part 2: the optional turn-scoped route resizer. Absent by default
+    /// (the built-in mechanical refit is used); the session layer may inject a
+    /// full-compaction resizer for the turn.
+    static ROUTE_RESIZER: std::sync::Arc<dyn RouteResizer>;
+}
+
+/// Run `fut` with `resizer` available to the router's per-route re-fit
+/// (#2143 part 2). Nest inside a turn scope alongside `with_router_context`.
+pub async fn with_route_resizer<F, T>(resizer: std::sync::Arc<dyn RouteResizer>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    ROUTE_RESIZER.scope(resizer, fut).await
+}
+
+fn current_route_resizer() -> Option<std::sync::Arc<dyn RouteResizer>> {
+    ROUTE_RESIZER.try_with(std::sync::Arc::clone).ok()
+}
+
+/// Best-effort mechanical re-fit of a conversation to a route's window
+/// (#2143 part 2). Drops the OLDEST history — always keeping the leading
+/// system message(s), never starting the kept tail on a `Tool` message (which
+/// would orphan a tool result from its assistant `tool_call`), and always
+/// keeping the final message (the current turn) — until the request fits or
+/// nothing more can be dropped. Deliberately simpler than full compaction (no
+/// summaries/placeholders); a richer resizer can be injected via
+/// [`with_route_resizer`]. Returns `None` when it cannot make the request fit,
+/// so the route is skipped exactly as before.
+async fn mechanical_route_refit(
+    provider: &std::sync::Arc<dyn crate::provider::LlmProvider>,
+    messages: &[octos_core::Message],
+    tools: &[crate::types::ToolSpec],
+) -> Option<Vec<octos_core::Message>> {
+    use octos_core::MessageRole;
+    let last = messages.len().checked_sub(1)?;
+    // Leading system messages are always kept.
+    let sys_end = messages
+        .iter()
+        .position(|m| m.role != MessageRole::System)
+        .unwrap_or(0);
+    if sys_end >= last {
+        return None; // only system + one turn; nothing to drop
+    }
+    let mut split = sys_end + 1;
+    while split < last {
+        // Never begin the kept tail on a tool result — its assistant call may
+        // have been in the dropped prefix.
+        if messages[split].role == MessageRole::Tool {
+            split += 1;
+            continue;
+        }
+        let mut candidate: Vec<octos_core::Message> = messages[..sys_end].to_vec();
+        candidate.extend_from_slice(&messages[split..]);
+        if route_fits_request(provider, &candidate, tools).await {
+            return Some(candidate);
+        }
+        split += 1;
+    }
+    None
+}
+
+/// #2143 part 2: when the request does not fit `provider`, ask the turn-scoped
+/// [`RouteResizer`] (or the built-in mechanical refit) to re-compact for the
+/// route's window, returning the refitted messages IFF they now actually fit.
+/// `None` means "skip this route" — the pre-#2143 behavior.
+pub(crate) async fn refit_for_route(
+    provider: &std::sync::Arc<dyn crate::provider::LlmProvider>,
+    messages: &[octos_core::Message],
+    tools: &[crate::types::ToolSpec],
+) -> Option<Vec<octos_core::Message>> {
+    if let Some(resizer) = current_route_resizer() {
+        let window = provider.context_window();
+        if let Some(refit) = resizer.refit(messages, window).await
+            && route_fits_request(provider, &refit, tools).await
+        {
+            return Some(refit);
+        }
+    }
+    mechanical_route_refit(provider, messages, tools).await
+}
+
+/// The dispatch decision for one route (#2143 part 2).
+pub(crate) enum RouteDecision {
+    /// The request fits as-is; dispatch the original messages.
+    Fits,
+    /// The request was re-fitted for this route; dispatch these instead.
+    Refit(Vec<octos_core::Message>),
+    /// The route cannot serve this request even after a re-fit; skip it.
+    Skip,
+}
+
+/// Decide how to dispatch `messages` to `provider` (#2143 part 2): send as-is
+/// if they fit, re-fit for this route if a resizer (or the mechanical refit)
+/// can make them fit, else skip. This replaces the pre-#2143 fit-or-skip guard
+/// at the dispatch funnel.
+pub(crate) async fn decide_route(
+    provider: &std::sync::Arc<dyn crate::provider::LlmProvider>,
+    messages: &[octos_core::Message],
+    tools: &[crate::types::ToolSpec],
+) -> RouteDecision {
+    if route_fits_request(provider, messages, tools).await {
+        return RouteDecision::Fits;
+    }
+    match refit_for_route(provider, messages, tools).await {
+        Some(refit) => RouteDecision::Refit(refit),
+        None => RouteDecision::Skip,
+    }
+}
+
 /// Route-fit guard for failover/fallback dispatch (#2135 rounds 7-8, P1):
 /// before re-sending an UNCHANGED request to an alternate route, resolve
 /// that route's readiness (a lazily-probed local provider may still be
@@ -387,6 +518,97 @@ mod tests {
         assert!(
             route_fits_request(&light, &msg, &[]).await,
             "a base-estimate provider still fits"
+        );
+    }
+
+    /// #2143 part 2: a route the FULL history overflows is re-fitted (oldest
+    /// turns dropped, system + recent kept) and SERVED, instead of skipped.
+    #[tokio::test]
+    async fn decide_route_refits_when_trimming_makes_it_fit() {
+        use octos_core::{Message, MessageRole};
+        use std::sync::Arc;
+        struct Tiny;
+        #[async_trait::async_trait]
+        impl crate::provider::LlmProvider for Tiny {
+            async fn chat(
+                &self,
+                _m: &[Message],
+                _t: &[crate::types::ToolSpec],
+                _c: &crate::config::ChatConfig,
+            ) -> eyre::Result<crate::types::ChatResponse> {
+                unreachable!()
+            }
+            fn model_id(&self) -> &str {
+                "tiny"
+            }
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+        }
+        let provider: Arc<dyn crate::provider::LlmProvider> =
+            Arc::new(crate::ContextWindowOverride::new(Arc::new(Tiny), 2_000));
+        let big = "x".repeat(4_000); // ~1000 tokens each
+        let messages = vec![
+            Message::system("system prompt"),
+            Message::user(&big),
+            Message::assistant(&big),
+            Message::user("what changed?"), // small, recent
+        ];
+        // Whole history overflows 2000 tokens; dropping the two big old turns
+        // leaves system + the recent user turn, which fits.
+        match decide_route(&provider, &messages, &[]).await {
+            RouteDecision::Refit(refit) => {
+                assert!(refit.len() < messages.len(), "refit drops old history");
+                assert_eq!(refit[0].role, MessageRole::System, "system is preserved");
+                assert_eq!(
+                    refit.last().unwrap().content,
+                    "what changed?",
+                    "the current turn is preserved"
+                );
+                assert!(
+                    route_fits_request(&provider, &refit, &[]).await,
+                    "the refit actually fits the route"
+                );
+            }
+            RouteDecision::Fits => panic!("full history should not fit a 2000-token window"),
+            RouteDecision::Skip => panic!("a trimmable history must refit, not skip"),
+        }
+    }
+
+    /// #2143 part 2: a single message that alone overflows the window cannot be
+    /// re-fit, so the route is still SKIPPED (no regression, no orphaning).
+    #[tokio::test]
+    async fn decide_route_skips_when_the_tail_alone_overflows() {
+        use octos_core::Message;
+        use std::sync::Arc;
+        struct Tiny;
+        #[async_trait::async_trait]
+        impl crate::provider::LlmProvider for Tiny {
+            async fn chat(
+                &self,
+                _m: &[Message],
+                _t: &[crate::types::ToolSpec],
+                _c: &crate::config::ChatConfig,
+            ) -> eyre::Result<crate::types::ChatResponse> {
+                unreachable!()
+            }
+            fn model_id(&self) -> &str {
+                "tiny"
+            }
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+        }
+        let provider: Arc<dyn crate::provider::LlmProvider> =
+            Arc::new(crate::ContextWindowOverride::new(Arc::new(Tiny), 2_000));
+        let huge = "x".repeat(40_000); // ~10k tokens, the current turn itself
+        let messages = vec![Message::system("s"), Message::user(&huge)];
+        assert!(
+            matches!(
+                decide_route(&provider, &messages, &[]).await,
+                RouteDecision::Skip
+            ),
+            "an unshrinkable request must skip the route, not orphan or overflow"
         );
     }
 

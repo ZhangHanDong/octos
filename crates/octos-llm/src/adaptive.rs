@@ -2274,15 +2274,26 @@ impl AdaptiveRouter {
         // slot's metrics (not the provider's fault; the circuit breaker
         // must not open over prompt size) — failover treats it like any
         // other error and moves to a lane that fits.
-        if !crate::context::route_fits_request(&self.slots[idx].provider, messages, tools).await {
-            return Err(eyre::eyre!(
-                "route {} skipped: request does not fit its context window ({} tokens)",
-                self.slots[idx].provider.provider_name(),
-                self.slots[idx].provider.context_window()
-            ));
-        }
+        // #2143 part 2: fit-or-refit-or-skip. When the request doesn't fit this
+        // route, try a per-route re-compaction before giving up on the lane.
+        let decision =
+            crate::context::decide_route(&self.slots[idx].provider, messages, tools).await;
+        let send_messages: &[Message] = match &decision {
+            crate::context::RouteDecision::Fits => messages,
+            crate::context::RouteDecision::Refit(refit) => refit,
+            crate::context::RouteDecision::Skip => {
+                return Err(eyre::eyre!(
+                    "route {} skipped: request does not fit its context window ({} tokens)",
+                    self.slots[idx].provider.provider_name(),
+                    self.slots[idx].provider.context_window()
+                ));
+            }
+        };
         let start = Instant::now();
-        let result = self.slots[idx].provider.chat(messages, tools, config).await;
+        let result = self.slots[idx]
+            .provider
+            .chat(send_messages, tools, config)
+            .await;
         let elapsed_us = start.elapsed().as_micros() as u64;
 
         match &result {
@@ -2369,17 +2380,24 @@ impl AdaptiveRouter {
         // slot's metrics (not the provider's fault; the circuit breaker
         // must not open over prompt size) — failover treats it like any
         // other error and moves to a lane that fits.
-        if !crate::context::route_fits_request(&self.slots[idx].provider, messages, tools).await {
-            return Err(eyre::eyre!(
-                "route {} skipped: request does not fit its context window ({} tokens)",
-                self.slots[idx].provider.provider_name(),
-                self.slots[idx].provider.context_window()
-            ));
-        }
+        // #2143 part 2: fit-or-refit-or-skip (see try_chat).
+        let decision =
+            crate::context::decide_route(&self.slots[idx].provider, messages, tools).await;
+        let send_messages: &[Message] = match &decision {
+            crate::context::RouteDecision::Fits => messages,
+            crate::context::RouteDecision::Refit(refit) => refit,
+            crate::context::RouteDecision::Skip => {
+                return Err(eyre::eyre!(
+                    "route {} skipped: request does not fit its context window ({} tokens)",
+                    self.slots[idx].provider.provider_name(),
+                    self.slots[idx].provider.context_window()
+                ));
+            }
+        };
         let start = Instant::now();
         let result = self.slots[idx]
             .provider
-            .chat_stream(messages, tools, config)
+            .chat_stream(send_messages, tools, config)
             .await;
         let elapsed_us = start.elapsed().as_micros() as u64;
 
