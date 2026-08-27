@@ -219,22 +219,9 @@ pub(crate) fn toolchain_write_grants(allow_network: bool) -> ToolchainWriteGrant
     // dependency resolution or overwrite a crate across workspaces
     // (#2136 review round 3, P1).
     if let Some(cargo) = resolve("CARGO_HOME", ".cargo") {
-        grants
-            .literals
-            .push(cargo.join(".package-cache").to_string_lossy().into_owned());
-        // Download-write set — ONLY when the operator has explicitly
-        // enabled network (#2136 review round 3, P1: allow_network must be
-        // a WORKING download escape hatch, and enabling it IS the trust
-        // decision that also accepts the writable-cache surface fresh
-        // fetches require). Off by default.
-        if allow_network {
-            for dir in ["registry/index", "registry/cache", "registry/src", "git"] {
-                grants
-                    .subpaths
-                    .push(cargo.join(dir).to_string_lossy().into_owned());
-            }
-        }
+        push_cargo_grants(&mut grants, &cargo, allow_network);
     }
+
     // NO rustup grants (#2136 review round 3, P1): a plain build via the
     // rustup proxy only READS ~/.rustup (default-toolchain lookup), which
     // is globally allowed; it does not write settings.toml or the toolchain
@@ -243,6 +230,24 @@ pub(crate) fn toolchain_write_grants(allow_network: bool) -> ToolchainWriteGrant
     // (rustup's original "could not READ settings" symptom was an
     // octoscode read-restriction, not an octos one.)
     grants
+}
+
+/// Pure grant-builder for a KNOWN cargo home (no filesystem probe) — the
+/// testable core of [`toolchain_write_grants`]. Default: just the advisory
+/// build lock. With `allow_network`, the download-write set
+/// (registry/{index,cache,src} + git) is added. Never the persistence
+/// vectors (bin, toolchains).
+fn push_cargo_grants(grants: &mut ToolchainWriteGrants, cargo: &Path, allow_network: bool) {
+    grants
+        .literals
+        .push(cargo.join(".package-cache").to_string_lossy().into_owned());
+    if allow_network {
+        for dir in ["registry/index", "registry/cache", "registry/src", "git"] {
+            grants
+                .subpaths
+                .push(cargo.join(dir).to_string_lossy().into_owned());
+        }
+    }
 }
 
 /// The grants a config asks for: the detected set when `allow_toolchains`
@@ -1135,50 +1140,53 @@ mod tests {
     /// `allow_toolchains: false` must yield nothing at all.
     #[test]
     fn toolchain_grants_exclude_persistence_vectors_and_honor_config() {
-        // DEFAULT (network off): only the cargo lock is writable. Nothing
-        // under ~/.rustup, no registry/index/cache/src, no git — a plain
-        // cached build reads everything it needs (#2136 review round 3).
-        let default_grants = toolchain_write_grants(false);
-        for path in default_grants
+        use std::path::Path;
+        // Hermetic: exercise the pure builder against a KNOWN cargo home so
+        // the test does not depend on the runner having ~/.cargo (Windows CI
+        // does not) and uses component-based checks, not `/`-slash strings.
+        let cargo = Path::new("/tmp/octos-test-cargo");
+
+        // DEFAULT (network off): only the cargo lock is writable.
+        let mut default_grants = ToolchainWriteGrants::default();
+        push_cargo_grants(&mut default_grants, cargo, false);
+        assert!(
+            default_grants.subpaths.is_empty(),
+            "no download-write set without network: {:?}",
+            default_grants.subpaths
+        );
+        let lock = cargo.join(".package-cache");
+        assert_eq!(
+            default_grants.literals,
+            vec![lock.to_string_lossy().into_owned()],
+            "the only default grant is the cargo lock"
+        );
+
+        // NETWORK ON: the download-write set is added, but NEVER the
+        // persistence vectors.
+        let mut net_grants = ToolchainWriteGrants::default();
+        push_cargo_grants(&mut net_grants, cargo, true);
+        let net_paths: Vec<&str> = net_grants
             .literals
             .iter()
-            .chain(default_grants.subpaths.iter())
-        {
-            assert!(
-                !path.contains("/.rustup")
-                    && !path.contains("/registry/index")
-                    && !path.contains("/registry/cache")
-                    && !path.contains("/registry/src")
-                    && !path.contains("/.cargo/git")
-                    && !path.contains("/.cargo/bin"),
-                "default grant must be lock-only, got: {path}"
-            );
-        }
+            .chain(net_grants.subpaths.iter())
+            .map(String::as_str)
+            .collect();
         assert!(
-            default_grants
-                .literals
+            net_paths
                 .iter()
-                .any(|p| p.ends_with("/.cargo/.package-cache")),
-            "the cargo lock must be writable by default"
+                .any(|p| Path::new(p).ends_with("registry/cache")),
+            "network-on must allow crate downloads: {net_paths:?}"
         );
-
-        // NETWORK ON: the download-write set is added (operator trust
-        // decision), but NEVER the persistence vectors.
-        let net_grants = toolchain_write_grants(true);
-        assert!(
-            net_grants
-                .subpaths
-                .iter()
-                .any(|p| p.ends_with("/registry/cache")),
-            "network-on must allow crate downloads"
-        );
-        for path in net_grants.literals.iter().chain(net_grants.subpaths.iter()) {
+        for p in &net_paths {
+            let path = Path::new(p);
             assert!(
-                !path.contains("/.cargo/bin") && !path.contains("/.rustup/toolchains"),
-                "persistence vector granted even under network: {path}"
+                !path.ends_with(".cargo/bin")
+                    && !path.components().any(|c| c.as_os_str() == "toolchains"),
+                "persistence vector granted even under network: {p}"
             );
         }
 
+        // allow_toolchains=false yields nothing regardless of environment.
         let off = configured_toolchain_grants(&SandboxConfig {
             allow_toolchains: false,
             ..SandboxConfig::default()
