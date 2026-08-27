@@ -1440,7 +1440,10 @@ async fn exec_session_completes_even_when_a_descendant_keeps_stdout_open() {
         result.output
     );
     assert!(
-        payload["output"].as_str().unwrap_or("").contains("foreground-done"),
+        payload["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("foreground-done"),
         "foreground output must be captured: {}",
         result.output
     );
