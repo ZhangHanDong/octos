@@ -2509,6 +2509,13 @@ mod tests {
     /// project-scoped checker is meaningless in the daemon's start dir, and
     /// carrying cwd on the payload lets ONE profile-level executor serve
     /// every session (#2129 review, findings 4 and 7).
+    ///
+    /// Unix-gated: it drives `sh -c "pwd"` and matches the output against
+    /// Rust's canonicalized path — on Windows Git Bash's `pwd` emits a
+    /// unix-style path (`/c/...`) that never equals the `C:\...` form, so
+    /// the assertion is inherently POSIX. The cwd-passing behavior is
+    /// platform-independent; only this path-format check is unix-specific.
+    #[cfg(unix)]
     #[tokio::test]
     async fn hook_child_runs_in_payload_cwd() {
         let tmp = tempfile::tempdir().unwrap();
