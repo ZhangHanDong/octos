@@ -311,6 +311,13 @@ async fn mechanical_route_refit(
     if sys_end >= last {
         return None; // only system + one turn; nothing to drop
     }
+    // Orphan-safety depends on octos's invariant that a tool_result sits in the
+    // contiguous block immediately after its assistant tool_call (see
+    // message_repair::synthesize_missing_tool_results): because the only
+    // dropped span is the contiguous middle `[sys_end, split)` and the kept
+    // tail never STARTS on a Tool message, a kept tool_result's call is always
+    // kept too. If a future change interleaves a non-tool message between a
+    // call and its result, this guard would need to widen.
     let mut split = sys_end + 1;
     while split < last {
         // Never begin the kept tail on a tool result — its assistant call may
@@ -322,6 +329,24 @@ async fn mechanical_route_refit(
         let mut candidate: Vec<octos_core::Message> = messages[..sys_end].to_vec();
         candidate.extend_from_slice(&messages[split..]);
         if route_fits_request(provider, &candidate, tools).await {
+            // #2143 review (item 4): re-fitting silently drops history — the
+            // model answers from a truncated conversation and the old "route
+            // skipped" error is suppressed. Surface it so operators can see the
+            // context loss (which route, how much dropped) instead of it being
+            // invisible.
+            let dropped = messages.len().saturating_sub(candidate.len());
+            tracing::debug!(
+                provider = provider.provider_name(),
+                window = provider.context_window(),
+                messages_dropped = dropped,
+                kept = candidate.len(),
+                "route re-fit: trimmed conversation history to fit a smaller route"
+            );
+            metrics::counter!(
+                "octos_route_refit_total",
+                "provider" => provider.provider_name().to_string()
+            )
+            .increment(1);
             return Some(candidate);
         }
         split += 1;
