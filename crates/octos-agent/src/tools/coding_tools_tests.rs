@@ -1410,7 +1410,8 @@ async fn exec_session_captures_all_output_when_process_exits_at_deadline() {
     // first. Runs many trials because the race is timing-sensitive.
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
-    for _ in 0..15 {
+    let mut completed = 0;
+    for _ in 0..40 {
         let result = registry
             .execute(
                 "exec_command",
@@ -1424,9 +1425,8 @@ async fn exec_session_captures_all_output_when_process_exits_at_deadline() {
             .await
             .expect("exec command");
         let payload: Value = serde_json::from_str(&result.output).expect("session payload");
-        // If it reports finished, the full output MUST be present (no
-        // truncated-by-race capture).
         if payload["running"] == Value::Bool(false) {
+            completed += 1;
             let out = payload["output"].as_str().unwrap_or("");
             assert!(
                 out.contains("TAIL_MARKER"),
@@ -1434,6 +1434,39 @@ async fn exec_session_captures_all_output_when_process_exits_at_deadline() {
             );
         }
     }
+    // Non-vacuous: the completed-session path MUST have been exercised
+    // (otherwise the assertion above never runs).
+    assert!(
+        completed > 0,
+        "no trial reached the completed path — test is vacuous"
+    );
+}
+
+/// #2128 acceptance: execute a command DENIED by a real sandbox and assert
+/// the tool response carries the [sandbox] explanation (macOS only — needs
+/// a live seatbelt profile).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn denied_command_response_carries_sandbox_hint() {
+    use crate::sandbox::{SandboxConfig, create_sandbox};
+    let temp = tempfile::tempdir().expect("tempdir");
+    // Real seatbelt sandbox, workspace = temp; writing OUTSIDE it is denied.
+    let sandbox = create_sandbox(&SandboxConfig::default());
+    let registry = ToolRegistry::with_builtins_and_sandbox(temp.path(), sandbox);
+    // Target a path guaranteed outside the workspace and not otherwise
+    // writable; the shell's own error carries the kernel EPERM phrase.
+    let result = registry
+        .execute(
+            "exec_command",
+            &json!({ "cmd": "echo x > /etc/octos_denied_probe" }),
+        )
+        .await
+        .expect("exec command");
+    assert!(
+        result.output.contains("[sandbox]"),
+        "denied command must surface the sandbox hint, got: {}",
+        result.output
+    );
 }
 
 #[cfg(not(windows))]

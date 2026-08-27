@@ -520,8 +520,13 @@ impl ExecCommandTool {
             input.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_MS),
         ))
         .await;
-        let captured = output.lock().await.clone();
+        // #2136 review round 3, P2: sample the exit code FIRST, then the
+        // output. The exit-code task sets the code only AFTER joining the
+        // pipe readers, so `code.is_some()` (not running) guarantees the
+        // output buffer is fully drained — reading output after the code
+        // therefore never sees a stale/empty capture with running:false.
         let code = *exit_code.lock().await;
+        let captured = output.lock().await.clone();
         Ok(ToolResult {
             output: json!({
                 "session_id": session_id,
@@ -605,8 +610,9 @@ impl Tool for WriteStdinTool {
             }
         }
         tokio::time::sleep(Duration::from_millis(input.yield_time_ms.unwrap_or(250))).await;
-        let output = session.output.lock().await.clone();
+        // #2136 review round 3, P2: code before output (see spawn_session).
         let code = *session.exit_code.lock().await;
+        let output = session.output.lock().await.clone();
         Ok(ToolResult {
             output: json!({
                 "session_id": input.session_id,

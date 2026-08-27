@@ -1645,8 +1645,8 @@ mod tests {
     fn toolchain_grants_emitted_with_workspace_write() {
         let sb = MacosSandbox {
             toolchain_write_grants: super::super::ToolchainWriteGrants {
-                literals: vec!["/Users/t/.rustup/settings.toml".into()],
-                subpaths: vec!["/Users/t/.rustup/tmp".into()],
+                literals: vec!["/Users/t/.cargo/.package-cache".into()],
+                subpaths: vec![],
             },
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1665,12 +1665,12 @@ mod tests {
             .find(|a| a.contains("deny default"))
             .expect("should have SBPL profile");
         assert!(
-            profile.contains("(allow file-write* (literal \"/Users/t/.rustup/settings.toml\"))"),
-            "rustup settings lock must be writable: {profile}"
+            profile.contains("(allow file-write* (literal \"/Users/t/.cargo/.package-cache\"))"),
+            "the cargo lock must be writable: {profile}"
         );
         assert!(
-            profile.contains("(allow file-write* (subpath \"/Users/t/.rustup/tmp\"))"),
-            "rustup scratch must be writable: {profile}"
+            !profile.contains("/registry/index"),
+            "index must NOT be writable by default: {profile}"
         );
     }
 
@@ -1732,7 +1732,7 @@ mod tests {
         let sb = MacosSandbox {
             toolchain_write_grants: super::super::ToolchainWriteGrants {
                 literals: vec!["/Users/t/.cargo/.package-cache".into()],
-                subpaths: vec!["/Users/t/.cargo/registry/index".into()],
+                subpaths: vec![],
             },
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1758,10 +1758,6 @@ mod tests {
         assert!(
             profile.contains("(allow file-write* (literal \"/Users/t/.cargo/.package-cache\"))"),
             "lock must be writable: {profile}"
-        );
-        assert!(
-            profile.contains("(allow file-write* (subpath \"/Users/t/.cargo/registry/index\"))"),
-            "index must be writable: {profile}"
         );
         assert!(
             !cmd.as_std()

@@ -172,40 +172,27 @@ pub(crate) struct ToolchainWriteGrants {
     pub(crate) subpaths: Vec<String>,
 }
 
-/// Detect installed toolchains and return the PRECISE write set each needs.
+/// The PRECISE write set a Rust build needs inside the sandbox.
 ///
-/// Rust (rustup), detected via `$RUSTUP_HOME` or the conventional
-/// `~/.rustup` home:
-/// - `<rustup>/settings.toml` — the shim write-locks it on EVERY
-///   cargo/rustc invocation; this single literal is what turns "could not
-///   read settings file: Operation not permitted" into a working build.
-/// - `<rustup>/tmp`, `<rustup>/downloads` — rustup's own scratch; staged
-///   toolchain archives are hash-verified by rustup on install, so a
-///   poisoned staging file fails verification rather than executing.
+/// Reads of `~/.cargo` and `~/.rustup` are globally allowed, so cached
+/// dependencies, the registry index, and the installed toolchain are all
+/// usable WITHOUT any write grant. The only default write is:
+/// - `<cargo>/.package-cache` — cargo's advisory build lock, opened
+///   write-intent on every invocation (an EPERM here fails the build).
 ///
-/// Cargo, detected via `$CARGO_HOME` or `~/.cargo`, is granted ONLY its
-/// non-executable coordination files so an OFFLINE build against an
-/// already-populated host cache works without opening a poisoning vector:
-/// - `<cargo>/.package-cache` — the advisory build lock cargo opens
-///   write-intent on every invocation (an EPERM here fails the build
-///   before it starts).
-/// - `<cargo>/registry/index` — the registry INDEX cache (JSON/bincode
-///   metadata cargo writes during dependency resolution). Not executable
-///   code; a tampered checksum here is caught against the read-only crate
-///   cache rather than substituting a crate.
+/// When `allow_network` is set (the operator's explicit trust decision,
+/// which is also what makes fresh fetches possible), the DOWNLOAD-write
+/// set is added: `<cargo>/registry/{index,cache,src}` and `<cargo>/git`.
+/// These hold code cargo executes, so they are writable ONLY under
+/// network-on; the default keeps them read-only to prevent cross-workspace
+/// poisoning.
 ///
-/// Deliberately NOT granted (read-only — reads are globally allowed, so
-/// cached deps remain usable): `<cargo>/registry/cache` and
-/// `<cargo>/registry/src` (the .crate archives and extracted sources cargo
-/// EXECUTES — the review's poisoning vector), `<cargo>/git` (source
-/// checkouts, likewise), `<cargo>/bin` (on PATH — a writable shim is
-/// persistence), `<rustup>/toolchains` (compiler binaries outlive the
-/// session). Fresh DOWNLOADS need writes to registry/cache+src and so
-/// need `allow_network` plus, ultimately, proxy-isolated fetch (tracked
-/// separately) — the sandbox supports BUILDING with cached dependencies,
-/// not populating the cache. Only paths whose home actually exists are
-/// returned.
-pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
+/// Nothing under `~/.rustup` is ever granted (a plain build only reads it),
+/// and `<cargo>/bin` / `<rustup>/toolchains` are never writable
+/// (persistence vectors). The sandbox supports BUILDING with cached
+/// dependencies by default; fresh downloads need `allow_network` (see
+/// also the proxy-isolated-fetch follow-up).
+pub(crate) fn toolchain_write_grants(allow_network: bool) -> ToolchainWriteGrants {
     let mut grants = ToolchainWriteGrants::default();
     let home = std::env::var("HOME").ok();
     let resolve = |env_name: &str, conventional: &str| -> Option<PathBuf> {
@@ -215,32 +202,38 @@ pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
             .or_else(|| home.as_ref().map(|h| Path::new(h).join(conventional)))?;
         path.is_dir().then_some(path)
     };
-    if let Some(rustup) = resolve("RUSTUP_HOME", ".rustup") {
-        grants
-            .literals
-            .push(rustup.join("settings.toml").to_string_lossy().into_owned());
-        for dir in ["tmp", "downloads"] {
-            grants
-                .subpaths
-                .push(rustup.join(dir).to_string_lossy().into_owned());
-        }
-    }
+    // Cargo, default (network OFF): ONLY the advisory build lock. Reads of
+    // the whole cargo home are globally allowed, so a cached/offline build
+    // reads its deps and index without any write — the reviewer confirmed
+    // a live cached build with the index entirely READ-ONLY. registry
+    // index/cache/src and git stay read-only so nothing can corrupt
+    // dependency resolution or overwrite a crate across workspaces
+    // (#2136 review round 3, P1).
     if let Some(cargo) = resolve("CARGO_HOME", ".cargo") {
-        // Lock file (literal): opened write-intent on every cargo run.
         grants
             .literals
             .push(cargo.join(".package-cache").to_string_lossy().into_owned());
-        // Registry INDEX only (metadata, non-executable). NOT registry/cache
-        // or registry/src (executable payloads — read-only, so a cached
-        // build reads them but nothing can overwrite a crate), and NOT git.
-        grants.subpaths.push(
-            cargo
-                .join("registry")
-                .join("index")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        // Download-write set — ONLY when the operator has explicitly
+        // enabled network (#2136 review round 3, P1: allow_network must be
+        // a WORKING download escape hatch, and enabling it IS the trust
+        // decision that also accepts the writable-cache surface fresh
+        // fetches require). Off by default.
+        if allow_network {
+            for dir in ["registry/index", "registry/cache", "registry/src", "git"] {
+                grants
+                    .subpaths
+                    .push(cargo.join(dir).to_string_lossy().into_owned());
+            }
+        }
     }
+    // NO rustup grants (#2136 review round 3, P1): a plain build via the
+    // rustup proxy only READS ~/.rustup (default-toolchain lookup), which
+    // is globally allowed; it does not write settings.toml or the toolchain
+    // dirs. Granting settings.toml write let a sandboxed command
+    // persistently change the user's default toolchain/overrides — removed.
+    // (rustup's original "could not READ settings" symptom was an
+    // octoscode read-restriction, not an octos one.)
+    let _ = resolve; // retained for the cargo branch above
     grants
 }
 
@@ -248,7 +241,7 @@ pub(crate) fn toolchain_write_grants() -> ToolchainWriteGrants {
 /// is on, nothing otherwise.
 fn configured_toolchain_grants(config: &SandboxConfig) -> ToolchainWriteGrants {
     if config.allow_toolchains {
-        toolchain_write_grants()
+        toolchain_write_grants(config.allow_network)
     } else {
         ToolchainWriteGrants::default()
     }
@@ -300,9 +293,10 @@ pub(crate) fn sandbox_denial_hint(
     if cfg!(target_os = "macos") {
         Some(
             "\n[sandbox] This denial usually means the OS sandbox blocked a file access \
-             outside the workspace — not a bug in the command. Toolchain caches \
-             (~/.rustup settings, ~/.cargo registry) are writable when \
-             `sandbox.allow_toolchains` is enabled (the default); other paths need an \
+             outside the workspace — not a bug in the command. With \
+             `sandbox.allow_toolchains` on (the default), builds with CACHED \
+             dependencies work; fetching NEW crates is denied unless \
+             `sandbox.allow_network` is also enabled. Other paths need an \
              explicit allowance in the sandbox config.",
         )
     } else {
@@ -1133,21 +1127,50 @@ mod tests {
     /// `allow_toolchains: false` must yield nothing at all.
     #[test]
     fn toolchain_grants_exclude_persistence_vectors_and_honor_config() {
-        let grants = toolchain_write_grants();
-        for path in grants.literals.iter().chain(grants.subpaths.iter()) {
-            // #2136 review: the EXECUTABLE cargo payloads stay read-only —
-            // registry/cache (.crate archives), registry/src (extracted
-            // sources), git (checkouts) — plus the persistence vectors.
-            // Only the non-executable lock + index are writable.
+        // DEFAULT (network off): only the cargo lock is writable. Nothing
+        // under ~/.rustup, no registry/index/cache/src, no git — a plain
+        // cached build reads everything it needs (#2136 review round 3).
+        let default_grants = toolchain_write_grants(false);
+        for path in default_grants
+            .literals
+            .iter()
+            .chain(default_grants.subpaths.iter())
+        {
             assert!(
-                !path.contains("/registry/cache")
+                !path.contains("/.rustup")
+                    && !path.contains("/registry/index")
+                    && !path.contains("/registry/cache")
                     && !path.contains("/registry/src")
                     && !path.contains("/.cargo/git")
-                    && !path.contains("/.cargo/bin")
-                    && !path.contains("/.rustup/toolchains"),
-                "executable/persistence path granted writable: {path}"
+                    && !path.contains("/.cargo/bin"),
+                "default grant must be lock-only, got: {path}"
             );
         }
+        assert!(
+            default_grants
+                .literals
+                .iter()
+                .any(|p| p.ends_with("/.cargo/.package-cache")),
+            "the cargo lock must be writable by default"
+        );
+
+        // NETWORK ON: the download-write set is added (operator trust
+        // decision), but NEVER the persistence vectors.
+        let net_grants = toolchain_write_grants(true);
+        assert!(
+            net_grants
+                .subpaths
+                .iter()
+                .any(|p| p.ends_with("/registry/cache")),
+            "network-on must allow crate downloads"
+        );
+        for path in net_grants.literals.iter().chain(net_grants.subpaths.iter()) {
+            assert!(
+                !path.contains("/.cargo/bin") && !path.contains("/.rustup/toolchains"),
+                "persistence vector granted even under network: {path}"
+            );
+        }
+
         let off = configured_toolchain_grants(&SandboxConfig {
             allow_toolchains: false,
             ..SandboxConfig::default()
