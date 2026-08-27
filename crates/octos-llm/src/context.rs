@@ -228,6 +228,24 @@ pub(crate) fn estimate_tool_tokens(tool: &crate::types::ToolSpec) -> u32 {
         + 8 // serialization scaffolding per tool
 }
 
+/// Provider-agnostic base request-size estimate (#2143 part 3): messages plus
+/// serialized tool declarations. This is what the route-fit guard summed
+/// inline before #2143; it is now the DEFAULT body of
+/// [`crate::provider::LlmProvider::estimate_request_tokens`], which concrete
+/// providers override to add their own request-envelope overhead (a separate
+/// system block, per-message content-block framing, cache-control metadata)
+/// that this base does not model.
+pub fn estimate_request_tokens_base(
+    messages: &[octos_core::Message],
+    tools: &[crate::types::ToolSpec],
+) -> u32 {
+    messages
+        .iter()
+        .map(estimate_message_tokens)
+        .chain(tools.iter().map(estimate_tool_tokens))
+        .sum()
+}
+
 /// Route-fit guard for failover/fallback dispatch (#2135 rounds 7-8, P1):
 /// before re-sending an UNCHANGED request to an alternate route, resolve
 /// that route's readiness (a lazily-probed local provider may still be
@@ -246,11 +264,11 @@ pub(crate) async fn route_fits_request(
 ) -> bool {
     provider.ensure_ready().await;
     let window = provider.context_window();
-    let estimated: u32 = messages
-        .iter()
-        .map(estimate_message_tokens)
-        .chain(tools.iter().map(estimate_tool_tokens))
-        .sum();
+    // #2143 part 3: ask the provider itself, so its request-envelope overhead
+    // (system-block framing, per-message metadata) is counted instead of only
+    // approximated by the margin below. The default impl is the base estimate,
+    // so unspecialized providers behave exactly as before.
+    let estimated = provider.estimate_request_tokens(messages, tools);
     let margin = (window / 8).clamp(64, 1024);
     estimated <= window.saturating_sub(margin)
 }
@@ -297,6 +315,78 @@ mod tests {
         assert!(
             !route_fits_request(&provider, &msg, &[fat_tool]).await,
             "tool schema must count against the window"
+        );
+    }
+
+    /// #2143 part 3: the route-fit guard asks the PROVIDER for the request size,
+    /// so a provider's request-envelope overhead is counted — and the override
+    /// must survive the RetryProvider + ContextWindowOverride wrappers the
+    /// router dispatches through (delegation).
+    #[tokio::test]
+    async fn route_fit_uses_provider_request_estimate_through_wrappers() {
+        use std::sync::Arc;
+        struct Heavy;
+        #[async_trait::async_trait]
+        impl crate::provider::LlmProvider for Heavy {
+            async fn chat(
+                &self,
+                _m: &[octos_core::Message],
+                _t: &[crate::types::ToolSpec],
+                _c: &crate::config::ChatConfig,
+            ) -> eyre::Result<crate::types::ChatResponse> {
+                unreachable!()
+            }
+            fn model_id(&self) -> &str {
+                "heavy"
+            }
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+            fn estimate_request_tokens(
+                &self,
+                messages: &[octos_core::Message],
+                tools: &[crate::types::ToolSpec],
+            ) -> u32 {
+                // A big request envelope the flat estimator would miss.
+                estimate_request_tokens_base(messages, tools) + 3_000
+            }
+        }
+        struct Light;
+        #[async_trait::async_trait]
+        impl crate::provider::LlmProvider for Light {
+            async fn chat(
+                &self,
+                _m: &[octos_core::Message],
+                _t: &[crate::types::ToolSpec],
+                _c: &crate::config::ChatConfig,
+            ) -> eyre::Result<crate::types::ChatResponse> {
+                unreachable!()
+            }
+            fn model_id(&self) -> &str {
+                "light"
+            }
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+        }
+        let msg = [octos_core::Message::user("hi")];
+        // Window 2000: the tiny message alone would fit, but Heavy's +3000
+        // envelope pushes the request over — proving the estimate reaches the
+        // guard through RetryProvider(ContextWindowOverride(..)).
+        let heavy: Arc<dyn crate::provider::LlmProvider> = Arc::new(crate::RetryProvider::new(
+            Arc::new(crate::ContextWindowOverride::new(Arc::new(Heavy), 2_000)),
+        ));
+        assert!(
+            !route_fits_request(&heavy, &msg, &[]).await,
+            "the provider's request-envelope estimate must count through the wrappers"
+        );
+        // Control: the default (base-only) provider fits the same window.
+        let light: Arc<dyn crate::provider::LlmProvider> = Arc::new(crate::RetryProvider::new(
+            Arc::new(crate::ContextWindowOverride::new(Arc::new(Light), 2_000)),
+        ));
+        assert!(
+            route_fits_request(&light, &msg, &[]).await,
+            "a base-estimate provider still fits"
         );
     }
 
