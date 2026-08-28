@@ -949,9 +949,17 @@ async fn process_chat_turn(
     history: &[Message],
     approval_requester: Arc<dyn ToolApprovalRequester>,
 ) -> Result<ConversationResponse> {
-    with_chat_approval(
-        approval_requester,
-        agent.process_message(input, history, vec![]),
+    // #2143: scope the whole turn so an AdaptiveRouter pins ONE route for it —
+    // readiness, history sizing, and the send all resolve to the same slot,
+    // instead of sizing for the conservative min-across-slots envelope. The
+    // serve/API paths already wrap their turns this way; the local `octos chat`
+    // coding harness (the local-model path these fixes target) did not.
+    octos_llm::with_router_context(
+        octos_llm::RouterContext::default(),
+        with_chat_approval(
+            approval_requester,
+            agent.process_message(input, history, vec![]),
+        ),
     )
     .await
 }
