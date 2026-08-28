@@ -4,9 +4,10 @@
 //! Before-hooks can deny operations (exit code 1). Circuit breaker auto-disables
 //! hooks after consecutive failures.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use metrics::counter;
 use serde::{Deserialize, Serialize};
@@ -700,6 +701,31 @@ pub enum HookResult {
     Feedback(Vec<String>),
 }
 
+/// Per-session hook state: consecutive-failure counts and last-run instants,
+/// each indexed parallel to `HookExecutor::hooks`.
+///
+/// #2153: this used to be a single `Vec<AtomicU32>` owned by the executor, so
+/// an `Arc<HookExecutor>` shared across every session/workspace under a profile
+/// shared ONE breaker — a genuine infra failure in one workspace counted
+/// toward disabling the hook for ALL sessions. Scoping the state by session
+/// key isolates both the breaker and the debounce window per session.
+#[derive(Debug)]
+struct SessionHookState {
+    /// Consecutive failure count per hook index (the circuit-breaker counter).
+    failures: Vec<u32>,
+    /// When each hook index last actually ran, for the after-event debounce.
+    last_run: Vec<Option<Instant>>,
+}
+
+impl SessionHookState {
+    fn new(hook_count: usize) -> Self {
+        Self {
+            failures: vec![0; hook_count],
+            last_run: vec![None; hook_count],
+        }
+    }
+}
+
 /// Executes hooks with circuit breaker protection.
 pub struct HookExecutor {
     hooks: Vec<HookConfig>,
@@ -709,9 +735,19 @@ pub struct HookExecutor {
     /// time so the matcher loop stays infallible. Hooks with no
     /// `path_filter` keep an empty inner Vec.
     path_filters: Vec<Vec<glob::Pattern>>,
-    /// Per-hook consecutive failure count.
-    failures: Vec<AtomicU32>,
+    /// Per-session breaker + debounce state, keyed by session scope
+    /// (session_id, else workspace cwd, else a shared global bucket). The
+    /// executor is `Arc`-shared across sessions, so this interior-mutable map
+    /// is what keeps one session's failures/throttle from leaking onto
+    /// another (#2153). Entries are created lazily on first use.
+    session_state: Mutex<HashMap<String, SessionHookState>>,
     failure_threshold: u32,
+    /// After-event (advisory) hooks that already ran within this window for
+    /// the same session are SKIPPED, so a burst of edits (e.g. several
+    /// `edit_file` calls in one assistant turn) does not pay one full
+    /// project `cargo check` each. `Duration::ZERO` disables it (the default);
+    /// before-event deny hooks are never debounced. (#2153 finding 2.)
+    after_event_debounce: Duration,
     /// Optional domain-data enricher applied to payloads before serialization.
     enricher: Option<Arc<dyn HookPayloadEnricher>>,
 }
@@ -722,7 +758,6 @@ impl HookExecutor {
     }
 
     pub fn with_threshold(hooks: Vec<HookConfig>, failure_threshold: u32) -> Self {
-        let failures = (0..hooks.len()).map(|_| AtomicU32::new(0)).collect();
         let path_filters = hooks
             .iter()
             .map(|hook| compile_path_filters(&hook.command, &hook.path_filter))
@@ -730,10 +765,132 @@ impl HookExecutor {
         Self {
             hooks,
             path_filters,
-            failures,
+            session_state: Mutex::new(HashMap::new()),
             failure_threshold,
+            after_event_debounce: Duration::ZERO,
             enricher: None,
         }
+    }
+
+    /// Enable after-event hook debouncing (#2153 finding 2): an advisory
+    /// after-event hook that ran within `window` for the same session is
+    /// skipped, coalescing a burst of edits into far fewer full project
+    /// checks. `Duration::ZERO` (the default) leaves every hook running every
+    /// time. Builder-style so the coding-defaults assembly can opt in while
+    /// plain executors stay unthrottled.
+    pub fn with_after_event_debounce(mut self, window: Duration) -> Self {
+        self.after_event_debounce = window;
+        self
+    }
+
+    /// The session-scope key for breaker + debounce state. Prefer the
+    /// session id, fall back to the workspace cwd, and finally a shared
+    /// empty-string bucket for context-free runs (e.g. unit tests). Keying
+    /// on either session or workspace fixes the cross-contamination in
+    /// #2153 — a flaky hook in one scope never disables it in another.
+    fn session_key(payload: &HookPayload) -> String {
+        payload
+            .session_id
+            .clone()
+            .or_else(|| payload.cwd.clone())
+            .unwrap_or_default()
+    }
+
+    /// Read a hook's consecutive-failure count for a session scope.
+    fn breaker_load(&self, key: &str, i: usize) -> u32 {
+        let map = self.session_state.lock().unwrap();
+        map.get(key).map(|s| s.failures[i]).unwrap_or(0)
+    }
+
+    /// Reset a hook's failure count to zero for a session scope.
+    fn breaker_reset(&self, key: &str, i: usize) {
+        let mut map = self.session_state.lock().unwrap();
+        if let Some(state) = map.get(key) {
+            // Avoid allocating an entry just to store a zero into a
+            // never-failed hook.
+            if state.failures[i] == 0 {
+                return;
+            }
+        } else {
+            return;
+        }
+        map.get_mut(key).unwrap().failures[i] = 0;
+    }
+
+    /// Increment a hook's failure count for a session scope, returning the
+    /// new value. Creates the session entry on first failure.
+    fn breaker_incr(&self, key: &str, i: usize) -> u32 {
+        let mut map = self.session_state.lock().unwrap();
+        let state = map
+            .entry(key.to_string())
+            .or_insert_with(|| SessionHookState::new(self.hooks.len()));
+        state.failures[i] = state.failures[i].saturating_add(1);
+        state.failures[i]
+    }
+
+    /// Claim the one-shot "hook disabled" warning for a session scope: returns
+    /// true exactly once, when the count first reaches the threshold, by
+    /// bumping it past the threshold so later calls stay silent.
+    fn breaker_claim_warning(&self, key: &str, i: usize) -> bool {
+        let mut map = self.session_state.lock().unwrap();
+        let Some(state) = map.get_mut(key) else {
+            return false;
+        };
+        if state.failures[i] == self.failure_threshold {
+            state.failures[i] = self.failure_threshold + 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Debounce gate for an after-event hook: true if it last COMPLETED within
+    /// the window for this session (→ skip). The window is measured from the
+    /// previous run's completion, not its start, because the check itself
+    /// (a whole-project `cargo check`) can take far longer than the window —
+    /// stamping at start would never coalesce a burst of edits. With
+    /// sequential inline tool execution this collapses several `edit_file`
+    /// calls in one assistant turn to a single check, while a later edit (a
+    /// new thinking step, arriving after the window) still gets a fresh check.
+    /// `Duration::ZERO` never throttles.
+    fn debounce_should_skip(&self, key: &str, i: usize) -> bool {
+        if self.after_event_debounce.is_zero() {
+            return false;
+        }
+        let map = self.session_state.lock().unwrap();
+        map.get(key)
+            .and_then(|s| s.last_run[i])
+            .is_some_and(|last| last.elapsed() < self.after_event_debounce)
+    }
+
+    /// Stamp an after-event hook's completion time for the debounce window.
+    /// Called after the hook runs (any outcome) so the NEXT edit within the
+    /// window is coalesced away.
+    fn debounce_mark_ran(&self, key: &str, i: usize) {
+        if self.after_event_debounce.is_zero() {
+            return;
+        }
+        let mut map = self.session_state.lock().unwrap();
+        let state = map
+            .entry(key.to_string())
+            .or_insert_with(|| SessionHookState::new(self.hooks.len()));
+        state.last_run[i] = Some(Instant::now());
+    }
+
+    /// Test-only: preset a hook's failure count for a session scope (the
+    /// per-session replacement for poking the old `failures[i]` atomic).
+    #[cfg(test)]
+    fn set_failures_for_test(&self, key: &str, i: usize, n: u32) {
+        let mut map = self.session_state.lock().unwrap();
+        map.entry(key.to_string())
+            .or_insert_with(|| SessionHookState::new(self.hooks.len()))
+            .failures[i] = n;
+    }
+
+    /// Test-only: read a hook's failure count for a session scope.
+    #[cfg(test)]
+    fn failures_for_test(&self, key: &str, i: usize) -> u32 {
+        self.breaker_load(key, i)
     }
 
     /// Attach a synchronous domain-data enricher. Additive: callers that do
@@ -792,6 +949,11 @@ impl HookExecutor {
         let mut injected_contexts: Vec<String> = Vec::new();
         let mut feedback: Vec<String> = Vec::new();
 
+        // #2153: breaker + debounce state is scoped to this session key so a
+        // flaky hook (or a rapid edit burst) in one session never disables or
+        // throttles the hook for another session sharing this Arc executor.
+        let session_key = Self::session_key(payload_ref);
+
         for (i, hook) in self.hooks.iter().enumerate() {
             if hook.event != event {
                 continue;
@@ -843,25 +1005,26 @@ impl HookExecutor {
                 continue;
             }
 
-            // Circuit breaker: skip if too many failures
-            let fail_count = self.failures[i].load(Ordering::Relaxed);
+            // Circuit breaker: skip if too many failures for THIS session.
+            let fail_count = self.breaker_load(&session_key, i);
             if fail_count >= self.failure_threshold {
-                // Atomically claim the warning (threshold -> threshold+1) so it fires once
-                if self.failures[i]
-                    .compare_exchange(
-                        self.failure_threshold,
-                        self.failure_threshold + 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
+                // Claim the warning (threshold -> threshold+1) so it fires once
+                if self.breaker_claim_warning(&session_key, i) {
                     warn!(
                         hook_command = ?hook.command,
                         "hook disabled after {} consecutive failures",
                         self.failure_threshold
                     );
                 }
+                continue;
+            }
+
+            // #2153: debounce after-event (advisory) hooks — a burst of edits
+            // in one turn should not pay one full project check each. A
+            // before-event hook can DENY, so it is never throttled.
+            if matches!(event, HookEvent::AfterToolCall)
+                && self.debounce_should_skip(&session_key, i)
+            {
                 continue;
             }
 
@@ -874,9 +1037,15 @@ impl HookExecutor {
             if hook_cwd.is_none() && hook.requires_bin.is_some() {
                 continue;
             }
-            match self.execute_hook(hook, &payload_json, hook_cwd).await {
+            let hook_result = self.execute_hook(hook, &payload_json, hook_cwd).await;
+            // #2153: stamp the debounce window at COMPLETION (any outcome) so a
+            // subsequent edit within the window is coalesced. After-events only.
+            if matches!(event, HookEvent::AfterToolCall) {
+                self.debounce_mark_ran(&session_key, i);
+            }
+            match hook_result {
                 Ok((0, stdout, _stderr)) => {
-                    self.failures[i].store(0, Ordering::Relaxed);
+                    self.breaker_reset(&session_key, i);
                     // Context injection (user_prompt_submit): a hook that exits
                     // 0 and prints to stdout contributes that text as extra
                     // per-turn context. Other events ignore exit-0 stdout.
@@ -891,7 +1060,7 @@ impl HookExecutor {
                         HookEvent::BeforeToolCall | HookEvent::BeforeSpawnVerify
                     ) =>
                 {
-                    self.failures[i].store(0, Ordering::Relaxed);
+                    self.breaker_reset(&session_key, i);
                     match serde_json::from_str::<serde_json::Value>(&stdout) {
                         Ok(modified_args) => {
                             tracing::info!(
@@ -923,10 +1092,10 @@ impl HookExecutor {
                     if is_before {
                         // Before-events: exit 1 DENIES; anything else is infra.
                         if code == 1 {
-                            self.failures[i].store(0, Ordering::Relaxed);
+                            self.breaker_reset(&session_key, i);
                             return HookResult::Deny(stdout);
                         }
-                        let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                        let new_count = self.breaker_incr(&session_key, i);
                         let msg = format!(
                             "hook {:?} exited with code {} on before-event ({}/{})",
                             hook.command, code, new_count, self.failure_threshold
@@ -955,7 +1124,7 @@ impl HookExecutor {
                             "\n... (hook output truncated)",
                         );
                         if output.trim().is_empty() {
-                            let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                            let new_count = self.breaker_incr(&session_key, i);
                             let msg = format!(
                                 "hook {:?} exited with code {} and no output ({}/{})",
                                 hook.command, code, new_count, self.failure_threshold
@@ -963,13 +1132,13 @@ impl HookExecutor {
                             warn!("{}", msg);
                             last_error = Some(msg);
                         } else {
-                            self.failures[i].store(0, Ordering::Relaxed);
+                            self.breaker_reset(&session_key, i);
                             feedback.push(format!("{:?}:\n{}", hook.command, output));
                         }
                     }
                 }
                 Err(e) => {
-                    let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                    let new_count = self.breaker_incr(&session_key, i);
                     let msg = format!(
                         "hook {:?} failed: {} ({}/{})",
                         hook.command, e, new_count, self.failure_threshold
@@ -1466,7 +1635,7 @@ mod tests {
             requires_bin: None,
         }]);
         // Set failures at threshold so circuit breaker trips
-        executor.failures[0].store(3, Ordering::Relaxed);
+        executor.set_failures_for_test("", 0, 3);
 
         let payload = HookPayload {
             schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
@@ -1667,7 +1836,7 @@ mod tests {
         assert!(matches!(r1, HookResult::Error(_)));
         let r2 = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert!(matches!(r2, HookResult::Error(_)));
-        assert_eq!(executor.failures[0].load(Ordering::Relaxed), 2);
+        assert_eq!(executor.failures_for_test("", 0), 2);
     }
 
     #[tokio::test]
@@ -1699,6 +1868,140 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn circuit_breaker_is_scoped_per_session_not_shared() {
+        // #2153 finding 1: one Arc-shared executor must NOT let a hook's
+        // failures in one session/workspace disable it for another. Two
+        // payloads with distinct cwds are two distinct session scopes.
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                // exit 2 with no output = infra failure that counts.
+                command: vec!["sh".into(), "-c".into(), "exit 2".into()],
+                timeout_ms: 5000,
+                tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
+            }],
+            3,
+        );
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let key_a = dir_a.path().to_string_lossy().to_string();
+        let key_b = dir_b.path().to_string_lossy().to_string();
+        let payload_a = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_a.path()),
+            None,
+        );
+        let payload_b = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_b.path()),
+            None,
+        );
+
+        // Trip the breaker for session A only.
+        for _ in 0..3 {
+            executor.run(HookEvent::AfterToolCall, &payload_a).await;
+        }
+        // A is disabled — the 4th run is SKIPPED (Allow, not the Error the
+        // hook would otherwise produce).
+        assert_eq!(
+            executor.run(HookEvent::AfterToolCall, &payload_a).await,
+            HookResult::Allow,
+            "session A's breaker must trip after its own failures"
+        );
+        // B shares the SAME Arc executor but its breaker is untouched: the
+        // hook still RUNS (returns Error from exit 2) and B's counter is
+        // independent — the pre-#2153 shared Vec would have skipped it here.
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload_b).await,
+                HookResult::Error(_)
+            ),
+            "session B must be unaffected by session A's tripped breaker"
+        );
+        assert!(executor.failures_for_test(&key_a, 0) >= 3);
+        assert_eq!(executor.failures_for_test(&key_b, 0), 1);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_event_debounce_coalesces_a_burst_per_session() {
+        // #2153 finding 2: with a debounce window, a second after-event hook
+        // within the window for the SAME session is skipped (so N rapid edits
+        // pay one project check, not N) — but a different session is not.
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                // nonzero WITH output => Feedback (does not count toward breaker).
+                command: vec!["sh".into(), "-c".into(), "echo problem; exit 1".into()],
+                timeout_ms: 5000,
+                tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
+            }],
+            3,
+        )
+        .with_after_event_debounce(std::time::Duration::from_secs(60));
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let payload_a = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_a.path()),
+            None,
+        );
+        let payload_b = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_b.path()),
+            None,
+        );
+
+        // First edit in session A: the hook runs and returns Feedback.
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload_a).await,
+                HookResult::Feedback(_)
+            ),
+            "the first edit runs the check"
+        );
+        // Second edit in A within the 60s window: coalesced away (Allow).
+        assert_eq!(
+            executor.run(HookEvent::AfterToolCall, &payload_a).await,
+            HookResult::Allow,
+            "a second edit within the debounce window is coalesced"
+        );
+        // A different session is NOT throttled — its first edit still runs.
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload_b).await,
+                HookResult::Feedback(_)
+            ),
+            "the debounce window is per-session, not global"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn test_circuit_breaker_resets_on_success() {
         let executor = HookExecutor::with_threshold(
             vec![HookConfig {
@@ -1713,14 +2016,14 @@ mod tests {
         );
 
         // Simulate 2 prior failures
-        executor.failures[0].store(2, Ordering::Relaxed);
+        executor.set_failures_for_test("", 0, 2);
 
         // Success resets counter
         let payload =
             HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None);
         let r = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert_eq!(r, HookResult::Allow);
-        assert_eq!(executor.failures[0].load(Ordering::Relaxed), 0);
+        assert_eq!(executor.failures_for_test("", 0), 0);
     }
 
     #[test]

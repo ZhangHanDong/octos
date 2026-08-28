@@ -723,7 +723,16 @@ impl ProfileRuntime {
         let mut all_hooks = octos_agent::workspace_policy::coding_default_hooks();
         all_hooks.extend(reload.host_hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
-        let hook_executor = Some(Arc::new(HookExecutor::new(all_hooks)));
+        // #2153 finding 2: coalesce a burst of edits so a whole-project
+        // `cargo check` (up to its 60s timeout) does not run once per edit.
+        // The window is measured from the previous check's completion, so
+        // several `edit_file` calls in one assistant turn collapse to a single
+        // check while a later edit (a new thinking step) still gets a fresh
+        // one. Breaker + debounce state are per session (see HookExecutor).
+        let hook_executor = Some(Arc::new(
+            HookExecutor::new(all_hooks)
+                .with_after_event_debounce(std::time::Duration::from_millis(2000)),
+        ));
         let skills_dir_candidate = self.data_dir.join("skills");
 
         Ok(Arc::new(Self {
@@ -1429,7 +1438,16 @@ impl ProfileRuntime {
         let mut all_hooks = octos_agent::workspace_policy::coding_default_hooks();
         all_hooks.extend(config.hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
-        let hook_executor = Some(Arc::new(HookExecutor::new(all_hooks)));
+        // #2153 finding 2: coalesce a burst of edits so a whole-project
+        // `cargo check` (up to its 60s timeout) does not run once per edit.
+        // The window is measured from the previous check's completion, so
+        // several `edit_file` calls in one assistant turn collapse to a single
+        // check while a later edit (a new thinking step) still gets a fresh
+        // one. Breaker + debounce state are per session (see HookExecutor).
+        let hook_executor = Some(Arc::new(
+            HookExecutor::new(all_hooks)
+                .with_after_event_debounce(std::time::Duration::from_millis(2000)),
+        ));
 
         info!(
             profile_id = %profile.id,
