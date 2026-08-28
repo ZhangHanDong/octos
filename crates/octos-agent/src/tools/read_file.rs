@@ -268,6 +268,29 @@ impl Tool for ReadFileTool {
             }
         }
 
+        // #2131 part 4: budget-aware reads. An UNBOUNDED read of a file larger
+        // than the tool-output budget would be truncated on the way in and then
+        // evicted by compaction — forcing the exact re-read loop #2131 targets.
+        // Return a range hint instead of accept-then-evict, so the model asks
+        // for the slice it needs. A read that already names a range is honored.
+        if start_line.is_none() && end_line.is_none() {
+            let budget = octos_core::tool_output_limit("read_file");
+            if file_size > budget {
+                return Ok(ToolResult {
+                    output: format!(
+                        "{} is {} bytes — larger than the ~{}-byte tool-output budget, so an \
+                         unbounded read would be truncated and then evicted from context \
+                         (forcing a re-read). Read a bounded range instead: pass start_line and \
+                         end_line (e.g. start_line: 1, end_line: 200), or grep for the part you \
+                         need first.",
+                        input.path, file_size, budget
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
         let content = match super::read_no_follow(&path).await {
             Ok(c) => c,
@@ -1197,5 +1220,49 @@ mod tests {
             .expect("still recoverable: the tool takes offset/limit");
         assert!(advice.contains("offset"), "{advice}");
         assert!(advice.contains("limit"), "{advice}");
+    }
+
+    /// #2131 part 4: an UNBOUNDED read of a file bigger than the tool-output
+    /// budget returns a range hint (not the body that would be truncated then
+    /// evicted); a read that already names a range is honored.
+    #[tokio::test]
+    async fn oversized_unbounded_read_returns_a_range_hint_not_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = octos_core::tool_output_limit("read_file");
+        // Comfortably over the budget, but well under the 10MB hard cap.
+        let line = "abcdefghij\n";
+        let big = line.repeat(budget / line.len() + 2_000);
+        std::fs::write(dir.path().join("big.rs"), &big).unwrap();
+        let tool = ReadFileTool::new(dir.path());
+
+        // Unbounded → hint, not the body.
+        let r = tool
+            .execute(&serde_json::json!({"path": "big.rs"}))
+            .await
+            .unwrap();
+        assert!(
+            !r.success,
+            "an oversized unbounded read must not dump the body"
+        );
+        assert!(
+            r.output.contains("bounded range"),
+            "the hint must tell the model to read a range: {}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("abcdefghij"),
+            "the body must NOT be returned"
+        );
+
+        // A bounded read of the same file is honored (reads the slice).
+        let r2 = tool
+            .execute(&serde_json::json!({"path": "big.rs", "start_line": 1, "end_line": 3}))
+            .await
+            .unwrap();
+        assert!(r2.success, "a bounded read is honored");
+        assert!(
+            r2.output.contains("abcdefghij"),
+            "the bounded slice returns content"
+        );
     }
 }
