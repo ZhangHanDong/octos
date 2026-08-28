@@ -1142,6 +1142,16 @@ impl ChatCommand {
         }
         let model_id = base_provider.model_id().to_string();
 
+        // #2142: operator override of the primary's effective context window
+        // (config.llm.primary.context_window). Wraps the probed provider so it
+        // beats both the catalog and the runtime probe through the delegating
+        // stack.
+        let base_provider = crate::qos_catalog::apply_context_window_override(
+            base_provider,
+            config.context_window,
+            "primary",
+        );
+
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
             base_provider
         } else if config.fallback_models.is_empty() {
@@ -1164,7 +1174,15 @@ impl ChatCommand {
                     fb.base_url.clone(),
                     fb.api_type.as_deref(),
                 ) {
-                    Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
+                    Ok(p) => {
+                        // #2142: per-fallback context-window override.
+                        let p = crate::qos_catalog::apply_context_window_override(
+                            p,
+                            fb.context_window,
+                            "fallback",
+                        );
+                        providers.push(Arc::new(RetryProvider::new(p)));
+                    }
                     Err(e) => {
                         tracing::warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
                     }
