@@ -266,6 +266,15 @@ pub struct ProfileConfig {
     /// Lifecycle hooks for agent events (per-profile).
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
+    /// #2168: per-profile tool-visibility policy (allow / deny / require_tags,
+    /// with `group:*` support). Projected into `Config.tool_policy` so a serve
+    /// / UserProfile session can slim its tool roster the way the built-in
+    /// `coding` ProfileDefinition does (#2133) — the serve path already applies
+    /// `Config.tool_policy`, it just had no way to be set from a profile. e.g.
+    /// a lean `allow` list drops a small local model to the core coding
+    /// surface. `None` = no filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<octos_agent::ToolPolicy>,
     /// Human-approval rules for tool calls requiring a human decision
     /// (per-profile; see `docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2764,7 +2773,9 @@ pub(crate) fn config_from_profile(
         // #1768: thread the profile's snapshot opt-in so serve sessions
         // honor it (parity with format_after_edit).
         snapshots: profile.config.snapshots.clone(),
-        tool_policy: None,
+        // #2168: carry the profile's tool policy so a serve / UserProfile
+        // session can slim its roster (the serve path already applies this).
+        tool_policy: profile.config.tool_policy.clone(),
         tool_policy_by_provider: Default::default(),
         embedding: None,
         memory: profile.config.memory.clone(),
@@ -3723,6 +3734,44 @@ mod tests {
             ..profile
         };
         assert!(!config_from_profile(&off, None, None).format_after_edit);
+    }
+
+    #[test]
+    fn config_from_profile_threads_tool_policy() {
+        // #2168: config_from_profile hardcoded `tool_policy: None`, so a serve /
+        // UserProfile session could never slim its tool roster (the lean #2133
+        // roster only reaches the built-in `coding` ProfileDefinition). A
+        // profile-level tool_policy must now reach the runtime Config, where the
+        // serve path already applies it.
+        let policy: octos_agent::ToolPolicy = serde_json::from_value(serde_json::json!({
+            "allow": ["read_file", "write_file", "group:runtime", "check", "update_plan"]
+        }))
+        .expect("valid tool policy");
+        let profile = UserProfile {
+            id: "lean-serve".into(),
+            name: "Lean Serve".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                tool_policy: Some(policy.clone()),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(
+            config_from_profile(&profile, None, None).tool_policy,
+            Some(policy),
+            "a profile tool_policy must reach the runtime config (serve applies it)"
+        );
+        // A profile without one stays None (no filtering) — unchanged behavior.
+        let off = UserProfile {
+            config: ProfileConfig::default(),
+            ..profile
+        };
+        assert_eq!(config_from_profile(&off, None, None).tool_policy, None);
     }
 
     #[test]
