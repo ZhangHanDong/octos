@@ -1156,6 +1156,33 @@ impl ContextManager {
         self.record_tool_output_with_source_ref(tool_call_id, tool_name, raw_output, None)
     }
 
+    /// #2131: re-materialize a tool output by its `tool_call_id` — the handle
+    /// compaction leaves on every evicted stub. Returns the FULL raw bytes when
+    /// the output was spilled to the content-addressed ledger, otherwise the
+    /// model-visible content that was recorded (already all there was). `None`
+    /// when no tool output with that call id is known. The most recent match
+    /// wins if a call id somehow repeats.
+    ///
+    /// In-memory only: the artifact map is populated during the live session,
+    /// so recall works for the process that produced the output (the case that
+    /// matters — a model re-reading a file it just evicted). After a cold
+    /// reload the spilled bytes may not be back in memory; the model-visible
+    /// content is always available as the floor.
+    pub(crate) fn tool_output_by_call_id(&self, call_id: &str) -> Option<String> {
+        let envelope = self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::ToolOutput { envelope } if envelope.tool_call_id == call_id => {
+                Some(envelope)
+            }
+            _ => None,
+        })?;
+        if let Some(artifact_ref) = envelope.raw_artifact_ref.as_ref()
+            && let Some(bytes) = self.tool_output_artifacts.get(artifact_ref)
+        {
+            return Some(String::from_utf8_lossy(bytes).into_owned());
+        }
+        Some(envelope.model_visible_content.clone())
+    }
+
     pub(crate) fn record_tool_output_with_source_ref(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -2323,6 +2350,32 @@ mod tests {
             b"sentinel",
             "second persist must not rewrite an existing content-addressed artifact"
         );
+    }
+
+    /// #2131: recall re-materializes an evicted tool output by its
+    /// tool_call_id. A large (spilled) output comes back in FULL from the
+    /// content-addressed ledger; a small one returns its recorded content; an
+    /// unknown id returns None.
+    #[test]
+    fn tool_output_by_call_id_recovers_spilled_and_inline_outputs() {
+        let mut manager = ContextManager::new("coding:local:recall", None);
+        manager.record_message(&assistant_tool_call("call_big"));
+        let big = "y".repeat(20 * 1024); // > inline threshold -> spilled artifact
+        manager.record_tool_output("call_big", "read_file", &big);
+        manager.record_message(&assistant_tool_call("call_small"));
+        manager.record_tool_output("call_small", "shell", "tiny output");
+
+        assert_eq!(
+            manager.tool_output_by_call_id("call_big").as_deref(),
+            Some(big.as_str()),
+            "a spilled output recalls in FULL from the ledger"
+        );
+        assert_eq!(
+            manager.tool_output_by_call_id("call_small").as_deref(),
+            Some("tiny output"),
+            "a small inline output recalls its recorded content"
+        );
+        assert_eq!(manager.tool_output_by_call_id("call_missing"), None);
     }
 
     /// Index-based provider tool-call ids (kimi `functions.foo:0`, vllm
