@@ -87,13 +87,17 @@ fn render_page(content: &str, page: usize) -> String {
     let body = &content[s..e];
     if total == 1 {
         body.to_string()
-    } else {
+    } else if page + 1 < total {
+        // More pages follow — name the concrete next call.
         format!(
             "{body}\n[recall page {}/{} — call recall(tool_call_id=…, page={}) for the next page]",
             page + 1,
             total,
             page + 1
         )
+    } else {
+        // Final page: no next call to invite.
+        format!("{body}\n[recall page {}/{} — last page]", page + 1, total)
     }
 }
 
@@ -215,6 +219,22 @@ mod tests {
         assert_ne!(
             p0.output, p1.output,
             "page 2 is different content, not a re-truncation"
+        );
+        assert!(
+            p0.output.contains("for the next page"),
+            "non-final pages invite the next"
+        );
+        // The final page (a high index clamps to the last) must NOT invite a
+        // non-existent next page (#2131 review item 3).
+        let last = t
+            .execute(&serde_json::json!({"tool_call_id": "call_big", "page": 9_999}))
+            .await
+            .unwrap();
+        assert!(last.output.contains("last page"), "{}", last.output);
+        assert!(
+            !last.output.contains("for the next page"),
+            "{}",
+            last.output
         );
     }
 }

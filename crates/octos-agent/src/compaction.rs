@@ -393,14 +393,11 @@ impl ToolResultPlaceholder {
             "turn_id": self.turn_id,
             "original_byte_len": self.original_byte_len,
             "reason": self.reason,
-            // #2131: name the concrete recovery call so the model restores the
-            // evicted output instead of re-running the tool. Kept minimal — the
-            // `recall` tool's own description carries the semantics; this is
-            // just the exact call string. Harmless where no recall tool is
-            // wired (a recall on an unknown id fails cleanly). Not a struct
-            // field — regenerated from tool_call_id each render, and
-            // `from_placeholder_content` ignores the extra key.
-            "recall": format!("recall(tool_call_id=\"{}\")", self.tool_call_id),
+            // #2131: the placeholder already carries `tool_call_id`, and the
+            // `recall` tool's description tells the model to restore an evicted
+            // output by exactly that id — so no in-placeholder call hint is
+            // needed. Emitting one here would also mislead the chat/acp/mcp
+            // paths, which build placeholders but register no recall tool.
         });
         format!(
             "{}{}",
@@ -1631,11 +1628,7 @@ mod tests {
         };
         let content = p.to_placeholder_content();
         assert!(content.starts_with(TOOL_RESULT_PLACEHOLDER_PREFIX));
-        // #2131: the stub names the concrete recall call by tool_call_id, and
-        // the extra `recall` key does NOT break the struct round-trip (it is
-        // regenerated on render, not a struct field). The `"` around the id are
-        // JSON-escaped in the envelope, so match the id separately.
-        assert!(content.contains("recall(tool_call_id="), "{content}");
+        // The placeholder carries tool_call_id (the recall handle).
         assert!(content.contains("id1"), "{content}");
         let parsed = ToolResultPlaceholder::from_placeholder_content(&content).unwrap();
         assert_eq!(parsed, p);
@@ -1666,11 +1659,7 @@ mod tests {
     #[test]
     fn runner_skips_summary_when_prune_brings_under_budget() {
         let policy = CompactionPolicy {
-            // Headroom above the post-prune total (the 6 turns + the placeholder,
-            // which #2131 grew slightly by naming the recall call). The pre-prune
-            // total — dominated by the 8 KB stale tool result — is still far over
-            // this, so the runner engages and prune must satisfy the budget.
-            token_budget: 1_200,
+            token_budget: 1_000,
             prune_tool_results_after_turns: Some(1),
             ..Default::default()
         };
