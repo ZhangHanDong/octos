@@ -2192,12 +2192,13 @@ mod tests {
                 "{resurrected} must stay excluded in the rebound session registry"
             );
         }
-        // #2133: `tool_search` is now in the lean allow list (the escape
-        // hatch) and `bash` is the single retained shell; both must survive
-        // the rebind re-narrowing. `check`/`update_plan` too.
+        // #2133: `tool_search`, `check`, and `update_plan` are now in the lean
+        // allow list, and the shells (group:runtime) are kept; all must survive
+        // the rebind re-narrowing.
         for kept in [
             "read_file",
             "bash",
+            "shell",
             "grep",
             "edit_file",
             "tool_search",

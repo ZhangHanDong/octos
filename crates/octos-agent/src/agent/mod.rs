@@ -1541,6 +1541,7 @@ mod profile_integration_tests {
         );
         for kept in [
             "read_file",
+            "shell",
             "bash",
             "edit_file",
             "grep",
