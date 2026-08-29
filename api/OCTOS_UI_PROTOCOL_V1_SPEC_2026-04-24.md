@@ -444,7 +444,8 @@ Supervised review and M15 agent/goal/loop autonomy (capability-gated, accepted
 - `review/start`
 - `agent/list`, `agent/status/read`, `agent/output/read`,
   `agent/artifact/list`, `agent/artifact/read`, `agent/interrupt`, `agent/close`
-- `session/goal/get`, `session/goal/set`, `session/goal/clear`
+- `session/goal/get`, `session/goal/set`, `session/goal/clear`,
+  `session/goal/operator_transition`
 - `loop/create`, `loop/list`, `loop/delete`, `loop/pause`, `loop/resume`,
   `loop/fire_now`
 - `monitor/create`, `monitor/list`, `monitor/pause`, `monitor/resume`,
