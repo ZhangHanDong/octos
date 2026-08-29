@@ -811,6 +811,15 @@ impl ServeCommand {
             crate::profiles::ProfileStore::open(&state_home, &data_dir)
                 .wrap_err("failed to open profile store")?,
         );
+        // Operator goal transitions must serialize with the live
+        // orchestrator. The data-dir serve lock tells the CLI whether this
+        // endpoint is mandatory; a missing endpoint while the lock is held is
+        // therefore a fail-closed old-version/startup condition, never an
+        // excuse to append an offline snapshot behind the live cache.
+        #[cfg(unix)]
+        let _goal_operator_control =
+            crate::commands::goal::spawn_goal_operator_control(&data_dir, profile_store.clone())
+                .wrap_err("failed to start local goal operator-control RPC")?;
 
         // M11-F regression fix REG-4: bootstrap bundled app-skills
         // (`crates/app-skills/`) and platform-skills (`crates/platform-

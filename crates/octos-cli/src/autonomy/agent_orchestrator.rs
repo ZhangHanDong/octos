@@ -24145,6 +24145,106 @@ mod tests {
         assert!(again.is_err());
     }
 
+    #[test]
+    fn goal_operator_archive_race_shutdown_drain_cannot_revive_live_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path().join("supervisor"))
+            .unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "archive-race");
+        let created = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "race archive against a draining turn".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .unwrap();
+        let goal_id = created["goal"]["goal_id"].as_str().unwrap().to_owned();
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                Some(&goal_id),
+                "archive",
+                "operator won the race",
+                Some(dir.path()),
+            )
+            .unwrap();
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            0,
+            "archive must tombstone queued GoalContinue work"
+        );
+
+        // This is the same post-turn accountant used by stdio's bounded
+        // shutdown drain. A turn dispatched before archive may arrive late,
+        // but its persist must preserve the archived status.
+        let _ = orchestrator.record_goal_turn(&session_id, "tenant-a", Some(&goal_id), 123, 1);
+        let live = orchestrator
+            .get_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
+        assert_eq!(live["goal"]["status"], json!("archived"));
+        let replay = SupervisorStore::new(dir.path().join("supervisor"))
+            .load_goal_groups_by_id()
+            .unwrap();
+        let persisted = replay
+            .values()
+            .find(|group| {
+                supervisor_metadata_str(&group.metadata, "goal_id") == Some(goal_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(
+            supervisor_metadata_str(&persisted.metadata, "status"),
+            Some("archived")
+        );
+        let ledger = octos_fleet::GoalLedger::open(InProcessAgentOrchestrator::goal_ledger_path(
+            dir.path(),
+            &goal_id,
+        ))
+        .unwrap();
+        assert_eq!(
+            ledger.get_goal(&goal_id).unwrap().unwrap().status,
+            "archived"
+        );
+    }
+
+    #[test]
+    fn goal_operator_reopen_enqueues_exactly_one_continuation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "reopen-queue");
+        let created = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "resume once".into(),
+                status: Some("blocked".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .unwrap();
+        let goal_id = created["goal"]["goal_id"].as_str().unwrap();
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                Some(goal_id),
+                "reopen",
+                "resume online",
+                None,
+            )
+            .unwrap();
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
+    }
+
     /// #25 — reopen refuses the TERMINAL states (`complete`/`archived`) and
     /// an already-active goal, and never resurrects an over-budget goal as
     /// `active`.
