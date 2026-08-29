@@ -8028,6 +8028,16 @@ struct RawGoalSetParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawGoalOperatorTransitionParams {
+    session_id: SessionKey,
+    goal_id: String,
+    action: String,
+    reason: String,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawLoopCreateParams {
     session_id: SessionKey,
     #[serde(default)]
@@ -15788,6 +15798,7 @@ fn is_autonomy_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::SESSION_GOAL_GET
             | octos_core::ui_protocol::methods::SESSION_GOAL_SET
             | octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR
+            | octos_core::ui_protocol::methods::SESSION_GOAL_OPERATOR_TRANSITION
             | octos_core::ui_protocol::methods::LOOP_CREATE
             | octos_core::ui_protocol::methods::LOOP_LIST
             | octos_core::ui_protocol::methods::LOOP_DELETE
@@ -15815,7 +15826,10 @@ fn autonomy_method_available(method: &str, features: ConnectionUiFeatures) -> bo
         | octos_core::ui_protocol::methods::AGENT_CLOSE => features.agent_control_available(),
         octos_core::ui_protocol::methods::SESSION_GOAL_GET
         | octos_core::ui_protocol::methods::SESSION_GOAL_SET
-        | octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR => features.goal_runtime_available(),
+        | octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR
+        | octos_core::ui_protocol::methods::SESSION_GOAL_OPERATOR_TRANSITION => {
+            features.goal_runtime_available()
+        }
         octos_core::ui_protocol::methods::LOOP_CREATE
         | octos_core::ui_protocol::methods::LOOP_LIST
         | octos_core::ui_protocol::methods::LOOP_DELETE
@@ -16098,6 +16112,26 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                     session_id: params.session_id,
                     profile_id,
                 },
+                ledger_data_dir.as_deref(),
+            )
+        }
+        methods::SESSION_GOAL_OPERATOR_TRANSITION => {
+            let params: RawGoalOperatorTransitionParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                Some(&params.session_id),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            let ledger_data_dir =
+                profile_data_dir_for.and_then(|resolve| resolve(profile_id.as_str()));
+            orchestrator.operator_transition_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: params.session_id,
+                    profile_id,
+                },
+                &params.goal_id,
+                &params.action,
+                &params.reason,
                 ledger_data_dir.as_deref(),
             )
         }
@@ -36919,7 +36953,7 @@ fn autonomy_rpc_notifications(method: &str, result: &Value) -> Vec<UiNotificatio
     };
     let mut notifications = Vec::new();
     match method {
-        methods::SESSION_GOAL_SET => {
+        methods::SESSION_GOAL_SET | methods::SESSION_GOAL_OPERATOR_TRANSITION => {
             if let Ok(event) = serde_json::from_value::<SessionGoalUpdatedEvent>(result.clone()) {
                 notifications.push(UiNotification::SessionGoalUpdated(event));
             }

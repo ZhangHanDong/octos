@@ -615,6 +615,23 @@ pub(crate) trait AgentOrchestrator: Send + Sync {
     fn set_goal(&self, request: GoalSetRequest) -> Result<Value, RpcError>;
     fn clear_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError>;
 
+    fn operator_transition_goal_with_ledger_sync(
+        &self,
+        request: GoalSessionRequest,
+        goal_id: &str,
+        action: &str,
+        reason: &str,
+        ledger_data_dir: Option<&Path>,
+    ) -> Result<Value, RpcError> {
+        let _ = (goal_id, action, reason, ledger_data_dir);
+        Err(method_not_supported_error(
+            "session/goal/operator_transition",
+            "goal_operator_transition",
+            Some(&request.session_id),
+            Some(&request.profile_id),
+        ))
+    }
+
     /// #1973 fix B — [`Self::clear_goal`] plus a best-effort sync of the
     /// cleared status into the durable per-goal SQLite ledger under
     /// `ledger_data_dir` (the PROFILE data dir), so the goals-row stops
@@ -2219,11 +2236,11 @@ impl InProcessAgentOrchestrator {
     /// row + decisions (best-effort, outside the state lock).
     ///
     /// Returns the post-transition goal JSON snapshot.
-    #[cfg_attr(not(test), allow(dead_code))] // tests exercise it; prod call sites land with the goal UI follow-up
     pub(crate) fn operator_transition_goal(
         &self,
         session_id: &SessionKey,
         profile_id: &str,
+        expected_goal_id: Option<&str>,
         action: &str,
         reason: &str,
         ledger_data_dir: Option<&Path>,
@@ -2250,6 +2267,13 @@ impl InProcessAgentOrchestrator {
                 return Err(format!(
                     "goal `{}` belongs to profile `{}`, not `{profile_id}`",
                     goal.goal_id, goal.profile_id
+                ));
+            }
+            if expected_goal_id.is_some_and(|expected| expected != goal.goal_id) {
+                return Err(format!(
+                    "goal identity mismatch: session `{session_id}` currently owns `{}`, not `{}`",
+                    goal.goal_id,
+                    expected_goal_id.unwrap_or_default()
                 ));
             }
             let prior_status = goal.status.clone();
@@ -2309,6 +2333,35 @@ impl InProcessAgentOrchestrator {
             let snapshot = goal.clone();
             if snapshot.status == "active" {
                 enqueue_goal_continuation(&mut state, &key, &snapshot.profile_id, &snapshot);
+            } else if snapshot.status == "archived" {
+                // An online archive is a scheduler fence, not merely a status
+                // repaint. Retire every queued, not-yet-started continuation
+                // bound to this exact goal while holding the same state lock
+                // as the status transition. An in-flight turn is deliberately
+                // left alone; its goal-id/status/revision gates may settle
+                // cost but cannot re-activate the archived record.
+                let queued = state
+                    .continuations
+                    .pending_items()
+                    .filter(|item| item.reason == MasterContinuationReason::GoalContinue)
+                    .filter(|item| {
+                        item.goal_id
+                            .as_ref()
+                            .is_some_and(|goal_id| goal_id.as_str() == snapshot.goal_id)
+                    })
+                    .map(|item| (item.group_id.clone(), item.dedupe_key.clone()))
+                    .collect::<Vec<_>>();
+                for (group_id, dedupe_key) in queued {
+                    state.continuations.cancel(&dedupe_key);
+                    if let Some(store) = state.supervisor_store.as_ref() {
+                        let _ = store.record_continuation_completed(
+                            group_id.as_str(),
+                            dedupe_key.as_str(),
+                            now_ms_u64(),
+                            Some("discarded:goal_archived_by_operator".into()),
+                        );
+                    }
+                }
             }
             persist_goal_state(&state, &key, &snapshot, false);
             snapshot
@@ -10102,6 +10155,41 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     fn clear_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
         // #1973 fix B — shared body; no ledger dir on this legacy entry point.
         self.clear_goal_impl(request, None)
+    }
+
+    fn operator_transition_goal_with_ledger_sync(
+        &self,
+        request: GoalSessionRequest,
+        goal_id: &str,
+        action: &str,
+        reason: &str,
+        ledger_data_dir: Option<&Path>,
+    ) -> Result<Value, RpcError> {
+        let goal = self
+            .operator_transition_goal(
+                &request.session_id,
+                &request.profile_id,
+                Some(goal_id),
+                action,
+                reason,
+                ledger_data_dir,
+            )
+            .map_err(|message| {
+                autonomy_error(
+                    kinds::GOAL_UNAVAILABLE,
+                    message,
+                    Some(&request.session_id),
+                    Some(&request.profile_id),
+                    Some(("goal_id", goal_id)),
+                    true,
+                )
+            })?;
+        Ok(json!({
+            "session_id": request.session_id,
+            "profile_id": request.profile_id,
+            "goal": goal,
+            "transition_actor": "operator"
+        }))
     }
 
     fn clear_goal_with_ledger_sync(
@@ -23993,7 +24081,14 @@ mod tests {
         // A blocked goal has no model exit: goal_update to complete is gated.
         // The OPERATOR reopens it.
         let reopened = orchestrator
-            .operator_transition_goal(&session_id, "tenant-a", "reopen", "operator reopened", None)
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                None,
+                "reopen",
+                "operator reopened",
+                None,
+            )
             .expect("operator reopen");
         assert_eq!(reopened["status"], json!("active"));
         // After reopen the model can close the goal via goal_update.
@@ -24021,6 +24116,7 @@ mod tests {
             .operator_transition_goal(
                 &session_id,
                 "tenant-a",
+                None,
                 "archive",
                 "operator archived",
                 None,
@@ -24028,13 +24124,20 @@ mod tests {
             .expect("archive");
         assert_eq!(archived["status"], json!("archived"));
         // Reopen from archived is refused.
-        let reopen =
-            orchestrator.operator_transition_goal(&session_id, "tenant-a", "reopen", "nope", None);
+        let reopen = orchestrator.operator_transition_goal(
+            &session_id,
+            "tenant-a",
+            None,
+            "reopen",
+            "nope",
+            None,
+        );
         assert!(reopen.is_err());
         // A second archive is refused (idempotence guard).
         let again = orchestrator.operator_transition_goal(
             &session_id,
             "tenant-a",
+            None,
             "archive",
             "again",
             None,
@@ -24053,7 +24156,7 @@ mod tests {
         // Already active -> nothing to reopen.
         assert!(
             orchestrator
-                .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+                .operator_transition_goal(&session_id, "tenant-a", None, "reopen", "r", None)
                 .is_err()
         );
         // Complete -> reopen refused.
@@ -24069,7 +24172,7 @@ mod tests {
             .expect("complete");
         assert!(
             orchestrator
-                .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+                .operator_transition_goal(&session_id, "tenant-a", None, "reopen", "r", None)
                 .is_err()
         );
         // Over-budget reopen refused: burn the budget, block, then reopen.
@@ -24093,7 +24196,7 @@ mod tests {
             goal.status = "blocked".into();
         }
         let err = orchestrator
-            .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+            .operator_transition_goal(&session_id, "tenant-a", None, "reopen", "r", None)
             .unwrap_err();
         assert!(err.contains("exhausted its token budget"), "{err}");
     }
@@ -24113,7 +24216,7 @@ mod tests {
             .expect("configure store");
         seed_goal(&orchestrator, &session_id, "tenant-a");
         orchestrator
-            .operator_transition_goal(&session_id, "tenant-a", "archive", "archive it", None)
+            .operator_transition_goal(&session_id, "tenant-a", None, "archive", "archive it", None)
             .expect("archive");
         // Boot 2: a FRESH orchestrator loading the same store restores the
         // archived status from the event stream.
