@@ -2149,6 +2149,13 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             })
         }
         APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE => json!({ "path": "." }),
+        methods::SESSION_GOAL_OPERATOR_TRANSITION => json!({
+            "session_id": session_id,
+            "profile_id": "dispatch-parity",
+            "goal_id": "goal_probe",
+            "action": "archive",
+            "reason": "dispatch parity probe",
+        }),
         methods::AGENT_LIST
         | methods::AGENT_STATUS_READ
         | methods::AGENT_OUTPUT_READ

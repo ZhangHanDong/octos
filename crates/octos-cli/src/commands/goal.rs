@@ -4,11 +4,10 @@
 //! `group_registered` metadata that `restore_goal_from_group` replays at
 //! boot), NOT in the goal-ledger SQLite `goals` table (a direct sqlite edit
 //! changes no running process and is never restored from). These commands
-//! therefore work by appending a fresh `group_registered` goal snapshot with
-//! the new status to the profile's supervisor event store: a running serve
-//! keeps its in-memory record (restart-free processes never re-read the
-//! stream, by design), and the NEXT boot replays the new status into the
-//! orchestrator's memory. The command prints that restart requirement.
+//! route through the live serve when its data-dir lock is held. Only a proven
+//! offline data dir retains the append-only fallback; a live-but-unreachable
+//! control endpoint fails closed so an old in-memory snapshot cannot overwrite
+//! the operator's intent.
 //!
 //! `reopen` admits `blocked|paused|budget_limited` → `active`; `archive`
 //! admits any status → `archived`, which is a TERMINAL, irreversible state
@@ -70,7 +69,271 @@ pub enum GoalSubcommand {
 // ([`GoalStatusView`]) so the two modes can never diverge.
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GoalOperatorControlRequest {
+    method: String,
+    session_id: String,
+    profile_id: String,
+    goal_id: String,
+    action: String,
+    reason: String,
+}
+
+impl GoalOperatorControlRequest {
+    #[cfg(feature = "api")]
+    fn action_target_status(&self) -> &str {
+        match self.action.as_str() {
+            "reopen" => "active",
+            "archive" => "archived",
+            _ => "<invalid>",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GoalOperatorControlResponse {
+    ok: bool,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+const GOAL_OPERATOR_CONTROL_SOCKET: &str = ".octos-goal-control.sock";
+const GOAL_OPERATOR_TRANSITION_METHOD: &str = "session/goal/operator_transition";
+
+#[cfg(all(unix, feature = "api"))]
+pub(crate) fn spawn_goal_operator_control(
+    data_dir: &Path,
+    profile_store: std::sync::Arc<crate::profiles::ProfileStore>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let socket_path = data_dir.join(GOAL_OPERATOR_CONTROL_SOCKET);
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    let runtime_data_dir = data_dir.to_path_buf();
+    Ok(tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let profile_store = profile_store.clone();
+            let runtime_data_dir = runtime_data_dir.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    serve_goal_operator_connection(stream, &profile_store, &runtime_data_dir).await
+                {
+                    tracing::warn!(%error, "online goal-control RPC connection failed");
+                }
+            });
+        }
+    }))
+}
+
+#[cfg(all(unix, feature = "api"))]
+async fn serve_goal_operator_connection(
+    stream: tokio::net::UnixStream,
+    profile_store: &crate::profiles::ProfileStore,
+    runtime_data_dir: &Path,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut line = String::new();
+    tokio::io::BufReader::new(read_half)
+        .read_line(&mut line)
+        .await?;
+    let response = match serde_json::from_str::<GoalOperatorControlRequest>(&line) {
+        Ok(request) if request.method == GOAL_OPERATOR_TRANSITION_METHOD => {
+            let ledger_data_dir = profile_store
+                .get(&request.profile_id)
+                .ok()
+                .flatten()
+                .map(|profile| profile_store.resolve_data_dir(&profile));
+            match crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                .operator_transition_goal(
+                    &octos_core::SessionKey(request.session_id.clone()),
+                    &request.profile_id,
+                    Some(&request.goal_id),
+                    &request.action,
+                    &request.reason,
+                    ledger_data_dir.as_deref(),
+                ) {
+                Ok(goal) => {
+                    let result = serde_json::json!({
+                        "session_id": &request.session_id,
+                        "profile_id": &request.profile_id,
+                        "goal": goal,
+                        "transition_actor": "operator"
+                    });
+                    let live_status = result
+                        .pointer("/goal/status")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    let supervisor_status =
+                        SupervisorStore::new(runtime_data_dir.join("supervisor"))
+                            .load_goal_groups_by_id()
+                            .ok()
+                            .and_then(|groups| {
+                                groups.into_values().find(|group| {
+                                    metadata_str(group, "goal_id") == Some(request.goal_id.as_str())
+                                        && metadata_str(group, "profile_id")
+                                            == Some(request.profile_id.as_str())
+                                        && metadata_str(group, "session_id")
+                                            == Some(request.session_id.as_str())
+                                })
+                            })
+                            .and_then(|group| metadata_str(&group, "status").map(str::to_owned));
+                    let ledger_status = ledger_data_dir
+                        .as_deref()
+                        .and_then(|dir| load_goal_status(dir, &request.goal_id).ok().flatten())
+                        .map(|view| view.status);
+                    if live_status.as_deref() == Some(request.action_target_status())
+                        && supervisor_status == live_status
+                        && ledger_status == live_status
+                    {
+                        GoalOperatorControlResponse {
+                            ok: true,
+                            result: Some(result),
+                            error: None,
+                        }
+                    } else {
+                        GoalOperatorControlResponse {
+                            ok: false,
+                            result: Some(result),
+                            error: Some(format!(
+                                "transition committed but three-way reconciliation failed: \
+                                 live={live_status:?}, supervisor={supervisor_status:?}, \
+                                 ledger={ledger_status:?}"
+                            )),
+                        }
+                    }
+                }
+                Err(error) => GoalOperatorControlResponse {
+                    ok: false,
+                    result: None,
+                    error: Some(error),
+                },
+            }
+        }
+        Ok(_) => GoalOperatorControlResponse {
+            ok: false,
+            result: None,
+            error: Some("unsupported local control method".into()),
+        },
+        Err(error) => GoalOperatorControlResponse {
+            ok: false,
+            result: None,
+            error: Some(format!("invalid request: {error}")),
+        },
+    };
+    let mut bytes = serde_json::to_vec(&response)?;
+    bytes.push(b'\n');
+    write_half.write_all(&bytes).await?;
+    write_half.shutdown().await?;
+    Ok(())
+}
+
+enum ServeLiveness {
+    Offline,
+    Live,
+}
+
+fn serve_liveness(data_dir: &Path) -> Result<ServeLiveness> {
+    let lock_path = data_dir.join(".octos-serve.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            fs2::FileExt::unlock(&file)?;
+            Ok(ServeLiveness::Offline)
+        }
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(ServeLiveness::Live)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn online_transition(
+    data_dir: &Path,
+    located: &LocatedGoal,
+    profile: &str,
+    goal_id: &str,
+    action: &str,
+) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let socket_path = data_dir.join(GOAL_OPERATOR_CONTROL_SOCKET);
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket_path).map_err(|error| {
+        eyre!(
+            "octos serve is live for this data directory, but its online goal-control RPC is \
+             unavailable at {} ({error}); refusing an unsafe offline {action}. Stop serve and \
+             retry, or upgrade the running serve.",
+            socket_path.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let request = GoalOperatorControlRequest {
+        method: GOAL_OPERATOR_TRANSITION_METHOD.to_owned(),
+        session_id: located.session_id.clone(),
+        profile_id: profile.to_owned(),
+        goal_id: goal_id.to_owned(),
+        action: action.to_owned(),
+        reason: format!("operator invoked `octos goal {action}`"),
+    };
+    serde_json::to_writer(&mut stream, &request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream).read_line(&mut line)?;
+    let response: GoalOperatorControlResponse = serde_json::from_str(&line)
+        .map_err(|error| eyre!("malformed response from online goal-control RPC: {error}"))?;
+    if !response.ok {
+        bail!(
+            "online goal transition failed: {}",
+            response.error.as_deref().unwrap_or("unknown serve error")
+        );
+    }
+    let result = response.result.unwrap_or_default();
+    let status = result
+        .pointer("/goal/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    println!(
+        "goal `{goal_id}` on session `{}` transitioned online via live serve -> {status} ({action})",
+        located.session_id
+    );
+    println!("note: live state, supervisor recovery stream, and goal ledger were updated inline.");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn online_transition(
+    _data_dir: &Path,
+    _located: &LocatedGoal,
+    _profile: &str,
+    _goal_id: &str,
+    action: &str,
+) -> Result<()> {
+    bail!(
+        "octos serve is live, but this build has no local goal-control transport; refusing an \
+         unsafe offline {action}. Stop serve and retry."
+    )
+}
 
 /// #2116 read-only `status` args (union family on our GoalSubcommand).
 #[derive(Debug, Args)]
@@ -239,12 +502,22 @@ impl Executable for GoalCommand {
                 })?;
                 match self.subcommand {
                     GoalSubcommand::List => cmd_list(&goals_by_id),
-                    GoalSubcommand::Reopen { goal_id } => {
-                        cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "reopen")
-                    }
-                    GoalSubcommand::Archive { goal_id } => {
-                        cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "archive")
-                    }
+                    GoalSubcommand::Reopen { goal_id } => route_transition(
+                        &data_dir,
+                        &store,
+                        &goals_by_id,
+                        &self.profile,
+                        &goal_id,
+                        "reopen",
+                    ),
+                    GoalSubcommand::Archive { goal_id } => route_transition(
+                        &data_dir,
+                        &store,
+                        &goals_by_id,
+                        &self.profile,
+                        &goal_id,
+                        "archive",
+                    ),
                     GoalSubcommand::Status(_) => unreachable!("guarded by the outer match"),
                 }
             }
@@ -279,6 +552,21 @@ impl Executable for GoalCommand {
                 Ok(())
             }
         }
+    }
+}
+
+fn route_transition(
+    data_dir: &Path,
+    store: &SupervisorStore,
+    goals_by_id: &std::collections::HashMap<String, SupervisedGroupRecord>,
+    profile: &str,
+    goal_id: &str,
+    action: &str,
+) -> Result<()> {
+    let located = locate_goal(goals_by_id, profile, goal_id)?;
+    match serve_liveness(data_dir)? {
+        ServeLiveness::Live => online_transition(data_dir, &located, profile, goal_id, action),
+        ServeLiveness::Offline => cmd_transition_located(store, located, goal_id, action),
     }
 }
 
@@ -358,6 +646,7 @@ fn cmd_list(goals_by_id: &std::collections::HashMap<String, SupervisedGroupRecor
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_transition(
     store: &SupervisorStore,
     goals_by_id: &std::collections::HashMap<String, SupervisedGroupRecord>,
@@ -366,6 +655,15 @@ fn cmd_transition(
     action: &str,
 ) -> Result<()> {
     let located = locate_goal(goals_by_id, profile, goal_id)?;
+    cmd_transition_located(store, located, goal_id, action)
+}
+
+fn cmd_transition_located(
+    store: &SupervisorStore,
+    located: LocatedGoal,
+    goal_id: &str,
+    action: &str,
+) -> Result<()> {
     let prior_status = metadata_str(&located.group, "status")
         .unwrap_or("<unknown>")
         .to_owned();
@@ -431,9 +729,8 @@ fn cmd_transition(
         located.session_id
     );
     println!(
-        "note: a running octos serve keeps its in-memory goal state; the new status takes \
-         effect on the next serve restart (the supervisor event stream is the authoritative \
-         record and is replayed at boot)."
+        "note: no live serve owns this data directory; the offline transition is durable in \
+         the supervisor recovery stream and takes effect on the next serve start."
     );
     Ok(())
 }
@@ -628,6 +925,37 @@ mod tests {
 mod tests_2116_readonly {
     use super::*;
 
+    fn supervisor_goal_group(
+        session_id: &str,
+        profile: &str,
+        goal_id: &str,
+        status: &str,
+    ) -> SupervisedGroupRecord {
+        let mut group = SupervisedGroupRecord::new(format!("autonomy-goal:{session_id}"), 1);
+        group
+            .metadata
+            .insert("autonomy_record_kind".into(), serde_json::json!("goal"));
+        group
+            .metadata
+            .insert("autonomy_goal_cleared".into(), serde_json::json!(false));
+        group
+            .metadata
+            .insert("session_id".into(), serde_json::json!(session_id));
+        group
+            .metadata
+            .insert("profile_id".into(), serde_json::json!(profile));
+        group
+            .metadata
+            .insert("goal_id".into(), serde_json::json!(goal_id));
+        group
+            .metadata
+            .insert("objective".into(), serde_json::json!("obj"));
+        group
+            .metadata
+            .insert("status".into(), serde_json::json!(status));
+        group
+    }
+
     fn seed_goal(data_dir: &Path, goal_id: &str, status: &str) {
         let db_path = goal_ledger_db_path(data_dir, goal_id);
         std::fs::create_dir_all(db_path.parent().expect("parent")).expect("mkdir");
@@ -722,5 +1050,67 @@ mod tests_2116_readonly {
         );
         // Sanitization parity: odd ids map the same way on both sides.
         assert_eq!(sanitize_goal_id_for_file("a/b c"), "a_b_c");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_operator_live_rpc_failure_does_not_append_offline_transition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SupervisorStore::new(temp.path().join("supervisor"));
+        store
+            .record_group_registered(supervisor_goal_group(
+                "api:s1", "octos", "goal_01", "active",
+            ))
+            .expect("seed supervisor goal");
+        let lock_path = temp.path().join(".octos-serve.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+            .expect("open serve lock");
+        fs2::FileExt::try_lock_exclusive(&lock).expect("simulate live serve");
+
+        let events = temp
+            .path()
+            .join("supervisor")
+            .join("supervisor-events.jsonl");
+        let before = std::fs::read_to_string(&events)
+            .expect("before rows")
+            .lines()
+            .count();
+        let groups = store.load_goal_groups_by_id().expect("goal view");
+        let error = route_transition(temp.path(), &store, &groups, "octos", "goal_01", "archive")
+            .expect_err("live endpoint absence must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing an unsafe offline archive")
+        );
+        let after = std::fs::read_to_string(&events)
+            .expect("after rows")
+            .lines()
+            .count();
+        assert_eq!(after, before, "RPC failure must not append an offline row");
+        let folded = store.load_goal_groups_by_id().expect("folded state");
+        let goal = folded.values().next().expect("goal remains");
+        assert_eq!(metadata_str(goal, "status"), Some("active"));
+    }
+
+    #[test]
+    fn goal_operator_proven_offline_route_keeps_append_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SupervisorStore::new(temp.path().join("supervisor"));
+        store
+            .record_group_registered(supervisor_goal_group(
+                "api:s1", "octos", "goal_01", "active",
+            ))
+            .expect("seed supervisor goal");
+        let groups = store.load_goal_groups_by_id().expect("goal view");
+        route_transition(temp.path(), &store, &groups, "octos", "goal_01", "archive")
+            .expect("offline archive");
+        let folded = store.load_goal_groups_by_id().expect("folded state");
+        let goal = folded.values().next().expect("goal remains");
+        assert_eq!(metadata_str(goal, "status"), Some("archived"));
     }
 }

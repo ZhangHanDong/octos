@@ -375,7 +375,10 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::AGENT_ARTIFACT_READ
         | methods::AGENT_INTERRUPT
         | methods::AGENT_CLOSE => Some(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
-        methods::SESSION_GOAL_GET | methods::SESSION_GOAL_SET | methods::SESSION_GOAL_CLEAR => {
+        methods::SESSION_GOAL_GET
+        | methods::SESSION_GOAL_SET
+        | methods::SESSION_GOAL_CLEAR
+        | methods::SESSION_GOAL_OPERATOR_TRANSITION => {
             Some(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1)
         }
         methods::LOOP_CREATE
@@ -1076,6 +1079,9 @@ pub mod methods {
     pub const SESSION_GOAL_GET: &str = "session/goal/get";
     pub const SESSION_GOAL_SET: &str = "session/goal/set";
     pub const SESSION_GOAL_CLEAR: &str = "session/goal/clear";
+    /// Operator-only online archive/reopen transition. Unlike the offline CLI
+    /// fallback this mutates the running orchestrator's live goal record.
+    pub const SESSION_GOAL_OPERATOR_TRANSITION: &str = "session/goal/operator_transition";
 
     /// UPCR-2026-021 M15 recurring loop runtime surface.
     pub const LOOP_CREATE: &str = "loop/create";
@@ -1372,6 +1378,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_GOAL_GET,
     methods::SESSION_GOAL_SET,
     methods::SESSION_GOAL_CLEAR,
+    methods::SESSION_GOAL_OPERATOR_TRANSITION,
     methods::LOOP_CREATE,
     methods::LOOP_LIST,
     methods::LOOP_DELETE,
@@ -1498,6 +1505,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_GOAL_GET,
     methods::SESSION_GOAL_SET,
     methods::SESSION_GOAL_CLEAR,
+    methods::SESSION_GOAL_OPERATOR_TRANSITION,
     methods::LOOP_CREATE,
     methods::LOOP_LIST,
     methods::LOOP_DELETE,
