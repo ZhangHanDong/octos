@@ -72,6 +72,36 @@ fn default_limit() -> usize {
     50
 }
 
+/// Max chars kept from a single emitted match/context line — pi's
+/// `GREP_MAX_LINE_LENGTH` (`packages/coding-agent/src/core/tools/truncate.ts`).
+///
+/// Without this, one minified-JS line consumes the whole grep output budget
+/// (`octos_core::tool_output_limit("grep")`) blind: the backstop head/tail cut
+/// then elides every later match while the model sees mostly one giant line.
+const GREP_MAX_LINE_LENGTH: usize = 500;
+
+/// Cap one emitted line at [`GREP_MAX_LINE_LENGTH`] characters.
+///
+/// `display` is the text as it would be emitted (the plain match site trims
+/// it first); `raw_line` is the physical line it came from. The cap fires on
+/// `display` and cuts by char index (never inside a multi-byte UTF-8 char);
+/// the suffix names the RAW line's char count, so the same physical line
+/// reports the same `N chars total` at every emission site regardless of
+/// site-local trimming. Re-running the search cannot reveal more of the
+/// line; `read_file` can.
+fn cap_match_line<'a>(display: &'a str, raw_line: &str) -> std::borrow::Cow<'a, str> {
+    match display.char_indices().nth(GREP_MAX_LINE_LENGTH) {
+        None => std::borrow::Cow::Borrowed(display),
+        Some((cut, _)) => {
+            let total_chars = raw_line.chars().count();
+            std::borrow::Cow::Owned(format!(
+                "{}\u{2026} [line truncated, {total_chars} chars total]",
+                &display[..cut]
+            ))
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for GrepTool {
     fn name(&self) -> &str {
@@ -79,7 +109,17 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents using regex. Respects .gitignore. Use file_pattern to filter which files to search (e.g., '*.rs'). Use path to scope the search to a specific directory."
+        static DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "Search file contents using regex. Respects .gitignore. Use file_pattern to \
+                 filter which files to search (e.g., '*.rs'). Use path to scope the search to a \
+                 specific directory. Output is truncated beyond {} bytes (middle elided) and \
+                 each matched line beyond {GREP_MAX_LINE_LENGTH} chars, so prefer narrow \
+                 patterns and path/file_pattern filters over broad sweeps.",
+                octos_core::tool_output_limit("grep")
+            )
+        });
+        &DESCRIPTION
     }
 
     fn tags(&self) -> &[&str] {
@@ -144,7 +184,9 @@ impl Tool for GrepTool {
         levers.push("tighten the pattern");
         levers.push("lower limit and re-run");
         Some(format!(
-            "[{omitted_bytes} bytes omitted] Too many matches to return. Narrow the search: {}.",
+            "[{omitted_bytes} bytes omitted] Too many matches to return. Narrow the search: {}. \
+             Matched lines are already capped at {GREP_MAX_LINE_LENGTH} chars — re-running \
+             cannot reveal more of a long line; use read_file to see one in full.",
             levers.join(", ")
         ))
     }
@@ -404,12 +446,17 @@ fn run_grep(
                             "{} {:4}│ {}\n",
                             marker,
                             actual_line + 1,
-                            ctx_line
+                            cap_match_line(ctx_line, ctx_line)
                         ));
                     }
                     matches.push(ctx_output);
                 } else {
-                    matches.push(format!("{}:{}: {}", rel_path, line_num + 1, line.trim()));
+                    matches.push(format!(
+                        "{}:{}: {}",
+                        rel_path,
+                        line_num + 1,
+                        cap_match_line(line.trim(), line)
+                    ));
                 }
             }
         }
@@ -908,6 +955,208 @@ mod tests {
         assert!(
             !already_scoped.contains("scope it with path"),
             "a lever already in use must not be suggested again: {already_scoped}"
+        );
+    }
+
+    // ── per-match-line cap (pi GREP_MAX_LINE_LENGTH port) ────────────────
+
+    /// One minified-JS line must not blow the whole 30KB grep budget: each
+    /// emitted match line is capped at 500 chars with a suffix naming the
+    /// original length. Driven through the REAL execute path.
+    #[tokio::test]
+    async fn should_cap_match_line_at_500_chars_when_line_is_longer() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_line = format!("needle{}", "a".repeat(600)); // 606 chars
+        std::fs::write(
+            dir.path().join("minified.js"),
+            format!("{long_line}\nneedle short\n"),
+        )
+        .unwrap();
+
+        let tool = GrepTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        // Mutation guard: deleting the cap re-emits the full 600-char run.
+        assert!(
+            !result.output.contains(&"a".repeat(501)),
+            "match line emitted uncapped"
+        );
+        assert!(
+            result
+                .output
+                .contains(&format!("… [line truncated, {} chars total]", 606)),
+            "cap suffix must name the original length: {}",
+            result.output
+        );
+        // Exactly 500 chars of payload survive: "needle" + 494 'a's.
+        assert!(
+            result
+                .output
+                .contains(&format!("needle{}…", "a".repeat(494))),
+            "cap must keep exactly 500 chars: {}",
+            result.output
+        );
+        // A short sibling match is untouched.
+        assert!(result.output.contains("needle short"));
+    }
+
+    #[tokio::test]
+    async fn should_not_cap_match_line_when_exactly_500_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("needle{}", "b".repeat(494)); // exactly 500 chars
+        std::fs::write(dir.path().join("edge.txt"), format!("{line}\n")).unwrap();
+
+        let tool = GrepTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains(&line),
+            "an exactly-at-limit line must pass through untouched: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("[line truncated"),
+            "no cap suffix at the boundary: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_cap_multibyte_match_line_at_char_boundary_when_over_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // 6 + 600 = 606 chars, mostly 3-byte CJK: a byte-indexed cut would
+        // split a char and panic (or emit invalid UTF-8).
+        let line = format!("needle{}", "\u{754C}".repeat(600));
+        std::fs::write(dir.path().join("cjk.txt"), format!("{line}\n")).unwrap();
+
+        let tool = GrepTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result
+                .output
+                .contains("… [line truncated, 606 chars total]"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains(&format!("needle{}…", "\u{754C}".repeat(494))),
+            "the cap must count CHARS, not bytes: {}",
+            result.output
+        );
+        assert!(!result.output.contains(&"\u{754C}".repeat(495)));
+    }
+
+    #[tokio::test]
+    async fn should_cap_context_lines_when_context_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_neighbor = "c".repeat(700);
+        std::fs::write(
+            dir.path().join("ctx.txt"),
+            format!("{long_neighbor}\nneedle here\n"),
+        )
+        .unwrap();
+
+        let tool = GrepTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({ "pattern": "needle", "context": 1 }))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains(&"c".repeat(501)),
+            "context lines must be capped too: one long neighbour blows the budget just the same"
+        );
+        assert!(
+            result
+                .output
+                .contains("… [line truncated, 700 chars total]"),
+            "{}",
+            result.output
+        );
+    }
+
+    /// The `N chars total` suffix must name the RAW physical line's char
+    /// count at BOTH emission sites. The plain match site trims before
+    /// capping; counting the trimmed text there while the context site
+    /// counts the raw line makes the same physical line report two different
+    /// totals depending on the `context` argument.
+    #[tokio::test]
+    async fn should_report_same_chars_total_with_and_without_context_when_line_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Raw 606 chars: 100 leading spaces + "needle" + 500 'a's (trimmed: 506).
+        let raw_line = format!("{}needle{}", " ".repeat(100), "a".repeat(500));
+        std::fs::write(dir.path().join("indent.txt"), format!("{raw_line}\n")).unwrap();
+
+        let tool = GrepTool::new(dir.path());
+        let plain = tool
+            .execute(&serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        let with_context = tool
+            .execute(&serde_json::json!({ "pattern": "needle", "context": 1 }))
+            .await
+            .unwrap();
+        assert!(plain.success && with_context.success);
+
+        let total_of = |output: &str| -> String {
+            let start = output
+                .find("[line truncated, ")
+                .expect("cap suffix must be present")
+                + "[line truncated, ".len();
+            output[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect()
+        };
+        let plain_total = total_of(&plain.output);
+        let ctx_total = total_of(&with_context.output);
+        assert_eq!(
+            plain_total, ctx_total,
+            "same physical line must report the same total at both emission sites\nplain: {}\nctx: {}",
+            plain.output, with_context.output
+        );
+        assert_eq!(plain_total, "606", "the total is the RAW line's char count");
+    }
+
+    /// With the per-line cap in place, a long line can no longer be recovered
+    /// by re-running grep — the recovery advice must say so and point at
+    /// read_file instead.
+    #[test]
+    fn should_mention_per_line_cap_in_recovery_when_matches_overflow() {
+        let tool = GrepTool::new(std::path::Path::new("."));
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "pattern": "x" }), 1_000)
+            .expect("grep always has narrowing available");
+        assert!(advice.contains("500 chars"), "{advice}");
+        assert!(advice.contains("read_file"), "{advice}");
+    }
+
+    /// pi-style truncation contract: the model is warned about the output cap
+    /// UP FRONT, in the tool description, using the real limits.
+    #[test]
+    fn should_state_truncation_contract_in_description_when_grep() {
+        let tool = GrepTool::new(std::path::Path::new("."));
+        let desc = tool.description();
+        let limit = octos_core::tool_output_limit("grep");
+        assert!(
+            desc.contains(&limit.to_string()),
+            "description must carry the real output cap ({limit}): {desc}"
+        );
+        assert!(
+            desc.contains("500"),
+            "description must carry the per-line cap: {desc}"
         );
     }
 }
