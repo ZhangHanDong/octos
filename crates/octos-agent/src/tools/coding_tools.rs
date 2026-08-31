@@ -492,6 +492,20 @@ impl ExecCommandTool {
         // #28c — BEFORE snapshot for the file-change receipt, reusing the
         // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
         // omits the receipt.
+        // Fail closed on an unhonorable sandbox config BEFORE spawning
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
+        if let Some(refusal) = self.sandbox.refusal() {
+            return Ok(ToolResult {
+                output: refusal.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -602,6 +616,20 @@ impl ExecCommandTool {
         cwd: PathBuf,
         input: ExecCommandInput,
     ) -> Result<ToolResult> {
+        // Fail closed on an unhonorable sandbox config BEFORE spawning
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
+        if let Some(refusal) = self.sandbox.refusal() {
+            return Ok(ToolResult {
+                output: refusal.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2031,6 +2059,20 @@ impl Tool for BashTool {
         // #28c — BEFORE snapshot for the file-change receipt, reusing the
         // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
         // omits the receipt.
+        // Fail closed on an unhonorable sandbox config BEFORE spawning
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
+        if let Some(refusal) = self.sandbox.refusal() {
+            return Ok(ToolResult {
+                output: refusal.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
