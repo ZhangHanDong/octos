@@ -3735,6 +3735,10 @@ fn create_custom_provider(
         "anthropic" => {
             let mut provider = octos_llm::anthropic::AnthropicProvider::new(key, model)
                 .with_base_url(&base_url)
+                // #2194: label stays "custom" (its logical identity for
+                // adaptive-lane / QoS matching); the Anthropic cache rate is
+                // carried by ProviderMetadata::cache_lane, set from the provider
+                // TYPE in AnthropicProvider::provider_metadata().
                 .with_provider_label("custom");
             if let Some(t) = llm_timeout_secs {
                 let c =
@@ -4076,6 +4080,15 @@ mod custom_provider_tests {
 
         assert_eq!(provider.provider_name(), "custom");
         assert_eq!(provider.model_id(), "llama-3.1-70b-instruct");
+        // #2194 R4: a custom OpenAI endpoint keeps the "custom" identity AND the
+        // residual cache lane (full-rate reads) — NOT the Anthropic 0.1x bucket.
+        let meta = provider.provider_metadata();
+        assert_eq!(meta.cache_lane, octos_llm::CacheLane::Residual);
+        assert_eq!(
+            octos_llm::pricing::cache_rates_for_lane(meta.cache_lane).read_multiplier,
+            1.0,
+            "custom + api_type=openai must price cache reads at the residual rate",
+        );
     }
 
     #[test]
@@ -4089,8 +4102,24 @@ mod custom_provider_tests {
         )
         .unwrap();
 
+        // #2194 R4: the label STAYS "custom" (its logical identity for
+        // adaptive-lane / QoS matching — relabeling it silently disabled a
+        // configured lane restriction). The Anthropic cache rate is instead
+        // carried by the metadata cache_lane, sourced from the provider TYPE,
+        // so pricing is correct WITHOUT overloading the identity label.
         assert_eq!(provider.provider_name(), "custom");
         assert_eq!(provider.model_id(), "claude-compatible");
+        let meta = provider.provider_metadata();
+        assert_eq!(
+            meta.cache_lane,
+            octos_llm::CacheLane::Anthropic,
+            "custom + api_type=anthropic must carry the Anthropic cache lane",
+        );
+        assert_eq!(
+            octos_llm::pricing::cache_rates_for_lane(meta.cache_lane).read_multiplier,
+            0.1,
+            "and therefore price cache reads at 0.1x, not the 1.0x residual",
+        );
     }
 
     #[test]

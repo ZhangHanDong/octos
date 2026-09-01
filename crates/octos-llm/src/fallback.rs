@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::Result;
+use futures::StreamExt;
 use octos_core::Message;
 use tracing::warn;
 
@@ -12,7 +13,7 @@ use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::retry::RetryProvider;
 use crate::router::ProviderRouter;
-use crate::types::{ChatResponse, ChatStream, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 /// A provider that falls back to compatible alternatives on failure.
 /// When a provider fails, it's put in cooldown via the router so future
@@ -71,7 +72,29 @@ impl FallbackProvider {
             router.record_failure(model_id);
         }
     }
+
+    /// Prepend the winning slot index to a stream so a downstream consumer can
+    /// attribute the response to the exact answering provider (mirrors
+    /// `ProviderChain::stream_with_provider_index`).
+    fn stream_with_provider_index(&self, idx: usize, stream: ChatStream) -> ChatStream {
+        Box::pin(
+            futures::stream::once(async move { StreamEvent::ProviderIndex(idx) }).chain(stream),
+        )
+    }
 }
+
+/// Fallback wins are attributed with `FALLBACK_INDEX_BASE + j`, a range
+/// disjoint from any realistic primary slot index, so metadata resolution can
+/// tell a fallback win from the primary's OWN (possibly nested-container)
+/// winner index WITHOUT clobbering the latter. No provider has a million slots.
+///
+/// KNOWN LIMITATION (#2199): this flat tag does NOT compose when the PRIMARY is
+/// itself a `FallbackProvider` — the inner's `FALLBACK_INDEX_BASE + j` tag is
+/// indistinguishable from the outer's own, so a preserved inner-fallback index
+/// resolves to the OUTER's fallback. Same root cause as #2199 (a flat
+/// `provider_index` cannot carry `(which-child, child-index)` through nesting);
+/// the durable fix carries the answering leaf's metadata on the response.
+pub(crate) const FALLBACK_INDEX_BASE: usize = 1_000_000;
 
 #[async_trait]
 impl LlmProvider for FallbackProvider {
@@ -82,6 +105,10 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         match self.primary.chat(messages, tools, config).await {
+            // #2194 R6: PRESERVE the primary's own attribution. A nested
+            // container primary already stamped its real winner; clobbering it
+            // with a flat slot index would mis-resolve a mixed-lane primary.
+            // Resolution treats any primary-range index as the primary's own.
             Ok(resp) => Ok(resp),
             Err(primary_err) => {
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
@@ -110,13 +137,17 @@ impl LlmProvider for FallbackProvider {
                         continue;
                     }
                     match fb.chat(messages, tools, config).await {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
                             warn!(
                                 primary = self.primary.model_id(),
                                 fallback = fb.model_id(),
                                 fallback_idx = i,
                                 "fallback provider succeeded"
                             );
+                            // Tag in a range disjoint from any primary index
+                            // so resolution can tell a fallback win from the
+                            // primary's own index.
+                            resp.provider_index = Some(FALLBACK_INDEX_BASE + i);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -141,6 +172,8 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         match self.primary.chat_stream(messages, tools, config).await {
+            // Pass the primary's stream through unchanged so its own
+            // ProviderIndex (a nested container's real winner) survives.
             Ok(stream) => Ok(stream),
             Err(primary_err) => {
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
@@ -155,7 +188,7 @@ impl LlmProvider for FallbackProvider {
                     error = %primary_err,
                     "primary stream failed, trying fallbacks"
                 );
-                for fb in &self.fallbacks {
+                for (i, fb) in self.fallbacks.iter().enumerate() {
                     // #2135 round-7 P1: same fit guard as the chat path.
                     if !crate::context::route_fits_request(fb, messages, tools).await {
                         warn!(
@@ -166,7 +199,11 @@ impl LlmProvider for FallbackProvider {
                         continue;
                     }
                     match fb.chat_stream(messages, tools, config).await {
-                        Ok(stream) => return Ok(stream),
+                        Ok(stream) => {
+                            return Ok(
+                                self.stream_with_provider_index(FALLBACK_INDEX_BASE + i, stream)
+                            );
+                        }
                         Err(e) => {
                             self.record_failure(fb.model_id());
                             warn!(fallback = fb.model_id(), error = %e, "fallback stream also failed");
@@ -184,6 +221,30 @@ impl LlmProvider for FallbackProvider {
 
     fn provider_name(&self) -> &str {
         self.primary.provider_name()
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        // #2194 R5: slot 0 (primary) is the identity/default.
+        self.primary.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
+        match provider_index {
+            // A fallback answered (tagged FALLBACK_INDEX_BASE + j): resolve to
+            // that fallback. KNOWN LIMITATION (tracked): if the fallback is
+            // itself a mixed-lane container, its exact answering slot is not
+            // resolved here — its default metadata is used.
+            Some(i) if i >= FALLBACK_INDEX_BASE => self
+                .fallbacks
+                .get(i - FALLBACK_INDEX_BASE)
+                .map(|fb| fb.provider_metadata())
+                .unwrap_or_else(|| self.primary.provider_metadata()),
+            // The primary answered: the index is the primary's OWN (preserved),
+            // so DELEGATE — a mixed-lane container primary then resolves the
+            // exact answering slot's cache lane rather than its default.
+            Some(i) => self.primary.provider_metadata_for_index(Some(i)),
+            None => self.primary.provider_metadata(),
+        }
     }
 
     // #2135 round-6 P1: the MINIMUM across primary and every fallback —
@@ -383,6 +444,126 @@ mod tests {
             fb_calls.load(Ordering::SeqCst),
             1,
             "fallback must be called once"
+        );
+    }
+
+    #[test]
+    fn fallback_propagates_lane_and_identity_by_index() {
+        // #2194 R5: FallbackProvider wraps [primary, fallbacks...]; pricing must
+        // see the ANSWERING provider's cache lane, not the default Residual, and
+        // the primary's identity must survive for adaptive-lane matching.
+        let primary: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-5-sonnet")
+                .with_provider_label("custom"),
+        );
+        let fallback: Arc<dyn LlmProvider> = Arc::new(
+            crate::openai::OpenAIProvider::new("k", "gpt-4o").with_provider_label("openai"),
+        );
+        let fp = FallbackProvider::new(primary, vec![fallback]);
+
+        let meta = fp.provider_metadata();
+        assert_eq!(meta.provider, "custom", "identity is the primary's label");
+        assert_eq!(
+            meta.cache_lane,
+            crate::CacheLane::Anthropic,
+            "primary's Anthropic lane, not the default Residual",
+        );
+        // Primary-range indices (incl. a nested container primary's own
+        // winner) and None resolve THROUGH the primary.
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(0)).cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(1)).cache_lane,
+            crate::CacheLane::Anthropic,
+            "index 1 is a primary-range index, delegated to the primary",
+        );
+        assert_eq!(
+            fp.provider_metadata_for_index(None).cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+        // A fallback win is tagged FALLBACK_INDEX_BASE + j.
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(super::FALLBACK_INDEX_BASE))
+                .cache_lane,
+            crate::CacheLane::Residual,
+            "fallback slot 0 (OpenAI) -> residual lane",
+        );
+        // Out-of-range fallback tag falls back to the primary, never a panic.
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(super::FALLBACK_INDEX_BASE + 99))
+                .cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+    }
+
+    // KNOWN LIMITATION (#2199): a flat provider_index does not compose when a
+    // FallbackProvider is the PRIMARY of another FallbackProvider. The inner's
+    // fallback tag (FALLBACK_INDEX_BASE + j) is misread by the outer as its own
+    // fallback index, so resolution routes to outer.fallbacks[j] instead of the
+    // inner's answering fallback. Ignored until the durable answering-metadata
+    // fix (carry the resolved leaf metadata on the response) lands.
+    #[ignore = "flat-index nesting non-compositionality; tracked in #2199"]
+    #[test]
+    fn nested_fallback_as_primary_resolves_inner_fallback_lane() {
+        let inner_primary: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-5-sonnet")
+                .with_provider_label("custom"),
+        );
+        let inner_fallback: Arc<dyn LlmProvider> = Arc::new(
+            crate::openai::OpenAIProvider::new("k", "gpt-4o").with_provider_label("openai"),
+        );
+        let inner: Arc<dyn LlmProvider> =
+            Arc::new(FallbackProvider::new(inner_primary, vec![inner_fallback]));
+        let outer_fallback: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-opus")
+                .with_provider_label("other-anthropic"),
+        );
+        let outer = FallbackProvider::new(inner, vec![outer_fallback]);
+        // The inner's fallback answered -> its tag is Some(FALLBACK_INDEX_BASE).
+        // DESIRED: resolve to the inner's OpenAI fallback (residual lane).
+        // ACTUAL (bug): resolves to outer.fallbacks[0] (Anthropic).
+        assert_eq!(
+            outer
+                .provider_metadata_for_index(Some(super::FALLBACK_INDEX_BASE))
+                .cache_lane,
+            crate::CacheLane::Residual,
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_winner_preserves_child_attribution() {
+        // #2194 R6: a leaf primary reports no index; FallbackProvider must NOT
+        // clobber it, so a nested container primary's real winner survives and
+        // pricing resolves through the primary.
+        let primary = CountingProvider::ok();
+        let fallback = CountingProvider::always_err_500();
+        let fp = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
+        let result = fp.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(
+            result.provider_index, None,
+            "leaf primary's own attribution (None) is preserved, not clobbered",
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_winner_is_attributed_with_its_slot_index() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        // #2194 R5: primary fails, fallback answers -> the response must carry
+        // the fallback's slot index (1) so pricing resolves the fallback's lane.
+        let primary = CountingProvider::always_err_500();
+        let fallback = CountingProvider::ok();
+        let fp = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
+        let result = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            fp.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .expect("fallback answers under Normal policy");
+        assert_eq!(
+            result.provider_index,
+            Some(super::FALLBACK_INDEX_BASE),
+            "fallback slot 0 answered -> tagged FALLBACK_INDEX_BASE + 0",
         );
     }
 
