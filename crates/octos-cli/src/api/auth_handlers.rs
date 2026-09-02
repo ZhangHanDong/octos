@@ -25,6 +25,36 @@ use super::router::AuthIdentity;
 /// Allows at most 3 requests per 5-minute window per email address.
 static OTP_RATE_LIMIT: LazyLock<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+const OTP_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+const OTP_RATE_LIMIT_MAX_KEYS: usize = 4096;
+
+fn otp_rate_limit_exceeded(
+    limits: &mut HashMap<String, (u32, std::time::Instant)>,
+    rate_limit_key: String,
+    now: std::time::Instant,
+) -> bool {
+    // Unknown addresses are deliberately rate-limited too, but they are
+    // attacker-controlled. Prune expired buckets before enforcing a hard cap
+    // so unique probes cannot grow this process-global map without bound.
+    if limits.len() >= OTP_RATE_LIMIT_MAX_KEYS {
+        limits.retain(|_, (_, started_at)| {
+            now.saturating_duration_since(*started_at) < OTP_RATE_LIMIT_WINDOW
+        });
+    }
+    if !limits.contains_key(&rate_limit_key) && limits.len() >= OTP_RATE_LIMIT_MAX_KEYS {
+        return true;
+    }
+
+    let entry = limits.entry(rate_limit_key).or_insert((0, now));
+    if now.saturating_duration_since(entry.1) >= OTP_RATE_LIMIT_WINDOW {
+        *entry = (0, now);
+    }
+    if entry.0 >= 3 {
+        return true;
+    }
+    entry.0 += 1;
+    false
+}
 
 pub(crate) fn is_top_level_profile_id(state: &AppState, profile_id: &str) -> bool {
     state
@@ -488,30 +518,9 @@ pub async fn send_code(
         None
     };
 
-    if scoped_profile_id.is_some() {
-        if scoped_login_target.is_none() {
-            tracing::warn!(
-                email = %requested_email,
-                scoped_profile = ?scoped_profile_id,
-                "OTP skipped — email does not match scoped profile"
-            );
-            return Ok(Json(SendCodeResponse {
-                ok: false,
-                message: Some("This email is not registered for this account".into()),
-            }));
-        }
-    } else if root_login_target.is_none() {
-        if !auth_mgr.allow_self_registration() {
-            tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
-            return Ok(Json(SendCodeResponse {
-                ok: false,
-                message: Some("This email is not registered for login".into()),
-            }));
-        }
-        tracing::info!(email = %requested_email, "sending OTP for self-registration (no existing profile)");
-    }
-
-    // Rate-limit OTP sends: max 3 per email per 5-minute window.
+    // Rate-limit every request, including unknown/uninvited addresses. Keeping
+    // this before the eligibility exits prevents a fast, unlimited probe path.
+    // Max 3 requests per email per 5-minute window.
     {
         let mut limits = OTP_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
         let rate_limit_key = scoped_login_target
@@ -526,13 +535,7 @@ pub async fn send_code(
                 })
             })
             .unwrap_or_else(|| requested_email.clone());
-        let entry = limits
-            .entry(rate_limit_key)
-            .or_insert((0, std::time::Instant::now()));
-        if entry.1.elapsed() > std::time::Duration::from_secs(300) {
-            *entry = (0, std::time::Instant::now()); // reset after 5 min
-        }
-        if entry.0 >= 3 {
+        if otp_rate_limit_exceeded(&mut limits, rate_limit_key, std::time::Instant::now()) {
             tracing::warn!(email = %req.email, "OTP rate limit exceeded");
             // Return generic success to avoid leaking rate-limit state
             return Ok(Json(SendCodeResponse {
@@ -540,7 +543,31 @@ pub async fn send_code(
                 message: Some("Verification code sent to your email".into()),
             }));
         }
-        entry.0 += 1;
+    }
+
+    if scoped_profile_id.is_some() && scoped_login_target.is_none() {
+        tracing::warn!(
+            email = %requested_email,
+            scoped_profile = ?scoped_profile_id,
+            "OTP skipped — email does not match scoped profile"
+        );
+        delay_ineligible_otp_response().await;
+        return Ok(Json(SendCodeResponse {
+            ok: true,
+            message: Some("Verification code sent to your email".into()),
+        }));
+    }
+    if scoped_profile_id.is_none() && root_login_target.is_none() {
+        tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
+        // The body is identical to an eligible request. A short jittered delay
+        // also reduces the otherwise-obvious microseconds-vs-SMTP timing gap.
+        // It cannot perfectly reproduce arbitrary SMTP latency, so the edge
+        // rate limit remains part of the public deployment's defence in depth.
+        delay_ineligible_otp_response().await;
+        return Ok(Json(SendCodeResponse {
+            ok: true,
+            message: Some("Verification code sent to your email".into()),
+        }));
     }
 
     tracing::info!(email = %requested_email, "login OTP requested");
@@ -579,6 +606,15 @@ pub async fn send_code(
             }))
         }
     }
+}
+
+async fn delay_ineligible_otp_response() {
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis() as u64
+        % 201;
+    tokio::time::sleep(std::time::Duration::from_millis(350 + jitter_ms)).await;
 }
 
 /// GET /api/auth/status
@@ -4329,6 +4365,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn otp_rate_limit_prunes_expired_keys_and_stays_bounded() {
+        let now = std::time::Instant::now();
+        let mut limits = (0..OTP_RATE_LIMIT_MAX_KEYS)
+            .map(|index| (format!("probe-{index}@example.com"), (1, now)))
+            .collect::<HashMap<_, _>>();
+
+        assert!(otp_rate_limit_exceeded(
+            &mut limits,
+            "overflow@example.com".into(),
+            now
+        ));
+        assert_eq!(limits.len(), OTP_RATE_LIMIT_MAX_KEYS);
+        assert!(!limits.contains_key("overflow@example.com"));
+
+        limits.insert(
+            "probe-0@example.com".into(),
+            (
+                1,
+                now - OTP_RATE_LIMIT_WINDOW - std::time::Duration::from_secs(1),
+            ),
+        );
+        assert!(!otp_rate_limit_exceeded(
+            &mut limits,
+            "replacement@example.com".into(),
+            now
+        ));
+        assert_eq!(limits.len(), OTP_RATE_LIMIT_MAX_KEYS);
+        assert!(limits.contains_key("replacement@example.com"));
+        assert!(!limits.contains_key("probe-0@example.com"));
+    }
+
+    #[test]
     fn should_require_ominix_only_for_local_voice_legs() {
         use crate::api::voice_turn::TtsRoute;
         use crate::skills_scope::AsrRoute;
@@ -6100,8 +6168,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_send_code_rejects_wrong_email() {
+    async fn scoped_send_code_hides_whether_email_is_registered() {
         let (_dir, state, user_store, profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
         child.public_subdomain = Some("assistant".into());
@@ -6127,11 +6196,47 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!resp.ok);
+        assert!(resp.ok);
         assert_eq!(
             resp.message.as_deref(),
-            Some("This email is not registered for this account")
+            Some("Verification code sent to your email")
         );
+        assert!(
+            auth_mgr
+                .test_pending_code("wrong@example.com", Some("tenant--assistant"))
+                .await
+                .is_none()
+        );
+        assert!(auth_mgr.test_sent_emails().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn root_send_code_hides_whether_email_is_invited() {
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
+
+        let Json(resp) = send_code(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "not-invited@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.ok);
+        assert_eq!(
+            resp.message.as_deref(),
+            Some("Verification code sent to your email")
+        );
+        assert!(
+            auth_mgr
+                .test_pending_code("not-invited@example.com", None)
+                .await
+                .is_none()
+        );
+        assert!(auth_mgr.test_sent_emails().await.is_empty());
     }
 
     #[tokio::test]
