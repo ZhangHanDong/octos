@@ -1291,12 +1291,13 @@ pub async fn remove_my_profile_skill(
 /// profiles saving different secrets under the same env var never overwrite a
 /// single shared keychain item (each profile reads back its own credential).
 ///
-/// `is_macos` and `set_secret` are injected for testability.
+/// `store_available` (a secret-store backend exists on this host) and
+/// `set_secret` are injected for testability.
 pub(crate) fn relocate_secret_to_keychain(
     env_vars: &mut HashMap<String, String>,
     key: &str,
     profile_id: &str,
-    is_macos: bool,
+    store_available: bool,
     set_secret: impl Fn(&str, &str) -> eyre::Result<()>,
 ) -> Result<(), String> {
     let Some(value) = env_vars.get(key) else {
@@ -1307,9 +1308,9 @@ pub(crate) fn relocate_secret_to_keychain(
     if !value.starts_with('{') {
         return Ok(());
     }
-    if !is_macos {
+    if !store_available {
         return Err(format!(
-            "{key}: keychain-backed credential storage is only supported on macOS"
+            "{key}: keychain-backed credential storage is unavailable on this host (no secret store backend)"
         ));
     }
     let account = crate::auth::keychain::scoped_account(key, profile_id);

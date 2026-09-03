@@ -291,7 +291,7 @@ pub(crate) fn relocate_keychain_backed_secrets(
             env_vars,
             &key,
             profile_id,
-            cfg!(target_os = "macos"),
+            crate::auth::keychain::is_available(),
             crate::auth::keychain::set_secret,
         )
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -5536,12 +5536,27 @@ mod tests {
 
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
-        // The shared helper used by every profile/sub-account save path must
-        // refuse a raw SA JSON on a non-macOS host (where keychain storage
-        // isn't available) rather than let it fall through to plaintext config.
-        // On macOS it would relocate to the keychain instead, so only assert on
-        // the non-macOS path (the one CI runs and the plaintext risk lives on).
-        if cfg!(target_os = "macos") {
+        // #2234/45a — the availability predicate is now `keychain::is_available()`
+        // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
+        // never-plaintext contract holds where NO backend exists (unsupported
+        // platforms); on Linux the raw JSON is legitimately relocated into the
+        // file store and the env slot becomes a marker.
+        if crate::auth::keychain::is_available() {
+            // Store-backed host (macOS keychain / linux file): relocation
+            // succeeds and the plaintext is replaced by a marker.
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                "VERTEX_SA_JSON".to_string(),
+                r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
+            );
+            relocate_keychain_backed_secrets(&mut env, "sub-account-1")
+                .expect("store-backed host relocates raw SA JSON");
+            let stored = env.get("VERTEX_SA_JSON").expect("slot present");
+            assert!(
+                !stored.contains("private_key"),
+                "raw JSON must not persist as plaintext; got: {stored}"
+            );
+            assert!(stored.contains("keychain"), "marker present: {stored}");
             return;
         }
         let mut env = std::collections::HashMap::new();
@@ -5552,7 +5567,7 @@ mod tests {
         let res = relocate_keychain_backed_secrets(&mut env, "sub-account-1");
         assert!(
             res.is_err(),
-            "raw VERTEX_SA_JSON must be rejected off macOS, never saved as plaintext"
+            "raw VERTEX_SA_JSON must be rejected on hosts with no secret store"
         );
         // The raw value is left untouched (the caller bails before saving).
         assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
