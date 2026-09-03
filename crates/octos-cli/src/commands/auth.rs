@@ -256,6 +256,40 @@ fn keychain_target(name: &str, profile_id: &str, secret: &str) -> (String, Strin
     }
 }
 
+/// #2234/45b — does this profile REFERENCE `name` as a credential?
+/// Referenced = declared in env_vars, OR named by the LLM contract:
+/// primary/fallback `route.api_key_env`, or any `sub_providers[].api_key_env`.
+/// Route-declared keys are exactly the issue's zai-coding shape (env_vars
+/// empty, primary route declaring ZAI_API_KEY).
+fn profile_references_key(profile: &crate::profiles::UserProfile, name: &str) -> bool {
+    if profile.config.env_vars.contains_key(name) {
+        return true;
+    }
+    let llm = profile.config.llm.as_ref();
+    let primary_route_env = llm
+        .and_then(|l| l.primary.as_ref())
+        .and_then(|sel| sel.route.as_ref())
+        .and_then(|r| r.api_key_env.as_deref());
+    if primary_route_env == Some(name) {
+        return true;
+    }
+    if llm
+        .map(|l| {
+            l.fallbacks
+                .iter()
+                .any(|sel| sel.route.as_ref().and_then(|r| r.api_key_env.as_deref()) == Some(name))
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    profile
+        .config
+        .sub_providers
+        .iter()
+        .any(|sp| sp.api_key_env.as_deref() == Some(name))
+}
+
 fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Result<()> {
     // Get the secret value: from argument or interactive prompt
     let secret = match value {
@@ -279,6 +313,22 @@ fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Resul
     // shared account.
     let scoped = should_scope(name, &secret);
 
+    // #2234/45b — the explicit-`--profile` guard runs BEFORE any secret is
+    // written: an unreferenced name under an explicit profile id is almost
+    // certainly a typo (the issue's exact failure mode), so refuse up front
+    // instead of storing an orphan secret.
+    let store = open_profile_store()?;
+    let profiles = get_profiles(&store, profile_id)?;
+    if profile_id.is_some() && !profiles.iter().any(|p| profile_references_key(p, name)) {
+        eyre::bail!(
+            "profile '{}' does not reference '{}' (not in env_vars, no LLM route \
+             api_key_env, no sub_provider api_key_env); refusing to store an \
+             unreferenced secret — check the name or configure the profile first",
+            profile_id.unwrap_or_default(),
+            name
+        );
+    }
+
     // Shared keys: store once up front (also covers the orphan / no-profile
     // case). Scoped keys are stored per profile in the loop below.
     if !scoped {
@@ -286,19 +336,25 @@ fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Resul
     }
 
     // Update profile(s) to use the keychain marker
-    let store = open_profile_store()?;
-    let profiles = get_profiles(&store, profile_id)?;
-
     let mut updated_count = 0;
     for mut profile in profiles {
-        if profile.config.env_vars.contains_key(name) {
+        if profile_references_key(&profile, name) {
             let (account, marker) = keychain_target(name, &profile.id, &secret);
             if scoped {
                 keychain::set_secret(&account, &secret)?;
             }
             profile.config.env_vars.insert(name.to_string(), marker);
             profile.updated_at = chrono::Utc::now();
-            store.save(&profile)?;
+            // #2234/45b — store-then-save with rollback: if the profile
+            // save fails after the secret landed, delete the freshly
+            // stored account so a half-applied update leaves no orphan.
+            if let Err(save_err) = store.save(&profile) {
+                let _ = keychain::delete_secret(&account);
+                return Err(eyre::eyre!(
+                    "profile '{}' save failed; rolled back the stored secret: {save_err}",
+                    profile.id
+                ));
+            }
             updated_count += 1;
             println!(
                 "  {} profile '{}' updated to use keychain",
@@ -624,6 +680,113 @@ fn get_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2234/45b — build a UserProfile with the given LLM-contract shape.
+    fn profile_with_llm(
+        id: &str,
+        llm: Option<crate::profiles::LlmProfileConfig>,
+    ) -> crate::profiles::UserProfile {
+        let now = chrono::Utc::now();
+        crate::profiles::UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig {
+                llm,
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn route_with_env(env: Option<&str>) -> crate::profiles::LlmRouteConfig {
+        crate::profiles::LlmRouteConfig {
+            api_key_env: env.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn selection_with_route(env: Option<&str>) -> crate::profiles::LlmModelSelectionConfig {
+        crate::profiles::LlmModelSelectionConfig {
+            route: Some(route_with_env(env)),
+            ..Default::default()
+        }
+    }
+
+    /// The issue's zai-coding shape: env_vars EMPTY, primary route declares
+    /// ZAI_API_KEY — the key is REFERENCED.
+    #[test]
+    fn references_zai_coding_shape_primary_route_env() {
+        let llm = crate::profiles::LlmProfileConfig {
+            primary: Some(selection_with_route(Some("ZAI_API_KEY"))),
+            ..Default::default()
+        };
+        let p = profile_with_llm("zai-coding", Some(llm));
+        assert!(profile_references_key(&p, "ZAI_API_KEY"));
+        assert!(!profile_references_key(&p, "OTHER_KEY"));
+    }
+
+    /// Fallback route reference.
+    #[test]
+    fn references_fallback_route_env() {
+        let llm = crate::profiles::LlmProfileConfig {
+            fallbacks: vec![selection_with_route(Some("FALLBACK_KEY"))],
+            ..Default::default()
+        };
+        let p = profile_with_llm("p", Some(llm));
+        assert!(profile_references_key(&p, "FALLBACK_KEY"));
+    }
+
+    /// Sub-provider reference.
+    #[test]
+    fn references_sub_provider_env() {
+        let mut p = profile_with_llm("p", None);
+        p.config
+            .sub_providers
+            .push(crate::config::SubProviderConfig {
+                key: "cheap".into(),
+                provider: "zai".into(),
+                model: None,
+                api_key_env: Some("CHEAP_LANE_KEY".into()),
+                base_url: None,
+                description: None,
+                api_type: None,
+                default_context_window: None,
+                max_output_tokens: None,
+            });
+        assert!(profile_references_key(&p, "CHEAP_LANE_KEY"));
+    }
+
+    /// env_vars classic reference still wins.
+    #[test]
+    fn references_env_vars_membership() {
+        let mut p = profile_with_llm("p", None);
+        p.config
+            .env_vars
+            .insert("CLASSIC_KEY".to_string(), "v".to_string());
+        assert!(profile_references_key(&p, "CLASSIC_KEY"));
+    }
+
+    /// Unrelated name under an explicit profile id → the set_key guard
+    /// refuses BEFORE storing (pinned at the predicate level here; the
+    /// command-level guard composes this with the store).
+    #[test]
+    fn unrelated_name_not_referenced() {
+        let llm = crate::profiles::LlmProfileConfig {
+            primary: Some(selection_with_route(Some("ZAI_API_KEY"))),
+            ..Default::default()
+        };
+        let p = profile_with_llm("zai-coding", Some(llm));
+        assert!(
+            !profile_references_key(&p, "UNRELATED"),
+            "unreferenced name must be refused under an explicit --profile"
+        );
+    }
+
     use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantStore};
 
     #[test]
