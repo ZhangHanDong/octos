@@ -1,6 +1,5 @@
 //! Auth command: login, logout, status, and keychain management.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -290,16 +289,56 @@ fn profile_references_key(profile: &crate::profiles::UserProfile, name: &str) ->
         .any(|sp| sp.api_key_env.as_deref() == Some(name))
 }
 
-fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Result<()> {
+/// #2234/45c — read a SECRET without terminal echo.
+///
+/// Real tty → `rpassword` (safe termios ECHO-off wrapper; the workspace
+/// `deny(unsafe_code)` rules out a hand-rolled termios arm). Non-tty
+/// (piped tests / `echo | octos`) → plain read via the injected reader:
+/// echo is moot off-terminal, and tests drive this arm deterministically.
+fn read_secret_line<R: std::io::BufRead>(reader: R, prompt: &str) -> std::io::Result<String> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    if unsafe_tty_check() {
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        return rpassword::read_password();
+    }
+    let mut reader = reader;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    reader.read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+/// #2234/45c — tty probe without unsafe: `rpassword`'s public API has no
+/// isatty, but /dev/tty reachability is a faithful proxy — when stdin is
+/// redirected, opening the CONTROLLING tty succeeds while reading stdin
+/// would come from the pipe (the case tests inject). Simple heuristic: a
+/// Stdio `is_terminal()` (std, 1.70+, safe).
+#[cfg(unix)]
+fn unsafe_tty_check() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal()
+}
+
+/// #2234/45c — injectable profile-save seam (issue Tests requested:
+/// "Profile-save failure rolls back the newly stored secret"). Production
+/// passes the direct store save; tests inject a failing closure to pin the
+/// rollback without touching the real profile store.
+fn set_key_with_save(
+    name: &str,
+    value: Option<String>,
+    profile_id: Option<&str>,
+    store: &ProfileStore,
+    save_profile: impl Fn(&crate::profiles::UserProfile) -> Result<()>,
+) -> Result<()> {
     // Get the secret value: from argument or interactive prompt
     let secret = match value {
         Some(v) => v,
         None => {
-            print!("Enter value for {}: ", name.cyan());
-            std::io::stdout().flush()?;
-            let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf)?;
-            let trimmed = buf.trim().to_string();
+            let prompt = format!("Enter value for {}: ", name.cyan());
+            let trimmed = read_secret_line(std::io::stdin().lock(), &prompt)?;
             if trimmed.is_empty() {
                 eyre::bail!("no value provided");
             }
@@ -317,8 +356,7 @@ fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Resul
     // written: an unreferenced name under an explicit profile id is almost
     // certainly a typo (the issue's exact failure mode), so refuse up front
     // instead of storing an orphan secret.
-    let store = open_profile_store()?;
-    let profiles = get_profiles(&store, profile_id)?;
+    let profiles = get_profiles(store, profile_id)?;
     if profile_id.is_some() && !profiles.iter().any(|p| profile_references_key(p, name)) {
         eyre::bail!(
             "profile '{}' does not reference '{}' (not in env_vars, no LLM route \
@@ -348,7 +386,7 @@ fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Resul
             // #2234/45b — store-then-save with rollback: if the profile
             // save fails after the secret landed, delete the freshly
             // stored account so a half-applied update leaves no orphan.
-            if let Err(save_err) = store.save(&profile) {
+            if let Err(save_err) = save_profile(&profile) {
                 let _ = keychain::delete_secret(&account);
                 return Err(eyre::eyre!(
                     "profile '{}' save failed; rolled back the stored secret: {save_err}",
@@ -389,6 +427,13 @@ fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Resul
     Ok(())
 }
 
+fn set_key(name: &str, value: Option<String>, profile_id: Option<&str>) -> Result<()> {
+    let store = open_profile_store()?;
+    set_key_with_save(name, value, profile_id, &store, |profile| {
+        store.save(profile)
+    })
+}
+
 fn list_keys(profile_id: Option<&str>) -> Result<()> {
     let store = open_profile_store()?;
     let profiles = get_profiles(&store, profile_id)?;
@@ -413,6 +458,18 @@ fn list_keys(profile_id: Option<&str>) -> Result<()> {
             }
         }
     }
+
+    // #2234/45c — name the ACTIVE backend and its availability up front;
+    // values are never printed (only marker-resolved account NAMES below).
+    println!(
+        "backend: {} ({})",
+        keychain::backend_name(),
+        if keychain::is_available() {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
 
     if keychain_keys.is_empty() && plain_keys.is_empty() {
         println!("No API keys configured in any profile.");
@@ -575,13 +632,7 @@ fn unlock_keychain(password: Option<String>) -> Result<()> {
 
     let pw = match password {
         Some(p) => p,
-        None => {
-            print!("macOS login password: ");
-            std::io::stdout().flush()?;
-            let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf)?;
-            buf.trim().to_string()
-        }
+        None => read_secret_line(std::io::stdin().lock(), "macOS login password: ")?,
     };
 
     keychain::unlock(&pw)?;
@@ -769,6 +820,118 @@ mod tests {
             .env_vars
             .insert("CLASSIC_KEY".to_string(), "v".to_string());
         assert!(profile_references_key(&p, "CLASSIC_KEY"));
+    }
+
+    /// #2234/45c — save-failure rollback, via the injectable seam: the
+    /// scoped secret was stored, the save fails, the freshly stored account
+    /// is deleted (rollback), and the error names the rollback.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn save_failure_rolls_back_stored_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Point BOTH the secret store and the profile store at the temp dir:
+        // a real profile row exists (so the reference guard passes) while
+        // the SAVE step is injected to fail.
+        let _root = crate::auth::keychain::test_override_secrets_root(tmp.path().join("secrets"));
+        let store =
+            crate::profiles::ProfileStore::open_unified(&tmp.path().join(".octos")).unwrap();
+        let mut profile = profile_with_llm("zai-coding", None);
+        profile
+            .config
+            .env_vars
+            .insert("VERTEX_SA_JSON".to_string(), "placeholder".to_string());
+        store.save(&profile).unwrap();
+        let json_path = tmp
+            .path()
+            .join(".octos")
+            .join("profiles")
+            .join("zai-coding.json");
+        let profile_json_before = std::fs::read_to_string(&json_path).unwrap_or_default();
+
+        let secret = r#"{"type":"service_account","private_key":"x"}"#;
+        let err = set_key_with_save(
+            "VERTEX_SA_JSON",
+            Some(secret.to_string()),
+            Some("zai-coding"),
+            &store,
+            |_profile| Err(eyre::eyre!("injected save failure")),
+        )
+        .expect_err("save failure must surface");
+        assert!(
+            err.to_string().contains("rolled back"),
+            "error must name the rollback: {err}"
+        );
+        let account = crate::auth::keychain::scoped_account("VERTEX_SA_JSON", "zai-coding");
+        assert_eq!(
+            crate::auth::keychain::get_secret(&account).unwrap(),
+            None,
+            "rollback must delete the freshly stored secret"
+        );
+        // Profile JSON bytes unchanged (the injected save never ran).
+        let after = std::fs::read_to_string(&json_path).unwrap_or_default();
+        assert_eq!(profile_json_before, after, "profile bytes must not change");
+    }
+
+    /// #2234/45c — secret-store failure leaves profile JSON bytes UNCHANGED
+    /// (issue: "profile JSON unchanged when the store fails"). With the
+    /// store unavailable (unsupported platform semantics via an empty root
+    /// read-only dir), set_key fails BEFORE any profile write.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn store_failure_leaves_profile_unchanged() {
+        // Empty value + interactive arm would prompt; pass explicit value.
+        // Make the store UNAVAILABLE: point the root at a path whose parent
+        // cannot host 0700 dirs (a FILE as the root → ensure_root fails).
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "not-a-dir").unwrap();
+        let _root = crate::auth::keychain::test_override_secrets_root(blocker.clone());
+        let store =
+            crate::profiles::ProfileStore::open_unified(&tmp.path().join(".octos")).unwrap();
+        let mut profile = profile_with_llm("zai-coding", None);
+        profile
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".to_string(), "placeholder".to_string());
+        store.save(&profile).unwrap();
+        let json_path = tmp
+            .path()
+            .join(".octos")
+            .join("profiles")
+            .join("zai-coding.json");
+        let before = std::fs::read_to_string(&json_path).unwrap_or_default();
+
+        let err = set_key_with_save(
+            "ZAI_API_KEY",
+            Some("sk-x".to_string()),
+            Some("zai-coding"),
+            &store,
+            |_profile| unreachable!("save must never run when the store fails"),
+        )
+        .expect_err("store failure must surface");
+        // The store error names the file path it could not use.
+        assert!(
+            err.to_string().contains("blocker"),
+            "error should name the unusable root: {err}"
+        );
+        // Profile JSON bytes unchanged — the store failed BEFORE any write.
+        let after = std::fs::read_to_string(&json_path).unwrap_or_default();
+        assert_eq!(before, after, "profile bytes must not change");
+    }
+
+    /// #2234/45c — interactive input is read WITHOUT echo from the injected
+    /// reader (the non-tty arm): value arrives trimmed, prompt printed.
+    #[test]
+    fn interactive_read_uses_injected_reader_without_echo() {
+        let input = std::io::Cursor::new(b"sk-from-pipe\n".to_vec());
+        // Non-tty under `cargo test` (stdin is the harness pipe), so this
+        // exercises the reader arm deterministically.
+        let got = read_secret_line(input, "Enter value for TEST: ").expect("injected reader read");
+        assert_eq!(got, "sk-from-pipe", "trimmed secret from the reader");
+        // Empty input → empty string (caller bails with 'no value').
+        let empty =
+            read_secret_line(std::io::Cursor::new(b"\n".to_vec()), "p: ").expect("empty read ok");
+        assert_eq!(empty, "");
     }
 
     /// Unrelated name under an explicit profile id → the set_key guard
