@@ -72,6 +72,7 @@ test_a2.md
 !CLAUDE.md
 !CHANGELOG.md
 !.octos/AGENTS.md
+!specs/task-issue-2237-goal-create-admits-archived.spec.md
 !specs/task-approval-post-tool-continuation.spec.md
 !specs/kv-cache-friendly-compaction.spec.md
 !specs/task-compaction-instruction-priority.spec.md
