@@ -3183,9 +3183,22 @@ mod issue_2236_build_cache_tests {
         )
         .unwrap();
         let wt = peers_root.join(&staged.slug).join("wt");
-        let ours = std::fs::read(wt.join(".cargo").join("config.toml")).unwrap();
-        let repo = std::fs::read(ws.join(".cargo").join("config.toml")).unwrap();
-        assert_eq!(ours, repo, "repo config untouched");
+        // #2236-r1 — normalize CRLF to LF on BOTH sides before comparing:
+        // on a Windows checkout with core.autocrlf, git materializes the
+        // committed config.toml with CRLF in one tree and LF in the other,
+        // so the raw byte comparison broke despite identical content. The
+        // contract's intent is "untouched", not "same EOL".
+        let read_norm = |p: &std::path::Path| {
+            std::fs::read(p)
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|b| *b != b'\r')
+                .collect::<Vec<u8>>()
+        };
+        let ours = read_norm(&wt.join(".cargo").join("config.toml"));
+        let repo = read_norm(&ws.join(".cargo").join("config.toml"));
+        assert_eq!(ours, repo, "repo config untouched (CRLF-normalized)");
         let note = staged.build_cache.note_line(&ws).unwrap();
         assert!(note.contains("left untouched"), "{note}");
     }
