@@ -3123,11 +3123,15 @@ mod issue_2236_build_cache_tests {
         let wt = peers_root.join(&staged.slug).join("wt");
         let cfg = wt.join(".cargo").join("config.toml");
         let body = std::fs::read_to_string(&cfg).unwrap();
-        assert!(body.contains("[build]"), "config body: {body}");
-        assert!(
-            body.contains(&format!("target-dir = \"{}/target\"", ws.display())),
-            "absolute target-dir: {body}"
+        // #2236-r2 — the config is EXACTLY two lines: [build] + target-dir.
+        // Nothing else (CARGO_HOME, registry keys, …) may ride along.
+        assert_eq!(
+            body,
+            format!("[build]\ntarget-dir = \"{}/target\"\n", ws.display()),
+            "config must be exactly the two contract lines"
         );
+        assert!(!body.contains("CARGO_HOME"), "no CARGO_HOME key");
+        assert!(!body.contains("registry"), "no registry key");
         let exclude =
             std::fs::read_to_string(wt.join(".git").join("info").join("exclude")).unwrap();
         assert!(

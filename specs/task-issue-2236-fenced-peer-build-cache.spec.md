@@ -20,6 +20,8 @@ issue #2236)。本任务让围栏 peer 在不放松 `.git` 隔离的前提下复
 - 触发条件:围栏创建(`stage_peer` 中 `worktree == true` 分支)且 workspace 根目录存在
   `Cargo.toml`。非 Cargo workspace 不写任何文件、不改 `model_note`。
 - 机制:在克隆完成后写 `wt/.cargo/config.toml`,内容恰为
+  `[build]` + `target-dir` 两行,不含 CARGO_HOME/registry 等任何其它键
+  (原条目续):
   `[build]\ntarget-dir = "<workspace_root>/target"\n`(绝对路径,经 `Path::display`),
   并把 `.cargo/config.toml` 追加进 `wt/.git/info/exclude`,保证 peer 的 `git status` 干净、
   `git add` 不会把它带进提交。不用环境变量(peer 的工具进程环境不由 stage 阶段掌控)。
@@ -40,6 +42,7 @@ issue #2236)。本任务让围栏 peer 在不放松 `.git` 隔离的前提下复
 
 ### Allowed Changes
 - crates/octos-cli/src/peers/mod.rs
+- specs/*.spec.md
 - crates/octos-cli/src/obs_events.rs
 
 ### Forbidden
@@ -53,6 +56,7 @@ issue #2236)。本任务让围栏 peer 在不放松 `.git` 隔离的前提下复
 - 非 Cargo 生态(npm、pnpm 等)的缓存复用。
 - 沙箱对共享 `target/` 的写放行(另立)。
 - 智能围栏(#20a)判定逻辑。
+- 共享 target 的 LRU 回收与围栏拆除配对(后续 issue,对齐 #2235)。
 
 ## Acceptance Criteria
 
