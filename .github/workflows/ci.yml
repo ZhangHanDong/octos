@@ -1343,13 +1343,17 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          echo "$NEEDS_JSON" | python3 -c '
-          import json, sys
-          needs = json.load(sys.stdin)
-          bad = {k: v["result"] for k, v in needs.items() if v["result"] in ("failure", "cancelled")}
-          for k, v in sorted(needs.items()):
-              print(f"{k}: {v[\"result\"]}")
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          bad = {}
+          for name in sorted(needs):
+              result = needs[name]["result"]
+              print(name + ": " + result)
+              if result in ("failure", "cancelled"):
+                  bad[name] = result
           if bad:
-              print("gate: FAIL ->", bad); sys.exit(1)
-          print("gate: all required jobs succeeded or were skipped by event gating")
-          '
+              print("gate: FAIL -> " + json.dumps(bad))
+              sys.exit(1)
+          print("gate: all required jobs succeeded (event-gated skips are fine)")
+          PY
