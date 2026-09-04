@@ -5576,22 +5576,44 @@ mod tests {
     #[test]
     fn relocate_rejects_service_account_json_under_custom_env_name_off_macos() {
         // The dashboard "Custom" bypass: SA JSON pasted under VERTEX_API_KEY
-        // (not the whitelisted name) must still be caught by content detection
-        // and rejected off macOS — never written to plaintext config.
-        if cfg!(target_os = "macos") {
-            return;
-        }
+        // (not the whitelisted name) must still be caught by content
+        // detection — never written to plaintext config.
+        //
+        // #2234/45a contract (same shape as the twin at ~L5533): the
+        // availability predicate is `keychain::is_available()`, NOT
+        // `cfg!(macos)`. On a store-backed host (linux file backend with an
+        // INJECTED temp root) the JSON is legitimately relocated: Ok, the
+        // slot becomes a keychain marker, the raw value never remains.
+        // Hosts with NO backend keep the rejection.
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
         let mut env = std::collections::HashMap::new();
         env.insert(
             "VERTEX_API_KEY".to_string(),
             r#"{"type":"service_account","private_key":"x"}"#.to_string(),
         );
         let res = relocate_keychain_backed_secrets(&mut env, "tenant-1");
-        assert!(
-            res.is_err(),
-            "SA JSON under a custom env name must be rejected off macOS"
-        );
-        assert!(env.get("VERTEX_API_KEY").unwrap().starts_with('{'));
+        let slot = env.get("VERTEX_API_KEY").expect("slot present");
+        if crate::auth::keychain::is_available() {
+            assert!(
+                res.is_ok(),
+                "store-backed host relocates SA JSON under a custom name"
+            );
+            assert!(
+                crate::auth::keychain::is_marker(slot),
+                "slot must be a keychain marker, got: {slot}"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the raw private key must never remain in the slot"
+            );
+        } else {
+            assert!(
+                res.is_err(),
+                "SA JSON under a custom env name must be rejected with no store"
+            );
+            assert!(slot.starts_with('{'), "raw value left untouched");
+        }
     }
 
     #[test]
