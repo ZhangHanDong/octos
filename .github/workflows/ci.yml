@@ -1311,3 +1311,45 @@ jobs:
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
           cargo test -p octos-agent --test security_sandbox -- --nocapture
+
+  # Aggregate gate for the `default-branch-protection` ruleset, whose required
+  # status context is literally "CI required". Until now nothing produced that
+  # context, so every PR sat on "Expected — waiting for status" until a
+  # maintainer posted it by hand. This job runs after every PR-relevant job and
+  # reports the single required status automatically: skipped upstream jobs
+  # (event-gated ARM/RISC-V/release builds) are fine, any failure or
+  # cancellation fails the gate.
+  ci-required:
+    name: CI required
+    if: always() && github.event_name != 'schedule'
+    needs:
+      - dashboard
+      - swarm-app
+      - typos
+      - ux-gate-report
+      - windows-deploy-script
+      - web-app-base-url-windows
+      - check
+      - test-octos-agent
+      - test-octos-cli
+      - check-matrix
+      - check-windows
+      - e2e-changes
+      - e2e-tool-regression
+      - security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job failed or was cancelled
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS_JSON" | python3 -c '
+          import json, sys
+          needs = json.load(sys.stdin)
+          bad = {k: v["result"] for k, v in needs.items() if v["result"] in ("failure", "cancelled")}
+          for k, v in sorted(needs.items()):
+              print(f"{k}: {v[\"result\"]}")
+          if bad:
+              print("gate: FAIL ->", bad); sys.exit(1)
+          print("gate: all required jobs succeeded or were skipped by event gating")
+          '
