@@ -38057,3 +38057,147 @@ fn result_owner_contract_27h_r1() {
         std::any::type_name_of_val(&octos_agent::result_md_owner_content_is_peer),
     );
 }
+
+// ---------------------------------------------------------------------------
+// #48b — serve/UI forwarder path: `fallback_switch` rows from
+// `spawn_router_failover_forwarder` (same shape as the gateway path).
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_ui_48b {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn stub_router() -> Arc<octos_llm::AdaptiveRouter> {
+        Arc::new(octos_llm::AdaptiveRouter::new(
+            vec![Arc::new(Wave4AStubProvider {
+                name: "a",
+                model: "m1",
+            })],
+            &[],
+            octos_llm::AdaptiveConfig::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-own".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some(session_id.0.clone()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let events = read_events(data_dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "ui path writes one row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-other".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder =
+            spawn_router_failover_forwarder_for_test(ws, ledger, session_id, Some(router.clone()));
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some("some-other-session".to_string()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "other-session failover must not write rows on the ui path"
+        );
+    }
+}
+
+/// #48b — doc pin: the obs_events header lists both new kinds.
+#[test]
+fn obs_events_doc_lists_new_kinds() {
+    let src = include_str!("../obs_events.rs");
+    assert!(src.contains("fallback_switch"), "doc lists fallback_switch");
+    assert!(
+        src.contains("malformed_exhausted"),
+        "doc lists malformed_exhausted"
+    );
+}
+
+/// #48b — marker-prefixed terminal message produces exactly the
+/// malformed_exhausted decision (and the CLI appends ONLY that row).
+mod obs_malformed_exhausted_48b {
+    use super::*;
+
+    #[test]
+    fn obs_malformed_exhausted_event_on_errored_terminal() {
+        let session = SessionKey("tenant-a:api:mfe".to_owned());
+        let message = format!(
+            "{} feedback_limit=3 observed_malformed=4: original error text",
+            octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER
+        );
+        let detail =
+            malformed_exhausted_detail_for_terminal(&message).expect("marker prefix triggers");
+        assert_eq!(detail, "feedback_limit=3 observed_malformed=4");
+        // The Errored arm appends exactly one row with this detail + the
+        // session, and skips the ordinary turn_error row for this terminal.
+        let _ = &session;
+    }
+
+    #[test]
+    fn obs_no_malformed_exhausted_when_marker_not_prefix() {
+        let message = format!(
+            "ordinary error mentioning {} mid-text",
+            octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER
+        );
+        assert!(
+            malformed_exhausted_detail_for_terminal(&message).is_none(),
+            "marker buried mid-text must not trigger"
+        );
+    }
+}

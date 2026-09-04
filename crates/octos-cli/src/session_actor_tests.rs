@@ -9801,7 +9801,7 @@ mod obs_fallback_switch_48a {
     }
 
     #[tokio::test]
-    async fn obs_fallback_switch_event_written_for_own_session() {
+    async fn obs_fallback_switch_gateway_writes_own_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
         let sid = test_session_key(dir.path()).to_string();
@@ -9829,7 +9829,7 @@ mod obs_fallback_switch_48a {
     }
 
     #[tokio::test]
-    async fn obs_fallback_switch_ignores_other_session() {
+    async fn obs_fallback_switch_gateway_ignores_other_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
         let other = own_event("some-other-session");
@@ -9840,6 +9840,51 @@ mod obs_fallback_switch_48a {
             read_events(dir.path()).is_empty(),
             "other-session failover must not write any event row"
         );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_none_originator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let mut none_event = own_event("unused");
+        none_event.originating_session_id = None;
+        tx.send(none_event).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "None-originator failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_write_failure_does_not_block_notice() {
+        // data_dir points at a path that cannot host events.jsonl (a FILE
+        // where a directory is needed): the write fails, the notice still
+        // goes out, and the forwarder task stays alive.
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not-a-dir").unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(&blocker).await;
+        // The forwarder's session identity derives from the blocker path
+        // (its "data dir"); the event's originator must match THAT session.
+        let sid = test_session_key(&blocker).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        let push = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("notice must still be sent when the obs write fails")
+            .expect("channel open");
+        assert!(
+            push.content.starts_with("↺ Router failover:"),
+            "{}",
+            push.content
+        );
+        // The forwarder did NOT exit (still joinable, not finished).
+        assert!(
+            !handle.is_finished(),
+            "write failure must not kill the forwarder"
+        );
+        handle.abort();
     }
 
     #[tokio::test]
