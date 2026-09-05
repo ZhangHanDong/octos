@@ -374,6 +374,11 @@ pub(crate) mod linux_file {
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux_file::override_root_for_tests as test_override_secrets_root;
 
+/// Non-Linux test builds: the file backend does not exist, so the hook is the
+/// documented no-op (the api test modules call it unconditionally).
+#[cfg(all(test, not(target_os = "linux")))]
+pub(crate) fn test_override_secrets_root(_root: std::path::PathBuf) {}
+
 /// Unlock the login keychain so subsequent operations succeed from SSH.
 ///
 /// Also disables auto-lock so the keychain stays unlocked until reboot.
