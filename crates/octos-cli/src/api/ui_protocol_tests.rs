@@ -38374,21 +38374,38 @@ mod obs_malformed_exhausted_48b {
     }
 
     /// #48c — the critical test above must use the REAL agent error path
-    /// (no hand-built marker message). This pins the SOURCE: the test file
-    /// must not format! the marker into the terminal input, and must read
-    /// events.jsonl.
+    /// (no hand-built marker message). This pins the SOURCE — scoped to
+    /// ONLY the target function body (contract v3.1), not the whole file:
+    /// from `fn obs_malformed_exhausted_event_on_errored_terminal` to the
+    /// next `#[` or `fn ` after it.
     #[test]
     fn obs_malformed_exhausted_terminal_test_uses_real_agent_error() {
         let src = include_str!("ui_protocol_tests.rs");
-        // No hand-built marker message feeding the terminal.
+        let start = src
+            .find("fn obs_malformed_exhausted_event_on_errored_terminal")
+            .expect("target fn exists");
+        let rest = &src[start + 1..];
+        // Scope: the target function body ends at the NEXT attribute or fn.
+        let end_rel = rest
+            .find("\n    #[")
+            .or_else(|| rest.find("\n    fn "))
+            .or_else(|| rest.find("\n}"))
+            .expect("target fn body ends somewhere");
+        let body = &src[start..start + 1 + end_rel];
+        // It drives the real loop_runner.
         assert!(
-            !src.contains("format!(\"{} feedback_limit"),
-            "the critical test must not hand-build the marker message"
+            body.contains("process_message"),
+            "the critical test must drive the real agent loop: {body}"
         );
         // It reads the real events file.
         assert!(
-            src.contains("events.jsonl"),
+            body.contains("events.jsonl"),
             "the critical test must read events.jsonl"
+        );
+        // No hand-built marker message feeding the terminal.
+        assert!(
+            !body.contains("format!(\"{} feedback_limit"),
+            "the critical test must not hand-build the marker message"
         );
     }
 
