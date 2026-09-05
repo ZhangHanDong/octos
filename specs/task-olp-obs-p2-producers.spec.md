@@ -11,7 +11,7 @@ estimate: 1.5d
 不写事件)与 malformed tool-call 自纠预算耗尽(agent 侧超过 3 次后落入通用错误分派,CLI 的
 `events.jsonl` 今日只在连接断开路径写 `turn_error`,agent 失败终态不写事件)。本任务给
 `events.jsonl` 增加两个 kind 的发射点,沿用 `obs_events.rs` 的 best-effort 语义,不改既有六种
-kind 的字段、文案与发射时机,不改 wire 协议。契约 v3 已并入 codex/grok 对抗复审与 codex gpt-6 PR 复审。
+kind 的字段、文案与发射时机,不改 wire 协议。契约 v3.1 已并入 codex/grok 对抗复审与 codex gpt-6 两轮 PR 复审。
 
 ## Decisions
 
@@ -47,6 +47,15 @@ kind 的字段、文案与发射时机,不改 wire 协议。契约 v3 已并入 
   (None 透传)解耦:None 与他会话都不写事件,通知逻辑逐字不变。
 - 本契约所有 octos-cli 测试 MUST 以 `cargo test -p octos-cli --features api --lib <filter>` 运行(api 模块受
   feature 门控,默认 feature 不编译这些测试);ACK 与 PR 必须报该命令的计数。
+- **契约验证接线(v3.1)**:agent-spec 选择器无法携带 cargo feature,故新增无 feature 门控的集成测试
+  `crates/octos-cli/tests/olp_obs_p2_gate.rs`:每个 UI/终态场景一个 `olp_obs_p2_gate_<场景测试名>` 函数,函数体以
+  `std::process::Command` 运行 `cargo test -p octos-cli --features api --lib <该场景测试名> -- --exact`(继承
+  `CARGO_TARGET_DIR`/`CARGO` 环境,cwd 为工作区根),断言退出成功且 stdout 含 `1 passed`;这些门测试不复制被测逻辑,
+  只是把 feature 参数绑进选择器。下列 UI/终态场景的 `Test:` 改为结构化选择器 `Package: octos-cli` +
+  `Filter: olp_obs_p2_gate_<name>`;gateway(session_actor)与 agent 场景不受 feature 门控,保持直绑。
+- 源码断言测试 `obs_malformed_exhausted_terminal_test_uses_real_agent_error` MUST 只扫描目标函数体(从
+  `fn obs_malformed_exhausted_event_on_errored_terminal` 到下一个 `#[` 或 `fn ` 之间),断言其中含
+  `process_message` 与 `events.jsonl` 读取、不含以 MARKER 手工 `format!` 的 message;不得扫整文件。
 - 契约 v3(2026-09-05,codex gpt-6 PR 复审后):UI None 归属、终态测试真实链路、选择器拆分为修订。
 - 测试(全部为**新建**,提交树上没有可直接复用的 forwarder+data_dir 或 marker→事件夹具):
   gateway 路径在 `crates/octos-cli/src/session_actor_tests.rs` 用 broadcast `FailoverEvent` +
@@ -66,6 +75,7 @@ kind 的字段、文案与发射时机,不改 wire 协议。契约 v3 已并入 
 - crates/octos-agent/src/agent/loop_runner.rs
 - crates/octos-agent/src/agent/loop_runner_tests.rs
 - crates/octos-agent/src/lib.rs
+- crates/octos-cli/tests/olp_obs_p2_gate.rs
 
 ### Forbidden
 - 不改既有六种 kind 的字段、detail 文案与发射时机(含连接断开路径的 `turn_error`)。
@@ -117,20 +127,26 @@ Scenario: 事件写失败不阻断通知
 
 Scenario: serve/UI 路径本会话 failover 写入事件(critical)
   Tags: critical
-  Test: obs_fallback_switch_ui_forwarder_writes_own_session
+  Test:
+    Package: octos-cli
+    Filter: olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_writes_own_session
   Given spawn_router_failover_forwarder 以临时 ledger data_dir 启动且广播一条本会话 FailoverEvent
   When 转发器处理该事件
   Then events.jsonl 新增一行 kind 为 fallback_switch 且 session 等于本会话 id
 
 Scenario: serve/UI 路径他会话不写事件
-  Test: obs_fallback_switch_ui_forwarder_ignores_other_session
+  Test:
+    Package: octos-cli
+    Filter: olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_ignores_other_session
   Given spawn_router_failover_forwarder 收到一条他会话的 FailoverEvent
   When 转发器处理该事件
   Then events.jsonl 不新增任何行
 
 Scenario: serve/UI 路径 None 不写事件但通知照旧(critical)
   Tags: critical
-  Test: obs_fallback_switch_ui_forwarder_ignores_none_originator
+  Test:
+    Package: octos-cli
+    Filter: olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_ignores_none_originator
   Given spawn_router_failover_forwarder 收到一条 originating_session_id 为 None 的 FailoverEvent
   When 转发器处理该事件
   Then events.jsonl 不新增任何行
@@ -147,7 +163,9 @@ Scenario: 自纠预算耗尽的错误以 marker 开头且直接返回
 
 Scenario: 耗尽时 CLI 终态路径发射 malformed_exhausted(critical)
   Tags: critical
-  Test: obs_malformed_exhausted_event_on_errored_terminal
+  Test:
+    Package: octos-cli
+    Filter: olp_obs_p2_gate_obs_malformed_exhausted_event_on_errored_terminal
   Given 用 MalformedThenOkProvider 类提供者驱动真实 loop_runner 连续四次 MalformedArgs 得到 Err,并以 classify_runtime_error_message 得到终态 message
   When 以临时 ledger data_dir 调用 CLI 的终态发射函数(try_emit_terminal 或其被测内核)处理 TerminalReason::Errored
   Then 临时 data_dir 的 events.jsonl 新增恰一行 kind 为 malformed_exhausted
@@ -155,19 +173,25 @@ Scenario: 耗尽时 CLI 终态路径发射 malformed_exhausted(critical)
   And events.jsonl 中 turn_error 行数与处理前相等
 
 Scenario: 终态测试不得手拼 message
-  Test: obs_malformed_exhausted_terminal_test_uses_real_agent_error
+  Test:
+    Package: octos-cli
+    Filter: olp_obs_p2_gate_obs_malformed_exhausted_terminal_test_uses_real_agent_error
   Given 仓库检出
   When 读取 crates/octos-cli/src/api/ui_protocol_tests.rs 中 obs_malformed_exhausted_event_on_errored_terminal 的函数体
   Then 函数体不含以 MALFORMED_TOOLCALL_EXHAUSTED_MARKER 手工 format 的 message 且含对 events.jsonl 的读取
 
 Scenario: 正文中间含 marker 的普通错误不触发
-  Test: obs_no_malformed_exhausted_when_marker_not_prefix
+  Test:
+    Package: octos-cli
+    Filter: olp_obs_p2_gate_obs_no_malformed_exhausted_when_marker_not_prefix
   Given turn 以一个正文中间含 MARKER 字样但不以其开头的普通错误结束
   When CLI 处理该终态
   Then events.jsonl 不新增 malformed_exhausted 行
 
 Scenario: 事件流文档列出新 kind
-  Test: obs_events_doc_lists_new_kinds
+  Test:
+    Package: octos-cli
+    Filter: olp_obs_p2_gate_obs_events_doc_lists_new_kinds
   Given 仓库检出
   When 读取 crates/octos-cli/src/obs_events.rs 的顶部注释
   Then 注释含 fallback_switch 与 malformed_exhausted
