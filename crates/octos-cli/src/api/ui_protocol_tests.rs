@@ -38078,6 +38078,17 @@ mod obs_fallback_switch_ui_48b {
             .collect()
     }
 
+    fn read_obs_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        read_events(data_dir)
+    }
+
+    fn count_turn_error_rows(data_dir: &std::path::Path) -> usize {
+        read_events(data_dir)
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("turn_error"))
+            .count()
+    }
+
     fn stub_router() -> Arc<octos_llm::AdaptiveRouter> {
         Arc::new(octos_llm::AdaptiveRouter::new(
             vec![Arc::new(Wave4AStubProvider {
@@ -38173,20 +38184,153 @@ fn obs_events_doc_lists_new_kinds() {
 /// malformed_exhausted decision (and the CLI appends ONLY that row).
 mod obs_malformed_exhausted_48b {
     use super::*;
+    use std::io::BufRead as _;
 
-    #[test]
-    fn obs_malformed_exhausted_event_on_errored_terminal() {
-        let session = SessionKey("tenant-a:api:mfe".to_owned());
-        let message = format!(
-            "{} feedback_limit=3 observed_malformed=4: original error text",
-            octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn count_turn_error_rows(data_dir: &std::path::Path) -> usize {
+        read_events(data_dir)
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("turn_error"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+        // #48c — REAL agent error → terminal path → events.jsonl, no
+        // hand-built message: a provider that always returns MalformedArgs
+        // drives the loop_runner to exhaustion, the REAL error is classified
+        // through `classify_runtime_error_message`, and the Errored terminal
+        // appends exactly one malformed_exhausted row to a temp ledger dir.
+        struct AlwaysMalformedProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for AlwaysMalformedProvider {
+            fn provider_name(&self) -> &str {
+                "always-malformed"
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Err(eyre::Report::new(octos_llm::StreamError::MalformedArgs {
+                    tool_id: "call_bad".to_string(),
+                    tool_name: "shell".to_string(),
+                    error: "expected `,` or `}` at line 1 column 4123".to_string(),
+                }))
+            }
+            fn model_id(&self) -> &str {
+                "always-malformed"
+            }
+        }
+        let provider: std::sync::Arc<dyn octos_llm::LlmProvider> =
+            std::sync::Arc::new(AlwaysMalformedProvider);
+        let tools = octos_agent::ToolRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+        let memory = std::sync::Arc::new(
+            octos_memory::EpisodeStore::open(dir.path().join("memory"))
+                .await
+                .unwrap(),
         );
-        let detail =
-            malformed_exhausted_detail_for_terminal(&message).expect("marker prefix triggers");
-        assert_eq!(detail, "feedback_limit=3 observed_malformed=4");
-        // The Errored arm appends exactly one row with this detail + the
-        // session, and skips the ordinary turn_error row for this terminal.
-        let _ = &session;
+        let agent = octos_agent::Agent::new(
+            octos_core::AgentId::new("mfe-real"),
+            provider,
+            tools,
+            memory,
+        );
+        // The REAL exhausted error (marker prefix comes from the loop_runner
+        // return, NOT from this test's format!).
+        let error = agent
+            .process_message("never produces valid JSON", &[], vec![])
+            .await
+            .expect_err("exhausted malformed budget terminates the turn");
+        let message = classify_runtime_error_message(&error);
+        assert!(
+            message.starts_with(octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER),
+            "real classified error carries the marker: {message}"
+        );
+
+        // Terminal path with a temp ledger data_dir.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let session_id = SessionKey("tenant-a:api:mfe-real".to_owned());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+        let turn_error_before = count_turn_error_rows(data_dir.path());
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("runtime_error", message.as_str())),
+            None,
+            None,
+        )
+        .await;
+        // Drain the ws notifications so the runtime doesn't complain.
+        while rx.try_recv().is_ok() {}
+
+        let rows = read_events(data_dir.path());
+        let mfe: Vec<_> = rows
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("malformed_exhausted"))
+            .collect();
+        assert_eq!(
+            mfe.len(),
+            1,
+            "exactly one malformed_exhausted row: {rows:?}"
+        );
+        assert_eq!(
+            mfe[0].get("detail").and_then(|d| d.as_str()),
+            Some("feedback_limit=3 observed_malformed=4"),
+            "detail verbatim from the real error"
+        );
+        assert_eq!(
+            mfe[0].get("session").and_then(|s| s.as_str()),
+            Some("tenant-a:api:mfe-real")
+        );
+        assert_eq!(
+            count_turn_error_rows(data_dir.path()),
+            turn_error_before,
+            "no turn_error row added for this terminal"
+        );
+    }
+
+    /// #48c — the critical test above must use the REAL agent error path
+    /// (no hand-built marker message). This pins the SOURCE: the test file
+    /// must not format! the marker into the terminal input, and must read
+    /// events.jsonl.
+    #[test]
+    fn obs_malformed_exhausted_terminal_test_uses_real_agent_error() {
+        let src = include_str!("ui_protocol_tests.rs");
+        // No hand-built marker message feeding the terminal.
+        assert!(
+            !src.contains("format!(\"{} feedback_limit"),
+            "the critical test must not hand-build the marker message"
+        );
+        // It reads the real events file.
+        assert!(
+            src.contains("events.jsonl"),
+            "the critical test must read events.jsonl"
+        );
     }
 
     #[test]

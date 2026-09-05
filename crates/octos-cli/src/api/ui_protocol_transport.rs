@@ -38366,21 +38366,33 @@ fn spawn_router_failover_forwarder(
                             continue;
                         }
                     }
-                    // #48b — OLP observability: same-shaped `fallback_switch`
-                    // row as the gateway path, written BEFORE the durable
-                    // client notice; best-effort (an unwritable data_dir or a
-                    // None data_dir skips the row and never blocks the notice).
-                    if let Some(data_dir) = ledger.config_data_dir() {
-                        let detail = format!(
-                            "router failover: {} -> {} ({}, {}ms)",
-                            event.from_provider, event.to_provider, event.reason, event.elapsed_ms
-                        );
-                        crate::obs_events::append_obs_event(
-                            &data_dir,
-                            &crate::obs_events::ObsEvent::new("fallback_switch", &detail)
-                                .session(Some(&session_id_str))
-                                .model_lane(Some(&event.to_provider)),
-                        );
+                    // #48c — the EVENT row is stricter than the notice
+                    // filter above (which stays verbatim): only an
+                    // EXPLICIT own-session stamp writes a row. None and
+                    // other sessions write nothing.
+                    let own_session_event =
+                        event.originating_session_id.as_deref() == Some(session_id_str.as_str());
+                    if own_session_event {
+                        // #48b — OLP observability: same-shaped
+                        // `fallback_switch` row as the gateway path, written
+                        // BEFORE the durable client notice; best-effort (an
+                        // unwritable data_dir or a None data_dir skips the
+                        // row and never blocks the notice).
+                        if let Some(data_dir) = ledger.config_data_dir() {
+                            let detail = format!(
+                                "router failover: {} -> {} ({}, {}ms)",
+                                event.from_provider,
+                                event.to_provider,
+                                event.reason,
+                                event.elapsed_ms
+                            );
+                            crate::obs_events::append_obs_event(
+                                &data_dir,
+                                &crate::obs_events::ObsEvent::new("fallback_switch", &detail)
+                                    .session(Some(&session_id_str))
+                                    .model_lane(Some(&event.to_provider)),
+                            );
+                        }
                     }
                     let notif = UiNotification::RouterFailover(
                         octos_core::ui_protocol::RouterFailoverEvent {
