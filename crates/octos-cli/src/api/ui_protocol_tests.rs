@@ -38078,17 +38078,6 @@ mod obs_fallback_switch_ui_48b {
             .collect()
     }
 
-    fn read_obs_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
-        read_events(data_dir)
-    }
-
-    fn count_turn_error_rows(data_dir: &std::path::Path) -> usize {
-        read_events(data_dir)
-            .iter()
-            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("turn_error"))
-            .count()
-    }
-
     fn stub_router() -> Arc<octos_llm::AdaptiveRouter> {
         Arc::new(octos_llm::AdaptiveRouter::new(
             vec![Arc::new(Wave4AStubProvider {
@@ -38165,6 +38154,70 @@ mod obs_fallback_switch_ui_48b {
         assert!(
             read_events(data_dir.path()).is_empty(),
             "other-session failover must not write rows on the ui path"
+        );
+    }
+
+    /// #48c-r1 — None originator: no `events.jsonl` row, but the client
+    /// NOTICE still passes through (the Codex P1 notice filter is
+    /// verbatim-untouched for None; only the event write is stricter).
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-none".to_owned());
+        let router = stub_router();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        // No RouterContext => originating_session_id is None.
+        router.publish_failover_for_subscribers("a", "b", "quota", 120);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "None-originator failover must not write rows on the ui path (#48c strict event gate)"
+        );
+        // The notice still passes through, verbatim pre-#48c behavior.
+        // The wire carries serialized WS text frames; decode the envelope to
+        // confirm the RouterFailover notice survived the None gate.
+        let noticed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(axum::extract::ws::Message::Text(text)) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if v.get("method").and_then(|t| t.as_str()) == Some("router/failover")
+                                || v.get("type").and_then(|t| t.as_str()) == Some("router/failover")
+                            {
+                                return v;
+                            }
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("notification channel closed without a RouterFailover notice"),
+                }
+            }
+        })
+        .await
+        .expect("None-originator failover notice still forwarded");
+        let params = noticed.get("params").cloned().unwrap_or_default();
+        assert_eq!(
+            params.get("session_id").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str()),
+            "notice targets THIS session: {noticed}"
+        );
+        assert_eq!(
+            params.get("from_provider").and_then(|s| s.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            params.get("to_provider").and_then(|s| s.as_str()),
+            Some("b")
         );
     }
 }
@@ -38289,6 +38342,12 @@ mod obs_malformed_exhausted_48b {
         while rx.try_recv().is_ok() {}
 
         let rows = read_events(data_dir.path());
+        // The pair of helpers are pinned to a REAL use: total row count and
+        // the turn_error count (unchanged) come from the same read.
+        assert!(
+            !rows.is_empty(),
+            "terminal wrote at least the malformed_exhausted row"
+        );
         let mfe: Vec<_> = rows
             .iter()
             .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("malformed_exhausted"))
