@@ -33,6 +33,10 @@ fn run_gated_test(target: &str) {
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("CARGO") // subprocess must invoke cargo itself
+        // #48d-r: inherit CARGO_TARGET_DIR when set (shares the outer
+        // lock-holding build dir instead of contending on a second one);
+        // when unset, cargo falls back to ./target — either way nested
+        // invocations queue on the SAME lock rather than deadlocking.
         .output()
         .unwrap_or_else(|e| panic!("spawn {cargo} for {target}: {e}"));
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
